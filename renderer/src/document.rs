@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
 use ropey::Rope;
 
+use crate::syntax::{self, Lang};
 use crate::theme;
 
 #[derive(Clone, Copy)]
@@ -55,19 +56,25 @@ pub struct Document {
     pub rope: Rope,
     pub sel: Selection,
     pub scroll_y: f32,
+    pub scroll_x: f32,
     pub dirty: bool,
     history: Vec<Edit>,
     future: Vec<Edit>,
     pub buffer: Buffer,
-    is_md: bool,
+    lang: Lang,
+    ext: String,
 }
 
-fn apply_buffer_text(buffer: &mut Buffer, fs: &mut FontSystem, text: &str, lines: usize, is_md: bool) {
+fn apply_buffer_text(buffer: &mut Buffer, fs: &mut FontSystem, text: &str, lines: usize, lang: Lang, ext: &str) {
     let h = (lines as f32 + 2.0) * theme::LINE_HEIGHT + 200.0;
     buffer.set_size(fs, None, Some(h));
     let mono = Attrs::new().family(Family::Name(theme::MONO_FAMILY));
-    if is_md {
-        let spans = md_spans(text);
+    // An installed extension grammar (parsed natively) takes priority for its
+    // file types; then markdown; then tree-sitter; else plain.
+    let spans = crate::textmate::spans_for(ext, text)
+        .or_else(|| (lang == Lang::Markdown).then(|| md_spans(text)))
+        .or_else(|| syntax::highlight_spans(lang, text));
+    if let Some(spans) = spans {
         buffer.set_rich_text(
             fs,
             spans.iter().map(|(s, a)| (s.as_str(), *a)),
@@ -91,26 +98,26 @@ fn md_spans(text: &str) -> Vec<(String, Attrs<'static>)> {
         let trimmed = body.trim_start();
         if trimmed.starts_with("```") {
             in_fence = !in_fence;
-            out.push((line.to_string(), mono(theme::MD_CODE)));
+            out.push((line.to_string(), mono(theme::MD_CODE())));
             continue;
         }
         if in_fence {
-            out.push((line.to_string(), mono(theme::MD_CODE)));
+            out.push((line.to_string(), mono(theme::MD_CODE())));
         } else if trimmed.starts_with('#') {
-            out.push((line.to_string(), mono(theme::MD_HEADING)));
+            out.push((line.to_string(), mono(theme::MD_HEADING())));
         } else if trimmed.starts_with('>') {
-            out.push((line.to_string(), mono(theme::MD_QUOTE)));
+            out.push((line.to_string(), mono(theme::MD_QUOTE())));
         } else if !trimmed.is_empty()
             && trimmed.chars().all(|c| c == '-' || c == '*' || c == '_' || c == ' ')
             && trimmed.chars().filter(|&c| c == '-' || c == '*' || c == '_').count() >= 3
         {
-            out.push((line.to_string(), mono(theme::MD_RULE)));
+            out.push((line.to_string(), mono(theme::MD_RULE())));
         } else if trimmed.starts_with("* ") || trimmed.starts_with("- ") || trimmed.starts_with("+ ") {
             let indent = body.len() - trimmed.len();
-            out.push((body[..indent + 1].to_string(), mono(theme::MD_LIST)));
-            out.push((format!("{}\n", &body[indent + 1..]), mono(theme::FG_TEXT)));
+            out.push((body[..indent + 1].to_string(), mono(theme::MD_LIST())));
+            out.push((format!("{}\n", &body[indent + 1..]), mono(theme::FG_TEXT())));
         } else {
-            out.push((line.to_string(), mono(theme::FG_TEXT)));
+            out.push((line.to_string(), mono(theme::FG_TEXT())));
         }
     }
     out
@@ -118,17 +125,18 @@ fn md_spans(text: &str) -> Vec<(String, Attrs<'static>)> {
 
 impl Document {
     pub fn new(path: Option<PathBuf>, contents: String, fs: &mut FontSystem) -> Self {
-        let is_md = path
+        let ext = path
             .as_ref()
             .and_then(|p| p.extension())
-            .map(|e| e.eq_ignore_ascii_case("md"))
-            .unwrap_or(false);
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        let lang = Lang::from_ext(&ext);
         let mut buffer = Buffer::new(fs, Metrics::new(theme::FONT_SIZE, theme::LINE_HEIGHT));
         // Strip CR for display: cosmic-text renders a stray \r (from CRLF files)
         // as an extra line break, double-spacing the whole document. The rope
         // keeps the original \r\n so saving preserves line endings.
         let display = contents.replace('\r', "");
-        apply_buffer_text(&mut buffer, fs, &display, display.matches('\n').count(), is_md);
+        apply_buffer_text(&mut buffer, fs, &display, display.matches('\n').count(), lang, &ext);
         let name = match &path {
             Some(p) => p
                 .file_name()
@@ -142,18 +150,28 @@ impl Document {
             rope: Rope::from_str(&contents),
             sel: Selection::caret(0),
             scroll_y: 0.0,
+            scroll_x: 0.0,
             dirty: false,
             history: Vec::new(),
             future: Vec::new(),
             buffer,
-            is_md,
+            lang,
+            ext,
         }
+    }
+
+    /// Widest shaped line in pixels (for horizontal scrolling).
+    pub fn max_line_width(&self) -> f32 {
+        self.buffer
+            .layout_runs()
+            .map(|r| r.line_w)
+            .fold(0.0_f32, f32::max)
     }
 
     pub fn reshape(&mut self, fs: &mut FontSystem) {
         let text = self.rope.to_string().replace('\r', "");
         let lines = self.rope.len_lines();
-        apply_buffer_text(&mut self.buffer, fs, &text, lines, self.is_md);
+        apply_buffer_text(&mut self.buffer, fs, &text, lines, self.lang, &self.ext);
     }
 
     fn apply_op(&mut self, op: &EditOp, at_byte: usize) {
@@ -384,6 +402,127 @@ impl Document {
         let line_start_char = self.rope.line_to_char(line);
         let byte = self.rope.char_to_byte(line_start_char + len_chars);
         self.place(byte, extend);
+    }
+
+    /// Select the word (alphanumeric/underscore run) under `byte`; if the click
+    /// is on a non-word char, select just that char.
+    pub fn select_word(&mut self, byte: usize) {
+        let total = self.rope.len_chars();
+        if total == 0 {
+            return;
+        }
+        let mut ci = self.rope.byte_to_char(byte.min(self.rope.len_bytes()));
+        if ci >= total {
+            ci = total - 1;
+        }
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        let here = self.rope.char(ci);
+        if !is_word(here) {
+            self.sel.anchor = self.rope.char_to_byte(ci);
+            self.sel.head = self.rope.char_to_byte((ci + 1).min(total));
+            self.sel.desired_col = None;
+            return;
+        }
+        let mut start = ci;
+        while start > 0 && is_word(self.rope.char(start - 1)) {
+            start -= 1;
+        }
+        let mut end = ci;
+        while end < total && is_word(self.rope.char(end)) {
+            end += 1;
+        }
+        self.sel.anchor = self.rope.char_to_byte(start);
+        self.sel.head = self.rope.char_to_byte(end);
+        self.sel.desired_col = None;
+    }
+
+    /// Byte offset of the previous word boundary (skips whitespace, then a run
+    /// of word chars or a run of punctuation).
+    pub fn prev_word(&self, byte: usize) -> usize {
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        let mut ci = self.rope.byte_to_char(byte.min(self.rope.len_bytes()));
+        while ci > 0 && self.rope.char(ci - 1).is_whitespace() {
+            ci -= 1;
+        }
+        if ci > 0 && is_word(self.rope.char(ci - 1)) {
+            while ci > 0 && is_word(self.rope.char(ci - 1)) {
+                ci -= 1;
+            }
+        } else {
+            while ci > 0 {
+                let c = self.rope.char(ci - 1);
+                if c.is_whitespace() || is_word(c) {
+                    break;
+                }
+                ci -= 1;
+            }
+        }
+        self.rope.char_to_byte(ci)
+    }
+
+    /// Byte offset of the next word boundary.
+    pub fn next_word(&self, byte: usize) -> usize {
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        let total = self.rope.len_chars();
+        let mut ci = self.rope.byte_to_char(byte.min(self.rope.len_bytes()));
+        if ci < total && is_word(self.rope.char(ci)) {
+            while ci < total && is_word(self.rope.char(ci)) {
+                ci += 1;
+            }
+        } else if ci < total && !self.rope.char(ci).is_whitespace() {
+            while ci < total {
+                let c = self.rope.char(ci);
+                if c.is_whitespace() || is_word(c) {
+                    break;
+                }
+                ci += 1;
+            }
+        }
+        while ci < total && self.rope.char(ci).is_whitespace() && self.rope.char(ci) != '\n' {
+            ci += 1;
+        }
+        self.rope.char_to_byte(ci)
+    }
+
+    pub fn move_word_left(&mut self, extend: bool) {
+        let b = self.prev_word(self.sel.head);
+        self.place(b, extend);
+    }
+
+    pub fn move_word_right(&mut self, extend: bool) {
+        let b = self.next_word(self.sel.head);
+        self.place(b, extend);
+    }
+
+    pub fn delete_word_back(&mut self, fs: &mut FontSystem) {
+        if !self.sel.is_empty() {
+            self.delete_selection(fs);
+            return;
+        }
+        let start = self.prev_word(self.sel.head);
+        let end = self.sel.head;
+        if start >= end {
+            return;
+        }
+        let lo_char = self.rope.byte_to_char(start);
+        let hi_char = self.rope.byte_to_char(end);
+        let removed = self.rope.slice(lo_char..hi_char).to_string();
+        self.push_and_apply(EditOp::Delete(removed), start, Selection::caret(start));
+        self.reshape(fs);
+    }
+
+    /// Select the whole line under `byte`, including its trailing newline.
+    pub fn select_line(&mut self, byte: usize) {
+        let line = self.rope.byte_to_line(byte.min(self.rope.len_bytes()));
+        let start = self.rope.line_to_byte(line);
+        let end = if line + 1 < self.rope.len_lines() {
+            self.rope.line_to_byte(line + 1)
+        } else {
+            self.rope.len_bytes()
+        };
+        self.sel.anchor = start;
+        self.sel.head = end;
+        self.sel.desired_col = None;
     }
 
     pub fn select_all(&mut self) {

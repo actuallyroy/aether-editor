@@ -1,0 +1,138 @@
+// OpenVSX marketplace client. Runs on a background thread (blocking HTTP via
+// ureq) so the UI never stalls; results are sent back over a channel and polled
+// from the event loop. Search + .vsix download/extract live here. Kept behind a
+// small RemoteExt type so a different registry could be swapped in later.
+
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+use serde_json::Value;
+
+const BASE: &str = "https://open-vsx.org";
+
+/// One marketplace search result (icon bytes fetched eagerly, best-effort).
+#[derive(Clone)]
+pub struct RemoteExt {
+    pub name: String,
+    pub namespace: String, // publisher
+    pub display: String,
+    pub description: String,
+    pub version: String,
+    pub download_url: Option<String>,
+    pub icon: Option<Vec<u8>>, // raw PNG/JPG bytes, decoded on the GPU thread
+}
+
+impl RemoteExt {
+    /// Stable atlas key / install id: `namespace.name`.
+    pub fn id(&self) -> String {
+        format!("{}.{}", self.namespace, self.name)
+    }
+}
+
+fn get_string(url: &str) -> Option<String> {
+    ureq::get(url).call().ok()?.into_string().ok()
+}
+
+fn get_bytes(url: &str, max: usize) -> Option<Vec<u8>> {
+    let resp = ureq::get(url).call().ok()?;
+    let mut buf = Vec::new();
+    resp.into_reader().take(max as u64).read_to_end(&mut buf).ok()?;
+    (!buf.is_empty()).then_some(buf)
+}
+
+/// Search OpenVSX. Fetches up to `size` results and eagerly downloads raster
+/// icons for the first several (skipping SVG, which we can't rasterize yet).
+pub fn search(query: &str, size: usize) -> Vec<RemoteExt> {
+    let url = format!(
+        "{BASE}/api/-/search?query={}&size={}&offset=0&includeAllVersions=false",
+        urlencode(query),
+        size
+    );
+    let Some(body) = get_string(&url) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&body) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if let Some(arr) = v["extensions"].as_array() {
+        for (i, e) in arr.iter().enumerate() {
+            let name = e["name"].as_str().unwrap_or("").to_string();
+            let namespace = e["namespace"].as_str().unwrap_or("").to_string();
+            if name.is_empty() || namespace.is_empty() {
+                continue;
+            }
+            let files = &e["files"];
+            let icon_url = files.get("icon").and_then(|u| u.as_str());
+            // Only fetch a handful of raster icons to keep search snappy.
+            let icon = icon_url
+                .filter(|u| {
+                    let l = u.to_lowercase();
+                    i < 12 && (l.ends_with(".png") || l.ends_with(".jpg") || l.ends_with(".jpeg"))
+                })
+                .and_then(|u| get_bytes(u, 512 * 1024));
+            out.push(RemoteExt {
+                name,
+                namespace,
+                display: e["displayName"].as_str().unwrap_or("").to_string(),
+                description: e["description"].as_str().unwrap_or("").to_string(),
+                version: e["version"].as_str().unwrap_or("").to_string(),
+                download_url: files.get("download").and_then(|u| u.as_str()).map(String::from),
+                icon,
+            });
+        }
+    }
+    out
+}
+
+/// Download a `.vsix` (a zip) and extract its `extension/` payload into
+/// `~/.vscode/extensions/<namespace>.<name>-<version>/`. Returns the new dir.
+pub fn install(ext: &RemoteExt, ext_root: &Path) -> Result<PathBuf, String> {
+    let url = ext.download_url.as_ref().ok_or("no download url")?;
+    let resp = ureq::get(url).call().map_err(|e| e.to_string())?;
+    let mut bytes = Vec::new();
+    resp.into_reader()
+        .take(64 * 1024 * 1024)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+
+    let dest = ext_root.join(format!("{}.{}-{}", ext.namespace, ext.name, ext.version));
+    let reader = std::io::Cursor::new(bytes);
+    let mut zip = zip::ZipArchive::new(reader).map_err(|e| e.to_string())?;
+    for i in 0..zip.len() {
+        let mut file = zip.by_index(i).map_err(|e| e.to_string())?;
+        let Some(enclosed) = file.enclosed_name() else {
+            continue;
+        };
+        // VSIX wraps the package under `extension/`; strip that prefix.
+        let Ok(rel) = enclosed.strip_prefix("extension") else {
+            continue;
+        };
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        let out_path = dest.join(rel);
+        if file.is_dir() {
+            std::fs::create_dir_all(&out_path).map_err(|e| e.to_string())?;
+        } else {
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let mut out = std::fs::File::create(&out_path).map_err(|e| e.to_string())?;
+            std::io::copy(&mut file, &mut out).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(dest)
+}
+
+/// Minimal percent-encoding for the query string (encode anything non-alnum).
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}

@@ -7,26 +7,34 @@
 // Activity bar, sidebar file tree, tab strip, editor (gutter + text),
 // status bar, command palette (Ctrl+Shift+P), find bar (Ctrl+F).
 
+mod commands;
 mod document;
+mod ext_runtime;
+mod extensions;
+mod gpu;
+mod icon;
+mod layout;
+mod marketplace;
 mod quad;
+mod syntax;
+mod textmate;
 mod theme;
+mod widgets;
 mod workspace;
 
 use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use arboard::Clipboard;
 use glyphon::{
-    Attrs, Buffer, Cache, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache, TextArea,
-    TextAtlas, TextBounds, TextRenderer, Viewport,
+    Attrs, Buffer, Family, Resolution, Shaping, TextArea, TextBounds,
 };
 use wgpu::{
-    Backends, CommandEncoderDescriptor, CompositeAlphaMode, DeviceDescriptor, Instance,
-    InstanceDescriptor, LoadOp, MultisampleState, Operations, PresentMode,
-    RenderPassColorAttachment, RenderPassDescriptor, RequestAdapterOptions, StoreOp,
-    SurfaceConfiguration, TextureFormat, TextureUsages, TextureViewDescriptor,
+    CommandEncoderDescriptor, LoadOp, Operations, RenderPassColorAttachment,
+    RenderPassDescriptor, StoreOp, TextureViewDescriptor,
 };
 use winit::{
     application::ApplicationHandler,
@@ -37,1215 +45,15 @@ use winit::{
     window::{CursorIcon, Window, WindowId},
 };
 
+use commands::{Command, COMMANDS, FindBarState, PaletteState};
 use document::Document;
-use quad::{Quad, QuadRenderer};
+use extensions::{ExtKind, Extension};
+use gpu::GpuState;
+use layout::Layout;
+use quad::Quad;
+use widgets::{Axis, ExtZone, Rect, Scrollbar, Splitter, VAlign};
 use workspace::Workspace;
 
-// ---------- Layout primitives ----------
-
-#[derive(Clone, Copy, Default)]
-struct Rect {
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-}
-
-impl Rect {
-    fn contains(&self, p: (f32, f32)) -> bool {
-        p.0 >= self.x && p.0 < self.x + self.w && p.1 >= self.y && p.1 < self.y + self.h
-    }
-    fn quad(&self, color: [f32; 4]) -> Quad {
-        Quad::new(self.x, self.y, self.w, self.h, color)
-    }
-}
-
-/// Reusable icon button. A single `rect` (supplied at draw time from the layout)
-/// is the single source of truth for the hit region, the hover background, and
-/// the centered glyph — so they can never drift apart. Backed by a one-glyph
-/// buffer to sidestep glyphon's multi-line layout quirks.
-struct IconButton {
-    buffer: Buffer,
-    size: f32,
-    cursor: CursorIcon,
-}
-
-impl IconButton {
-    fn new(fs: &mut FontSystem, glyph: char, family: &str, size: f32) -> Self {
-        let mut buffer = Buffer::new(fs, Metrics::new(size, size + 2.0));
-        buffer.set_size(fs, Some(128.0), Some(size + 8.0));
-        let mut tmp = [0u8; 4];
-        buffer.set_text(
-            fs,
-            glyph.encode_utf8(&mut tmp),
-            Attrs::new().family(Family::Name(family)),
-            Shaping::Advanced,
-        );
-        buffer.shape_until_scroll(fs, false);
-        // Buttons get the hand pointer by default; callers can override.
-        Self {
-            buffer,
-            size,
-            cursor: CursorIcon::Pointer,
-        }
-    }
-
-    fn cursor(&self) -> CursorIcon {
-        self.cursor
-    }
-
-    fn glyph_w(&self) -> f32 {
-        self.buffer
-            .layout_runs()
-            .next()
-            .map(|r| r.line_w)
-            .unwrap_or(self.size)
-    }
-
-    /// Push the button's glyph, centered in `rect` and clipped to it. The hover
-    /// background is drawn separately in the bg phase from the same rect, so the
-    /// two always align.
-    fn draw<'a>(&'a self, rect: Rect, color: glyphon::Color, areas: &mut Vec<TextArea<'a>>) {
-        let gw = self.glyph_w();
-        areas.push(TextArea {
-            buffer: &self.buffer,
-            left: rect.x + (rect.w - gw) * 0.5,
-            top: rect.y + (rect.h - self.size) * 0.5 - 1.0,
-            scale: 1.0,
-            bounds: TextBounds {
-                left: rect.x as i32,
-                top: rect.y as i32,
-                right: (rect.x + rect.w) as i32,
-                bottom: (rect.y + rect.h) as i32,
-            },
-            default_color: color,
-            custom_glyphs: &[],
-        });
-    }
-}
-
-/// Reusable single-line text label. Owns its buffer *and* its last content, so
-/// it reshapes only when the text actually changes (no parallel cache string),
-/// and draws a TextArea clipped to a supplied rect — that rect being the single
-/// source of truth for placement and clipping. Three alignment helpers cover
-/// the common cases (left-padded, centered, right-padded).
-struct TextLabel {
-    buffer: Buffer,
-    last: String,
-}
-
-impl TextLabel {
-    fn new(fs: &mut FontSystem, w: f32, h: f32) -> Self {
-        Self {
-            buffer: make_ui_buffer(fs, w, h),
-            last: String::new(),
-        }
-    }
-
-    fn set(&mut self, fs: &mut FontSystem, text: &str, family: &str) {
-        if self.last == text {
-            return;
-        }
-        self.buffer.set_text(
-            fs,
-            text,
-            Attrs::new().family(Family::Name(family)),
-            Shaping::Advanced,
-        );
-        self.buffer.shape_until_scroll(fs, false);
-        self.last = text.to_string();
-    }
-
-    /// Rich (multi-span, multi-color) variant. `key` is an opaque change-detection
-    /// string so we reshape only when the content changes.
-    fn set_rich(&mut self, fs: &mut FontSystem, key: &str, spans: &[(String, Attrs)], default: Attrs) {
-        if self.last == key {
-            return;
-        }
-        self.buffer.set_rich_text(
-            fs,
-            spans.iter().map(|(s, a)| (s.as_str(), *a)),
-            default,
-            Shaping::Advanced,
-        );
-        self.buffer.shape_until_scroll(fs, false);
-        self.last = key.to_string();
-    }
-
-    fn width(&self) -> f32 {
-        self.buffer
-            .layout_runs()
-            .next()
-            .map(|r| r.line_w)
-            .unwrap_or(0.0)
-    }
-
-    fn push<'a>(&'a self, left: f32, rect: Rect, color: glyphon::Color, areas: &mut Vec<TextArea<'a>>) {
-        areas.push(TextArea {
-            buffer: &self.buffer,
-            left,
-            top: rect.y + (rect.h - theme::UI_LINE_HEIGHT) * 0.5,
-            scale: 1.0,
-            bounds: TextBounds {
-                left: rect.x as i32,
-                top: rect.y as i32,
-                right: (rect.x + rect.w) as i32,
-                bottom: (rect.y + rect.h) as i32,
-            },
-            default_color: color,
-            custom_glyphs: &[],
-        });
-    }
-
-    fn draw_left<'a>(&'a self, rect: Rect, pad: f32, color: glyphon::Color, areas: &mut Vec<TextArea<'a>>) {
-        self.push(rect.x + pad, rect, color, areas);
-    }
-
-    fn draw_center<'a>(&'a self, rect: Rect, color: glyphon::Color, areas: &mut Vec<TextArea<'a>>) {
-        self.push(rect.x + (rect.w - self.width()) * 0.5, rect, color, areas);
-    }
-
-    fn draw_right<'a>(&'a self, rect: Rect, pad: f32, color: glyphon::Color, areas: &mut Vec<TextArea<'a>>) {
-        self.push(rect.x + rect.w - self.width() - pad, rect, color, areas);
-    }
-}
-
-/// A real editable single-line text input. It OWNS its text and edit operations
-/// (`insert` / `backspace` / `clear` / `set_text`), tracks focus, and renders a
-/// blinking caret at the end of the text — so callers route keystrokes into it
-/// instead of keeping their own parallel String. A leading space pads the text
-/// off the left edge; when empty it shows `placeholder`.
-struct TextInput {
-    buffer: Buffer,
-    text: String,
-    placeholder: String,
-    focused: bool,
-    shown: String, // last shaped content (change detection)
-    cursor: CursorIcon,
-}
-
-impl TextInput {
-    fn new(fs: &mut FontSystem, w: f32, h: f32) -> Self {
-        Self {
-            buffer: make_ui_buffer(fs, w, h),
-            text: String::new(),
-            placeholder: String::new(),
-            focused: false,
-            shown: String::new(),
-            cursor: CursorIcon::Text,
-        }
-    }
-
-    fn cursor(&self) -> CursorIcon {
-        self.cursor
-    }
-
-    fn text(&self) -> &str {
-        &self.text
-    }
-
-    fn focused(&self) -> bool {
-        self.focused
-    }
-
-    fn focus(&mut self, on: bool) {
-        self.focused = on;
-    }
-
-    fn reshape(&mut self, fs: &mut FontSystem) {
-        let content = if self.text.is_empty() {
-            self.placeholder.clone()
-        } else {
-            format!(" {}", self.text)
-        };
-        if self.shown == content {
-            return;
-        }
-        self.buffer.set_text(
-            fs,
-            &content,
-            Attrs::new().family(Family::Name(theme::UI_FAMILY)),
-            Shaping::Advanced,
-        );
-        self.buffer.shape_until_scroll(fs, false);
-        self.shown = content;
-    }
-
-    fn set_placeholder(&mut self, fs: &mut FontSystem, s: &str) {
-        if self.placeholder != s {
-            self.placeholder = s.to_string();
-            if self.text.is_empty() {
-                self.reshape(fs);
-            }
-        }
-    }
-
-    fn set_text(&mut self, fs: &mut FontSystem, s: &str) {
-        self.text = s.to_string();
-        self.reshape(fs);
-    }
-
-    fn clear(&mut self, fs: &mut FontSystem) {
-        self.text.clear();
-        self.reshape(fs);
-    }
-
-    fn insert(&mut self, fs: &mut FontSystem, s: &str) {
-        self.text.push_str(s);
-        self.reshape(fs);
-    }
-
-    fn backspace(&mut self, fs: &mut FontSystem) {
-        self.text.pop();
-        self.reshape(fs);
-    }
-
-    /// Width of the shaped content (used for caret position / label centering).
-    fn width(&self) -> f32 {
-        self.buffer
-            .layout_runs()
-            .next()
-            .map(|r| r.line_w)
-            .unwrap_or(0.0)
-    }
-
-    /// A thin caret bar at the end of the text (start when empty).
-    fn caret_quad(&self, rect: Rect, pad_x: f32) -> Quad {
-        let x = if self.text.is_empty() {
-            rect.x + pad_x + 1.0
-        } else {
-            rect.x + pad_x + self.width()
-        };
-        let h = theme::UI_LINE_HEIGHT - 6.0;
-        let y = rect.y + (rect.h - h) * 0.5;
-        Quad::new(x, y, 1.5, h, theme::CURSOR)
-    }
-
-    fn draw<'a>(&'a self, rect: Rect, pad_x: f32, color: glyphon::Color, areas: &mut Vec<TextArea<'a>>) {
-        areas.push(TextArea {
-            buffer: &self.buffer,
-            left: rect.x + pad_x,
-            top: rect.y + (rect.h - theme::UI_LINE_HEIGHT) * 0.5,
-            scale: 1.0,
-            bounds: TextBounds {
-                left: rect.x as i32,
-                top: rect.y as i32,
-                right: (rect.x + rect.w) as i32,
-                bottom: (rect.y + rect.h) as i32,
-            },
-            default_color: color,
-            custom_glyphs: &[],
-        });
-    }
-}
-
-/// VSCode-style header "command center": a centered box with a leading search
-/// glyph and a centered label, clickable to open the command palette. Composes
-/// the reusable IconButton (search glyph) + TextInput (label) so it inherits
-/// their rendering; the box chrome is drawn from the same rect.
-struct SearchField {
-    icon: IconButton,
-    label: TextInput,
-    cursor: CursorIcon,
-}
-
-impl SearchField {
-    fn new(fs: &mut FontSystem) -> Self {
-        let mut icon = IconButton::new(fs, theme::ICON_SEARCH, theme::ICON_FAMILY, 12.0);
-        icon.cursor = CursorIcon::Pointer;
-        Self {
-            icon,
-            label: TextInput::new(fs, 700.0, theme::TITLE_BAR_H),
-            cursor: CursorIcon::Pointer,
-        }
-    }
-
-    fn cursor(&self) -> CursorIcon {
-        self.cursor
-    }
-
-    fn set(&mut self, fs: &mut FontSystem, label: &str) {
-        self.label.set_placeholder(fs, label);
-    }
-
-    /// Box fill + 1px border, drawn from `rect`.
-    fn draw_bg(&self, rect: Rect, hovered: bool, bg_quads: &mut Vec<Quad>) {
-        let fill = if hovered {
-            theme::SEARCH_BG_HOVER
-        } else {
-            theme::SEARCH_BG
-        };
-        bg_quads.push(rect.quad(fill));
-        bg_quads.push(Quad::new(rect.x, rect.y, rect.w, 1.0, theme::SEARCH_BORDER));
-        bg_quads.push(Quad::new(rect.x, rect.y + rect.h - 1.0, rect.w, 1.0, theme::SEARCH_BORDER));
-        bg_quads.push(Quad::new(rect.x, rect.y, 1.0, rect.h, theme::SEARCH_BORDER));
-        bg_quads.push(Quad::new(rect.x + rect.w - 1.0, rect.y, 1.0, rect.h, theme::SEARCH_BORDER));
-    }
-
-    fn draw<'a>(&'a self, rect: Rect, areas: &mut Vec<TextArea<'a>>) {
-        // Leading search glyph at the left edge.
-        let icon_rect = Rect { x: rect.x + 4.0, y: rect.y, w: 22.0, h: rect.h };
-        self.icon.draw(icon_rect, theme::TITLE_FG, areas);
-        // Centered label, kept clear of the icon.
-        let pad = ((rect.w - self.label.width()) * 0.5).max(28.0);
-        self.label.draw(rect, pad, theme::FG_TEXT, areas);
-    }
-}
-
-/// Top-left menu bar (File, Edit, ...). Each item is a TextLabel laid out
-/// left-to-right; the per-item rects are the single source of truth for hover
-/// backgrounds and hit-testing.
-const MENU_ITEMS: [&str; 8] = [
-    "File", "Edit", "Selection", "View", "Go", "Run", "Terminal", "Help",
-];
-
-struct MenuBar {
-    labels: Vec<TextLabel>,
-    cursor: CursorIcon,
-}
-
-impl MenuBar {
-    fn new(fs: &mut FontSystem) -> Self {
-        let labels = MENU_ITEMS
-            .iter()
-            .map(|t| {
-                let mut l = TextLabel::new(fs, 240.0, theme::TITLE_BAR_H);
-                l.set(fs, t, theme::UI_FAMILY);
-                l
-            })
-            .collect();
-        Self {
-            labels,
-            cursor: CursorIcon::Pointer,
-        }
-    }
-
-    fn cursor(&self) -> CursorIcon {
-        self.cursor
-    }
-
-    /// Per-item rects laid out from the left edge of `bar`.
-    fn item_rects(&self, bar: Rect) -> Vec<Rect> {
-        let pad = 9.0;
-        let mut x = bar.x + 6.0;
-        self.labels
-            .iter()
-            .map(|l| {
-                let w = l.width() + pad * 2.0;
-                let r = Rect { x, y: bar.y, w, h: bar.h };
-                x += w;
-                r
-            })
-            .collect()
-    }
-
-    fn item_at(&self, bar: Rect, p: (f32, f32)) -> Option<usize> {
-        self.item_rects(bar).iter().position(|r| r.contains(p))
-    }
-
-    fn draw_bg(&self, bar: Rect, hovered: Option<usize>, bg_quads: &mut Vec<Quad>) {
-        if let Some(i) = hovered {
-            if let Some(r) = self.item_rects(bar).get(i) {
-                bg_quads.push(r.quad(theme::MENU_HOVER));
-            }
-        }
-    }
-
-    fn draw<'a>(&'a self, bar: Rect, areas: &mut Vec<TextArea<'a>>) {
-        let rects = self.item_rects(bar);
-        for (l, r) in self.labels.iter().zip(rects) {
-            l.draw_center(r, theme::TITLE_FG, areas);
-        }
-    }
-}
-
-/// Reusable line-number gutter. Owns its buffer and rebuilds only when the line
-/// count changes. Encapsulates the glyphon "first laid-out line is dropped"
-/// quirk in one place (see the known-issue note in `set`).
-struct Gutter {
-    buffer: Buffer,
-    last_count: usize,
-}
-
-impl Gutter {
-    fn new(fs: &mut FontSystem, w: f32) -> Self {
-        Self {
-            buffer: make_ui_buffer_mono(fs, w, 4000.0),
-            last_count: usize::MAX,
-        }
-    }
-
-    fn set(&mut self, fs: &mut FontSystem, count: usize) {
-        if self.last_count == count {
-            return;
-        }
-        // NOTE: line 1's "1" doesn't render on real GPUs (glyphon drops this
-        // buffer's first laid-out line). A spacer workaround caused bleed over the
-        // tab strip when scrolled, so it's left as a known minor issue.
-        let mut s = String::with_capacity(count * 6);
-        for i in 1..=count {
-            s.push_str(&format!("{:>4} \n", i));
-        }
-        self.buffer
-            .set_size(fs, None, Some(count as f32 * theme::LINE_HEIGHT + 200.0));
-        self.buffer.set_text(
-            fs,
-            &s,
-            Attrs::new().family(Family::Name(theme::MONO_FAMILY)),
-            Shaping::Advanced,
-        );
-        self.buffer.shape_until_scroll(fs, false);
-        self.last_count = count;
-    }
-
-    fn draw<'a>(&'a self, region: Rect, scroll_y: f32, color: glyphon::Color, areas: &mut Vec<TextArea<'a>>) {
-        areas.push(TextArea {
-            buffer: &self.buffer,
-            left: region.x,
-            top: region.y + theme::EDITOR_PAD - scroll_y,
-            scale: 1.0,
-            bounds: TextBounds {
-                left: region.x as i32,
-                top: region.y as i32,
-                right: (region.x + region.w) as i32,
-                bottom: (region.y + region.h) as i32,
-            },
-            default_color: color,
-            custom_glyphs: &[],
-        });
-    }
-}
-
-/// Reusable vertical list of fixed-height rows backed by one shared multi-line
-/// buffer. Provides the single source of truth for row geometry (`row_rect` /
-/// `row_at`) shared by hover/selection backgrounds, hit-testing, and the text
-/// draw. Used for the file tree and the command palette list.
-struct ListView {
-    buffer: Buffer,
-    last_key: String,
-    row_h: f32,
-    pad_x: f32,
-    cursor: CursorIcon,
-}
-
-impl ListView {
-    fn new(fs: &mut FontSystem, w: f32, h: f32, row_h: f32, pad_x: f32) -> Self {
-        Self {
-            buffer: make_ui_buffer(fs, w, h),
-            last_key: String::new(),
-            row_h,
-            pad_x,
-            cursor: CursorIcon::Pointer,
-        }
-    }
-
-    fn cursor(&self) -> CursorIcon {
-        self.cursor
-    }
-
-    fn set_text(&mut self, fs: &mut FontSystem, key: &str, w: f32, h: f32) {
-        if self.last_key == key {
-            return;
-        }
-        self.buffer.set_size(fs, Some(w), Some(h));
-        self.buffer.set_text(
-            fs,
-            key,
-            Attrs::new().family(Family::Name(theme::UI_FAMILY)),
-            Shaping::Advanced,
-        );
-        self.buffer.shape_until_scroll(fs, false);
-        self.last_key = key.to_string();
-    }
-
-    fn set_rich(&mut self, fs: &mut FontSystem, key: &str, spans: &[(String, Attrs)], w: f32, h: f32) {
-        if self.last_key == key {
-            return;
-        }
-        self.buffer.set_size(fs, Some(w), Some(h));
-        let default = Attrs::new()
-            .family(Family::Name(theme::UI_FAMILY))
-            .color(theme::FG_TEXT);
-        self.buffer.set_rich_text(
-            fs,
-            spans.iter().map(|(s, a)| (s.as_str(), *a)),
-            default,
-            Shaping::Advanced,
-        );
-        self.buffer.shape_until_scroll(fs, false);
-        self.last_key = key.to_string();
-    }
-
-    fn row_rect(&self, region: Rect, i: usize) -> Rect {
-        Rect {
-            x: region.x,
-            y: region.y + i as f32 * self.row_h,
-            w: region.w,
-            h: self.row_h,
-        }
-    }
-
-    /// Row index under `p` within `region`, bounded to `count` rows.
-    fn row_at(&self, region: Rect, p: (f32, f32), count: usize) -> Option<usize> {
-        if !region.contains(p) {
-            return None;
-        }
-        let idx = ((p.1 - region.y) / self.row_h) as usize;
-        (idx < count).then_some(idx)
-    }
-
-    fn draw<'a>(&'a self, region: Rect, color: glyphon::Color, areas: &mut Vec<TextArea<'a>>) {
-        self.draw_at(region, region.y, color, areas);
-    }
-
-    /// Draw the buffer with row 0 placed at `top`, clipped to `clip`. Lets a
-    /// caller render a vertical slice (e.g. rows above/below an inline insert).
-    fn draw_at<'a>(&'a self, clip: Rect, top: f32, color: glyphon::Color, areas: &mut Vec<TextArea<'a>>) {
-        areas.push(TextArea {
-            buffer: &self.buffer,
-            left: clip.x + self.pad_x,
-            top,
-            scale: 1.0,
-            bounds: TextBounds {
-                left: clip.x as i32,
-                top: clip.y as i32,
-                right: (clip.x + clip.w) as i32,
-                bottom: (clip.y + clip.h) as i32,
-            },
-            default_color: color,
-            custom_glyphs: &[],
-        });
-    }
-}
-
-/// A draggable divider that owns a resizable dimension (the sidebar width) plus
-/// its clamp range and drag state. Self-contained: the rest of the app just asks
-/// for `size()` and forwards mouse events; the handle geometry, hit-test, and
-/// clamping all live here.
-struct Splitter {
-    size: f32,
-    min: f32,
-    max: f32,
-    dragging: bool,
-    cursor: CursorIcon,
-}
-
-impl Splitter {
-    fn new(size: f32, min: f32, max: f32) -> Self {
-        Self {
-            size,
-            min,
-            max,
-            dragging: false,
-            cursor: CursorIcon::ColResize,
-        }
-    }
-
-    fn size(&self) -> f32 {
-        self.size
-    }
-
-    fn cursor(&self) -> CursorIcon {
-        self.cursor
-    }
-
-    fn is_dragging(&self) -> bool {
-        self.dragging
-    }
-
-    /// Thin hit strip straddling the right edge of `region`.
-    fn handle_rect(&self, region: Rect) -> Rect {
-        let half = theme::SIDEBAR_RESIZE_HANDLE * 0.5;
-        Rect {
-            x: region.x + region.w - half,
-            y: region.y,
-            w: theme::SIDEBAR_RESIZE_HANDLE,
-            h: region.h,
-        }
-    }
-
-    /// Begin a drag if `p` lands on the handle. Returns true if a drag started.
-    fn press(&mut self, p: (f32, f32), region: Rect) -> bool {
-        if self.handle_rect(region).contains(p) {
-            self.dragging = true;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// While dragging, set the size from the cursor; `origin` is the edge the
-    /// size is measured from. Returns true if the size changed.
-    fn drag(&mut self, cursor: f32, origin: f32) -> bool {
-        if !self.dragging {
-            return false;
-        }
-        let new = (cursor - origin).clamp(self.min, self.max);
-        if (new - self.size).abs() > 0.5 {
-            self.size = new;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn release(&mut self) {
-        self.dragging = false;
-    }
-}
-
-struct Layout {
-    title_bar: Rect,
-    activity_bar: Rect,
-    sidebar: Rect,
-    tab_strip: Rect,
-    gutter: Rect,
-    editor_text: Rect,
-    status_bar: Rect,
-    find_bar: Option<Rect>,
-    palette: Option<PaletteLayout>,
-}
-
-struct PaletteLayout {
-    box_: Rect,
-    input: Rect,
-    list: Rect,
-}
-
-impl Layout {
-    fn compute(
-        w: f32,
-        h: f32,
-        sidebar_visible: bool,
-        sidebar_width: f32,
-        find_active: bool,
-        palette_active: bool,
-    ) -> Self {
-        let tb = theme::TITLE_BAR_H;
-        let title_bar = Rect { x: 0.0, y: 0.0, w, h: tb };
-        let panel_h = h - theme::STATUS_BAR_HEIGHT - tb;
-        let activity_bar = Rect {
-            x: 0.0,
-            y: tb,
-            w: theme::ACTIVITY_BAR_WIDTH,
-            h: panel_h,
-        };
-        let sidebar = Rect {
-            x: activity_bar.w,
-            y: tb,
-            w: if sidebar_visible { sidebar_width } else { 0.0 },
-            h: panel_h,
-        };
-        let editor_left = sidebar.x + sidebar.w;
-        let tab_strip = Rect {
-            x: editor_left,
-            y: tb,
-            w: (w - editor_left).max(0.0),
-            h: theme::TAB_HEIGHT,
-        };
-        let find_bar = if find_active {
-            Some(Rect {
-                x: editor_left,
-                y: tb + tab_strip.h,
-                w: tab_strip.w,
-                h: theme::FIND_BAR_HEIGHT,
-            })
-        } else {
-            None
-        };
-        let editor_y = tb + tab_strip.h + if find_active { theme::FIND_BAR_HEIGHT } else { 0.0 };
-        let editor_h = (h - editor_y - theme::STATUS_BAR_HEIGHT).max(0.0);
-        let gutter = Rect {
-            x: editor_left,
-            y: editor_y,
-            w: theme::GUTTER_WIDTH,
-            h: editor_h,
-        };
-        let editor_text = Rect {
-            x: gutter.x + gutter.w,
-            y: editor_y,
-            w: (w - gutter.x - gutter.w).max(0.0),
-            h: editor_h,
-        };
-        let status_bar = Rect {
-            x: 0.0,
-            y: h - theme::STATUS_BAR_HEIGHT,
-            w,
-            h: theme::STATUS_BAR_HEIGHT,
-        };
-        let palette = if palette_active {
-            let pw = theme::PALETTE_WIDTH.min(w - 40.0);
-            let visible = 8usize;
-            let ph = theme::PALETTE_INPUT_HEIGHT
-                + theme::PALETTE_ROW_HEIGHT * visible as f32
-                + 8.0;
-            let bx = (w - pw) * 0.5;
-            let by = 80.0;
-            let box_ = Rect {
-                x: bx,
-                y: by,
-                w: pw,
-                h: ph,
-            };
-            let input = Rect {
-                x: box_.x + 4.0,
-                y: box_.y + 4.0,
-                w: box_.w - 8.0,
-                h: theme::PALETTE_INPUT_HEIGHT,
-            };
-            let list = Rect {
-                x: box_.x + 4.0,
-                y: input.y + input.h + 4.0,
-                w: box_.w - 8.0,
-                h: theme::PALETTE_ROW_HEIGHT * visible as f32,
-            };
-            Some(PaletteLayout { box_, input, list })
-        } else {
-            None
-        };
-        Self {
-            title_bar,
-            activity_bar,
-            sidebar,
-            tab_strip,
-            gutter,
-            editor_text,
-            status_bar,
-            find_bar,
-            palette,
-        }
-    }
-
-    /// Single source of truth for activity-bar button rects: 5 at the top,
-    /// 2 (account, settings) pinned to the bottom. Index matches the icon order.
-    fn activity_rects(&self) -> Vec<Rect> {
-        let ab = self.activity_bar;
-        (0..7)
-            .map(|i| {
-                let y = if i < 5 {
-                    ab.y + i as f32 * theme::ACTIVITY_CELL
-                } else {
-                    ab.y + ab.h - (7 - i) as f32 * theme::ACTIVITY_CELL
-                };
-                Rect {
-                    x: ab.x,
-                    y,
-                    w: ab.w,
-                    h: theme::ACTIVITY_CELL,
-                }
-            })
-            .collect()
-    }
-
-    /// Single source of truth for the window-control button rects (min, max,
-    /// close), left-to-right at the right edge of the title bar.
-    fn title_btn_rects(&self) -> Vec<Rect> {
-        (0..3)
-            .map(|b| Rect {
-                x: self.title_bar.w - (3 - b) as f32 * theme::TITLE_BTN_W,
-                y: self.title_bar.y,
-                w: theme::TITLE_BTN_W,
-                h: theme::TITLE_BAR_H,
-            })
-            .collect()
-    }
-
-    /// Single source of truth for tab rects: equal-width columns clamped to
-    /// [TAB_MIN_WIDTH, TAB_MAX_WIDTH], left-to-right across the tab strip.
-    fn tab_rects(&self, n: usize) -> Vec<Rect> {
-        if n == 0 {
-            return Vec::new();
-        }
-        let ideal = theme::TAB_MAX_WIDTH.min(self.tab_strip.w / n as f32);
-        let tab_w = ideal.max(theme::TAB_MIN_WIDTH).min(theme::TAB_MAX_WIDTH);
-        (0..n)
-            .map(|i| Rect {
-                x: self.tab_strip.x + i as f32 * tab_w,
-                y: self.tab_strip.y,
-                w: tab_w,
-                h: self.tab_strip.h,
-            })
-            .collect()
-    }
-
-    /// The layout-toggle buttons (left of the window controls).
-    fn layout_btn_rects(&self) -> Vec<Rect> {
-        let cw = 36.0;
-        let right = self.title_bar.w - 3.0 * theme::TITLE_BTN_W;
-        (0..3)
-            .map(|i| Rect {
-                x: right - (3 - i) as f32 * cw,
-                y: self.title_bar.y,
-                w: cw,
-                h: theme::TITLE_BAR_H,
-            })
-            .collect()
-    }
-
-    /// The menu-bar region (left portion of the title bar).
-    fn menu_bar_rect(&self) -> Rect {
-        Rect {
-            x: 0.0,
-            y: self.title_bar.y,
-            w: self.title_bar.w,
-            h: theme::TITLE_BAR_H,
-        }
-    }
-
-    /// The centered command-center search box in the title bar.
-    fn header_search_rect(&self) -> Rect {
-        let w = (self.title_bar.w * 0.34).clamp(280.0, 560.0);
-        let h = 22.0;
-        Rect {
-            x: (self.title_bar.w - w) * 0.5,
-            y: self.title_bar.y + (theme::TITLE_BAR_H - h) * 0.5,
-            w,
-            h,
-        }
-    }
-
-    /// The root-folder row (below the EXPLORER header, above the tree).
-    fn root_row_rect(&self) -> Rect {
-        Rect {
-            x: self.sidebar.x,
-            y: self.sidebar.y + theme::SIDEBAR_HEADER_H,
-            w: self.sidebar.w,
-            h: theme::TREE_ROW_HEIGHT,
-        }
-    }
-
-    /// The file-tree list region: the sidebar below the header + root row.
-    fn tree_region(&self) -> Rect {
-        let top = self.sidebar.y + theme::SIDEBAR_HEADER_H + theme::TREE_ROW_HEIGHT;
-        Rect {
-            x: self.sidebar.x,
-            y: top,
-            w: self.sidebar.w,
-            h: (self.sidebar.y + self.sidebar.h - top).max(0.0),
-        }
-    }
-
-    /// The Explorer header action buttons (New File / New Folder / Refresh /
-    /// Collapse All), right-aligned in the sidebar header.
-    fn explorer_action_rects(&self) -> Vec<Rect> {
-        let cw = 26.0;
-        let n = 4;
-        let right = self.sidebar.x + self.sidebar.w - 6.0;
-        let y = self.sidebar.y + (theme::SIDEBAR_HEADER_H - cw) * 0.5;
-        (0..n)
-            .map(|i| Rect {
-                x: right - (n - i) as f32 * cw,
-                y,
-                w: cw,
-                h: cw,
-            })
-            .collect()
-    }
-
-    /// The sidebar header region ("EXPLORER" + workspace name).
-    fn sidebar_header_rect(&self) -> Rect {
-        Rect {
-            x: self.sidebar.x,
-            y: self.sidebar.y,
-            w: self.sidebar.w,
-            h: theme::SIDEBAR_HEADER_H,
-        }
-    }
-
-    /// The close-button cell within a tab — a square icon-button rect pinned to
-    /// the tab's right edge. Drives both the × glyph and its hit region.
-    fn tab_close_rect(tab: Rect) -> Rect {
-        let s = 20.0;
-        Rect {
-            x: tab.x + tab.w - s - 6.0,
-            y: tab.y + (tab.h - s) * 0.5,
-            w: s,
-            h: s,
-        }
-    }
-}
-
-// ---------- Commands & palette ----------
-
-#[derive(Clone, Copy)]
-enum Command {
-    Save,
-    Close,
-    Find,
-    Undo,
-    Redo,
-    SelectAll,
-    ToggleSidebar,
-    NewFile,
-}
-
-const COMMANDS: &[(Command, &str, &str)] = &[
-    (Command::Save, "File: Save", "Ctrl+S"),
-    (Command::NewFile, "File: New Untitled", ""),
-    (Command::Close, "File: Close Tab", "Ctrl+W"),
-    (Command::Find, "Edit: Find", "Ctrl+F"),
-    (Command::Undo, "Edit: Undo", "Ctrl+Z"),
-    (Command::Redo, "Edit: Redo", "Ctrl+Y"),
-    (Command::SelectAll, "Edit: Select All", "Ctrl+A"),
-    (Command::ToggleSidebar, "View: Toggle Sidebar", ""),
-];
-
-struct PaletteState {
-    active: bool,
-    selected: usize,
-    filtered: Vec<usize>,
-}
-
-impl PaletteState {
-    fn new() -> Self {
-        let filtered: Vec<usize> = (0..COMMANDS.len()).collect();
-        Self {
-            active: false,
-            selected: 0,
-            filtered,
-        }
-    }
-    fn refilter(&mut self, query: &str) {
-        let q = query.to_lowercase();
-        self.filtered = (0..COMMANDS.len())
-            .filter(|&i| q.is_empty() || COMMANDS[i].1.to_lowercase().contains(&q))
-            .collect();
-        if self.selected >= self.filtered.len() {
-            self.selected = self.filtered.len().saturating_sub(1);
-        }
-    }
-    fn open(&mut self) {
-        self.active = true;
-        self.selected = 0;
-        self.refilter("");
-    }
-    fn close(&mut self) {
-        self.active = false;
-    }
-}
-
-struct FindBarState {
-    active: bool,
-    last_match: Option<usize>,
-}
-
-impl FindBarState {
-    fn new() -> Self {
-        Self {
-            active: false,
-            last_match: None,
-        }
-    }
-}
-
-// ---------- GpuState ----------
-
-struct UiBuffers {
-    sidebar_header: TextLabel,
-    root_label: TextLabel,
-    sidebar: ListView,
-    tabs: Buffer,
-    status: TextLabel,
-    status_right: TextLabel,
-    line_numbers: Gutter,
-    palette_input: TextInput,
-    palette_list: ListView,
-    find_input: TextInput,
-}
-
-struct GpuState {
-    window: Arc<Window>,
-    surface: wgpu::Surface<'static>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    config: SurfaceConfiguration,
-    font_system: FontSystem,
-    swash_cache: SwashCache,
-    viewport: Viewport,
-    atlas: TextAtlas,
-    text_renderer: TextRenderer,
-    quad_renderer: QuadRenderer,
-    ui: UiBuffers,
-    activity_btns: Vec<IconButton>,
-    titlebar_btns: Vec<IconButton>,
-    tab_close_btn: IconButton,
-    search: SearchField,
-    menubar: MenuBar,
-    layout_btns: Vec<IconButton>,
-    explorer_btns: Vec<IconButton>,
-    create_icons: [IconButton; 2],
-    create_input: TextInput,
-}
-
-impl GpuState {
-    async fn new(window: Arc<Window>) -> Result<Self> {
-        let size = window.inner_size();
-        let instance = Instance::new(InstanceDescriptor {
-            backends: Backends::PRIMARY,
-            ..Default::default()
-        });
-        let surface = instance.create_surface(window.clone())?;
-        let adapter = instance
-            .request_adapter(&RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
-            .await
-            .context("no compatible GPU adapter")?;
-        let (device, queue) = adapter
-            .request_device(
-                &DeviceDescriptor {
-                    label: Some("nova-device"),
-                    ..Default::default()
-                },
-                None,
-            )
-            .await
-            .context("failed to acquire wgpu device")?;
-
-        // Render to a non-sRGB surface so our sRGB-authored palette (and glyphon's
-        // sRGB glyph colors) display at their true values. An sRGB surface would
-        // re-encode the colors we write, washing every dark gray toward mid-gray.
-        let caps = surface.get_capabilities(&adapter);
-        let format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| *f == TextureFormat::Bgra8Unorm)
-            .or_else(|| caps.formats.iter().copied().find(|f| !f.is_srgb()))
-            .unwrap_or(caps.formats[0]);
-        let config = SurfaceConfiguration {
-            usage: TextureUsages::RENDER_ATTACHMENT,
-            format,
-            width: size.width.max(1),
-            height: size.height.max(1),
-            present_mode: PresentMode::Fifo,
-            alpha_mode: CompositeAlphaMode::Auto,
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
-        };
-        surface.configure(&device, &config);
-
-        let mut font_system = FontSystem::new();
-        // Load VSCode's Codicon icon font so our glyphs match VSCode exactly.
-        font_system
-            .db_mut()
-            .load_font_data(include_bytes!("../assets/codicon.ttf").to_vec());
-        let swash_cache = SwashCache::new();
-        let cache = Cache::new(&device);
-        let viewport = Viewport::new(&device, &cache);
-        let mut atlas = TextAtlas::new(&device, &queue, &cache, config.format);
-        let text_renderer =
-            TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
-        let quad_renderer = QuadRenderer::new(&device, config.format);
-
-        let ic = theme::ICON_FAMILY;
-        let activity_btns = vec![
-            IconButton::new(&mut font_system, theme::ICON_FILES, ic, 20.0),
-            IconButton::new(&mut font_system, theme::ICON_SEARCH, ic, 20.0),
-            IconButton::new(&mut font_system, theme::ICON_SOURCE_CONTROL, ic, 20.0),
-            IconButton::new(&mut font_system, theme::ICON_RUN, ic, 20.0),
-            IconButton::new(&mut font_system, theme::ICON_EXTENSIONS, ic, 20.0),
-            IconButton::new(&mut font_system, theme::ICON_ACCOUNT, ic, 20.0),
-            IconButton::new(&mut font_system, theme::ICON_SETTINGS, ic, 20.0),
-        ];
-        let titlebar_btns = vec![
-            IconButton::new(&mut font_system, theme::ICON_MIN, ic, 12.0),
-            IconButton::new(&mut font_system, theme::ICON_MAX, ic, 12.0),
-            IconButton::new(&mut font_system, theme::ICON_WIN_CLOSE, ic, 12.0),
-        ];
-        let tab_close_btn = IconButton::new(&mut font_system, theme::ICON_CLOSE, ic, 12.0);
-        let search = SearchField::new(&mut font_system);
-        let menubar = MenuBar::new(&mut font_system);
-        let layout_btns = vec![
-            IconButton::new(&mut font_system, theme::ICON_LAYOUT_SIDEBAR_LEFT, ic, 16.0),
-            IconButton::new(&mut font_system, theme::ICON_LAYOUT_PANEL, ic, 16.0),
-            IconButton::new(&mut font_system, theme::ICON_LAYOUT_SIDEBAR_RIGHT, ic, 16.0),
-        ];
-        let explorer_btns = vec![
-            IconButton::new(&mut font_system, theme::ICON_NEW_FILE, ic, 16.0),
-            IconButton::new(&mut font_system, theme::ICON_NEW_FOLDER, ic, 16.0),
-            IconButton::new(&mut font_system, theme::ICON_REFRESH, ic, 16.0),
-            IconButton::new(&mut font_system, theme::ICON_COLLAPSE_ALL, ic, 16.0),
-        ];
-        let create_icons = [
-            IconButton::new(&mut font_system, theme::ICON_FILE, ic, 16.0),
-            IconButton::new(&mut font_system, theme::ICON_FOLDER_CLOSED, ic, 16.0),
-        ];
-        let create_input = TextInput::new(&mut font_system, theme::SIDEBAR_WIDTH, theme::TREE_ROW_HEIGHT);
-
-        let ui = UiBuffers {
-            sidebar_header: TextLabel::new(&mut font_system, theme::SIDEBAR_WIDTH, 60.0),
-            root_label: TextLabel::new(&mut font_system, theme::SIDEBAR_WIDTH, theme::TREE_ROW_HEIGHT),
-            sidebar: ListView::new(
-                &mut font_system,
-                theme::SIDEBAR_WIDTH,
-                800.0,
-                theme::TREE_ROW_HEIGHT,
-                12.0,
-            ),
-            tabs: make_ui_buffer(&mut font_system, 4000.0, theme::TAB_HEIGHT),
-            status: TextLabel::new(&mut font_system, 4000.0, theme::STATUS_BAR_HEIGHT),
-            status_right: TextLabel::new(&mut font_system, 4000.0, theme::STATUS_BAR_HEIGHT),
-            line_numbers: Gutter::new(&mut font_system, theme::GUTTER_WIDTH),
-            palette_input: TextInput::new(&mut font_system, 600.0, theme::PALETTE_INPUT_HEIGHT),
-            palette_list: ListView::new(
-                &mut font_system,
-                600.0,
-                800.0,
-                theme::PALETTE_ROW_HEIGHT,
-                6.0,
-            ),
-            find_input: TextInput::new(&mut font_system, 800.0, theme::FIND_BAR_HEIGHT),
-        };
-
-        Ok(Self {
-            window,
-            surface,
-            device,
-            queue,
-            config,
-            font_system,
-            swash_cache,
-            viewport,
-            atlas,
-            text_renderer,
-            quad_renderer,
-            ui,
-            activity_btns,
-            titlebar_btns,
-            tab_close_btn,
-            search,
-            menubar,
-            layout_btns,
-            explorer_btns,
-            create_icons,
-            create_input,
-        })
-    }
-
-    fn resize(&mut self, w: u32, h: u32) {
-        if w == 0 || h == 0 {
-            return;
-        }
-        self.config.width = w;
-        self.config.height = h;
-        self.surface.configure(&self.device, &self.config);
-    }
-}
-
-fn make_ui_buffer(fs: &mut FontSystem, w: f32, h: f32) -> Buffer {
-    let mut b = Buffer::new(fs, Metrics::new(theme::UI_FONT_SIZE, theme::UI_LINE_HEIGHT));
-    b.set_size(fs, Some(w), Some(h));
-    b
-}
-
-fn make_ui_buffer_mono(fs: &mut FontSystem, w: f32, h: f32) -> Buffer {
-    let mut b = Buffer::new(fs, Metrics::new(theme::FONT_SIZE, theme::LINE_HEIGHT));
-    b.set_size(fs, Some(w), Some(h));
-    b
-}
 
 // ---------- App ----------
 
@@ -1261,12 +69,59 @@ impl UiCache {
     }
 }
 
-/// In-progress New File / New Folder creation (inline name entry in the tree).
+/// In-progress inline name entry in the tree — either a New File/Folder
+/// (`rename_from` = None, inserts a row) or a Rename (`rename_from` = Some,
+/// replaces the target's row).
 struct PendingCreate {
     is_dir: bool,
     parent: PathBuf,
-    row: usize,   // insertion index in the visible tree
+    row: usize,   // tree row the field occupies
     depth: usize, // indent level of the inline field
+    rename_from: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy)]
+enum MenuAction {
+    NewFile,
+    NewFolder,
+    Rename,
+    Delete,
+    CopyPath,
+}
+
+const MENU_ACTIONS: &[(MenuAction, &str)] = &[
+    (MenuAction::NewFile, "New File"),
+    (MenuAction::NewFolder, "New Folder"),
+    (MenuAction::Rename, "Rename"),
+    (MenuAction::Delete, "Delete"),
+    (MenuAction::CopyPath, "Copy Path"),
+];
+
+/// An open right-click context menu over the file tree.
+struct ContextMenu {
+    anchor: (f32, f32),
+    target: Option<usize>, // tree node index; None = empty area (root scope)
+}
+
+/// Which sidebar view the activity bar has selected.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SidebarView {
+    Explorer,
+    Extensions,
+}
+
+/// What a modal dialog confirms.
+enum DialogAction {
+    DeleteNode(usize),
+    CloseDoc(usize),
+}
+
+struct DialogState {
+    action: DialogAction,
+    buttons: &'static [&'static str],
+    has_check: bool,
+    checked: bool,
+    hovered: Option<usize>,
 }
 
 struct App {
@@ -1295,6 +150,30 @@ struct App {
     hovered_explorer: Option<usize>,
     selected_tree: Option<usize>,
     creating: Option<PendingCreate>,
+    context_menu: Option<ContextMenu>,
+    hovered_menu_item: Option<usize>,
+    dialog: Option<DialogState>,
+    skip_delete_confirm: bool,
+    editor_scroll: Scrollbar,
+    editor_hscroll: Scrollbar,
+    hovered_scrollbar: bool,
+    last_click: Instant,
+    last_click_pos: (f32, f32),
+    click_count: u32,
+    sidebar_view: SidebarView,
+    extensions: Vec<Extension>,
+    hovered_ext: Option<(usize, ExtZone)>,
+    text_drag: Option<InputId>, // active mouse drag-selection in a text input
+    ext_filter_active: bool,
+    ext_visible: Vec<usize>, // displayed row index -> index into the active source
+    ext_scroll: f32,
+    ext_remote: Vec<marketplace::RemoteExt>, // current marketplace search results
+    ext_showing_remote: bool,                // true while a search query is active
+    search_gen: u64,                         // discards stale background search results
+    worker_tx: Sender<WorkerMsg>,
+    worker_rx: Receiver<WorkerMsg>,
+    open_extension: Option<usize>, // extension details page open in the editor area
+    hovered_page_install: bool,
     pending_close: bool,
     cursor_blink_on: bool,
     last_blink: Instant,
@@ -1303,6 +182,7 @@ struct App {
 
 impl App {
     fn new(root: PathBuf, initial_file: Option<PathBuf>) -> Self {
+        let (worker_tx, worker_rx) = std::sync::mpsc::channel();
         Self {
             cwd: root.clone(),
             initial_file,
@@ -1333,6 +213,30 @@ impl App {
             hovered_explorer: None,
             selected_tree: None,
             creating: None,
+            context_menu: None,
+            hovered_menu_item: None,
+            dialog: None,
+            skip_delete_confirm: false,
+            editor_scroll: Scrollbar::new(Axis::Vertical),
+            editor_hscroll: Scrollbar::new(Axis::Horizontal),
+            hovered_scrollbar: false,
+            last_click: Instant::now(),
+            last_click_pos: (0.0, 0.0),
+            click_count: 0,
+            sidebar_view: SidebarView::Explorer,
+            extensions: Vec::new(),
+            hovered_ext: None,
+            text_drag: None,
+            ext_filter_active: false,
+            ext_visible: Vec::new(),
+            ext_scroll: 0.0,
+            ext_remote: Vec::new(),
+            ext_showing_remote: false,
+            search_gen: 0,
+            worker_tx,
+            worker_rx,
+            open_extension: None,
+            hovered_page_install: false,
             pending_close: false,
             cursor_blink_on: true,
             last_blink: Instant::now(),
@@ -1349,6 +253,54 @@ impl App {
         let layout = self.layout();
         let p = (self.mouse_pos.x as f32, self.mouse_pos.y as f32);
         let mut changed = false;
+
+        // Dialog (topmost modal) captures hover.
+        if let Some(has_check) = self.dialog.as_ref().map(|d| d.has_check) {
+            let new_hover = self.gpu.as_ref().and_then(|g| {
+                let win = (g.config.width as f32, g.config.height as f32);
+                let box_ = g.ui.dialog.box_rect(win, has_check);
+                g.ui.dialog.button_at(box_, p)
+            });
+            if self.dialog.as_ref().map(|d| d.hovered) != Some(new_hover) {
+                if let Some(d) = self.dialog.as_mut() {
+                    d.hovered = new_hover;
+                }
+                self.redraw();
+            }
+            let cursor = if new_hover.is_some() {
+                CursorIcon::Pointer
+            } else {
+                CursorIcon::Default
+            };
+            if cursor != self.cursor_icon {
+                self.cursor_icon = cursor;
+                if let Some(g) = self.gpu.as_ref() {
+                    g.window.set_cursor(cursor);
+                }
+            }
+            return;
+        }
+
+        // Context menu (modal) captures hover when open.
+        if self.context_menu.is_some() {
+            let new_item = self.context_menu_item_at(p);
+            if new_item != self.hovered_menu_item {
+                self.hovered_menu_item = new_item;
+                self.redraw();
+            }
+            let cursor = if new_item.is_some() {
+                CursorIcon::Pointer
+            } else {
+                CursorIcon::Default
+            };
+            if cursor != self.cursor_icon {
+                self.cursor_icon = cursor;
+                if let Some(g) = self.gpu.as_ref() {
+                    g.window.set_cursor(cursor);
+                }
+            }
+            return;
+        }
 
         let new_titlebtn = self.title_btn_at(p.0, p.1, &layout);
         if new_titlebtn != self.hovered_titlebtn {
@@ -1417,13 +369,58 @@ impl App {
             changed = true;
         }
 
-        let new_explorer = if self.sidebar_visible && layout.palette.is_none() {
+        let new_explorer = if self.sidebar_visible
+            && layout.palette.is_none()
+            && self.sidebar_view == SidebarView::Explorer
+        {
             layout.explorer_action_rects().iter().position(|r| r.contains(p))
         } else {
             None
         };
         if new_explorer != self.hovered_explorer {
             self.hovered_explorer = new_explorer;
+            changed = true;
+        }
+
+        let new_ext = if self.sidebar_visible
+            && layout.palette.is_none()
+            && self.sidebar_view == SidebarView::Extensions
+        {
+            let region = ext_list_region(layout.tree_region());
+            let scroll = self.ext_scroll;
+            self.gpu.as_ref().and_then(|g| g.ui.ext_rows.hit(region, scroll, p))
+        } else {
+            None
+        };
+        if new_ext != self.hovered_ext {
+            self.hovered_ext = new_ext;
+            changed = true;
+        }
+
+        let new_page_install = if let Some(ei) = self.open_extension {
+            let region = Rect {
+                x: layout.gutter.x,
+                y: layout.gutter.y,
+                w: layout.gutter.w + layout.editor_text.w,
+                h: layout.gutter.h,
+            };
+            self.extensions.get(ei).map(|e| e.supported() && !e.installed).unwrap_or(false)
+                && page_install_rect(region).contains(p)
+        } else {
+            false
+        };
+        if new_page_install != self.hovered_page_install {
+            self.hovered_page_install = new_page_install;
+            changed = true;
+        }
+
+        let over_scrollbar = self
+            .editor_scroll_metrics(&layout)
+            .and_then(|(t, c, v, s)| self.editor_scroll.thumb(t, c, v, s))
+            .map(|th| th.contains(p))
+            .unwrap_or(false);
+        if over_scrollbar != self.hovered_scrollbar {
+            self.hovered_scrollbar = over_scrollbar;
             changed = true;
         }
 
@@ -1455,6 +452,12 @@ impl App {
                 .as_ref()
                 .map(|g| g.explorer_btns[i].cursor())
                 .unwrap_or(CursorIcon::Default)
+        } else if self.focused_input_at(&layout, p).is_some() {
+            CursorIcon::Text
+        } else if new_ext.is_some() || new_page_install {
+            CursorIcon::Pointer
+        } else if self.open_extension.is_some() && layout.editor_text.contains(p) {
+            CursorIcon::Default
         } else if let Some(pal) = layout.palette.as_ref() {
             // Palette is modal: pointer over a row, arrow elsewhere.
             self.gpu
@@ -1478,6 +481,8 @@ impl App {
                 CursorIcon::Pointer
             } else if new_tree.is_some() {
                 g.ui.sidebar.cursor()
+            } else if over_scrollbar {
+                CursorIcon::Default
             } else if layout.editor_text.contains(p) {
                 // Editor text area: I-beam (not a component).
                 CursorIcon::Text
@@ -1539,6 +544,42 @@ impl App {
         )
     }
 
+    /// (track rect, content height, viewport height, scroll) for the editor
+    /// scrollbar, or None when the active doc fits (no scrollbar needed).
+    fn editor_scroll_metrics(&self, layout: &Layout) -> Option<(Rect, f32, f32, f32)> {
+        let d = self.workspace.active_doc()?;
+        let view = layout.editor_text.h;
+        let content = d.rope.len_lines() as f32 * theme::LINE_HEIGHT + theme::EDITOR_PAD * 2.0;
+        if content <= view {
+            return None;
+        }
+        let track = Rect {
+            x: layout.editor_text.x + layout.editor_text.w - theme::SCROLLBAR_WIDTH,
+            y: layout.editor_text.y,
+            w: theme::SCROLLBAR_WIDTH,
+            h: layout.editor_text.h,
+        };
+        Some((track, content, view, d.scroll_y))
+    }
+
+    /// (track, content width, viewport width, scroll_x) for the horizontal
+    /// scrollbar, or None when the widest line fits.
+    fn editor_hscroll_metrics(&self, layout: &Layout) -> Option<(Rect, f32, f32, f32)> {
+        let d = self.workspace.active_doc()?;
+        let view = layout.editor_text.w;
+        let content = d.max_line_width() + theme::EDITOR_PAD * 2.0;
+        if content <= view {
+            return None;
+        }
+        let track = Rect {
+            x: layout.editor_text.x,
+            y: layout.editor_text.y + layout.editor_text.h - theme::SCROLLBAR_WIDTH,
+            w: layout.editor_text.w - theme::SCROLLBAR_WIDTH,
+            h: theme::SCROLLBAR_WIDTH,
+        };
+        Some((track, content, view, d.scroll_x))
+    }
+
     fn ensure_cursor_visible(&mut self) {
         let layout = self.layout();
         let editor_inner_h = layout.editor_text.h - theme::EDITOR_PAD * 2.0;
@@ -1591,6 +632,7 @@ impl App {
             parent,
             row,
             depth,
+            rename_from: None,
         });
         if let Some(g) = self.gpu.as_mut() {
             g.create_input.clear(&mut g.font_system);
@@ -1601,8 +643,35 @@ impl App {
         self.redraw();
     }
 
-    /// Finish an inline creation: create the entry if a non-empty name was typed
-    /// (opening it when it's a file), otherwise just dismiss the field.
+    /// Begin an inline rename of a tree node: the field replaces the node's row,
+    /// pre-filled with its current name.
+    fn begin_rename(&mut self, idx: usize) {
+        let Some(n) = self.workspace.tree.nodes.get(idx) else {
+            return;
+        };
+        let parent = n
+            .path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| self.workspace.tree.root.clone());
+        let name = n.name.clone();
+        let pc = PendingCreate {
+            is_dir: n.is_dir,
+            parent,
+            row: idx,
+            depth: n.depth,
+            rename_from: Some(n.path.clone()),
+        };
+        self.creating = Some(pc);
+        if let Some(g) = self.gpu.as_mut() {
+            g.create_input.set_text(&mut g.font_system, &name);
+            g.create_input.focus(true);
+        }
+        self.redraw();
+    }
+
+    /// Finish an inline create/rename: apply if a non-empty name was typed
+    /// (opening new files), otherwise just dismiss the field.
     fn commit_create(&mut self) {
         let Some(pc) = self.creating.take() else {
             return;
@@ -1616,7 +685,19 @@ impl App {
             g.create_input.focus(false);
         }
         if !name.is_empty() {
-            if let Ok(path) = self.workspace.create_entry(&pc.parent, &name, pc.is_dir) {
+            if let Some(from) = pc.rename_from {
+                let to = pc.parent.join(&name);
+                if to != from && std::fs::rename(&from, &to).is_ok() {
+                    self.workspace.tree.refresh();
+                    // Re-point any open document at the renamed path.
+                    for d in self.workspace.documents.iter_mut() {
+                        if d.path.as_deref() == Some(from.as_path()) {
+                            d.path = Some(to.clone());
+                            d.name = name.clone();
+                        }
+                    }
+                }
+            } else if let Ok(path) = self.workspace.create_entry(&pc.parent, &name, pc.is_dir) {
                 if !pc.is_dir {
                     if let Some(g) = self.gpu.as_mut() {
                         let _ = self.workspace.open_file(&path, &mut g.font_system);
@@ -1631,6 +712,352 @@ impl App {
         self.creating = None;
         if let Some(g) = self.gpu.as_mut() {
             g.create_input.focus(false);
+        }
+        self.redraw();
+    }
+
+    // ---- Context menu ----
+
+    fn on_right_press(&mut self, x: f32, y: f32) {
+        let layout = self.layout();
+        if !self.sidebar_visible || !layout.sidebar.contains((x, y)) {
+            return;
+        }
+        let target = self.gpu.as_ref().and_then(|g| {
+            g.ui
+                .sidebar
+                .row_at(layout.tree_region(), (x, y), self.workspace.tree.nodes.len())
+        });
+        self.selected_tree = target;
+        self.context_menu = Some(ContextMenu { anchor: (x, y), target });
+        self.redraw();
+    }
+
+    /// Which menu item is under `p`, delegating geometry to the Menu widget.
+    fn context_menu_item_at(&self, p: (f32, f32)) -> Option<usize> {
+        let cm = self.context_menu.as_ref()?;
+        let g = self.gpu.as_ref()?;
+        let win = (g.config.width as f32, g.config.height as f32);
+        let menu = g.ui.menu.rect(cm.anchor, win);
+        g.ui.menu.item_at(menu, p)
+    }
+
+    fn close_context_menu(&mut self) {
+        self.context_menu = None;
+        self.hovered_menu_item = None;
+        self.redraw();
+    }
+
+    fn exec_menu_action(&mut self, action: MenuAction) {
+        let target = self.context_menu.as_ref().and_then(|m| m.target);
+        self.close_context_menu();
+        match action {
+            MenuAction::NewFile => self.begin_create(false),
+            MenuAction::NewFolder => self.begin_create(true),
+            MenuAction::Rename => {
+                if let Some(t) = target {
+                    self.begin_rename(t);
+                }
+            }
+            MenuAction::Delete => {
+                if let Some(t) = target {
+                    self.request_delete(t);
+                }
+            }
+            MenuAction::CopyPath => {
+                if let Some(t) = target {
+                    if let Some(n) = self.workspace.tree.nodes.get(t) {
+                        let s = n.path.display().to_string();
+                        if let Some(cb) = self.clipboard.as_mut() {
+                            let _ = cb.set_text(s);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// "Install" a supported extension into Nova. For color themes this loads and
+    /// applies the theme immediately; other supported kinds just mark installed
+    /// (their declarative contributions aren't loaded yet).
+    fn install_extension(&mut self, i: usize) {
+        let (kind, theme_path, grammar_paths) = match self.extensions.get(i) {
+            Some(e) => (e.kind, e.theme_path.clone(), e.grammar_paths.clone()),
+            None => return,
+        };
+        match kind {
+            ExtKind::Theme => {
+                if let Some(p) = theme_path {
+                    if let Some(t) = theme::load_vscode(&p) {
+                        theme::set(t);
+                    }
+                }
+            }
+            ExtKind::Grammar => {
+                // Parse each TextMate grammar and register it natively, then
+                // re-highlight open documents so a matching file lights up.
+                for gp in &grammar_paths {
+                    if let Some(g) = textmate::Grammar::load(gp) {
+                        textmate::register(g, &[]);
+                    }
+                }
+                if let Some(g) = self.gpu.as_mut() {
+                    for d in self.workspace.documents.iter_mut() {
+                        d.reshape(&mut g.font_system);
+                    }
+                }
+            }
+            _ => {}
+        }
+        if let Some(e) = self.extensions.get_mut(i) {
+            e.installed = true;
+        }
+        self.rebuild_ext_rows();
+        self.redraw();
+    }
+
+    /// Rebuild the sidebar's extension-row widgets from current extension data.
+    /// Called when the data changes (after a scan or an install), not per frame.
+    fn rebuild_ext_rows(&mut self) {
+        let Some(gpu) = self.gpu.as_mut() else { return };
+        let query = gpu.ui.ext_filter.text().trim().to_lowercase();
+        self.ext_showing_remote = !query.is_empty();
+        let mut visible = Vec::new();
+        let mut specs: Vec<widgets::ExtSpec> = Vec::new();
+        if self.ext_showing_remote {
+            // Marketplace results (already filtered by the remote query).
+            for (idx, e) in self.ext_remote.iter().enumerate() {
+                let name = if e.display.is_empty() { e.name.clone() } else { e.display.clone() };
+                let meta = format!("{} · Marketplace", e.namespace);
+                let desc: String = e.description.chars().take(80).collect();
+                let uv = e
+                    .icon
+                    .as_ref()
+                    .and_then(|b| gpu.icon_atlas.load_bytes(&gpu.queue, &e.id(), b));
+                visible.push(idx);
+                specs.push((name, meta, desc, true, uv));
+            }
+        } else {
+            // Locally installed extensions.
+            for (idx, e) in self.extensions.iter().enumerate() {
+                let meta = if e.installed {
+                    format!("{} · installed", e.publisher)
+                } else {
+                    format!("{} · {}", e.publisher, e.category())
+                };
+                let desc: String = e.description.chars().take(80).collect();
+                let uv = e.icon_path.as_ref().and_then(|p| gpu.icon_atlas.load(&gpu.queue, &e.name, p));
+                visible.push(idx);
+                specs.push((e.name.clone(), meta, desc, e.supported() && !e.installed, uv));
+            }
+        }
+        gpu.ui.ext_rows.rebuild(&mut gpu.font_system, &specs);
+        self.ext_visible = visible;
+        self.clamp_ext_scroll();
+    }
+
+    /// Kick off a background OpenVSX search for the current filter text.
+    fn trigger_search(&mut self) {
+        let query = self
+            .gpu
+            .as_ref()
+            .map(|g| g.ui.ext_filter.text().trim().to_string())
+            .unwrap_or_default();
+        if query.is_empty() {
+            return;
+        }
+        self.search_gen += 1;
+        let gen = self.search_gen;
+        let tx = self.worker_tx.clone();
+        std::thread::spawn(move || {
+            let results = marketplace::search(&query, 25);
+            let _ = tx.send(WorkerMsg::Search { gen, results });
+        });
+    }
+
+    /// Download + install a marketplace extension on a background thread.
+    fn install_remote(&mut self, idx: usize) {
+        let Some(ext) = self.ext_remote.get(idx).cloned() else { return };
+        let Some(root) = extensions::dir() else { return };
+        let tx = self.worker_tx.clone();
+        std::thread::spawn(move || {
+            let result = marketplace::install(&ext, &root).map(|_| ());
+            let _ = tx.send(WorkerMsg::Installed { result });
+        });
+    }
+
+    fn set_ext_filter_focus(&mut self, on: bool) {
+        self.ext_filter_active = on;
+        if let Some(g) = self.gpu.as_mut() {
+            if on {
+                g.ui.ext_filter.set_placeholder(&mut g.font_system, " Search Extensions");
+            }
+            g.ui.ext_filter.focus(on);
+        }
+    }
+
+    /// Record a click; returns true if it's a double-click (within 400ms and 4px).
+    /// Shares the editor's double-click state so the two can't both fire.
+    fn register_click(&mut self, x: f32, y: f32) -> bool {
+        let now = Instant::now();
+        let double = now.duration_since(self.last_click) < Duration::from_millis(400)
+            && (x - self.last_click_pos.0).abs() < 4.0
+            && (y - self.last_click_pos.1).abs() < 4.0;
+        self.last_click = now;
+        self.last_click_pos = (x, y);
+        double
+    }
+
+    /// (rect, left-pad) of a given input, if it's currently shown.
+    fn input_rect_for(&self, id: InputId, layout: &Layout) -> Option<(Rect, f32)> {
+        match id {
+            InputId::Palette => layout.palette.as_ref().map(|p| (p.input, 6.0)),
+            InputId::Find => layout.find_bar.as_ref().map(|fb| (*fb, 8.0)),
+            InputId::ExtFilter => {
+                (self.sidebar_visible && self.sidebar_view == SidebarView::Extensions)
+                    .then(|| (ext_filter_rect(layout.tree_region()), 6.0))
+            }
+        }
+    }
+
+    /// The focused input under point `p` (for click-to-position / drag-select).
+    fn focused_input_at(&self, layout: &Layout, p: (f32, f32)) -> Option<(InputId, Rect, f32)> {
+        for id in [InputId::Palette, InputId::Find, InputId::ExtFilter] {
+            if let Some((rect, pad)) = self.input_rect_for(id, layout) {
+                if rect.contains(p) {
+                    return Some((id, rect, pad));
+                }
+            }
+        }
+        None
+    }
+
+    fn clamp_ext_scroll(&mut self) {
+        let layout = self.layout();
+        let region = ext_list_region(layout.tree_region());
+        let content = self
+            .gpu
+            .as_ref()
+            .map(|g| g.ui.ext_rows.content_height())
+            .unwrap_or(0.0);
+        let max = (content - region.h).max(0.0);
+        self.ext_scroll = self.ext_scroll.clamp(0.0, max);
+    }
+
+    // ---- Modal dialogs ----
+
+    fn request_delete(&mut self, target: usize) {
+        if self.skip_delete_confirm {
+            self.perform_delete(target);
+            return;
+        }
+        let name = self
+            .workspace
+            .tree
+            .nodes
+            .get(target)
+            .map(|n| n.name.clone())
+            .unwrap_or_default();
+        let msg = format!("Are you sure you want to delete '{}'?", name);
+        if let Some(g) = self.gpu.as_mut() {
+            g.ui.dialog.set(
+                &mut g.font_system,
+                &msg,
+                &["Delete", "Cancel"],
+                Some("Do not ask me again"),
+            );
+        }
+        self.dialog = Some(DialogState {
+            action: DialogAction::DeleteNode(target),
+            buttons: &["Delete", "Cancel"],
+            has_check: true,
+            checked: false,
+            hovered: None,
+        });
+        self.redraw();
+    }
+
+    fn perform_delete(&mut self, target: usize) {
+        if let Some(n) = self.workspace.tree.nodes.get(target) {
+            let path = n.path.clone();
+            let res = if n.is_dir {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            if res.is_ok() {
+                self.workspace.tree.refresh();
+            }
+        }
+        self.redraw();
+    }
+
+    fn request_close(&mut self, idx: usize) {
+        let dirty = self.workspace.documents.get(idx).map(|d| d.dirty).unwrap_or(false);
+        if !dirty {
+            self.workspace.close_idx(idx);
+            self.redraw();
+            return;
+        }
+        let name = self
+            .workspace
+            .documents
+            .get(idx)
+            .map(|d| d.name.clone())
+            .unwrap_or_default();
+        let msg = format!("Do you want to save the changes you made to {}?", name);
+        if let Some(g) = self.gpu.as_mut() {
+            g.ui.dialog
+                .set(&mut g.font_system, &msg, &["Save", "Don't Save", "Cancel"], None);
+        }
+        self.dialog = Some(DialogState {
+            action: DialogAction::CloseDoc(idx),
+            buttons: &["Save", "Don't Save", "Cancel"],
+            has_check: false,
+            checked: false,
+            hovered: None,
+        });
+        self.redraw();
+    }
+
+    fn request_close_active(&mut self) {
+        if let Some(i) = self.workspace.active {
+            self.request_close(i);
+        }
+    }
+
+    fn close_dialog(&mut self) {
+        self.dialog = None;
+        self.redraw();
+    }
+
+    fn dialog_click(&mut self, i: usize) {
+        let Some(ds) = self.dialog.take() else {
+            return;
+        };
+        match ds.action {
+            DialogAction::DeleteNode(t) => {
+                // 0 = Delete, 1 = Cancel
+                if i == 0 {
+                    if ds.checked {
+                        self.skip_delete_confirm = true;
+                    }
+                    self.perform_delete(t);
+                }
+            }
+            DialogAction::CloseDoc(idx) => {
+                // 0 = Save, 1 = Don't Save, 2 = Cancel
+                match i {
+                    0 => {
+                        if let Some(d) = self.workspace.documents.get_mut(idx) {
+                            let _ = d.save();
+                        }
+                        self.workspace.close_idx(idx);
+                    }
+                    1 => self.workspace.close_idx(idx),
+                    _ => {}
+                }
+            }
         }
         self.redraw();
     }
@@ -1663,7 +1090,7 @@ impl App {
                 }
             }
             Command::Close => {
-                self.workspace.close_active();
+                self.request_close_active();
             }
             Command::Find => {
                 self.find.active = true;
@@ -1785,10 +1212,70 @@ impl App {
     fn on_mouse_press(&mut self, x: f32, y: f32) {
         let layout = self.layout();
 
+        // A modal dialog swallows all clicks: checkbox toggles, buttons act.
+        if let Some(has_check) = self.dialog.as_ref().map(|d| d.has_check) {
+            let hit = self.gpu.as_ref().map(|g| {
+                let win = (g.config.width as f32, g.config.height as f32);
+                let box_ = g.ui.dialog.box_rect(win, has_check);
+                if has_check && g.ui.dialog.check_hit(box_, (x, y)) {
+                    (true, usize::MAX)
+                } else if let Some(i) = g.ui.dialog.button_at(box_, (x, y)) {
+                    (false, i)
+                } else {
+                    (false, usize::MAX)
+                }
+            });
+            match hit {
+                Some((true, _)) => {
+                    if let Some(d) = self.dialog.as_mut() {
+                        d.checked = !d.checked;
+                    }
+                    self.redraw();
+                }
+                Some((false, i)) if i != usize::MAX => self.dialog_click(i),
+                _ => {}
+            }
+            return;
+        }
+
+        // A click while the context menu is open selects an item or dismisses it.
+        if self.context_menu.is_some() {
+            if let Some(i) = self.context_menu_item_at((x, y)) {
+                self.exec_menu_action(MENU_ACTIONS[i].0);
+            } else {
+                self.close_context_menu();
+            }
+            return;
+        }
+
         // A click anywhere while an inline create field is open commits it
         // (creates if a name was typed, discards if empty), then consumes the click.
         if self.creating.is_some() {
             self.commit_create();
+            return;
+        }
+
+        // Click inside a focused text input: position the caret and begin a
+        // drag-selection. (Handled before other regions so it wins the click.)
+        if let Some((id, rect, pad)) = self.focused_input_at(&layout, (x, y)) {
+            // Clicking the extensions filter box focuses it; clicking another input
+            // (palette/find) takes focus away from it.
+            self.ext_filter_active = id == InputId::ExtFilter;
+            let double = self.register_click(x, y);
+            if let Some(g) = self.gpu.as_mut() {
+                let inp = match id {
+                    InputId::Palette => &mut g.ui.palette_input,
+                    InputId::Find => &mut g.ui.find_input,
+                    InputId::ExtFilter => &mut g.ui.ext_filter,
+                };
+                if double {
+                    inp.select_word_at(rect, pad, x);
+                } else {
+                    inp.set_caret_from_x(rect, pad, x);
+                }
+            }
+            self.text_drag = Some(id);
+            self.redraw();
             return;
         }
 
@@ -1875,15 +1362,68 @@ impl App {
         }
 
         if let Some(idx) = layout.activity_rects().iter().position(|r| r.contains((x, y))) {
-            if idx == 0 {
-                self.sidebar_visible = !self.sidebar_visible;
+            // 0 = Explorer, 4 = Extensions. Clicking the active view's icon toggles
+            // the sidebar; clicking another switches to it (and shows the sidebar).
+            let view = match idx {
+                0 => Some(SidebarView::Explorer),
+                4 => Some(SidebarView::Extensions),
+                _ => None,
+            };
+            if let Some(v) = view {
+                if v == SidebarView::Extensions && self.extensions.is_empty() {
+                    self.extensions = extensions::scan();
+                    self.rebuild_ext_rows();
+                }
+                if self.sidebar_view == v && self.sidebar_visible {
+                    self.sidebar_visible = false;
+                } else {
+                    self.sidebar_view = v;
+                    self.sidebar_visible = true;
+                }
+                // The filter box is focused while the Extensions panel is showing.
+                let ext_focus = self.sidebar_visible && v == SidebarView::Extensions;
+                self.set_ext_filter_focus(ext_focus);
                 self.redraw();
             }
             return;
         }
 
+        // Extensions panel: Install pill, or click a row to open its details page.
+        if self.sidebar_visible
+            && self.sidebar_view == SidebarView::Extensions
+            && layout.sidebar.contains((x, y))
+        {
+            let region = ext_list_region(layout.tree_region());
+            let scroll = self.ext_scroll;
+            let hit = self.gpu.as_ref().and_then(|g| g.ui.ext_rows.hit(region, scroll, (x, y)));
+            match hit {
+                Some((i, ExtZone::Install)) => {
+                    if let Some(&src) = self.ext_visible.get(i) {
+                        if self.ext_showing_remote {
+                            self.install_remote(src);
+                        } else {
+                            self.install_extension(src);
+                        }
+                    }
+                }
+                Some((i, ExtZone::Body)) => {
+                    // Details page only for locally-installed extensions for now.
+                    if !self.ext_showing_remote {
+                        if let Some(&src) = self.ext_visible.get(i) {
+                            self.open_extension = Some(src);
+                            self.redraw();
+                        }
+                    }
+                }
+                None => {}
+            }
+            return;
+        }
+
         // Explorer header action buttons (New File / New Folder / Refresh / Collapse).
-        if self.sidebar_visible {
+        if self.sidebar_visible
+            && self.sidebar_view == SidebarView::Explorer
+        {
             if let Some(i) = layout
                 .explorer_action_rects()
                 .iter()
@@ -1917,6 +1457,7 @@ impl App {
                     if let Some(gpu) = self.gpu.as_mut() {
                         let _ = self.workspace.open_file(&path, &mut gpu.font_system);
                     }
+                    self.open_extension = None; // opening a file dismisses the ext page
                 }
                 self.redraw();
             }
@@ -1927,13 +1468,32 @@ impl App {
             let tab_rects = layout.tab_rects(self.workspace.documents.len());
             if let Some(idx) = tab_rects.iter().position(|r| r.contains((x, y))) {
                 if Layout::tab_close_rect(tab_rects[idx]).contains((x, y)) {
-                    self.workspace.close_idx(idx);
+                    self.request_close(idx);
                 } else {
                     self.workspace.switch_to(idx);
+                    self.open_extension = None;
                 }
                 self.redraw();
             }
             return;
+        }
+
+        // Extension details page (in the editor area): handle its Install button
+        // and consume other clicks so they don't fall through to the editor.
+        if let Some(ei) = self.open_extension {
+            let region = Rect {
+                x: layout.gutter.x,
+                y: layout.gutter.y,
+                w: layout.gutter.w + layout.editor_text.w,
+                h: layout.gutter.h,
+            };
+            if region.contains((x, y)) {
+                let supported = self.extensions.get(ei).map(|e| e.supported() && !e.installed).unwrap_or(false);
+                if supported && page_install_rect(region).contains((x, y)) {
+                    self.install_extension(ei);
+                }
+                return;
+            }
         }
 
         if let Some(fb) = layout.find_bar.as_ref() {
@@ -1942,14 +1502,90 @@ impl App {
             }
         }
 
+        // Editor scrollbar thumb drag (vertical then horizontal).
+        if let Some((track, content, view, scroll)) = self.editor_scroll_metrics(&layout) {
+            if self.editor_scroll.press((x, y), track, content, view, scroll) {
+                return;
+            }
+        }
+        if let Some((track, content, view, scroll)) = self.editor_hscroll_metrics(&layout) {
+            if self.editor_hscroll.press((x, y), track, content, view, scroll) {
+                return;
+            }
+        }
+
         if layout.editor_text.contains((x, y)) {
-            self.dragging_editor = true;
+            self.ext_filter_active = false; // editor takes keyboard focus
+            let now = Instant::now();
+            let consecutive = now.duration_since(self.last_click) < Duration::from_millis(400)
+                && (x - self.last_click_pos.0).abs() < 4.0
+                && (y - self.last_click_pos.1).abs() < 4.0;
+            // 1 = place, 2 = word, 3 = line, 4 = whole document (cycles).
+            self.click_count = if consecutive { (self.click_count % 4) + 1 } else { 1 };
+            self.last_click = now;
+            self.last_click_pos = (x, y);
             self.editor_click(x, y, self.mods.shift_key(), layout);
+            if self.click_count >= 2 {
+                if let Some(d) = self.workspace.active_doc_mut() {
+                    let b = d.sel.head;
+                    match self.click_count {
+                        2 => d.select_word(b),
+                        3 => d.select_line(b),
+                        _ => d.select_all(),
+                    }
+                }
+                self.dragging_editor = false;
+            } else {
+                self.dragging_editor = true;
+            }
+            self.redraw();
             return;
         }
     }
 
     fn on_mouse_move(&mut self, x: f32, y: f32) {
+        // Drag-select within a text input.
+        if let Some(id) = self.text_drag {
+            if self.mouse_pressed {
+                let layout = self.layout();
+                if let Some((rect, pad)) = self.input_rect_for(id, &layout) {
+                    if let Some(g) = self.gpu.as_mut() {
+                        let inp = match id {
+                            InputId::Palette => &mut g.ui.palette_input,
+                            InputId::Find => &mut g.ui.find_input,
+                            InputId::ExtFilter => &mut g.ui.ext_filter,
+                        };
+                        inp.extend_to_x(rect, pad, x);
+                    }
+                    self.redraw();
+                }
+                return;
+            }
+        }
+        if self.editor_scroll.is_dragging() && self.mouse_pressed {
+            let layout = self.layout();
+            if let Some((track, content, view, _)) = self.editor_scroll_metrics(&layout) {
+                if let Some(s) = self.editor_scroll.drag((x, y), track, content, view) {
+                    if let Some(d) = self.workspace.active_doc_mut() {
+                        d.scroll_y = s;
+                    }
+                    self.redraw();
+                }
+            }
+            return;
+        }
+        if self.editor_hscroll.is_dragging() && self.mouse_pressed {
+            let layout = self.layout();
+            if let Some((track, content, view, _)) = self.editor_hscroll_metrics(&layout) {
+                if let Some(s) = self.editor_hscroll.drag((x, y), track, content, view) {
+                    if let Some(d) = self.workspace.active_doc_mut() {
+                        d.scroll_x = s;
+                    }
+                    self.redraw();
+                }
+            }
+            return;
+        }
         if self.sidebar_split.is_dragging() && self.mouse_pressed {
             if self.sidebar_split.drag(x, theme::ACTIVITY_BAR_WIDTH) {
                 self.redraw();
@@ -1964,7 +1600,10 @@ impl App {
 
     fn on_mouse_release(&mut self) {
         self.dragging_editor = false;
+        self.text_drag = None;
         self.sidebar_split.release();
+        self.editor_scroll.release();
+        self.editor_hscroll.release();
     }
 
     fn editor_click(&mut self, x: f32, y: f32, extend: bool, layout: Layout) {
@@ -1974,7 +1613,7 @@ impl App {
         let Some(d) = self.workspace.active_doc_mut() else {
             return;
         };
-        let buf_x = x - (layout.editor_text.x + theme::EDITOR_PAD);
+        let buf_x = x - (layout.editor_text.x + theme::EDITOR_PAD) + d.scroll_x;
         let buf_y = y - (layout.editor_text.y + theme::EDITOR_PAD) + d.scroll_y;
         if let Some(hit) = d.buffer.hit(buf_x, buf_y) {
             let line = hit.line;
@@ -1991,7 +1630,18 @@ impl App {
 
     fn on_scroll(&mut self, dy: f32) {
         let layout = self.layout();
-        if !layout.editor_text.contains((self.mouse_pos.x as f32, self.mouse_pos.y as f32)) {
+        let p = (self.mouse_pos.x as f32, self.mouse_pos.y as f32);
+        // Extensions list scrolls when the cursor is over its region.
+        if self.sidebar_visible && self.sidebar_view == SidebarView::Extensions {
+            let region = ext_list_region(layout.tree_region());
+            if region.contains(p) {
+                self.ext_scroll -= dy;
+                self.clamp_ext_scroll();
+                self.redraw();
+                return;
+            }
+        }
+        if !layout.editor_text.contains(p) {
             // Could route to sidebar tree, but flat list fits fine for now.
             return;
         }
@@ -2004,12 +1654,38 @@ impl App {
         self.redraw();
     }
 
+    fn on_scroll_h(&mut self, dx: f32) {
+        let layout = self.layout();
+        let Some((_, content, view, _)) = self.editor_hscroll_metrics(&layout) else {
+            return;
+        };
+        let max = (content - view).max(0.0);
+        if let Some(d) = self.workspace.active_doc_mut() {
+            d.scroll_x = (d.scroll_x - dx).clamp(0.0, max);
+            self.redraw();
+        }
+    }
+
     fn on_key(&mut self, event: winit::event::KeyEvent) {
         if event.state != ElementState::Pressed {
             return;
         }
         let extend = self.mods.shift_key();
         let ctrl = self.mods.control_key();
+
+        // A modal dialog swallows keys; Escape cancels it.
+        if self.dialog.is_some() {
+            if matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape)) {
+                self.close_dialog();
+            }
+            return;
+        }
+
+        // Escape closes an open context menu first.
+        if self.context_menu.is_some() && matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape)) {
+            self.close_context_menu();
+            return;
+        }
 
         // Inline New File / New Folder name entry captures everything; the text
         // lives in the create_input TextInput component.
@@ -2079,25 +1755,16 @@ impl App {
                     }
                     return;
                 }
-                Key::Named(NamedKey::Backspace) => {
-                    if let Some(g) = self.gpu.as_mut() {
-                        g.ui.palette_input.backspace(&mut g.font_system);
-                    }
-                    self.refilter_palette();
-                    self.redraw();
-                    return;
-                }
                 _ => {}
             }
-            if let Some(t) = event.text.as_ref() {
-                let s: &str = t;
-                if !s.chars().any(|c| c.is_control()) {
-                    if let Some(g) = self.gpu.as_mut() {
-                        g.ui.palette_input.insert(&mut g.font_system, s);
-                    }
+            let consumed = self.gpu.as_mut().and_then(|g| {
+                edit_input(&mut g.ui.palette_input, &mut g.font_system, self.clipboard.as_mut(), &event, ctrl, extend)
+            });
+            if let Some(changed) = consumed {
+                if changed {
                     self.refilter_palette();
-                    self.redraw();
                 }
+                self.redraw();
             }
             return;
         }
@@ -2118,25 +1785,51 @@ impl App {
                     self.redraw();
                     return;
                 }
-                Key::Named(NamedKey::Backspace) => {
-                    if let Some(g) = self.gpu.as_mut() {
-                        g.ui.find_input.backspace(&mut g.font_system);
+                _ => {}
+            }
+            let consumed = self.gpu.as_mut().and_then(|g| {
+                edit_input(&mut g.ui.find_input, &mut g.font_system, self.clipboard.as_mut(), &event, ctrl, extend)
+            });
+            if consumed.is_some() {
+                self.redraw();
+            }
+            return;
+        }
+
+        // Extensions filter box captures editing while the panel is focused.
+        // Ctrl shortcuts (palette, etc.) still work via edit_input's clipboard set
+        // returning None for unrelated combos.
+        if self.ext_filter_active {
+            if matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape)) {
+                if let Some(g) = self.gpu.as_mut() {
+                    g.ui.ext_filter.clear(&mut g.font_system);
+                }
+                self.ext_scroll = 0.0;
+                self.rebuild_ext_rows();
+                self.redraw();
+                return;
+            }
+            let consumed = self.gpu.as_mut().and_then(|g| {
+                edit_input(&mut g.ui.ext_filter, &mut g.font_system, self.clipboard.as_mut(), &event, ctrl, extend)
+            });
+            match consumed {
+                Some(changed) => {
+                    if changed {
+                        self.ext_scroll = 0.0;
+                        self.trigger_search();
+                        self.rebuild_ext_rows();
                     }
                     self.redraw();
                     return;
                 }
-                _ => {}
-            }
-            if let Some(t) = event.text.as_ref() {
-                let s: &str = t;
-                if !s.chars().any(|c| c.is_control()) {
-                    if let Some(g) = self.gpu.as_mut() {
-                        g.ui.find_input.insert(&mut g.font_system, s);
+                None => {
+                    // Swallow other plain keys (Enter, arrows, Tab…) so they can't
+                    // leak to the editor. Ctrl-combos fall through to shortcuts.
+                    if !ctrl {
+                        return;
                     }
-                    self.redraw();
                 }
             }
-            return;
         }
 
         // Ctrl+Shift+P opens palette.
@@ -2211,10 +1904,18 @@ impl App {
 
         match event.logical_key.as_ref() {
             Key::Named(NamedKey::ArrowLeft) => {
-                d.move_left(extend);
+                if ctrl {
+                    d.move_word_left(extend);
+                } else {
+                    d.move_left(extend);
+                }
             }
             Key::Named(NamedKey::ArrowRight) => {
-                d.move_right(extend);
+                if ctrl {
+                    d.move_word_right(extend);
+                } else {
+                    d.move_right(extend);
+                }
             }
             Key::Named(NamedKey::ArrowUp) => {
                 d.move_up(extend);
@@ -2229,7 +1930,11 @@ impl App {
                 d.move_end(extend);
             }
             Key::Named(NamedKey::Backspace) => {
-                d.backspace(&mut gpu.font_system);
+                if ctrl {
+                    d.delete_word_back(&mut gpu.font_system);
+                } else {
+                    d.backspace(&mut gpu.font_system);
+                }
             }
             Key::Named(NamedKey::Delete) => {
                 d.delete_forward(&mut gpu.font_system);
@@ -2285,6 +1990,137 @@ fn create_row_geometry(tr: Rect, row: usize, depth: usize) -> (Rect, Rect, Rect)
         h: theme::TREE_ROW_HEIGHT,
     };
     (row_rect, icon_rect, field)
+}
+
+/// The activity-bar icon index that's currently "active" (highlighted).
+fn active_activity_idx(sidebar_visible: bool, view: SidebarView) -> Option<usize> {
+    if !sidebar_visible {
+        return None;
+    }
+    match view {
+        SidebarView::Explorer => Some(0),
+        SidebarView::Extensions => Some(4),
+    }
+}
+
+/// Messages from background worker threads (marketplace HTTP), polled in the
+/// event loop's idle tick so the UI never blocks on the network.
+enum WorkerMsg {
+    Search { gen: u64, results: Vec<marketplace::RemoteExt> },
+    Installed { result: Result<(), String> },
+}
+
+/// Identifies the text input under the cursor for click/drag selection.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InputId {
+    Palette,
+    Find,
+    ExtFilter,
+}
+
+/// Apply a common editing/navigation key to a focused text input. Returns
+/// `None` if the key wasn't consumed, or `Some(text_changed)` if it was (so the
+/// caller can re-filter only when the content actually changed). Shared by every
+/// input so selection, clipboard, and caret movement behave identically.
+fn edit_input(
+    input: &mut widgets::TextInput,
+    fs: &mut glyphon::FontSystem,
+    clip: Option<&mut Clipboard>,
+    event: &winit::event::KeyEvent,
+    ctrl: bool,
+    shift: bool,
+) -> Option<bool> {
+    use winit::keyboard::{Key, NamedKey};
+    if ctrl {
+        if let Key::Character(c) = event.logical_key.as_ref() {
+            match c.to_lowercase().as_str() {
+                "a" => {
+                    input.select_all();
+                    return Some(false);
+                }
+                "c" => {
+                    if let Some(cb) = clip {
+                        let _ = cb.set_text(input.selected_text().to_string());
+                    }
+                    return Some(false);
+                }
+                "x" => {
+                    if input.has_selection() {
+                        if let Some(cb) = clip {
+                            let _ = cb.set_text(input.selected_text().to_string());
+                        }
+                        input.backspace(fs);
+                        return Some(true);
+                    }
+                    return Some(false);
+                }
+                "v" => {
+                    if let Some(cb) = clip {
+                        if let Ok(t) = cb.get_text() {
+                            let t: String = t.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+                            input.insert(fs, &t);
+                            return Some(true);
+                        }
+                    }
+                    return Some(false);
+                }
+                _ => return None,
+            }
+        }
+        return None;
+    }
+    match event.logical_key.as_ref() {
+        Key::Named(NamedKey::ArrowLeft) => {
+            input.move_left(shift);
+            Some(false)
+        }
+        Key::Named(NamedKey::ArrowRight) => {
+            input.move_right(shift);
+            Some(false)
+        }
+        Key::Named(NamedKey::Home) => {
+            input.move_home(shift);
+            Some(false)
+        }
+        Key::Named(NamedKey::End) => {
+            input.move_end(shift);
+            Some(false)
+        }
+        Key::Named(NamedKey::Delete) => {
+            input.delete_forward(fs);
+            Some(true)
+        }
+        Key::Named(NamedKey::Backspace) => {
+            input.backspace(fs);
+            Some(true)
+        }
+        _ => {
+            if let Some(t) = event.text.as_ref() {
+                let s: &str = t;
+                if !s.chars().any(|c| c.is_control()) {
+                    input.insert(fs, s);
+                    return Some(true);
+                }
+            }
+            None
+        }
+    }
+}
+
+/// The search/filter box rect at the top of the Extensions sidebar.
+fn ext_filter_rect(tree: Rect) -> Rect {
+    Rect { x: tree.x + 10.0, y: tree.y + 8.0, w: tree.w - 20.0, h: 30.0 }
+}
+
+/// The scrollable extension-row list region (below the filter box).
+fn ext_list_region(tree: Rect) -> Rect {
+    const STRIP: f32 = 46.0; // filter box + padding
+    Rect { x: tree.x, y: tree.y + STRIP, w: tree.w, h: (tree.h - STRIP).max(0.0) }
+}
+
+/// The Install button rect on the extension details page (top-right of region).
+fn page_install_rect(region: Rect) -> Rect {
+    Rect { x: region.x + region.w - 180.0, y: region.y + 28.0, w: 130.0, h: 34.0 }
 }
 
 fn cursor_pos_in_buffer(buffer: &Buffer, line: usize, col_byte: usize) -> (f32, f32, f32) {
@@ -2367,8 +2203,39 @@ fn render(app: &mut App) -> Result<()> {
         // Activity-bar icons and window controls are IconButton widgets now
         // (rendered below from layout rects) — no per-glyph buffer juggling here.
 
-        // Sidebar header ("EXPLORER" title) + root folder row (chevron + name).
-        gpu.ui.sidebar_header.set(fs, "EXPLORER", theme::UI_FAMILY);
+        // Sidebar header — title depends on the active view.
+        let header = if app.sidebar_view == SidebarView::Extensions {
+            "EXTENSIONS"
+        } else {
+            "EXPLORER"
+        };
+        gpu.ui.sidebar_header.set(fs, header, theme::UI_FAMILY);
+
+        // Extension details page text.
+        if let Some(ei) = app.open_extension {
+            if let Some(e) = app.extensions.get(ei) {
+                let title = Attrs::new().family(Family::Name(theme::UI_FAMILY)).color(theme::FG_ACTIVE());
+                let dim = Attrs::new().family(Family::Name(theme::UI_FAMILY)).color(theme::FG_DIM());
+                let body = Attrs::new().family(Family::Name(theme::UI_FAMILY)).color(theme::FG_TEXT());
+                let note_col = if e.supported() { theme::SYN_COMMENT() } else { theme::FG_DIM() };
+                let note = Attrs::new().family(Family::Name(theme::UI_FAMILY)).color(note_col);
+                let support = if e.supported() {
+                    format!("Supported in Nova — {}", e.category())
+                } else {
+                    "Not supported yet — needs the extension runtime".to_string()
+                };
+                let desc = if e.description.is_empty() { "(no description)" } else { &e.description };
+                let spans = vec![
+                    (format!("{}\n", e.name), title),
+                    (format!("{} · {}\n\n", e.publisher, e.category()), dim),
+                    (format!("{}\n\n", desc), body),
+                    (support, note),
+                ];
+                gpu.ui.ext_detail.set_rich(fs, &format!("{}{}", e.name, e.installed), &spans, body);
+                gpu.ui.ext_install.set(fs, "Install", theme::UI_FAMILY);
+                gpu.ui.ext_installed.set(fs, "Installed", theme::UI_FAMILY);
+            }
+        }
         let ws_name = app
             .cwd
             .file_name()
@@ -2377,11 +2244,11 @@ fn render(app: &mut App) -> Result<()> {
         let root_spans = [
             (
                 format!("{}  ", theme::ICON_CHEVRON_DOWN),
-                Attrs::new().family(Family::Name(theme::ICON_FAMILY)).color(theme::FG_TEXT),
+                Attrs::new().family(Family::Name(theme::ICON_FAMILY)).color(theme::FG_TEXT()),
             ),
             (
                 ws_name.clone(),
-                Attrs::new().family(Family::Name(theme::UI_FAMILY)).color(theme::FG_TEXT),
+                Attrs::new().family(Family::Name(theme::UI_FAMILY)).color(theme::FG_TEXT()),
             ),
         ];
         gpu.ui
@@ -2408,10 +2275,10 @@ fn render(app: &mut App) -> Result<()> {
         {
             let ui_attrs = Attrs::new()
                 .family(Family::Name(theme::UI_FAMILY))
-                .color(theme::FG_TEXT);
+                .color(theme::FG_TEXT());
             let folder_attrs = Attrs::new()
                 .family(Family::Name(theme::ICON_FAMILY))
-                .color(theme::ICON_FOLDER_COLOR);
+                .color(theme::ICON_FOLDER_COLOR());
             let mut spans: Vec<(String, Attrs)> = Vec::new();
             for node in app.workspace.tree.nodes.iter() {
                 spans.push(("  ".repeat(node.depth), ui_attrs));
@@ -2521,6 +2388,12 @@ fn render(app: &mut App) -> Result<()> {
                 .palette_list
                 .set_text(fs, &list_text, pal.list.w, pal.list.h);
         }
+
+        // Context menu items.
+        if app.context_menu.is_some() {
+            let labels: Vec<&str> = MENU_ACTIONS.iter().map(|(_, l)| *l).collect();
+            gpu.ui.menu.set_items(fs, &labels);
+        }
     }
 
     // ---- Build quad lists ----
@@ -2528,7 +2401,7 @@ fn render(app: &mut App) -> Result<()> {
     let mut fg_quads: Vec<Quad> = Vec::new();
 
     // Title bar bg + window-control hover (hover rect == the button rect).
-    bg_quads.push(layout.title_bar.quad(theme::TITLE_BAR_BG));
+    bg_quads.push(layout.title_bar.quad(theme::TITLE_BAR_BG()));
     // Header command-center search box.
     gpu.search
         .draw_bg(layout.header_search_rect(), app.hovered_search, &mut bg_quads);
@@ -2536,48 +2409,70 @@ fn render(app: &mut App) -> Result<()> {
     gpu.menubar
         .draw_bg(layout.menu_bar_rect(), app.hovered_menu, &mut bg_quads);
     if let Some(i) = app.hovered_layout {
-        bg_quads.push(layout.layout_btn_rects()[i].quad(theme::TITLE_BTN_HOVER));
+        bg_quads.push(layout.layout_btn_rects()[i].quad(theme::TITLE_BTN_HOVER()));
     }
     if let Some(b) = app.hovered_titlebtn {
         let color = if b == 2 {
-            theme::TITLE_CLOSE_HOVER
+            theme::TITLE_CLOSE_HOVER()
         } else {
-            theme::TITLE_BTN_HOVER
+            theme::TITLE_BTN_HOVER()
         };
         bg_quads.push(layout.title_btn_rects()[b].quad(color));
     }
 
     // Activity bar bg + hover (hover rect == the button rect).
-    bg_quads.push(layout.activity_bar.quad(theme::ACTIVITY_BAR_BG));
+    bg_quads.push(layout.activity_bar.quad(theme::ACTIVITY_BAR_BG()));
     let act_rects = layout.activity_rects();
     if let Some(idx) = app.hovered_activity {
-        bg_quads.push(act_rects[idx].quad(theme::ACTIVITY_BAR_ACTIVE));
+        bg_quads.push(act_rects[idx].quad(theme::ACTIVITY_BAR_ACTIVE()));
     }
-    // Active-section accent stripe (Files = idx 0 when sidebar visible).
-    if app.sidebar_visible {
-        let r = act_rects[0];
+    // Active-section accent stripe on the active view's icon.
+    if let Some(ai) = active_activity_idx(app.sidebar_visible, app.sidebar_view) {
+        let r = act_rects[ai];
         bg_quads.push(Quad::new(r.x, r.y, 2.0, r.h, [1.0, 1.0, 1.0, 0.85]));
     }
     // Sidebar bg
     if app.sidebar_visible {
-        bg_quads.push(layout.sidebar.quad(theme::SIDEBAR_BG));
-        // Explorer header action hover.
-        if let Some(i) = app.hovered_explorer {
-            bg_quads.push(layout.explorer_action_rects()[i].quad(theme::MENU_HOVER));
-        }
-        // Inline-create row highlight (at the insert position).
-        if let Some(pc) = app.creating.as_ref() {
-            let (row_rect, _, _) = create_row_geometry(layout.tree_region(), pc.row, pc.depth);
-            bg_quads.push(row_rect.quad(theme::TREE_SELECTED));
-        }
-        // Tree row hover (below the header) — row rect from the ListView.
-        if let Some(idx) = app.hovered_tree {
-            bg_quads.push(
-                gpu.ui
-                    .sidebar
-                    .row_rect(layout.tree_region(), idx)
-                    .quad(theme::TREE_HOVER),
-            );
+        bg_quads.push(layout.sidebar.quad(theme::SIDEBAR_BG()));
+        if app.sidebar_view == SidebarView::Explorer {
+            // Explorer header action hover.
+            if let Some(i) = app.hovered_explorer {
+                bg_quads.push(layout.explorer_action_rects()[i].quad(theme::MENU_HOVER()));
+            }
+            // Inline-create row highlight (at the insert position).
+            if let Some(pc) = app.creating.as_ref() {
+                let (row_rect, _, _) = create_row_geometry(layout.tree_region(), pc.row, pc.depth);
+                bg_quads.push(row_rect.quad(theme::TREE_SELECTED()));
+            }
+            // Active-file highlight: the tree row matching the open document.
+            if app.creating.is_none() {
+                if let Some(path) = app.workspace.active_doc().and_then(|d| d.path.clone()) {
+                    if let Some(idx) = app.workspace.tree.nodes.iter().position(|n| n.path == path) {
+                        bg_quads.push(
+                            gpu.ui
+                                .sidebar
+                                .row_rect(layout.tree_region(), idx)
+                                .quad(theme::TREE_ACTIVE_FILE()),
+                        );
+                    }
+                }
+            }
+            // Tree row hover (below the header) — row rect from the ListView.
+            if let Some(idx) = app.hovered_tree {
+                bg_quads.push(
+                    gpu.ui
+                        .sidebar
+                        .row_rect(layout.tree_region(), idx)
+                        .quad(theme::TREE_HOVER()),
+                );
+            }
+        } else {
+            // Extensions view: filter box chrome (fixed at top). The scrollable rows
+            // are drawn in their own clipped pass after the main pass.
+            let fr = ext_filter_rect(layout.tree_region());
+            let border = Rect { x: fr.x - 1.0, y: fr.y - 1.0, w: fr.w + 2.0, h: fr.h + 2.0 };
+            bg_quads.push(border.quad(theme::SEARCH_BORDER()));
+            bg_quads.push(fr.quad(theme::SEARCH_BG()));
         }
         // Subtle right border.
         bg_quads.push(Quad::new(
@@ -2589,7 +2484,7 @@ fn render(app: &mut App) -> Result<()> {
         ));
     }
     // Tab strip bg
-    bg_quads.push(layout.tab_strip.quad(theme::TAB_BAR_BG));
+    bg_quads.push(layout.tab_strip.quad(theme::TAB_BAR_BG()));
     // Per-tab styling — geometry from the single-source tab rects.
     let n_tabs = app.workspace.documents.len();
     let tab_rects = layout.tab_rects(n_tabs);
@@ -2597,11 +2492,11 @@ fn render(app: &mut App) -> Result<()> {
         let active = app.workspace.active == Some(i);
         let hover = app.hovered_tab == Some(i);
         let fill = if active {
-            theme::TAB_ACTIVE
+            theme::TAB_ACTIVE()
         } else if hover {
-            theme::TAB_HOVER
+            theme::TAB_HOVER()
         } else {
-            theme::TAB_INACTIVE
+            theme::TAB_INACTIVE()
         };
         bg_quads.push(tab.quad(fill));
         // Top accent stripe for active tab.
@@ -2640,28 +2535,50 @@ fn render(app: &mut App) -> Result<()> {
         h: layout.gutter.h,
     };
     bg_quads.push(editor_full.quad([
-        theme::BG_EDITOR.r as f32,
-        theme::BG_EDITOR.g as f32,
-        theme::BG_EDITOR.b as f32,
-        theme::BG_EDITOR.a as f32,
+        theme::BG_EDITOR().r as f32,
+        theme::BG_EDITOR().g as f32,
+        theme::BG_EDITOR().b as f32,
+        theme::BG_EDITOR().a as f32,
     ]));
 
-    // Current-line highlight + selection.
-    if let Some(d) = app.workspace.active_doc() {
+    // Extension details page Install button (when the page is open).
+    if let Some(ei) = app.open_extension {
+        if app.extensions.get(ei).map(|e| e.supported() && !e.installed).unwrap_or(false) {
+            let c = if app.hovered_page_install {
+                theme::DIALOG_BTN_HOVER()
+            } else {
+                theme::DIALOG_BTN()
+            };
+            bg_quads.push(page_install_rect(editor_full).quad(c));
+        }
+    }
+
+    // Current-line highlight + selection. All editor quads must be clipped to
+    // the editor's vertical band so scrolled-off rows don't bleed into the tab
+    // strip / title bar above (text is clipped via its TextArea bounds; quads
+    // have no implicit clip, so we clamp them here). Skipped while the extension
+    // page occupies the editor area.
+    if let Some(d) = app.open_extension.is_none().then(|| app.workspace.active_doc()).flatten() {
+        let etop = layout.editor_text.y;
+        let ebot = layout.editor_text.y + layout.editor_text.h;
+        let clip_v = |y: f32, h: f32| -> Option<(f32, f32)> {
+            let top = y.max(etop);
+            let bot = (y + h).min(ebot);
+            (bot > top).then_some((top, bot - top))
+        };
+
         let (cur_line, _) = d.head_line_col();
         // Current line highlight across full editor width.
         let line_y = layout.editor_text.y + theme::EDITOR_PAD
             + cur_line as f32 * theme::LINE_HEIGHT
             - d.scroll_y;
-        if line_y + theme::LINE_HEIGHT > layout.editor_text.y
-            && line_y < layout.editor_text.y + layout.editor_text.h
-        {
+        if let Some((qy, qh)) = clip_v(line_y, theme::LINE_HEIGHT) {
             bg_quads.push(Quad::new(
                 editor_full.x,
-                line_y,
+                qy,
                 editor_full.w,
-                theme::LINE_HEIGHT,
-                theme::LINE_HIGHLIGHT,
+                qh,
+                theme::LINE_HIGHLIGHT(),
             ));
         }
 
@@ -2688,13 +2605,16 @@ fn render(app: &mut App) -> Result<()> {
                 };
                 let (xs, xe) = x_range_in_run(&run, col_start, col_end);
                 let w = (xe - xs).max(2.0);
-                bg_quads.push(Quad::new(
-                    layout.editor_text.x + theme::EDITOR_PAD + xs,
-                    layout.editor_text.y + theme::EDITOR_PAD + run.line_top - d.scroll_y,
-                    w,
-                    run.line_height,
-                    theme::SELECTION,
-                ));
+                let sel_y = layout.editor_text.y + theme::EDITOR_PAD + run.line_top - d.scroll_y;
+                if let Some((qy, qh)) = clip_v(sel_y, run.line_height) {
+                    bg_quads.push(Quad::new(
+                        layout.editor_text.x + theme::EDITOR_PAD + xs - d.scroll_x,
+                        qy,
+                        w,
+                        qh,
+                        theme::SELECTION(),
+                    ));
+                }
             }
         }
 
@@ -2702,28 +2622,69 @@ fn render(app: &mut App) -> Result<()> {
         if app.cursor_blink_on {
             let (cur_line2, cur_col_byte) = d.head_line_col();
             let (cx, cy, ch) = cursor_pos_in_buffer(&d.buffer, cur_line2, cur_col_byte);
-            fg_quads.push(Quad::new(
-                layout.editor_text.x + theme::EDITOR_PAD + cx,
-                layout.editor_text.y + theme::EDITOR_PAD + cy - d.scroll_y,
-                theme::CURSOR_WIDTH,
-                ch,
-                theme::CURSOR,
-            ));
+            let cursor_y = layout.editor_text.y + theme::EDITOR_PAD + cy - d.scroll_y;
+            if let Some((qy, qh)) = clip_v(cursor_y, ch) {
+                fg_quads.push(Quad::new(
+                    layout.editor_text.x + theme::EDITOR_PAD + cx - d.scroll_x,
+                    qy,
+                    theme::CURSOR_WIDTH,
+                    qh,
+                    theme::CURSOR(),
+                ));
+            }
+        }
+
+        // Editor scrollbar thumb (over text).
+        let view = layout.editor_text.h;
+        let content = d.rope.len_lines() as f32 * theme::LINE_HEIGHT + theme::EDITOR_PAD * 2.0;
+        let track = Rect {
+            x: layout.editor_text.x + layout.editor_text.w - theme::SCROLLBAR_WIDTH,
+            y: layout.editor_text.y,
+            w: theme::SCROLLBAR_WIDTH,
+            h: layout.editor_text.h,
+        };
+        if let Some(th) = app.editor_scroll.thumb(track, content, view, d.scroll_y) {
+            let color = if app.hovered_scrollbar || app.editor_scroll.is_dragging() {
+                theme::SCROLLBAR_THUMB_HOVER()
+            } else {
+                theme::SCROLLBAR_THUMB()
+            };
+            fg_quads.push(th.quad(color));
+        }
+
+        // Horizontal scrollbar thumb.
+        let hview = layout.editor_text.w;
+        let hcontent = d.max_line_width() + theme::EDITOR_PAD * 2.0;
+        if hcontent > hview {
+            let htrack = Rect {
+                x: layout.editor_text.x,
+                y: layout.editor_text.y + layout.editor_text.h - theme::SCROLLBAR_WIDTH,
+                w: layout.editor_text.w - theme::SCROLLBAR_WIDTH,
+                h: theme::SCROLLBAR_WIDTH,
+            };
+            if let Some(th) = app.editor_hscroll.thumb(htrack, hcontent, hview, d.scroll_x) {
+                let color = if app.editor_hscroll.is_dragging() {
+                    theme::SCROLLBAR_THUMB_HOVER()
+                } else {
+                    theme::SCROLLBAR_THUMB()
+                };
+                fg_quads.push(th.quad(color));
+            }
         }
     }
 
     // Status bar
-    bg_quads.push(layout.status_bar.quad(theme::STATUS_BAR_BG));
+    bg_quads.push(layout.status_bar.quad(theme::STATUS_BAR_BG()));
 
     // Find bar
     if let Some(fb) = layout.find_bar.as_ref() {
-        bg_quads.push(fb.quad(theme::TAB_BAR_BG));
+        bg_quads.push(fb.quad(theme::TAB_BAR_BG()));
         bg_quads.push(Quad::new(
             fb.x,
             fb.y + fb.h - 1.0,
             fb.w,
             1.0,
-            theme::BORDER,
+            theme::BORDER(),
         ));
     }
 
@@ -2736,22 +2697,22 @@ fn render(app: &mut App) -> Result<()> {
             gpu.config.height as f32,
             [0.0, 0.0, 0.0, 0.6],
         ));
-        bg_quads.push(pal.box_.quad(theme::PALETTE_BG));
+        bg_quads.push(pal.box_.quad(theme::PALETTE_BG()));
         bg_quads.push(Quad::new(
             pal.box_.x - 1.0,
             pal.box_.y - 1.0,
             pal.box_.w + 2.0,
             pal.box_.h + 2.0,
-            theme::PALETTE_BORDER,
+            theme::PALETTE_BORDER(),
         ));
-        bg_quads.push(pal.input.quad(theme::PALETTE_INPUT_BG));
+        bg_quads.push(pal.input.quad(theme::PALETTE_INPUT_BG()));
         // Selected row highlight — row rect from the ListView.
         if !app.palette.filtered.is_empty() {
             bg_quads.push(
                 gpu.ui
                     .palette_list
                     .row_rect(pal.list, app.palette.selected)
-                    .quad(theme::PALETTE_SELECTED),
+                    .quad(theme::PALETTE_SELECTED()),
             );
         }
     }
@@ -2767,6 +2728,23 @@ fn render(app: &mut App) -> Result<()> {
             let (_, _, field) = create_row_geometry(layout.tree_region(), pc.row, pc.depth);
             fg_quads.push(gpu.create_input.caret_quad(field, 0.0));
         }
+        if app.ext_filter_active && app.sidebar_visible && app.sidebar_view == SidebarView::Extensions {
+            let fr = ext_filter_rect(layout.tree_region());
+            fg_quads.push(gpu.ui.ext_filter.caret_quad(fr, 6.0));
+        }
+    }
+
+    // Text-input selection highlights — drawn into bg_quads (under glyphs, over
+    // the input box). Not blink-gated.
+    if let Some(pal) = layout.palette.as_ref() {
+        gpu.ui.palette_input.selection_quads(pal.input, 6.0, &mut bg_quads);
+    }
+    if let Some(fb) = layout.find_bar.as_ref() {
+        gpu.ui.find_input.selection_quads(*fb, 8.0, &mut bg_quads);
+    }
+    if app.ext_filter_active && app.sidebar_visible && app.sidebar_view == SidebarView::Extensions {
+        let fr = ext_filter_rect(layout.tree_region());
+        gpu.ui.ext_filter.selection_quads(fr, 6.0, &mut bg_quads);
     }
 
     // ---- Build text areas ----
@@ -2796,64 +2774,71 @@ fn render(app: &mut App) -> Result<()> {
     gpu.search.draw(layout.header_search_rect(), &mut areas);
     let layout_rects = layout.layout_btn_rects();
     for (i, btn) in gpu.layout_btns.iter().enumerate() {
-        btn.draw(layout_rects[i], theme::TITLE_FG, &mut areas);
+        btn.draw(layout_rects[i], theme::TITLE_FG(), &mut areas);
     }
     // Window controls — IconButton widgets at their layout rects (the same
     // rects the hover bg used above; glyph is centered in each).
     let tb_rects = layout.title_btn_rects();
     for (b, btn) in gpu.titlebar_btns.iter().enumerate() {
         let color = if app.hovered_titlebtn == Some(b) {
-            theme::FG_ACTIVE
+            theme::FG_ACTIVE()
         } else {
-            theme::TITLE_FG
+            theme::TITLE_FG()
         };
         btn.draw(tb_rects[b], color, &mut areas);
     }
 
     // Activity-bar icons — IconButton widgets at their cell rects.
     let act_rects = layout.activity_rects();
+    let active_act = active_activity_idx(app.sidebar_visible, app.sidebar_view);
     for (i, btn) in gpu.activity_btns.iter().enumerate() {
-        let color = if i == 0 && app.sidebar_visible {
-            theme::ACTIVITY_ICON_ACTIVE
+        let color = if Some(i) == active_act {
+            theme::ACTIVITY_ICON_ACTIVE()
         } else {
-            theme::ACTIVITY_ICON_FG
+            theme::ACTIVITY_ICON_FG()
         };
         btn.draw(act_rects[i], color, &mut areas);
     }
 
-    // Sidebar header + action buttons + root folder row + tree
+    // Sidebar header + (Explorer tree | Extensions list)
     if app.sidebar_visible {
         ui.sidebar_header
-            .push(layout.sidebar.x + 12.0, layout.sidebar_header_rect(), theme::FG_DIM, &mut areas);
-        let er = layout.explorer_action_rects();
-        for (i, btn) in gpu.explorer_btns.iter().enumerate() {
-            btn.draw(er[i], theme::TITLE_FG, &mut areas);
-        }
-        // Root folder row (chevron + workspace name).
-        ui.root_label
-            .draw_left(layout.root_row_rect(), 10.0, theme::FG_TEXT, &mut areas);
+            .push(layout.sidebar.x + 12.0, layout.sidebar_header_rect(), theme::FG_DIM(), &mut areas);
         let tr = layout.tree_region();
-        if let Some(pc) = app.creating.as_ref() {
-            // Insert an inline field at row `pc.row`: draw the rows above it, the
-            // field, then the rows from `pc.row` on shifted down by one row.
-            let rowh = theme::TREE_ROW_HEIGHT;
-            let (_, icon_rect, field) = create_row_geometry(tr, pc.row, pc.depth);
-            if pc.row > 0 {
-                let clip_a = Rect { x: tr.x, y: tr.y, w: tr.w, h: pc.row as f32 * rowh };
-                ui.sidebar.draw_at(clip_a, tr.y, theme::FG_TEXT, &mut areas);
+        if app.sidebar_view == SidebarView::Explorer {
+            let er = layout.explorer_action_rects();
+            for (i, btn) in gpu.explorer_btns.iter().enumerate() {
+                btn.draw(er[i], theme::TITLE_FG(), &mut areas);
             }
-            gpu.create_icons[pc.is_dir as usize].draw(icon_rect, theme::ICON_FILE_COLOR, &mut areas);
-            gpu.create_input.draw(field, 0.0, theme::FG_TEXT, &mut areas);
-            let below_y = tr.y + (pc.row as f32 + 1.0) * rowh;
-            let clip_b = Rect {
-                x: tr.x,
-                y: below_y,
-                w: tr.w,
-                h: (tr.y + tr.h - below_y).max(0.0),
-            };
-            ui.sidebar.draw_at(clip_b, tr.y + rowh, theme::FG_TEXT, &mut areas);
+            // Root folder row (chevron + workspace name).
+            ui.root_label
+                .draw_left(layout.root_row_rect(), 10.0, theme::FG_TEXT(), &mut areas);
+            if let Some(pc) = app.creating.as_ref() {
+                let rowh = theme::TREE_ROW_HEIGHT;
+                let (_, icon_rect, field) = create_row_geometry(tr, pc.row, pc.depth);
+                if pc.row > 0 {
+                    let clip_a = Rect { x: tr.x, y: tr.y, w: tr.w, h: pc.row as f32 * rowh };
+                    ui.sidebar.draw_at(clip_a, tr.y, theme::FG_TEXT(), &mut areas);
+                }
+                gpu.create_icons[pc.is_dir as usize].draw(icon_rect, theme::ICON_FILE_COLOR(), &mut areas);
+                gpu.create_input.draw(field, 0.0, theme::FG_TEXT(), &mut areas);
+                let below_y = tr.y + (pc.row as f32 + 1.0) * rowh;
+                let clip_b = Rect {
+                    x: tr.x,
+                    y: below_y,
+                    w: tr.w,
+                    h: (tr.y + tr.h - below_y).max(0.0),
+                };
+                ui.sidebar.draw_at(clip_b, tr.y + rowh, theme::FG_TEXT(), &mut areas);
+            } else {
+                ui.sidebar.draw(tr, theme::FG_TEXT(), &mut areas);
+            }
         } else {
-            ui.sidebar.draw(tr, theme::FG_TEXT, &mut areas);
+            // Extensions filter box text (fixed). The scrollable row text is drawn
+            // in the dedicated clipped pass after the main pass.
+            let fr = ext_filter_rect(tr);
+            let fc = if ui.ext_filter.text().is_empty() { theme::FG_DIM() } else { theme::FG_TEXT() };
+            ui.ext_filter.draw(fr, 6.0, fc, &mut areas);
         }
     }
 
@@ -2865,20 +2850,23 @@ fn render(app: &mut App) -> Result<()> {
         let active = app.workspace.active == Some(i);
         let line_top = i as f32 * theme::UI_LINE_HEIGHT;
         let color = if active {
-            theme::TAB_FG_ACTIVE
+            theme::TAB_FG_ACTIVE()
         } else {
-            theme::TAB_FG_INACTIVE
+            theme::TAB_FG_INACTIVE()
         };
+        let label_top = tab.text_top(theme::UI_LINE_HEIGHT, VAlign::Center);
         areas.push(TextArea {
             buffer: &ui.tabs,
             left: tab.x + 12.0,
-            top: tab.y + 9.0 - line_top,
+            top: label_top - line_top,
             scale: 1.0,
+            // Clip to just this label's line band (the buffer holds every tab's
+            // label, one per line) so neighbours don't bleed in.
             bounds: TextBounds {
                 left: tab.x as i32 + 6,
-                top: (tab.y + 7.0) as i32,
+                top: (label_top - 2.0) as i32,
                 right: (tab.x + tab.w - 26.0) as i32,
-                bottom: (tab.y + tab.h - 5.0) as i32,
+                bottom: (label_top + theme::UI_LINE_HEIGHT) as i32,
             },
             default_color: color,
             custom_glyphs: &[],
@@ -2887,9 +2875,9 @@ fn render(app: &mut App) -> Result<()> {
         // Close × — reusable IconButton at the close-button rect (same rect as
         // its hover bg + hit region). Hidden unless the tab is active/hovered.
         let close_color = if app.hovered_tab_close == Some(i) {
-            theme::CLOSE_FG_HOVER
+            theme::CLOSE_FG_HOVER()
         } else if active || app.hovered_tab == Some(i) {
-            theme::CLOSE_FG
+            theme::CLOSE_FG()
         } else {
             glyphon::Color::rgba(0xD4, 0xD4, 0xD4, 0)
         };
@@ -2897,19 +2885,39 @@ fn render(app: &mut App) -> Result<()> {
             .draw(Layout::tab_close_rect(*tab), close_color, &mut areas);
     }
 
-    // Editor: gutter line numbers + doc text.
-    if let Some(i) = active_idx {
+    // Editor area: either the extension details page or the document.
+    if let Some(ei) = app.open_extension {
+        let region = Rect {
+            x: layout.gutter.x,
+            y: layout.gutter.y,
+            w: layout.gutter.w + layout.editor_text.w,
+            h: layout.gutter.h,
+        };
+        let text_rect = Rect { x: region.x + 30.0, y: region.y + 24.0, w: region.w - 60.0, h: region.h - 48.0 };
+        ui.ext_detail.push(text_rect.x, text_rect, theme::FG_TEXT(), &mut areas);
+        // Install / Installed button label.
+        let installed = app.extensions.get(ei).map(|e| e.installed).unwrap_or(false);
+        let supported = app.extensions.get(ei).map(|e| e.supported()).unwrap_or(false);
+        if supported {
+            let pill = page_install_rect(region);
+            if installed {
+                ui.ext_installed.draw_center(pill, theme::FG_DIM(), &mut areas);
+            } else {
+                ui.ext_install.draw_center(pill, theme::FG_ACTIVE(), &mut areas);
+            }
+        }
+    } else if let Some(i) = active_idx {
         let d = &app.workspace.documents[i];
 
         // Line numbers — clipped to the gutter region so they never bleed over
         // the tab strip when scrolled.
         ui.line_numbers
-            .draw(layout.gutter, d.scroll_y, theme::FG_GUTTER, &mut areas);
+            .draw(layout.gutter, d.scroll_y, theme::FG_GUTTER(), &mut areas);
 
         // Document text
         areas.push(TextArea {
             buffer: &d.buffer,
-            left: layout.editor_text.x + theme::EDITOR_PAD,
+            left: layout.editor_text.x + theme::EDITOR_PAD - d.scroll_x,
             top: layout.editor_text.y + theme::EDITOR_PAD - d.scroll_y,
             scale: 1.0,
             bounds: TextBounds {
@@ -2918,7 +2926,7 @@ fn render(app: &mut App) -> Result<()> {
                 right: (layout.editor_text.x + layout.editor_text.w) as i32,
                 bottom: (layout.editor_text.y + layout.editor_text.h) as i32,
             },
-            default_color: theme::FG_TEXT,
+            default_color: theme::FG_TEXT(),
             custom_glyphs: &[],
         });
     }
@@ -2926,22 +2934,22 @@ fn render(app: &mut App) -> Result<()> {
     // Status bar — left: path; right: position/encoding/etc. Both via the
     // reusable TextLabel (left-padded and right-padded alignment helpers).
     ui.status
-        .draw_left(layout.status_bar, 12.0, theme::STATUS_BAR_FG, &mut areas);
+        .draw_left(layout.status_bar, 12.0, theme::STATUS_BAR_FG(), &mut areas);
     ui.status_right
-        .draw_right(layout.status_bar, 8.0, theme::STATUS_BAR_FG, &mut areas);
+        .draw_right(layout.status_bar, 8.0, theme::STATUS_BAR_FG(), &mut areas);
 
     // Find bar
     if let Some(fb) = layout.find_bar.as_ref() {
-        ui.find_input.draw(*fb, 8.0, theme::FG_TEXT, &mut areas);
+        ui.find_input.draw(*fb, 8.0, theme::FG_TEXT(), &mut areas);
     }
     } // end: palette closed
 
     // Palette text
     if let Some(pal) = layout.palette.as_ref() {
         ui.palette_input
-            .draw(pal.input, 6.0, theme::FG_TEXT, &mut areas);
+            .draw(pal.input, 6.0, theme::FG_TEXT(), &mut areas);
         ui.palette_list
-            .draw(pal.list, theme::FG_TEXT, &mut areas);
+            .draw(pal.list, theme::FG_TEXT(), &mut areas);
     }
 
     gpu.text_renderer.prepare(
@@ -2967,7 +2975,7 @@ fn render(app: &mut App) -> Result<()> {
                 view: &view,
                 resolve_target: None,
                 ops: Operations {
-                    load: LoadOp::Clear(theme::BG_EDITOR),
+                    load: LoadOp::Clear(theme::BG_EDITOR()),
                     store: StoreOp::Store,
                 },
             })],
@@ -2981,6 +2989,151 @@ fn render(app: &mut App) -> Result<()> {
         gpu.quad_renderer.render_fg(&mut pass);
     }
     gpu.queue.submit(Some(encoder.finish()));
+
+    // ---- Extensions list: clipped, scrollable pass over the sidebar ----
+    if app.sidebar_visible
+        && layout.palette.is_none()
+        && app.sidebar_view == SidebarView::Extensions
+    {
+        let region = ext_list_region(layout.tree_region());
+        let scroll = app.ext_scroll;
+        let mut eq: Vec<Quad> = Vec::new();
+        gpu.ui.ext_rows.draw_quads(region, scroll, app.hovered_ext, &mut eq);
+        let mut einst: Vec<icon::IconInstance> = Vec::new();
+        gpu.ui.ext_rows.icon_instances(region, scroll, &mut einst);
+        gpu.quad_renderer.prepare(&gpu.device, &gpu.queue, &eq, &[], (cfg_w, cfg_h));
+        gpu.icon_atlas.prepare(&gpu.device, &gpu.queue, &einst, (cfg_w, cfg_h));
+        let mut eareas: Vec<TextArea> = Vec::new();
+        gpu.ui.ext_rows.draw_text(region, scroll, app.hovered_ext, &mut eareas);
+        gpu.text_renderer.prepare(
+            &gpu.device,
+            &gpu.queue,
+            &mut gpu.font_system,
+            &mut gpu.atlas,
+            &gpu.viewport,
+            eareas,
+            &mut gpu.swash_cache,
+        )?;
+        let mut enc = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("nova-ext-pass"),
+        });
+        {
+            let mut pass = enc.begin_render_pass(&RenderPassDescriptor {
+                label: Some("nova-ext"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            // Clip to the list region so scrolled rows can't bleed over the filter
+            // box above or the status bar below.
+            let sx = region.x.max(0.0) as u32;
+            let sy = region.y.max(0.0) as u32;
+            let sw = (region.w.min(cfg_w as f32 - region.x)).max(0.0) as u32;
+            let sh = (region.h.min(cfg_h as f32 - region.y)).max(0.0) as u32;
+            if sw > 0 && sh > 0 {
+                pass.set_scissor_rect(sx, sy, sw, sh);
+                gpu.quad_renderer.render_bg(&mut pass);
+                gpu.icon_atlas.render(&mut pass);
+                gpu.text_renderer.render(&gpu.atlas, &gpu.viewport, &mut pass)?;
+            }
+        }
+        gpu.queue.submit(Some(enc.finish()));
+    }
+
+    // ---- Context menu overlay (second pass, drawn over everything) ----
+    if let Some(cm) = app.context_menu.as_ref() {
+        let menu = gpu.ui.menu.rect(cm.anchor, (cfg_w as f32, cfg_h as f32));
+        let mut mq: Vec<Quad> = Vec::new();
+        gpu.ui.menu.draw_bg(menu, app.hovered_menu_item, &mut mq);
+        gpu.quad_renderer
+            .prepare(&gpu.device, &gpu.queue, &mq, &[], (cfg_w, cfg_h));
+        let mut mareas: Vec<TextArea> = Vec::new();
+        gpu.ui.menu.draw(menu, &mut mareas);
+        gpu.text_renderer.prepare(
+            &gpu.device,
+            &gpu.queue,
+            &mut gpu.font_system,
+            &mut gpu.atlas,
+            &gpu.viewport,
+            mareas,
+            &mut gpu.swash_cache,
+        )?;
+        let mut enc2 = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("nova-menu-pass"),
+        });
+        {
+            let mut pass = enc2.begin_render_pass(&RenderPassDescriptor {
+                label: Some("nova-menu"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Load,
+                        store: StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            gpu.quad_renderer.render_bg(&mut pass);
+            gpu.text_renderer
+                .render(&gpu.atlas, &gpu.viewport, &mut pass)?;
+        }
+        gpu.queue.submit(Some(enc2.finish()));
+    }
+
+    // ---- Modal dialog overlay (third pass) ----
+    if let Some(ds) = app.dialog.as_ref() {
+        let win = (cfg_w as f32, cfg_h as f32);
+        let box_ = gpu.ui.dialog.box_rect(win, ds.has_check);
+        let mut dq: Vec<Quad> = Vec::new();
+        gpu.ui
+            .dialog
+            .draw_bg(box_, win, ds.hovered, ds.checked, ds.has_check, &mut dq);
+        gpu.quad_renderer
+            .prepare(&gpu.device, &gpu.queue, &dq, &[], (cfg_w, cfg_h));
+        let mut dareas: Vec<TextArea> = Vec::new();
+        gpu.ui.dialog.draw(box_, ds.has_check, &mut dareas);
+        gpu.text_renderer.prepare(
+            &gpu.device,
+            &gpu.queue,
+            &mut gpu.font_system,
+            &mut gpu.atlas,
+            &gpu.viewport,
+            dareas,
+            &mut gpu.swash_cache,
+        )?;
+        let mut enc3 = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("nova-dialog-pass"),
+        });
+        {
+            let mut pass = enc3.begin_render_pass(&RenderPassDescriptor {
+                label: Some("nova-dialog"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Load,
+                        store: StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            gpu.quad_renderer.render_bg(&mut pass);
+            gpu.text_renderer
+                .render(&gpu.atlas, &gpu.viewport, &mut pass)?;
+        }
+        gpu.queue.submit(Some(enc3.finish()));
+    }
+
     frame.present();
     gpu.atlas.trim();
     Ok(())
@@ -2990,6 +3143,26 @@ fn render(app: &mut App) -> Result<()> {
 
 impl ApplicationHandler for App {
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        // Drain background worker results (marketplace search/install).
+        while let Ok(msg) = self.worker_rx.try_recv() {
+            match msg {
+                WorkerMsg::Search { gen, results } => {
+                    if gen == self.search_gen {
+                        self.ext_remote = results;
+                        self.rebuild_ext_rows();
+                        self.redraw();
+                    }
+                }
+                WorkerMsg::Installed { result } => {
+                    if result.is_ok() {
+                        self.extensions = extensions::scan();
+                    }
+                    self.rebuild_ext_rows();
+                    self.redraw();
+                }
+            }
+        }
+
         let interval = Duration::from_millis(theme::BLINK_MS);
         let now = Instant::now();
         if now.duration_since(self.last_blink) >= interval {
@@ -3045,30 +3218,45 @@ impl ApplicationHandler for App {
                 self.hovered_activity = None;
                 self.redraw();
             }
-            WindowEvent::MouseInput {
-                state,
-                button: MouseButton::Left,
-                ..
-            } => match state {
-                ElementState::Pressed => {
-                    self.mouse_pressed = true;
-                    self.reset_blink();
-                    self.on_mouse_press(self.mouse_pos.x as f32, self.mouse_pos.y as f32);
-                    if self.pending_close {
-                        el.exit();
+            WindowEvent::MouseInput { state, button, .. } => {
+                let (px, py) = (self.mouse_pos.x as f32, self.mouse_pos.y as f32);
+                match (button, state) {
+                    (MouseButton::Left, ElementState::Pressed) => {
+                        self.mouse_pressed = true;
+                        self.reset_blink();
+                        self.on_mouse_press(px, py);
+                        if self.pending_close {
+                            el.exit();
+                        }
                     }
+                    (MouseButton::Left, ElementState::Released) => {
+                        self.mouse_pressed = false;
+                        self.on_mouse_release();
+                    }
+                    (MouseButton::Right, ElementState::Pressed) => {
+                        self.on_right_press(px, py);
+                    }
+                    _ => {}
                 }
-                ElementState::Released => {
-                    self.mouse_pressed = false;
-                    self.on_mouse_release();
-                }
-            },
+            }
             WindowEvent::MouseWheel { delta, .. } => {
-                let dy = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y * theme::LINE_HEIGHT * 3.0,
-                    MouseScrollDelta::PixelDelta(p) => p.y as f32,
+                let (mut dx, mut dy) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => {
+                        (x * theme::LINE_HEIGHT * 3.0, y * theme::LINE_HEIGHT * 3.0)
+                    }
+                    MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32),
                 };
-                self.on_scroll(dy);
+                // Shift turns the vertical wheel into horizontal scroll.
+                if self.mods.shift_key() && dx == 0.0 {
+                    dx = dy;
+                    dy = 0.0;
+                }
+                if dy != 0.0 {
+                    self.on_scroll(dy);
+                }
+                if dx != 0.0 {
+                    self.on_scroll_h(dx);
+                }
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 self.reset_blink();
