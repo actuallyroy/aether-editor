@@ -149,7 +149,7 @@ impl Theme {
             icon_file_color: Color::rgb(0xC5, 0xC5, 0xC5),
             title_bar_bg: [0.145, 0.149, 0.152, 1.0],
             title_fg: Color::rgb(0xCC, 0xCC, 0xCC),
-            search_bg: [0.18, 0.18, 0.19, 1.0],
+            search_bg: [0.118, 0.118, 0.125, 1.0],
             search_bg_hover: [0.22, 0.22, 0.23, 1.0],
             search_border: [0.27, 0.27, 0.28, 1.0],
             title_close_hover: [0.78, 0.16, 0.16, 1.0],
@@ -412,6 +412,7 @@ pub fn file_icon_color(name: &str) -> Color {
 // ---- Dimensions / fonts / glyphs (compile-time; themes never change these) ----
 
 pub const SCROLLBAR_WIDTH: f32 = 14.0;
+pub const SEARCH_ROW_H: f32 = UI_LINE_HEIGHT; // find-in-files result row height (one text line)
 // Auto-hide overlay scrollbars: held fully visible for HOLD ms after the last
 // scroll/hover, then fade to invisible over FADE ms.
 pub const SCROLLBAR_FADE_HOLD_MS: f32 = 900.0;

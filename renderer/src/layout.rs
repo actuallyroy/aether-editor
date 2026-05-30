@@ -71,9 +71,11 @@ impl Layout {
             None
         };
         let editor_y = tb + tab_strip.h + if find_active { theme::FIND_BAR_HEIGHT } else { 0.0 };
-        // Terminal panel sits above the status bar; the editor shrinks to fit.
+        // Terminal panel sits above the status bar; the editor shrinks to fit. A
+        // maximize request (huge height) is clamped here to fill the whole content
+        // area (editor_h → 0); normal drag is bounded by the splitter's own max.
         let term_h = match terminal_height {
-            Some(req) => req.min((h - editor_y - theme::STATUS_BAR_HEIGHT - 60.0).max(0.0)),
+            Some(req) => req.min((h - editor_y - theme::STATUS_BAR_HEIGHT).max(0.0)),
             None => 0.0,
         };
         let editor_h = (h - editor_y - theme::STATUS_BAR_HEIGHT - term_h).max(0.0);

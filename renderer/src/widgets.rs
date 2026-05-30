@@ -38,6 +38,9 @@ impl Rect {
     pub fn quad(&self, color: [f32; 4]) -> Quad {
         Quad::new(self.x, self.y, self.w, self.h, color)
     }
+    pub fn rounded_quad(&self, color: [f32; 4], radius: f32) -> Quad {
+        Quad::rounded(self.x, self.y, self.w, self.h, color, radius)
+    }
     /// The `top` y to place a line of height `line_h` in this rect at the given
     /// vertical alignment. Single source of truth for vertical text placement.
     pub fn text_top(&self, line_h: f32, align: VAlign) -> f32 {
@@ -845,6 +848,31 @@ impl ListView {
 
     pub fn draw<'a>(&'a self, region: Rect, color: glyphon::Color, areas: &mut Vec<TextArea<'a>>) {
         self.draw_at(region, region.y, color, areas);
+    }
+
+    /// Pixel x-span (relative to the buffer's left, i.e. add `clip.x + pad_x`) of a
+    /// byte range on row `row`, for drawing match highlights. None if not found.
+    pub fn line_x_range(&self, row: usize, byte_start: usize, byte_end: usize) -> Option<(f32, f32)> {
+        for run in self.buffer.layout_runs() {
+            if run.line_i != row {
+                continue;
+            }
+            let (mut x0, mut x1) = (f32::MAX, f32::MIN);
+            for g in run.glyphs {
+                if g.end <= byte_start || g.start >= byte_end {
+                    continue;
+                }
+                x0 = x0.min(g.x);
+                x1 = x1.max(g.x + g.w);
+            }
+            return (x1 > x0).then_some((x0, x1));
+        }
+        None
+    }
+
+    /// Left padding (px) the buffer is drawn at within its region.
+    pub fn pad_x(&self) -> f32 {
+        self.pad_x
     }
 
     /// Draw the buffer with row 0 placed at `top`, clipped to `clip`. Lets a

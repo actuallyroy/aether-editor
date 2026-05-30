@@ -17,6 +17,7 @@ use wgpu::{
 pub struct Quad {
     pub rect: [f32; 4],
     pub color: [f32; 4],
+    pub params: [f32; 4], // params[0] = corner radius (px); 0 = sharp rectangle
 }
 
 impl Quad {
@@ -24,6 +25,17 @@ impl Quad {
         Self {
             rect: [x, y, w, h],
             color,
+            params: [0.0; 4],
+        }
+    }
+
+    /// A rectangle with rounded corners of `radius` px (clamped to half the
+    /// smaller side in the shader). radius 0 is identical to `new`.
+    pub fn rounded(x: f32, y: f32, w: f32, h: f32, color: [f32; 4], radius: f32) -> Self {
+        Self {
+            rect: [x, y, w, h],
+            color,
+            params: [radius, 0.0, 0.0, 0.0],
         }
     }
 }
@@ -100,6 +112,11 @@ impl QuadRenderer {
                         VertexAttribute {
                             offset: 16,
                             shader_location: 1,
+                            format: VertexFormat::Float32x4,
+                        },
+                        VertexAttribute {
+                            offset: 32,
+                            shader_location: 2,
                             format: VertexFormat::Float32x4,
                         },
                     ],

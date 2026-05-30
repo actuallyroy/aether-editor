@@ -7,11 +7,15 @@ struct U {
 struct VIn {
     @location(0) rect: vec4<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) params: vec4<f32>, // params.x = corner radius (px)
 };
 
 struct VOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) color: vec4<f32>,
+    @location(1) local: vec2<f32>,  // pixel offset within the rect
+    @location(2) half: vec2<f32>,   // half-size of the rect
+    @location(3) radius: f32,
 };
 
 @vertex
@@ -25,7 +29,8 @@ fn vs_main(in: VIn, @builtin(vertex_index) vid: u32) -> VOut {
         vec2<f32>(0.0, 1.0),
     );
     let corner = corners[vid];
-    let px = in.rect.xy + corner * in.rect.zw;
+    let local = corner * in.rect.zw;
+    let px = in.rect.xy + local;
     let ndc = vec2<f32>(
         px.x / u.res.x * 2.0 - 1.0,
         1.0 - px.y / u.res.y * 2.0,
@@ -33,10 +38,24 @@ fn vs_main(in: VIn, @builtin(vertex_index) vid: u32) -> VOut {
     var out: VOut;
     out.pos = vec4<f32>(ndc, 0.0, 1.0);
     out.color = in.color;
+    out.local = local;
+    out.half = in.rect.zw * 0.5;
+    out.radius = in.params.x;
     return out;
 }
 
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {
-    return in.color;
+    // Sharp rectangles (the common case) skip the SDF entirely so their edges
+    // stay crisp and pixel-exact.
+    if (in.radius <= 0.0) {
+        return in.color;
+    }
+    // Signed distance to a rounded box, with ~1px antialiased edge coverage.
+    let r = min(in.radius, min(in.half.x, in.half.y));
+    let p = in.local - in.half;
+    let q = abs(p) - in.half + vec2<f32>(r, r);
+    let d = length(max(q, vec2<f32>(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - r;
+    let a = clamp(0.5 - d, 0.0, 1.0);
+    return vec4<f32>(in.color.rgb, in.color.a * a);
 }

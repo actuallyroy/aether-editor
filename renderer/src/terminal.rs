@@ -12,6 +12,60 @@ use std::sync::mpsc::{channel, Receiver};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use vte::{Params, Parser, Perform};
 
+use crate::widgets::{ScrollOpts, ScrollView};
+
+/// A single terminal split pane: the shell plus its own scrollback viewport and
+/// dirty flag. The panel shows a `Vec<Pane>` side-by-side (VSCode-style splits),
+/// so opening another never discards the previous shell — it sits beside it.
+pub struct Pane {
+    pub term: Terminal,
+    pub scroll: ScrollView,
+    pub dirty: bool,
+}
+
+impl Pane {
+    pub fn spawn(rows: usize, cols: usize) -> Option<Pane> {
+        Terminal::spawn(rows, cols).map(|term| Pane {
+            term,
+            scroll: ScrollView::new(ScrollOpts {
+                vertical: true,
+                horizontal: false,
+                stick_to_end: true,
+            }),
+            dirty: true,
+        })
+    }
+}
+
+/// A terminal "tab": one or more split panes shown side-by-side. The `+` button
+/// creates a new Group (a fresh tab); the split button adds a pane to the active
+/// Group. Only the active Group is visible; the others keep running in the back.
+pub struct Group {
+    pub panes: Vec<Pane>,
+    pub focused: usize, // focused pane within this group
+}
+
+impl Group {
+    pub fn new(pane: Pane) -> Self {
+        Self { panes: vec![pane], focused: 0 }
+    }
+
+    /// Tab label — the focused pane's shell name (e.g. "cmd"), with a "+N" suffix
+    /// when the group holds multiple split panes.
+    pub fn title(&self) -> String {
+        let base = self
+            .panes
+            .get(self.focused)
+            .map(|p| p.term.title.as_str())
+            .unwrap_or("shell");
+        if self.panes.len() > 1 {
+            format!("{base} (+{})", self.panes.len() - 1)
+        } else {
+            base.to_string()
+        }
+    }
+}
+
 /// One terminal cell: a glyph + foreground colour, plus an optional background
 /// (None = the panel's default background, so we skip the quad). Backgrounds are
 /// what make reverse-video cursors and colored TUIs (e.g. Claude Code) visible.
@@ -499,6 +553,7 @@ pub struct Terminal {
     rx: Receiver<Vec<u8>>,
     parser: Parser,
     pub grid: Grid,
+    pub title: String, // shell base name, shown on the terminal tab
 }
 
 impl Terminal {
@@ -509,6 +564,11 @@ impl Terminal {
             .openpty(PtySize { rows: rows as u16, cols: cols as u16, pixel_width: 0, pixel_height: 0 })
             .ok()?;
         let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+        let title = std::path::Path::new(&shell)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("shell")
+            .to_string();
         let cmd = CommandBuilder::new(shell);
         let child = pair.slave.spawn_command(cmd).ok()?;
         drop(pair.slave);
@@ -535,6 +595,7 @@ impl Terminal {
             rx,
             parser: Parser::new(),
             grid: Grid::new(rows, cols),
+            title,
         })
     }
 

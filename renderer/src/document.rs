@@ -268,6 +268,19 @@ impl Document {
         apply_buffer_text(&mut self.buffer, fs, &text, lines, self.lang, &self.ext, self.wrap_width);
     }
 
+    /// Replace the entire document from an external on-disk change (e.g. Replace
+    /// All). Resets undo history, clamps the selection, and marks the doc clean.
+    pub fn set_text_external(&mut self, text: &str, fs: &mut FontSystem) {
+        self.rope = Rope::from_str(text);
+        self.history.clear();
+        self.future.clear();
+        let max = self.rope.len_bytes();
+        self.sel.anchor = self.sel.anchor.min(max);
+        self.sel.head = self.sel.head.min(max);
+        self.dirty = false;
+        self.reshape(fs);
+    }
+
     fn apply_op(&mut self, op: &EditOp, at_byte: usize) {
         let at_char = self.rope.byte_to_char(at_byte);
         match op {

@@ -19,6 +19,9 @@ pub enum WorkerMsg {
     Readme { gen: u64, text: Option<String> },
     Changelog { gen: u64, text: Option<String> },
     Image { key: String, frames: Vec<crate::media::DecodedFrame> },
+    // Find-in-files (see search.rs): streamed batches of matches + a completion marker.
+    SearchHits { gen: u64, files: Vec<crate::search::FileMatches> },
+    SearchDone { gen: u64 },
 }
 
 /// Where a README image comes from: a remote URL or a local file path.

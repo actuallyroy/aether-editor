@@ -39,8 +39,15 @@ pub struct UiBuffers {
     pub dialog: Dialog,
     pub ext_rows: ExtensionList,
     pub ext_filter: TextInput, // extensions panel search/filter box
+    pub search_input: TextInput,   // find-in-files query box
+    pub search_replace: TextInput, // find-in-files replace box
+    pub replace_all_label: TextLabel, // "Replace All" button caption
+    pub search_list: ListView,   // find-in-files results (file headers + match lines)
+    pub search_opt_labels: [TextLabel; 3], // case / whole-word / regex toggle captions
     pub ext_detail: ExtensionDetail,
-    pub terminal: Buffer, // integrated terminal grid text (monospace, rich)
+    pub terminal_panes: Vec<Buffer>, // one monospace grid buffer per visible split pane
+    pub term_tablist: ListView,      // right-side terminal tab switcher (multi-tab only)
+
 }
 
 pub struct GpuState {
@@ -67,6 +74,7 @@ pub struct GpuState {
     pub explorer_btns: Vec<IconButton>,
     pub terminal_tabs: Vec<TextLabel>,   // panel header tab labels (stub)
     pub terminal_btns: Vec<IconButton>,  // panel header right-side icons (stub)
+    pub search_chevrons: [IconButton; 2], // [expanded ▾, collapsed ▸] for result file headers
     pub create_icons: [IconButton; 2],
     pub create_input: TextInput,
 }
@@ -174,6 +182,10 @@ impl GpuState {
                 l
             })
             .collect();
+        let search_chevrons = [
+            IconButton::new(&mut font_system, theme::ICON_CHEVRON_DOWN, ic, 16.0),
+            IconButton::new(&mut font_system, theme::ICON_CHEVRON_RIGHT, ic, 16.0),
+        ];
         let terminal_btns = vec![
             IconButton::new(&mut font_system, theme::ICON_ADD, ic, 16.0),
             IconButton::new(&mut font_system, theme::ICON_SPLIT_HORIZONTAL, ic, 16.0),
@@ -214,9 +226,48 @@ impl GpuState {
             menu: Menu::new(&mut font_system, 200.0),
             dialog: Dialog::new(&mut font_system),
             ext_rows: ExtensionList::new(),
-            ext_filter: TextInput::new(&mut font_system, theme::SIDEBAR_WIDTH, 30.0),
+            ext_filter: {
+                let mut t = TextInput::new(&mut font_system, theme::SIDEBAR_WIDTH, 30.0);
+                t.set_placeholder(&mut font_system, " Search Extensions in Marketplace");
+                t
+            },
+            search_input: {
+                let mut t = TextInput::new(&mut font_system, theme::SIDEBAR_WIDTH, 30.0);
+                t.set_placeholder(&mut font_system, " Search");
+                t
+            },
+            search_replace: {
+                let mut t = TextInput::new(&mut font_system, theme::SIDEBAR_WIDTH, 30.0);
+                t.set_placeholder(&mut font_system, " Replace");
+                t
+            },
+            replace_all_label: {
+                let mut l = TextLabel::new(&mut font_system, theme::SIDEBAR_WIDTH, 24.0);
+                l.set(&mut font_system, "Replace All", theme::UI_FAMILY());
+                l
+            },
+            search_list: ListView::new(&mut font_system, theme::SIDEBAR_WIDTH, 4000.0, theme::SEARCH_ROW_H, 10.0),
+            search_opt_labels: {
+                let mk = |fs: &mut FontSystem, s: &str| {
+                    let mut l = TextLabel::new(fs, 30.0, crate::SEARCH_OPT_SIZE);
+                    l.set(fs, s, theme::UI_FAMILY());
+                    l
+                };
+                [
+                    mk(&mut font_system, "Aa"), // case-sensitive
+                    mk(&mut font_system, "\\b"), // whole word
+                    mk(&mut font_system, ".*"), // regex
+                ]
+            },
             ext_detail: ExtensionDetail::new(&mut font_system),
-            terminal: make_ui_buffer_mono(&mut font_system, 4000.0, 4000.0),
+            terminal_panes: Vec::new(), // grown on demand as panes are split
+            term_tablist: ListView::new(
+                &mut font_system,
+                crate::TERMINAL_TABLIST_W,
+                800.0,
+                theme::TREE_ROW_HEIGHT,
+                10.0,
+            ),
         };
 
         Ok(Self {
@@ -243,6 +294,7 @@ impl GpuState {
             explorer_btns,
             terminal_tabs,
             terminal_btns,
+            search_chevrons,
             create_icons,
             create_input,
         })

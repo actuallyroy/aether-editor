@@ -60,7 +60,13 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         app.sidebar_split.size(),
         app.find.active,
         app.palette.active,
-        if app.terminal_visible { Some(app.terminal_split.size()) } else { None },
+        // Inlined (not the App method) so these stay disjoint-field reads while
+        // `gpu` holds a mutable borrow of app.gpu.
+        if app.terminal_visible {
+            Some(if app.terminal_maximized { 100_000.0 } else { app.terminal_split.size() })
+        } else {
+            None
+        },
     );
 
     // editor.wordWrap — wrap the active document to the editor width (or disable).
@@ -77,22 +83,24 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
 
     let now = Instant::now();
 
-    // Keep the terminal grid sized to its content area (panel minus the header),
-    // and size the scroll viewport to that area + total content height.
+    // Size the active tab's split panes' grids + scroll viewports to their columns.
     if let Some(panel) = layout.terminal_panel {
-        let content = crate::terminal_content(panel);
+        let area = crate::terminal_pane_area(crate::terminal_content(panel), app.term_groups.len());
         let cell_w = app.terminal_cell_w;
-        if let Some(t) = app.terminal.as_mut() {
-            let (rows, cols) = crate::terminal_grid_size(content, cell_w);
-            let (dc, dr) = t.dims();
-            if dc != cols || dr != rows {
-                t.resize(rows, cols);
-                app.terminal_dirty = true;
+        if let Some(g) = app.term_groups.get_mut(app.active_group) {
+            let rects = crate::terminal_pane_rects(area, g.panes.len());
+            for (i, pane) in g.panes.iter_mut().enumerate() {
+                let rect = rects[i];
+                let (rows, cols) = crate::terminal_grid_size(rect, cell_w);
+                let (dc, dr) = pane.term.dims();
+                if dc != cols || dr != rows {
+                    pane.term.resize(rows, cols);
+                    pane.dirty = true;
+                }
+                let content_h = pane.term.total_lines() as f32 * theme::LINE_HEIGHT();
+                pane.scroll.set_metrics(rect, (rect.w, content_h));
             }
         }
-        let total = app.terminal.as_ref().map(|t| t.total_lines()).unwrap_or(0);
-        let content_h = total as f32 * theme::LINE_HEIGHT();
-        app.terminal_scroll.set_metrics(content, (content.w, content_h));
     }
 
     // Size the scroll viewports for the extensions list + README detail page so
@@ -133,10 +141,10 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         // (rendered below from layout rects) — no per-glyph buffer juggling here.
 
         // Sidebar header — title depends on the active view.
-        let header = if app.sidebar_view == SidebarView::Extensions {
-            "EXTENSIONS"
-        } else {
-            "EXPLORER"
+        let header = match app.sidebar_view {
+            SidebarView::Extensions => "EXTENSIONS",
+            SidebarView::Search => "SEARCH",
+            SidebarView::Explorer => "EXPLORER",
         };
         gpu.ui.sidebar_header.set(fs, header, theme::UI_FAMILY());
 
@@ -308,14 +316,17 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             gpu.ui.line_numbers.set_from_buffer(fs, &d.buffer);
         }
 
-        // Integrated terminal grid text (rich, monospace, per-cell colors). Only
-        // re-shape when the grid actually changed (terminal_dirty) — reshaping a
-        // full screen of rich text every frame is what made TUIs feel laggy.
-        // Keep Advanced shaping: Basic mis-advances glyphs and drops fallback
-        // (box-drawing/powerline chars), which broke the monospace grid.
-        if app.terminal_visible && app.terminal_dirty {
-            let top_line = (app.terminal_scroll.offset().1 / theme::LINE_HEIGHT()).round() as usize;
-            if let (Some(t), Some(panel)) = (app.terminal.as_ref(), layout.terminal_panel) {
+        // Integrated terminal: one buffer per split pane, reshaped only when that
+        // pane's grid changed (pane.dirty). Advanced shaping keeps the monospace grid
+        // (Basic mis-advances glyphs and drops box-drawing/powerline fallback).
+        if app.terminal_visible {
+            if let Some(panel) = layout.terminal_panel {
+                let area = crate::terminal_pane_area(crate::terminal_content(panel), app.term_groups.len());
+                let n = app.term_groups.get(app.active_group).map_or(0, |g| g.panes.len());
+                while gpu.ui.terminal_panes.len() < n {
+                    let b = crate::widgets::make_ui_buffer_mono(fs, 4000.0, 4000.0);
+                    gpu.ui.terminal_panes.push(b);
+                }
                 let to_attr = |c: [f32; 4]| {
                     Attrs::new().family(Family::Name(theme::MONO_FAMILY())).color(glyphon::Color::rgba(
                         (c[0] * 255.0) as u8,
@@ -324,30 +335,60 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                         255,
                     ))
                 };
-                let owned: Vec<(String, Attrs)> =
-                    t.visual_spans(top_line).into_iter().map(|(s, c)| (s, to_attr(c))).collect();
-                gpu.ui.terminal.set_size(fs, None, Some(panel.h + 200.0));
-                gpu.ui.terminal.set_rich_text(
-                    fs,
-                    owned.iter().map(|(s, a)| (s.as_str(), *a)),
-                    to_attr([0.83, 0.83, 0.83, 1.0]),
-                    Shaping::Advanced,
-                );
-                gpu.ui.terminal.shape_until_scroll(fs, false);
-                // Capture the font's true monospace advance from the shaped glyphs
-                // so the block cursor maps to columns exactly (no accumulating drift).
-                if let Some(adv) = gpu
-                    .ui
-                    .terminal
-                    .layout_runs()
-                    .flat_map(|run| run.glyphs.iter())
-                    .map(|g| g.w)
-                    .find(|w| *w > 0.0)
-                {
-                    app.terminal_cell_w = adv;
+                let rects = crate::terminal_pane_rects(area, n);
+                let panes = app.term_groups.get_mut(app.active_group).map(|g| &mut g.panes);
+                for (i, pane) in panes.into_iter().flatten().enumerate() {
+                    if !pane.dirty {
+                        continue;
+                    }
+                    let rect = rects[i];
+                    let top_line = (pane.scroll.offset().1 / theme::LINE_HEIGHT()).round() as usize;
+                    let owned: Vec<(String, Attrs)> = pane
+                        .term
+                        .visual_spans(top_line)
+                        .into_iter()
+                        .map(|(s, c)| (s, to_attr(c)))
+                        .collect();
+                    let buf = &mut gpu.ui.terminal_panes[i];
+                    buf.set_size(fs, None, Some(rect.h + 200.0));
+                    buf.set_rich_text(
+                        fs,
+                        owned.iter().map(|(s, a)| (s.as_str(), *a)),
+                        to_attr([0.83, 0.83, 0.83, 1.0]),
+                        Shaping::Advanced,
+                    );
+                    buf.shape_until_scroll(fs, false);
+                    // Capture the real monospace advance so cursors map exactly.
+                    if let Some(adv) =
+                        buf.layout_runs().flat_map(|r| r.glyphs.iter()).map(|g| g.w).find(|w| *w > 0.0)
+                    {
+                        app.terminal_cell_w = adv;
+                    }
+                    pane.dirty = false;
                 }
-                app.terminal_dirty = false;
             }
+        }
+
+        // Terminal tab-list labels (only meaningful with more than one tab).
+        if app.terminal_visible && app.term_groups.len() > 1 {
+            let key: String = app
+                .term_groups
+                .iter()
+                .enumerate()
+                .map(|(i, g)| format!("{}: {}", i + 1, g.title()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            gpu.ui.term_tablist.set_text(fs, &key, crate::TERMINAL_TABLIST_W, 800.0);
+        }
+
+        // Find-in-files results list text (collapsible file headers + match lines,
+        // no line numbers). Wide buffer so each row stays on one line (clipped at
+        // the panel edge rather than wrapping, which would break the row math).
+        if app.sidebar_view == SidebarView::Search {
+            let rows = crate::search::build_rows(&app.search_results, &app.search_collapsed);
+            let key: String =
+                rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join("\n");
+            gpu.ui.search_list.set_text(fs, &key, 4000.0, 12000.0);
         }
 
         // Palette list (the input owns its own text now).
@@ -443,13 +484,66 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                         .quad(theme::TREE_HOVER()),
                 );
             }
-        } else {
+        } else if app.sidebar_view == SidebarView::Extensions {
             // Extensions view: filter box chrome (fixed at top). The scrollable rows
             // are drawn in their own clipped pass after the main pass.
             let fr = ext_filter_rect(layout.tree_region());
             let border = Rect { x: fr.x - 1.0, y: fr.y - 1.0, w: fr.w + 2.0, h: fr.h + 2.0 };
-            bg_quads.push(border.quad(theme::SEARCH_BORDER()));
-            bg_quads.push(fr.quad(theme::SEARCH_BG()));
+            bg_quads.push(border.rounded_quad(theme::SEARCH_BORDER(), 3.0));
+            bg_quads.push(fr.rounded_quad(theme::SEARCH_BG(), 2.0));
+        } else {
+            // Search (find-in-files) view: query box + option toggles.
+            let tree = layout.tree_region();
+            let fr = ext_filter_rect(tree);
+            let border = Rect { x: fr.x - 1.0, y: fr.y - 1.0, w: fr.w + 2.0, h: fr.h + 2.0 };
+            bg_quads.push(border.rounded_quad(theme::SEARCH_BORDER(), 3.0));
+            bg_quads.push(fr.rounded_quad(theme::SEARCH_BG(), 2.0));
+            // Option toggles (inside the box): highlight only when active.
+            let opts = crate::search_opt_rects(tree);
+            let on = [
+                app.search_opts.case_sensitive,
+                app.search_opts.whole_word,
+                app.search_opts.regex,
+            ];
+            for (i, r) in opts.iter().enumerate() {
+                if on[i] {
+                    bg_quads.push(r.rounded_quad(theme::TREE_SELECTED(), 3.0));
+                }
+            }
+            // Replace box chrome.
+            let rr = crate::search_replace_rect(tree);
+            let rb = Rect { x: rr.x - 1.0, y: rr.y - 1.0, w: rr.w + 2.0, h: rr.h + 2.0 };
+            bg_quads.push(rb.rounded_quad(theme::SEARCH_BORDER(), 3.0));
+            bg_quads.push(rr.rounded_quad(theme::SEARCH_BG(), 2.0));
+            // "Replace All" button.
+            let ba = crate::search_replace_all_rect(tree);
+            bg_quads.push(ba.rounded_quad(theme::DIALOG_BTN(), 3.0));
+            // Results: rows, scroll viewport, and per-match highlight quads.
+            let region = crate::search_results_region(tree);
+            let rows = crate::search::build_rows(&app.search_results, &app.search_collapsed);
+            app.search_scroll
+                .set_metrics(region, (region.w, rows.len() as f32 * theme::SEARCH_ROW_H));
+            let scroll = app.search_scroll.offset().1;
+            let pad = gpu.ui.search_list.pad_x();
+            for (ri, row) in rows.iter().enumerate() {
+                if row.ranges.is_empty() {
+                    continue;
+                }
+                let y = region.y + ri as f32 * theme::SEARCH_ROW_H - scroll;
+                if y + theme::SEARCH_ROW_H < region.y || y > region.y + region.h {
+                    continue; // off-screen
+                }
+                for &(s, e) in &row.ranges {
+                    if let Some((x0, x1)) = gpu.ui.search_list.line_x_range(ri, s, e) {
+                        let qx = region.x + pad + x0;
+                        let right = region.x + region.w;
+                        let w = (x1 - x0).min((right - qx).max(0.0));
+                        if w > 0.0 {
+                            bg_quads.push(Quad::new(qx, y, w, theme::SEARCH_ROW_H, theme::FIND_MATCH()));
+                        }
+                    }
+                }
+            }
         }
         // Subtle right border.
         bg_quads.push(Quad::new(
@@ -634,31 +728,49 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         }
         let char_w = app.terminal_cell_w;
         let line_h = theme::LINE_HEIGHT();
-        let top_line = (app.terminal_scroll.offset().1 / line_h).round() as usize;
-        let at_bottom = app.terminal_scroll.at_end();
-        if let Some(t) = app.terminal.as_ref() {
-            // Per-cell background fills (reverse-video cursor, colored TUIs) behind text.
-            for (row, c0, c1, bg) in t.bg_cells(top_line) {
-                let x = content.x + 8.0 + c0 as f32 * char_w;
-                let y = content.y + 4.0 + row as f32 * line_h;
-                if y + line_h <= content.y + content.h {
-                    bg_quads.push(Quad::new(x, y, (c1 - c0) as f32 * char_w, line_h, bg));
+        let area = crate::terminal_pane_area(content, app.term_groups.len());
+        if let Some(g) = app.term_groups.get(app.active_group) {
+            let rects = crate::terminal_pane_rects(area, g.panes.len());
+            for (i, pane) in g.panes.iter().enumerate() {
+                let rect = rects[i];
+                // Divider between adjacent split panes.
+                if i > 0 {
+                    bg_quads.push(Quad::new(rect.x - 1.0, rect.y, 1.0, rect.h, theme::PANEL_BORDER()));
                 }
-            }
-            // Our own block cursor only when the shell shows the hardware cursor
-            // (DECTCEM), and only at the live bottom (not scrolled into history).
-            // TUIs hide it and draw their own via reverse video above.
-            if app.terminal_focused && t.cursor_visible() && at_bottom {
-                let (cc, cr) = t.cursor();
-                let cx = content.x + 8.0 + cc as f32 * char_w;
-                let cy = content.y + 4.0 + cr as f32 * line_h;
-                if cy + line_h <= content.y + content.h {
-                    bg_quads.push(Quad::new(cx, cy, char_w.max(2.0), line_h, [0.6, 0.6, 0.6, 0.6]));
+                let right = rect.x + rect.w;
+                let top_line = (pane.scroll.offset().1 / line_h).round() as usize;
+                let at_bottom = pane.scroll.at_end();
+                // Per-cell background fills (reverse-video cursor, colored TUIs), clipped to the pane.
+                for (row, c0, c1, bg) in pane.term.bg_cells(top_line) {
+                    let x = rect.x + 8.0 + c0 as f32 * char_w;
+                    let w = ((c1 - c0) as f32 * char_w).min((right - x).max(0.0));
+                    let y = rect.y + 4.0 + row as f32 * line_h;
+                    if w > 0.0 && y + line_h <= rect.y + rect.h {
+                        bg_quads.push(Quad::new(x, y, w, line_h, bg));
+                    }
                 }
+                // Block cursor only in the focused pane, when the shell shows it
+                // (DECTCEM) and we're at the live bottom (not scrolled into history).
+                let focused = app.terminal_focused && i == g.focused;
+                if focused && pane.term.cursor_visible() && at_bottom {
+                    let (cc, cr) = pane.term.cursor();
+                    let cx = rect.x + 8.0 + cc as f32 * char_w;
+                    let cy = rect.y + 4.0 + cr as f32 * line_h;
+                    if cx < right && cy + line_h <= rect.y + rect.h {
+                        bg_quads.push(Quad::new(cx, cy, char_w.max(2.0), line_h, [0.6, 0.6, 0.6, 0.6]));
+                    }
+                }
+                // Auto-hiding scrollback scrollbar (overlay) for this pane.
+                pane.scroll.draw(now, &mut fg_quads);
             }
         }
-        // Auto-hiding scrollback scrollbar (overlay).
-        app.terminal_scroll.draw(now, &mut fg_quads);
+        // Terminal tab list (right side, shown when there's more than one tab).
+        if let Some(tl) = crate::terminal_tablist_rect(content, app.term_groups.len()) {
+            bg_quads.push(tl.quad(theme::SIDEBAR_BG()));
+            bg_quads.push(Quad::new(tl.x, tl.y, 1.0, tl.h, theme::PANEL_BORDER()));
+            let ry = tl.y + app.active_group as f32 * theme::TREE_ROW_HEIGHT;
+            bg_quads.push(Quad::new(tl.x, ry, tl.w, theme::TREE_ROW_HEIGHT, theme::TREE_ACTIVE_FILE()));
+        }
     }
 
     // README / extension detail page scrollbar (overlay over the editor area).
@@ -725,6 +837,19 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             let fr = ext_filter_rect(layout.tree_region());
             fg_quads.push(gpu.ui.ext_filter.caret_quad(fr, 6.0));
         }
+        if app.search_query_active && app.sidebar_visible && app.sidebar_view == SidebarView::Search {
+            let fr = ext_filter_rect(layout.tree_region());
+            fg_quads.push(gpu.ui.search_input.caret_quad(fr, 6.0));
+        }
+        if app.search_replace_active && app.sidebar_visible && app.sidebar_view == SidebarView::Search {
+            let rr = crate::search_replace_rect(layout.tree_region());
+            fg_quads.push(gpu.ui.search_replace.caret_quad(rr, 6.0));
+        }
+    }
+
+    // Find-in-files results scrollbar (overlay).
+    if app.sidebar_visible && app.sidebar_view == SidebarView::Search {
+        app.search_scroll.draw(now, &mut fg_quads);
     }
 
     // Text-input selection highlights — drawn into bg_quads (under glyphs, over
@@ -738,6 +863,14 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     if app.ext_filter_active && app.sidebar_visible && app.sidebar_view == SidebarView::Extensions {
         let fr = ext_filter_rect(layout.tree_region());
         gpu.ui.ext_filter.selection_quads(fr, 6.0, &mut bg_quads);
+    }
+    if app.search_query_active && app.sidebar_visible && app.sidebar_view == SidebarView::Search {
+        let fr = ext_filter_rect(layout.tree_region());
+        gpu.ui.search_input.selection_quads(fr, 6.0, &mut bg_quads);
+    }
+    if app.search_replace_active && app.sidebar_visible && app.sidebar_view == SidebarView::Search {
+        let rr = crate::search_replace_rect(layout.tree_region());
+        gpu.ui.search_replace.selection_quads(rr, 6.0, &mut bg_quads);
     }
 
     // ---- Build text areas ----
@@ -838,12 +971,65 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             } else {
                 ui.sidebar.draw(tr, theme::FG_TEXT(), &mut areas);
             }
-        } else {
+        } else if app.sidebar_view == SidebarView::Extensions {
             // Extensions filter box text (fixed). The scrollable row text is drawn
             // in the dedicated clipped pass after the main pass.
             let fr = ext_filter_rect(tr);
             let fc = if ui.ext_filter.text().is_empty() { theme::FG_DIM() } else { theme::FG_TEXT() };
             ui.ext_filter.draw(fr, 6.0, fc, &mut areas);
+        } else {
+            // Search view: query text, option-toggle captions, and the results list.
+            let fr = ext_filter_rect(tr);
+            let fc = if ui.search_input.text().is_empty() { theme::FG_DIM() } else { theme::FG_TEXT() };
+            ui.search_input.draw(fr, 6.0, fc, &mut areas);
+            let opts = crate::search_opt_rects(tr);
+            let on = [
+                app.search_opts.case_sensitive,
+                app.search_opts.whole_word,
+                app.search_opts.regex,
+            ];
+            for (i, r) in opts.iter().enumerate() {
+                let lbl = &ui.search_opt_labels[i];
+                let left = r.x + (r.w - lbl.width()) * 0.5;
+                let color = if on[i] { theme::FG_ACTIVE() } else { theme::FG_DIM() };
+                lbl.push(left, *r, color, &mut areas);
+            }
+            // Replace box text + "Replace All" button caption.
+            let rr = crate::search_replace_rect(tr);
+            let rc = if ui.search_replace.text().is_empty() { theme::FG_DIM() } else { theme::FG_TEXT() };
+            ui.search_replace.draw(rr, 6.0, rc, &mut areas);
+            let ba = crate::search_replace_all_rect(tr);
+            let bl = &ui.replace_all_label;
+            bl.push(ba.x + (ba.w - bl.width()) * 0.5, ba, theme::FG_TEXT(), &mut areas);
+            // Results list, scrolled + clipped to its region. Match lines render in
+            // the normal foreground; file headers are overdrawn brighter and get a
+            // codicon chevron, so file names stand out from their match contents.
+            let region = crate::search_results_region(tr);
+            let scroll = app.search_scroll.offset().1;
+            ui.search_list
+                .draw_at(region, region.y - scroll, theme::FG_TEXT(), &mut areas);
+            let rows = crate::search::build_rows(&app.search_results, &app.search_collapsed);
+            for (ri, row) in rows.iter().enumerate() {
+                if row.line.is_some() {
+                    continue; // only file headers get the bright pass + chevron
+                }
+                let y = region.y + ri as f32 * theme::SEARCH_ROW_H - scroll;
+                if y + theme::SEARCH_ROW_H < region.y || y > region.y + region.h {
+                    continue;
+                }
+                let top = y.max(region.y);
+                let band = Rect {
+                    x: region.x,
+                    y: top,
+                    w: region.w,
+                    h: ((y + theme::SEARCH_ROW_H) - top).max(0.0),
+                };
+                ui.search_list.draw_at(band, region.y - scroll, theme::FG_ACTIVE(), &mut areas);
+                let collapsed = app.search_collapsed.contains(&row.file);
+                let chev = &gpu.search_chevrons[collapsed as usize];
+                let cr = Rect { x: region.x + 4.0, y, w: 16.0, h: theme::SEARCH_ROW_H };
+                chev.draw(cr, theme::FG_DIM(), &mut areas);
+            }
         }
     }
 
@@ -951,27 +1137,44 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 };
                 gpu.terminal_tabs[i].push(r.x, r, color, &mut areas);
             }
-            // Right-side icon buttons (visual stubs).
+            // Right-side icon buttons.
             for (i, r) in crate::terminal_header_button_rects(panel).into_iter().enumerate() {
                 if let Some(b) = gpu.terminal_btns.get(i) {
-                    b.draw(r, theme::FG_DIM(), &mut areas);
+                    b.draw(r, theme::FG_TEXT(), &mut areas);
                 }
             }
-            // Terminal grid text, clipped to the content area below the header.
-            areas.push(TextArea {
-                buffer: &ui.terminal,
-                left: content.x + 8.0,
-                top: content.y + 4.0,
-                scale: 1.0,
-                bounds: TextBounds {
-                    left: content.x as i32,
-                    top: content.y as i32,
-                    right: (content.x + content.w) as i32,
-                    bottom: (content.y + content.h) as i32,
-                },
-                default_color: theme::FG_TEXT(),
-                custom_glyphs: &[],
-            });
+            // Each split pane's grid text in the active tab, clipped to its column.
+            let area = crate::terminal_pane_area(content, app.term_groups.len());
+            let n = app.term_groups.get(app.active_group).map_or(0, |g| g.panes.len());
+            for (i, r) in crate::terminal_pane_rects(area, n).into_iter().enumerate() {
+                if let Some(buf) = ui.terminal_panes.get(i) {
+                    areas.push(TextArea {
+                        buffer: buf,
+                        left: r.x + 8.0,
+                        top: r.y + 4.0,
+                        scale: 1.0,
+                        bounds: TextBounds {
+                            left: r.x as i32,
+                            top: r.y as i32,
+                            right: (r.x + r.w) as i32,
+                            bottom: (r.y + r.h) as i32,
+                        },
+                        default_color: theme::FG_TEXT(),
+                        custom_glyphs: &[],
+                    });
+                }
+            }
+            // Tab-list labels + per-tab close (×) buttons (right-side switcher).
+            if let Some(tl) = crate::terminal_tablist_rect(content, app.term_groups.len()) {
+                ui.term_tablist.draw(tl, theme::FG_TEXT(), &mut areas);
+                for row in 0..app.term_groups.len() {
+                    gpu.tab_close_btn.draw(
+                        crate::terminal_tab_close_rect(tl, row),
+                        theme::FG_TEXT(),
+                        &mut areas,
+                    );
+                }
+            }
         }
     }
     } // end: palette closed

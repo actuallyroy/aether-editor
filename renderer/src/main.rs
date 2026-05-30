@@ -20,6 +20,7 @@ mod marketplace;
 mod media;
 mod quad;
 mod render;
+mod search;
 mod settings;
 mod syntax;
 mod terminal;
@@ -107,6 +108,7 @@ pub(crate) struct ContextMenu {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SidebarView {
     Explorer,
+    Search,
     Extensions,
 }
 
@@ -158,6 +160,15 @@ pub(crate) struct App {
     pub(crate) last_click_pos: (f32, f32),
     pub(crate) click_count: u32,
     pub(crate) sidebar_view: SidebarView,
+    // Find-in-files (Search view) state.
+    pub(crate) search_query_active: bool,        // query input has keyboard focus
+    pub(crate) search_replace_active: bool,      // replace input has keyboard focus
+    pub(crate) search_opts: search::SearchOpts,  // case / whole-word / regex toggles
+    pub(crate) search_results: Vec<search::FileMatches>,
+    pub(crate) search_scroll: ScrollView,        // results list viewport
+    pub(crate) find_gen: u64,                    // discards stale find-in-files results
+    pub(crate) find_pending: bool,               // a background search is streaming results
+    pub(crate) search_collapsed: HashSet<usize>, // collapsed result file groups
     pub(crate) extensions: Vec<Extension>,
     pub(crate) hovered_ext: Option<usize>,
     pub(crate) text_drag: Option<InputId>, // active mouse drag-selection in a text input
@@ -181,19 +192,19 @@ pub(crate) struct App {
     pub(crate) hovered_detail_tab: Option<ext_detail::DetailTab>,
     pub(crate) hovered_page_install: bool,
     pub(crate) pending_close: bool,
-    pub(crate) terminal: Option<terminal::Terminal>,
+    // Integrated terminal tabs. Each group is a tab (`+` adds one); within a tab,
+    // panes are shown side-by-side (split). Only the active group is visible; the
+    // rest keep running in the background. No shell is ever discarded.
+    pub(crate) term_groups: Vec<terminal::Group>,
+    pub(crate) active_group: usize,
     pub(crate) terminal_visible: bool,
     pub(crate) terminal_focused: bool,
     pub(crate) terminal_split: Splitter, // draggable panel height
-    pub(crate) terminal_scroll: ScrollView, // scrollback viewport (pinned to bottom)
+    pub(crate) terminal_maximized: bool, // header maximize toggle (fills the content area)
     // Real monospace cell advance (px), measured from the shaped terminal buffer.
     // The cursor and grid sizing use this instead of an estimate so the block
     // cursor lands exactly on the glyph cell (no per-column drift).
     pub(crate) terminal_cell_w: f32,
-    // Set when shell output arrives or the panel resizes; render reshapes the
-    // terminal text only when this is set, then clears it. Avoids re-shaping a
-    // full screen of rich text on every unrelated redraw.
-    pub(crate) terminal_dirty: bool,
     pub(crate) cursor_blink_on: bool,
     pub(crate) last_blink: Instant,
     pub(crate) last_edit: Instant,  // for files.autoSave (afterDelay)
@@ -243,6 +254,14 @@ impl App {
             last_click_pos: (0.0, 0.0),
             click_count: 0,
             sidebar_view: SidebarView::Explorer,
+            search_query_active: false,
+            search_replace_active: false,
+            search_opts: search::SearchOpts::default(),
+            search_results: Vec::new(),
+            search_scroll: ScrollView::new(widgets::ScrollOpts::vertical()),
+            find_gen: 0,
+            find_pending: false,
+            search_collapsed: HashSet::new(),
             extensions: Vec::new(),
             hovered_ext: None,
             text_drag: None,
@@ -266,7 +285,8 @@ impl App {
             hovered_detail_tab: None,
             hovered_page_install: false,
             pending_close: false,
-            terminal: None,
+            term_groups: Vec::new(),
+            active_group: 0,
             terminal_visible: false,
             terminal_focused: false,
             terminal_split: Splitter::new(
@@ -276,12 +296,7 @@ impl App {
                 widgets::Axis::Vertical,
             ),
             terminal_cell_w: theme::FONT_SIZE() * 0.6, // refined after first shape
-            terminal_dirty: true,
-            terminal_scroll: ScrollView::new(widgets::ScrollOpts {
-                vertical: true,
-                horizontal: false,
-                stick_to_end: true,
-            }),
+            terminal_maximized: false,
             cursor_blink_on: true,
             last_blink: Instant::now(),
             last_edit: Instant::now(),
@@ -496,13 +511,23 @@ impl App {
                 over_scroll_thumb = true;
             }
         }
-        let term_inside = self.terminal_visible
-            && layout.terminal_panel.map_or(false, |pn| terminal_content(pn).contains(p));
-        if self.terminal_scroll.hover(term_inside) {
-            changed = true;
-        }
-        if term_inside && self.terminal_scroll.cursor(p).is_some() {
-            over_scroll_thumb = true;
+        if self.terminal_visible {
+            if let Some(panel) = layout.terminal_panel {
+                let area = terminal_pane_area(terminal_content(panel), self.term_groups.len());
+                let n = self.active_pane_count();
+                let rects = terminal_pane_rects(area, n);
+                if let Some(g) = self.term_groups.get_mut(self.active_group) {
+                    for (i, pane) in g.panes.iter_mut().enumerate() {
+                        let inside = rects.get(i).map_or(false, |r| r.contains(p));
+                        if pane.scroll.hover(inside) {
+                            changed = true;
+                        }
+                        if inside && pane.scroll.cursor(p).is_some() {
+                            over_scroll_thumb = true;
+                        }
+                    }
+                }
+            }
         }
         let ext_inside = self.sidebar_visible
             && self.sidebar_view == SidebarView::Extensions
@@ -511,6 +536,15 @@ impl App {
             changed = true;
         }
         if ext_inside && self.ext_scroll.cursor(p).is_some() {
+            over_scroll_thumb = true;
+        }
+        let search_inside = self.sidebar_visible
+            && self.sidebar_view == SidebarView::Search
+            && search_results_region(layout.tree_region()).contains(p);
+        if self.search_scroll.hover(search_inside) {
+            changed = true;
+        }
+        if search_inside && self.search_scroll.cursor(p).is_some() {
             over_scroll_thumb = true;
         }
         let det_inside = self.open_extension.is_some() && layout.editor_text.contains(p);
@@ -555,6 +589,13 @@ impl App {
                 .as_ref()
                 .map(|g| g.explorer_btns[i].cursor())
                 .unwrap_or(CursorIcon::Default)
+        } else if self.sidebar_visible
+            && self.sidebar_view == SidebarView::Search
+            && (search_opt_rects(layout.tree_region()).iter().any(|r| r.contains(p))
+                || search_results_region(layout.tree_region()).contains(p))
+        {
+            // Search option toggles + result rows are clickable.
+            CursorIcon::Pointer
         } else if self.focused_input_at(&layout, p).is_some() {
             CursorIcon::Text
         } else if new_ext.is_some() || new_page_install || new_detail_tab.is_some() || over_detail_link {
@@ -649,7 +690,7 @@ impl App {
             self.sidebar_split.size(),
             self.find.active,
             self.palette.active,
-            if self.terminal_visible { Some(self.terminal_split.size()) } else { None },
+            self.terminal_panel_height(),
         )
     }
 
@@ -683,14 +724,18 @@ impl App {
     /// across every region. None when nothing is fading.
     fn scroll_next_wake(&self, now: Instant) -> Option<Instant> {
         let mut earliest: Option<Instant> = None;
-        for w in [
-            self.workspace.active_doc().and_then(|d| d.scroll.next_wake(now)),
-            self.terminal_scroll.next_wake(now),
-            self.ext_scroll.next_wake(now),
-            self.ext_detail_scroll.next_wake(now),
-        ] {
+        let mut consider = |w: Option<Instant>| {
             if let Some(t) = w {
-                earliest = Some(earliest.map_or(t, |x| x.min(t)));
+                earliest = Some(earliest.map_or(t, |x: Instant| x.min(t)));
+            }
+        };
+        consider(self.workspace.active_doc().and_then(|d| d.scroll.next_wake(now)));
+        consider(self.ext_scroll.next_wake(now));
+        consider(self.ext_detail_scroll.next_wake(now));
+        consider(self.search_scroll.next_wake(now));
+        if let Some(g) = self.term_groups.get(self.active_group) {
+            for p in &g.panes {
+                consider(p.scroll.next_wake(now));
             }
         }
         earliest
@@ -981,6 +1026,85 @@ impl App {
         marketplace::search_async(self.worker_tx.clone(), query, self.search_gen);
     }
 
+    /// Kick off a background find-in-files for the current query + options.
+    fn trigger_find(&mut self) {
+        let query = self
+            .gpu
+            .as_ref()
+            .map(|g| g.ui.search_input.text().trim().to_string())
+            .unwrap_or_default();
+        self.search_results.clear();
+        self.search_collapsed.clear();
+        self.search_scroll.scroll_to_y(0.0);
+        self.find_gen += 1;
+        self.find_pending = false;
+        if query.is_empty() {
+            return;
+        }
+        self.find_pending = true;
+        let root = self.workspace.tree.root.clone();
+        search::search_async(self.worker_tx.clone(), self.find_gen, root, query, self.search_opts);
+    }
+
+    /// Replace All: rewrite every match across the found files with the replacement
+    /// text, then re-run the search and reload any open documents from disk.
+    fn replace_all(&mut self) {
+        let (query, replacement) = match self.gpu.as_ref() {
+            Some(g) => (
+                g.ui.search_input.text().trim().to_string(),
+                g.ui.search_replace.text().to_string(),
+            ),
+            None => return,
+        };
+        if query.is_empty() || self.search_results.is_empty() {
+            return;
+        }
+        let n = search::replace_all(&self.search_results, &query, self.search_opts, &replacement);
+        if n > 0 {
+            // Reload any open document whose file we just rewrote on disk.
+            if let Some(gpu) = self.gpu.as_mut() {
+                for d in self.workspace.documents.iter_mut() {
+                    if let Some(p) = d.path.clone() {
+                        if let Ok(text) = std::fs::read_to_string(&p) {
+                            d.set_text_external(&text, &mut gpu.font_system);
+                        }
+                    }
+                }
+            }
+            self.trigger_find(); // refresh results against the new contents
+        }
+        self.redraw();
+    }
+
+    /// Flattened result rows (file headers + match lines), respecting collapse state.
+    /// Shared by rendering and click hit-testing so indices line up.
+    fn search_rows(&self) -> Vec<search::SearchRow> {
+        search::build_rows(&self.search_results, &self.search_collapsed)
+    }
+
+    /// Open a search result: open the file (if needed) and place the caret at the
+    /// match — line `line` (1-based), byte column `col` within that line.
+    fn open_search_result(&mut self, file_idx: usize, line: usize, col: usize) {
+        let Some(path) = self.search_results.get(file_idx).map(|f| f.path.clone()) else {
+            return;
+        };
+        if let Some(gpu) = self.gpu.as_mut() {
+            if self.workspace.open_file(&path, &mut gpu.font_system).is_ok() {
+                self.open_extension = None;
+                if let Some(d) = self.workspace.active_doc_mut() {
+                    let li = line.saturating_sub(1);
+                    if li < d.rope.len_lines() {
+                        let line_start = d.rope.line_to_byte(li);
+                        let line_len = d.rope.line(li).len_bytes();
+                        d.place(line_start + col.min(line_len), false);
+                    }
+                }
+            }
+        }
+        self.ensure_cursor_visible();
+        self.redraw();
+    }
+
     /// Download + install a marketplace extension on a background thread.
     fn install_remote(&mut self, idx: usize) {
         let Some(ext) = self.ext_remote.get(idx).cloned() else { return };
@@ -1076,10 +1200,14 @@ impl App {
             Focus::Palette
         } else if self.find.active {
             Focus::Find
-        } else if self.terminal_visible && self.terminal_focused {
+        } else if self.terminal_visible && self.terminal_focused && !self.term_groups.is_empty() {
             Focus::Terminal
         } else if self.ext_filter_active {
             Focus::ExtFilter
+        } else if self.search_query_active {
+            Focus::Search
+        } else if self.search_replace_active {
+            Focus::SearchReplace
         } else {
             Focus::Editor
         }
@@ -1088,9 +1216,8 @@ impl App {
     fn set_ext_filter_focus(&mut self, on: bool) {
         self.ext_filter_active = on;
         if let Some(g) = self.gpu.as_mut() {
-            if on {
-                g.ui.ext_filter.set_placeholder(&mut g.font_system, " Search Extensions");
-            }
+            // Placeholder is set once at construction so it shows whenever the box
+            // is empty, focused or not.
             g.ui.ext_filter.focus(on);
         }
     }
@@ -1116,12 +1243,26 @@ impl App {
                 (self.sidebar_visible && self.sidebar_view == SidebarView::Extensions)
                     .then(|| (ext_filter_rect(layout.tree_region()), 6.0))
             }
+            InputId::Search => {
+                (self.sidebar_visible && self.sidebar_view == SidebarView::Search)
+                    .then(|| (ext_filter_rect(layout.tree_region()), 6.0))
+            }
+            InputId::SearchReplace => {
+                (self.sidebar_visible && self.sidebar_view == SidebarView::Search)
+                    .then(|| (search_replace_rect(layout.tree_region()), 6.0))
+            }
         }
     }
 
     /// The focused input under point `p` (for click-to-position / drag-select).
     fn focused_input_at(&self, layout: &Layout, p: (f32, f32)) -> Option<(InputId, Rect, f32)> {
-        for id in [InputId::Palette, InputId::Find, InputId::ExtFilter] {
+        for id in [
+            InputId::Palette,
+            InputId::Find,
+            InputId::ExtFilter,
+            InputId::Search,
+            InputId::SearchReplace,
+        ] {
             if let Some((rect, pad)) = self.input_rect_for(id, layout) {
                 if rect.contains(p) {
                     return Some((id, rect, pad));
@@ -1333,17 +1474,137 @@ impl App {
         self.redraw();
     }
 
-    /// Show/hide the integrated terminal, spawning the shell on first open and
-    /// focusing it so keystrokes go to the shell.
+    /// Requested terminal panel height: huge when maximized (clamped by the layout
+    /// to leave a sliver of editor), the splitter size otherwise, None when hidden.
+    pub(crate) fn terminal_panel_height(&self) -> Option<f32> {
+        if !self.terminal_visible {
+            return None;
+        }
+        Some(if self.terminal_maximized { 100_000.0 } else { self.terminal_split.size() })
+    }
+
+    /// Number of split panes in the active tab (0 when there's no terminal).
+    fn active_pane_count(&self) -> usize {
+        self.term_groups.get(self.active_group).map_or(0, |g| g.panes.len())
+    }
+
+    /// Spawn a pane sized to fit when the active tab shows `count` side-by-side panes.
+    fn spawn_pane(&self, count: usize) -> Option<terminal::Pane> {
+        let panel = self.layout().terminal_panel?;
+        let area = terminal_pane_area(terminal_content(panel), self.term_groups.len().max(1));
+        let rect = terminal_pane_rects(area, count.max(1))
+            .into_iter()
+            .next()
+            .unwrap_or(area);
+        let (rows, cols) = terminal_grid_size(rect, self.terminal_cell_w);
+        terminal::Pane::spawn(rows, cols)
+    }
+
+    /// Header `+`: open a new terminal tab (a fresh group). The previous tab keeps
+    /// running in the background and stays reachable from the tab list.
+    fn new_terminal_tab(&mut self) {
+        if let Some(p) = self.spawn_pane(1) {
+            self.term_groups.push(terminal::Group::new(p));
+            self.active_group = self.term_groups.len() - 1;
+            self.terminal_focused = true;
+            self.mark_terminals_dirty(); // tab list appearing reflows pane widths
+        }
+        self.redraw();
+    }
+
+    /// Header split: add a side-by-side pane to the active tab.
+    fn split_terminal(&mut self) {
+        let count = self.active_pane_count() + 1;
+        if let Some(p) = self.spawn_pane(count) {
+            if let Some(g) = self.term_groups.get_mut(self.active_group) {
+                g.panes.push(p);
+                g.focused = g.panes.len() - 1;
+                self.terminal_focused = true;
+            }
+            self.mark_terminals_dirty();
+        }
+        self.redraw();
+    }
+
+    /// Header trash: kill the focused pane; drop the tab if it was its last pane;
+    /// hide the panel if that was the last tab.
+    fn kill_terminal(&mut self) {
+        let Some(g) = self.term_groups.get_mut(self.active_group) else {
+            return;
+        };
+        if g.panes.is_empty() {
+            return;
+        }
+        let i = g.focused.min(g.panes.len() - 1);
+        g.panes.remove(i);
+        if g.panes.is_empty() {
+            self.term_groups.remove(self.active_group);
+            if self.term_groups.is_empty() {
+                self.terminal_visible = false;
+                self.terminal_focused = false;
+                self.terminal_maximized = false;
+            } else {
+                self.active_group = self.active_group.min(self.term_groups.len() - 1);
+            }
+        } else {
+            g.focused = i.min(g.panes.len() - 1);
+        }
+        self.mark_terminals_dirty();
+        self.redraw();
+    }
+
+    /// Switch the visible terminal tab.
+    fn switch_terminal_tab(&mut self, i: usize) {
+        if i < self.term_groups.len() {
+            self.active_group = i;
+            self.terminal_focused = true;
+            self.mark_terminals_dirty();
+            self.redraw();
+        }
+    }
+
+    /// Tab-list × button: kill an entire tab (all its panes); hide the panel if it
+    /// was the last tab.
+    fn kill_terminal_tab(&mut self, i: usize) {
+        if i >= self.term_groups.len() {
+            return;
+        }
+        self.term_groups.remove(i);
+        if self.term_groups.is_empty() {
+            self.terminal_visible = false;
+            self.terminal_focused = false;
+            self.terminal_maximized = false;
+        } else {
+            self.active_group = self.active_group.min(self.term_groups.len() - 1);
+        }
+        self.mark_terminals_dirty();
+        self.redraw();
+    }
+
+    /// Header maximize: grow the panel to fill the whole content area (toggle).
+    fn toggle_terminal_max(&mut self) {
+        self.terminal_maximized = !self.terminal_maximized;
+        self.mark_terminals_dirty();
+        self.redraw();
+    }
+
+    /// Mark every pane in every tab as needing a reshape (after a layout change).
+    fn mark_terminals_dirty(&mut self) {
+        for g in &mut self.term_groups {
+            for p in &mut g.panes {
+                p.dirty = true;
+            }
+        }
+    }
+
+    /// Show/hide the integrated terminal, spawning the first tab on first open.
     fn toggle_terminal(&mut self) {
         self.terminal_visible = !self.terminal_visible;
         self.terminal_focused = self.terminal_visible;
-        self.terminal_dirty = true;
-        if self.terminal_visible && self.terminal.is_none() {
-            let layout = self.layout();
-            if let Some(panel) = layout.terminal_panel {
-                let (rows, cols) = terminal_grid_size(terminal_content(panel), self.terminal_cell_w);
-                self.terminal = terminal::Terminal::spawn(rows, cols);
+        if self.terminal_visible && self.term_groups.is_empty() {
+            if let Some(p) = self.spawn_pane(1) {
+                self.term_groups.push(terminal::Group::new(p));
+                self.active_group = 0;
             }
         }
         self.redraw();
@@ -1520,13 +1781,27 @@ impl App {
         // click before any region handler (terminal focus, extension rows, editor).
         // Guarded by visibility so a stale off-screen thumb can't grab the click.
         if layout.palette.is_none() {
-            if self.terminal_visible && self.terminal_scroll.press((x, y)) {
-                self.terminal_dirty = true;
-                return;
+            if self.terminal_visible {
+                if let Some(g) = self.term_groups.get_mut(self.active_group) {
+                    for i in 0..g.panes.len() {
+                        if g.panes[i].scroll.press((x, y)) {
+                            g.panes[i].dirty = true;
+                            g.focused = i;
+                            return;
+                        }
+                    }
+                }
             }
             if self.sidebar_visible
                 && self.sidebar_view == SidebarView::Extensions
                 && self.ext_scroll.press((x, y))
+            {
+                self.redraw();
+                return;
+            }
+            if self.sidebar_visible
+                && self.sidebar_view == SidebarView::Search
+                && self.search_scroll.press((x, y))
             {
                 self.redraw();
                 return;
@@ -1550,6 +1825,7 @@ impl App {
         if layout.palette.is_none() {
             if let Some(panel) = layout.terminal_panel {
                 if self.terminal_split.press((x, y), panel) {
+                    self.terminal_maximized = false; // dragging restores from maximized
                     return;
                 }
             }
@@ -1561,21 +1837,68 @@ impl App {
             if let Some(panel) = layout.terminal_panel {
                 let content = terminal_content(panel);
                 if content.contains((x, y)) {
+                    // The right-side tab list: × kills that tab, the row body switches.
+                    if let Some(tl) = terminal_tablist_rect(content, self.term_groups.len()) {
+                        if tl.contains((x, y)) {
+                            let idx = ((y - tl.y) / theme::TREE_ROW_HEIGHT) as usize;
+                            if idx < self.term_groups.len() {
+                                if terminal_tab_close_rect(tl, idx).contains((x, y)) {
+                                    self.kill_terminal_tab(idx);
+                                } else {
+                                    self.switch_terminal_tab(idx);
+                                }
+                            }
+                            return;
+                        }
+                    }
+                    // Otherwise focus whichever split pane was clicked.
+                    let area = terminal_pane_area(content, self.term_groups.len());
+                    let rects = terminal_pane_rects(area, self.active_pane_count());
+                    if let Some(i) = rects.iter().position(|r| r.contains((x, y))) {
+                        if let Some(g) = self.term_groups.get_mut(self.active_group) {
+                            g.focused = i;
+                        }
+                    }
                     self.terminal_focused = true;
                     self.redraw();
                     return;
                 }
-                // Header strip (above content): the close button hides the panel;
-                // the rest are visual stubs that just consume the click.
+                // Header strip (above content): right-side icon buttons.
                 if panel.contains((x, y)) {
                     let btns = terminal_header_button_rects(panel);
-                    if btns.last().map_or(false, |r| r.contains((x, y))) {
-                        self.toggle_terminal();
+                    if let Some(i) = btns.iter().position(|r| r.contains((x, y))) {
+                        match i {
+                            0 => self.new_terminal_tab(),    // + new tab
+                            1 => self.split_terminal(),      // ⊟ split active tab
+                            2 => self.kill_terminal(),       // 🗑 kill focused pane
+                            4 => self.toggle_terminal_max(), // ⌃ maximize/restore
+                            5 => self.toggle_terminal(),     // × hide panel
+                            _ => {}                           // 3 more — menu infra TBD
+                        }
                     }
                     return;
                 }
             }
             self.terminal_focused = false;
+        }
+
+        // Search option toggles sit inside the query box, so claim them before the
+        // input-focus handler below (which would otherwise eat the click as a caret set).
+        if self.sidebar_visible && self.sidebar_view == SidebarView::Search {
+            if let Some(i) = search_opt_rects(layout.tree_region())
+                .iter()
+                .position(|r| r.contains((x, y)))
+            {
+                match i {
+                    0 => self.search_opts.case_sensitive = !self.search_opts.case_sensitive,
+                    1 => self.search_opts.whole_word = !self.search_opts.whole_word,
+                    2 => self.search_opts.regex = !self.search_opts.regex,
+                    _ => {}
+                }
+                self.trigger_find();
+                self.redraw();
+                return;
+            }
         }
 
         // Click inside a focused text input: position the caret and begin a
@@ -1584,12 +1907,16 @@ impl App {
             // Clicking the extensions filter box focuses it; clicking another input
             // (palette/find) takes focus away from it.
             self.ext_filter_active = id == InputId::ExtFilter;
+            self.search_query_active = id == InputId::Search;
+            self.search_replace_active = id == InputId::SearchReplace;
             let double = self.register_click(x, y);
             if let Some(g) = self.gpu.as_mut() {
                 let inp = match id {
                     InputId::Palette => &mut g.ui.palette_input,
                     InputId::Find => &mut g.ui.find_input,
                     InputId::ExtFilter => &mut g.ui.ext_filter,
+                    InputId::Search => &mut g.ui.search_input,
+                    InputId::SearchReplace => &mut g.ui.search_replace,
                 };
                 if double {
                     inp.select_word_at(rect, pad, x);
@@ -1693,6 +2020,7 @@ impl App {
             // the sidebar; clicking another switches to it (and shows the sidebar).
             let view = match idx {
                 0 => Some(SidebarView::Explorer),
+                1 => Some(SidebarView::Search),
                 4 => Some(SidebarView::Extensions),
                 _ => None,
             };
@@ -1707,10 +2035,10 @@ impl App {
                     self.sidebar_view = v;
                     self.sidebar_visible = true;
                 }
-                // Opening the panel does NOT focus the filter — focus (and its
-                // caret) only happens when the user clicks the box. Switching views
-                // clears any prior filter focus.
+                // Switching views clears any prior input focus.
                 self.set_ext_filter_focus(false);
+                self.search_query_active = false;
+                self.search_replace_active = false;
                 self.redraw();
             }
             return;
@@ -1733,6 +2061,48 @@ impl App {
                     };
                     self.open_ext_detail(which);
                 }
+            }
+            return;
+        }
+
+        // Search view: option toggles + clicking a result row opens that match.
+        if self.sidebar_visible
+            && self.sidebar_view == SidebarView::Search
+            && layout.sidebar.contains((x, y))
+        {
+            let tree = layout.tree_region();
+            if let Some(i) = search_opt_rects(tree).iter().position(|r| r.contains((x, y))) {
+                match i {
+                    0 => self.search_opts.case_sensitive = !self.search_opts.case_sensitive,
+                    1 => self.search_opts.whole_word = !self.search_opts.whole_word,
+                    2 => self.search_opts.regex = !self.search_opts.regex,
+                    _ => {}
+                }
+                self.trigger_find();
+                self.redraw();
+                return;
+            }
+            if search_replace_all_rect(tree).contains((x, y)) {
+                self.replace_all();
+                return;
+            }
+            let region = search_results_region(tree);
+            if region.contains((x, y)) {
+                let row = ((y - region.y + self.search_scroll.offset().1) / theme::SEARCH_ROW_H) as usize;
+                if let Some(sr) = self.search_rows().get(row) {
+                    let (file, line, col) = (sr.file, sr.line, sr.col);
+                    match line {
+                        Some(line) => self.open_search_result(file, line, col),
+                        None => {
+                            // File header — toggle its collapse state.
+                            if !self.search_collapsed.insert(file) {
+                                self.search_collapsed.remove(&file);
+                            }
+                            self.redraw();
+                        }
+                    }
+                }
+                return;
             }
             return;
         }
@@ -1845,6 +2215,8 @@ impl App {
 
         if layout.editor_text.contains((x, y)) {
             self.ext_filter_active = false; // editor takes keyboard focus
+            self.search_query_active = false;
+            self.search_replace_active = false;
             let now = Instant::now();
             let consecutive = now.duration_since(self.last_click) < Duration::from_millis(400)
                 && (x - self.last_click_pos.0).abs() < 4.0
@@ -1883,6 +2255,8 @@ impl App {
                             InputId::Palette => &mut g.ui.palette_input,
                             InputId::Find => &mut g.ui.find_input,
                             InputId::ExtFilter => &mut g.ui.ext_filter,
+                            InputId::Search => &mut g.ui.search_input,
+                            InputId::SearchReplace => &mut g.ui.search_replace,
                         };
                         inp.extend_to_x(rect, pad, x);
                     }
@@ -1892,15 +2266,25 @@ impl App {
             }
         }
         // Scrollbar thumb drags — one ScrollView is dragging at a time.
-        if self.terminal_scroll.is_dragging() && self.mouse_pressed {
-            if self.terminal_scroll.drag((x, y)) {
-                self.terminal_dirty = true;
+        if self.mouse_pressed {
+            if let Some(g) = self.term_groups.get_mut(self.active_group) {
+                if let Some(p) = g.panes.iter_mut().find(|p| p.scroll.is_dragging()) {
+                    if p.scroll.drag((x, y)) {
+                        p.dirty = true;
+                    }
+                    self.redraw();
+                    return;
+                }
+            }
+        }
+        if self.ext_scroll.is_dragging() && self.mouse_pressed {
+            if self.ext_scroll.drag((x, y)) {
                 self.redraw();
             }
             return;
         }
-        if self.ext_scroll.is_dragging() && self.mouse_pressed {
-            if self.ext_scroll.drag((x, y)) {
+        if self.search_scroll.is_dragging() && self.mouse_pressed {
+            if self.search_scroll.drag((x, y)) {
                 self.redraw();
             }
             return;
@@ -1946,9 +2330,14 @@ impl App {
         self.text_drag = None;
         self.sidebar_split.release();
         self.terminal_split.release();
-        self.terminal_scroll.release();
+        for g in &mut self.term_groups {
+            for p in &mut g.panes {
+                p.scroll.release();
+            }
+        }
         self.ext_scroll.release();
         self.ext_detail_scroll.release();
+        self.search_scroll.release();
         if let Some(d) = self.workspace.active_doc_mut() {
             d.scroll.release();
         }
@@ -1983,10 +2372,17 @@ impl App {
         // event so the editor doesn't scroll underneath.
         if self.terminal_visible {
             if let Some(panel) = layout.terminal_panel {
-                if terminal_content(panel).contains(p) {
-                    if self.terminal_scroll.on_wheel(0.0, dy) {
-                        self.terminal_dirty = true;
-                        self.redraw();
+                let content = terminal_content(panel);
+                if content.contains(p) {
+                    let area = terminal_pane_area(content, self.term_groups.len());
+                    let rects = terminal_pane_rects(area, self.active_pane_count());
+                    if let Some(i) = rects.iter().position(|r| r.contains(p)) {
+                        if let Some(g) = self.term_groups.get_mut(self.active_group) {
+                            if g.panes[i].scroll.on_wheel(0.0, dy) {
+                                g.panes[i].dirty = true;
+                                self.redraw();
+                            }
+                        }
                     }
                     return;
                 }
@@ -1998,6 +2394,15 @@ impl App {
             let region = ext_list_region(layout.tree_region());
             if region.contains(p) {
                 if self.ext_scroll.on_wheel(0.0, dy) {
+                    self.redraw();
+                }
+                return;
+            }
+        }
+        // Search results scroll when the cursor is over the results region.
+        if self.sidebar_visible && self.sidebar_view == SidebarView::Search {
+            if search_results_region(layout.tree_region()).contains(p) {
+                if self.search_scroll.on_wheel(0.0, dy) {
                     self.redraw();
                 }
                 return;
@@ -2070,12 +2475,13 @@ impl App {
         match self.focus() {
             Focus::Terminal => {
                 if let Some(bytes) = translate_terminal_key(&event, ctrl, extend) {
-                    if let Some(t) = self.terminal.as_mut() {
-                        t.write(&bytes);
+                    if let Some(g) = self.term_groups.get_mut(self.active_group) {
+                        if let Some(p) = g.panes.get_mut(g.focused) {
+                            p.term.write(&bytes);
+                            p.scroll.scroll_to_end(); // typing snaps to the live bottom
+                            p.dirty = true;
+                        }
                     }
-                    // Typing snaps the view back to the live screen (bottom).
-                    self.terminal_scroll.scroll_to_end();
-                    self.terminal_dirty = true;
                     self.redraw();
                 }
                 return;
@@ -2208,6 +2614,63 @@ impl App {
                     None => {
                         // Swallow other plain keys (Enter, arrows…) so they can't leak
                         // to the editor; let Ctrl-combos fall through to shortcuts.
+                        if !ctrl {
+                            return;
+                        }
+                    }
+                }
+            }
+            Focus::Search => {
+                if matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape)) {
+                    if let Some(g) = self.gpu.as_mut() {
+                        g.ui.search_input.clear(&mut g.font_system);
+                    }
+                    self.search_results.clear();
+                    self.search_scroll.scroll_to_y(0.0);
+                    self.redraw();
+                    return;
+                }
+                let consumed = self.gpu.as_mut().and_then(|g| {
+                    edit_input(&mut g.ui.search_input, &mut g.font_system, self.clipboard.as_mut(), &event, ctrl, extend)
+                });
+                match consumed {
+                    Some(changed) => {
+                        if changed {
+                            self.trigger_find();
+                        }
+                        self.redraw();
+                        return;
+                    }
+                    None => {
+                        if !ctrl {
+                            return;
+                        }
+                    }
+                }
+            }
+            Focus::SearchReplace => {
+                match event.logical_key.as_ref() {
+                    Key::Named(NamedKey::Escape) => {
+                        self.search_replace_active = false;
+                        self.redraw();
+                        return;
+                    }
+                    // Enter in the replace box runs Replace All.
+                    Key::Named(NamedKey::Enter) => {
+                        self.replace_all();
+                        return;
+                    }
+                    _ => {}
+                }
+                let consumed = self.gpu.as_mut().and_then(|g| {
+                    edit_input(&mut g.ui.search_replace, &mut g.font_system, self.clipboard.as_mut(), &event, ctrl, extend)
+                });
+                match consumed {
+                    Some(_) => {
+                        self.redraw();
+                        return;
+                    }
+                    None => {
                         if !ctrl {
                             return;
                         }
@@ -2391,6 +2854,7 @@ pub(crate) fn active_activity_idx(sidebar_visible: bool, view: SidebarView) -> O
     }
     match view {
         SidebarView::Explorer => Some(0),
+        SidebarView::Search => Some(1),
         SidebarView::Extensions => Some(4),
     }
 }
@@ -2406,6 +2870,8 @@ enum Focus {
     Palette,   // command palette
     Find,      // find bar
     ExtFilter, // extensions search box
+    Search,    // find-in-files query box
+    SearchReplace, // find-in-files replace box
     Terminal,  // integrated terminal
 }
 
@@ -2479,6 +2945,8 @@ enum InputId {
     Palette,
     Find,
     ExtFilter,
+    Search,
+    SearchReplace,
 }
 
 /// Apply a common editing/navigation key to a focused text input. Returns
@@ -2576,6 +3044,35 @@ pub(crate) fn ext_filter_rect(tree: Rect) -> Rect {
     Rect { x: tree.x + 10.0, y: tree.y + 8.0, w: tree.w - 20.0, h: 30.0 }
 }
 
+/// Search view: the query box (top), the three option toggles (case / word /
+/// regex) below it, and the results region filling the rest. The query box reuses
+/// `ext_filter_rect`'s geometry.
+pub(crate) const SEARCH_OPT_SIZE: f32 = 18.0;
+/// The three option toggles, right-aligned *inside* the query box (VSCode-style).
+pub(crate) fn search_opt_rects(tree: Rect) -> [Rect; 3] {
+    let input = ext_filter_rect(tree);
+    let (s, gap) = (SEARCH_OPT_SIZE, 3.0);
+    let total = 3.0 * s + 2.0 * gap;
+    let start = input.x + input.w - 6.0 - total;
+    let y = input.y + (input.h - s) * 0.5;
+    std::array::from_fn(|i| Rect { x: start + i as f32 * (s + gap), y, w: s, h: s })
+}
+/// The replace box, directly below the query box.
+pub(crate) fn search_replace_rect(tree: Rect) -> Rect {
+    let q = ext_filter_rect(tree);
+    Rect { x: q.x, y: q.y + q.h + 6.0, w: q.w, h: 30.0 }
+}
+/// The "Replace All" button, below the replace box.
+pub(crate) fn search_replace_all_rect(tree: Rect) -> Rect {
+    let r = search_replace_rect(tree);
+    Rect { x: r.x, y: r.y + r.h + 6.0, w: r.w, h: 24.0 }
+}
+pub(crate) fn search_results_region(tree: Rect) -> Rect {
+    let b = search_replace_all_rect(tree);
+    let top = b.y + b.h + 8.0;
+    Rect { x: tree.x, y: top, w: tree.w, h: (tree.y + tree.h - top).max(0.0) }
+}
+
 /// Grid (rows, cols) that fits the terminal panel at the editor font metrics.
 /// Right-aligned icon-button rects in the terminal panel header, drawn left→right
 /// as: +, split, trash, …, maximize, close (6 buttons — matches `GpuState::terminal_btns`).
@@ -2586,6 +3083,49 @@ pub(crate) fn terminal_header_button_rects(panel: Rect) -> Vec<Rect> {
     let start_x = right - TERMINAL_HEADER_BTNS as f32 * bw;
     (0..TERMINAL_HEADER_BTNS)
         .map(|i| Rect { x: start_x + i as f32 * bw, y: panel.y, w: bw, h: theme::TERMINAL_HEADER_H })
+        .collect()
+}
+
+pub(crate) const TERMINAL_TABLIST_W: f32 = 160.0;
+
+/// The right-side terminal-tab list rect — shown (VSCode-style) only when there's
+/// more than one tab, so a single terminal still uses the full width.
+pub(crate) fn terminal_tablist_rect(content: Rect, group_count: usize) -> Option<Rect> {
+    if group_count <= 1 {
+        return None;
+    }
+    let w = TERMINAL_TABLIST_W.min(content.w * 0.4);
+    Some(Rect { x: content.x + content.w - w, y: content.y, w, h: content.h })
+}
+
+/// The pane area: the content minus the tab list (when the list is shown).
+pub(crate) fn terminal_pane_area(content: Rect, group_count: usize) -> Rect {
+    match terminal_tablist_rect(content, group_count) {
+        Some(tl) => Rect { w: (content.w - tl.w).max(1.0), ..content },
+        None => content,
+    }
+}
+
+/// The close (×) button rect for terminal tab-list row `row`.
+pub(crate) fn terminal_tab_close_rect(tl: Rect, row: usize) -> Rect {
+    let s = 18.0;
+    Rect {
+        x: tl.x + tl.w - s - 6.0,
+        y: tl.y + row as f32 * theme::TREE_ROW_HEIGHT + (theme::TREE_ROW_HEIGHT - s) * 0.5,
+        w: s,
+        h: s,
+    }
+}
+
+/// Split the terminal pane area into `n` side-by-side pane rects (1px gaps).
+pub(crate) fn terminal_pane_rects(content: Rect, n: usize) -> Vec<Rect> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let gap = 1.0;
+    let w = ((content.w - gap * (n - 1) as f32) / n as f32).max(1.0);
+    (0..n)
+        .map(|i| Rect { x: content.x + i as f32 * (w + gap), y: content.y, w, h: content.h })
         .collect()
 }
 
@@ -2686,6 +3226,18 @@ impl ApplicationHandler for App {
                     }
                     self.redraw();
                 }
+                WorkerMsg::SearchHits { gen, files } => {
+                    if gen == self.find_gen {
+                        self.search_results.extend(files);
+                        self.redraw();
+                    }
+                }
+                WorkerMsg::SearchDone { gen } => {
+                    if gen == self.find_gen {
+                        self.find_pending = false;
+                        self.redraw();
+                    }
+                }
             }
         }
 
@@ -2705,15 +3257,30 @@ impl ApplicationHandler for App {
             }
         }
 
-        // Integrated terminal: drain shell output, and keep ticking while it's open
-        // so new output appears promptly.
+        // Integrated terminal: drain every pane's shell output, and keep ticking
+        // while open so new output appears promptly.
         if self.terminal_visible {
-            let changed = self.terminal.as_mut().map(|t| t.poll()).unwrap_or(false);
+            let mut changed = false;
+            for g in &mut self.term_groups {
+                for p in &mut g.panes {
+                    if p.term.poll() {
+                        p.dirty = true;
+                        changed = true;
+                    }
+                }
+            }
             if changed {
-                self.terminal_dirty = true;
                 self.redraw();
             }
             self.cursor_blink_on = true;
+            el.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(30)));
+            return;
+        }
+
+        // While a find-in-files search is streaming, keep waking to drain its
+        // results from the worker channel (otherwise idle ControlFlow::Wait would
+        // never poll them).
+        if self.find_pending {
             el.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(30)));
             return;
         }
