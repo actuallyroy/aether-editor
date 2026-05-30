@@ -46,7 +46,7 @@ use winit::{
     window::{CursorIcon, Window, WindowId},
 };
 
-use commands::{Command, COMMANDS, FindBarState, PaletteState};
+use commands::{Command, FindBarState, PaletteState};
 use document::Document;
 use extensions::{ExtKind, Extension, OpenExt};
 use marketplace::WorkerMsg;
@@ -129,7 +129,6 @@ pub(crate) enum DialogAction {
 
 pub(crate) struct DialogState {
     pub(crate) action: DialogAction,
-    pub(crate) buttons: &'static [&'static str],
     pub(crate) has_check: bool,
     pub(crate) checked: bool,
     pub(crate) hovered: Option<usize>,
@@ -689,15 +688,6 @@ impl App {
         self.workspace.documents.len() + self.detail.open_extension.is_some() as usize
     }
 
-    /// The active tab index — the extension page when open, else the active document.
-    pub(crate) fn active_tab(&self) -> Option<usize> {
-        if self.detail.open_extension.is_some() {
-            Some(self.workspace.documents.len())
-        } else {
-            self.workspace.active
-        }
-    }
-
     /// The tab index of the open extension page, if any.
     pub(crate) fn ext_tab_index(&self) -> Option<usize> {
         self.detail.open_extension.map(|_| self.workspace.documents.len())
@@ -839,7 +829,6 @@ impl App {
         match intent {
             ui::Intent::OpenFile { path, line, col } => self.open_file_at(path, line, col),
             ui::Intent::OpenExtDetail(which) => self.open_ext_detail(which),
-            ui::Intent::OpenSettings(p) => self.open_settings_file(Some(p)),
             ui::Intent::ReloadOpenDocs => {
                 if let Some(gpu) = self.gpu.as_mut() {
                     for d in self.workspace.documents.iter_mut() {
@@ -851,7 +840,6 @@ impl App {
                     }
                 }
             }
-            ui::Intent::Redraw => self.redraw(),
         }
     }
 
@@ -984,7 +972,6 @@ impl App {
         }
         self.dialog = Some(DialogState {
             action: DialogAction::DeleteNode(target),
-            buttons: &["Delete", "Cancel"],
             has_check: true,
             checked: false,
             hovered: None,
@@ -1027,7 +1014,6 @@ impl App {
         }
         self.dialog = Some(DialogState {
             action: DialogAction::CloseDoc(idx),
-            buttons: &["Save", "Don't Save", "Cancel"],
             has_check: false,
             checked: false,
             hovered: None,
@@ -1181,33 +1167,8 @@ impl App {
     }
 
     // Integrated-terminal actions live on `ui::terminal_panel::TerminalPanel`; these
-    // are thin glue that supply the panel rect + cell metric and trigger a redraw.
-    fn new_terminal_tab(&mut self) {
-        let panel = self.layout().terminal_panel;
-        self.terminal.new_terminal_tab(panel, self.terminal_cell_w);
-        self.redraw();
-    }
-    fn split_terminal(&mut self) {
-        let panel = self.layout().terminal_panel;
-        self.terminal.split_terminal(panel, self.terminal_cell_w);
-        self.redraw();
-    }
-    fn kill_terminal(&mut self) {
-        self.terminal.kill_terminal();
-        self.redraw();
-    }
-    fn switch_terminal_tab(&mut self, i: usize) {
-        self.terminal.switch_tab(i);
-        self.redraw();
-    }
-    fn kill_terminal_tab(&mut self, i: usize) {
-        self.terminal.kill_tab(i);
-        self.redraw();
-    }
-    fn toggle_terminal_max(&mut self) {
-        self.terminal.toggle_max();
-        self.redraw();
-    }
+    // The terminal panel owns its tab/pane/split actions (driven from its own
+    // `content_press`); `App` only handles toggling the panel's visibility.
     /// Show/hide the integrated terminal, spawning the first tab on first open.
     fn toggle_terminal(&mut self) {
         if self.terminal.toggle() {
@@ -1521,9 +1482,10 @@ impl App {
                 .and_then(|gpu| gpu.ui.palette_list.row_at(pal.list, (x, y), self.palette.filtered.len()));
             if let Some(idx) = row {
                 self.palette.selected = idx;
-                let cmd = COMMANDS[self.palette.filtered[idx]].0;
-                self.palette.close();
-                self.exec_command(cmd);
+                if let Some(cmd) = self.palette.selected_command() {
+                    self.palette.close();
+                    self.exec_command(cmd);
+                }
             }
             return;
         }
@@ -1983,27 +1945,17 @@ impl App {
                         return;
                     }
                     Key::Named(NamedKey::ArrowDown) => {
-                        if !self.palette.filtered.is_empty() {
-                            self.palette.selected =
-                                (self.palette.selected + 1) % self.palette.filtered.len();
-                        }
+                        self.palette.select_next();
                         self.redraw();
                         return;
                     }
                     Key::Named(NamedKey::ArrowUp) => {
-                        if !self.palette.filtered.is_empty() {
-                            if self.palette.selected == 0 {
-                                self.palette.selected = self.palette.filtered.len() - 1;
-                            } else {
-                                self.palette.selected -= 1;
-                            }
-                        }
+                        self.palette.select_prev();
                         self.redraw();
                         return;
                     }
                     Key::Named(NamedKey::Enter) => {
-                        if let Some(&i) = self.palette.filtered.get(self.palette.selected) {
-                            let cmd = COMMANDS[i].0;
+                        if let Some(cmd) = self.palette.selected_command() {
                             self.palette.close();
                             self.exec_command(cmd);
                         }

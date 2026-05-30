@@ -63,6 +63,26 @@ impl PaletteState {
     pub fn close(&mut self) {
         self.active = false;
     }
+    /// Move the selection down one row (wraps to the top).
+    pub fn select_next(&mut self) {
+        if !self.filtered.is_empty() {
+            self.selected = (self.selected + 1) % self.filtered.len();
+        }
+    }
+    /// Move the selection up one row (wraps to the bottom).
+    pub fn select_prev(&mut self) {
+        if !self.filtered.is_empty() {
+            self.selected = if self.selected == 0 {
+                self.filtered.len() - 1
+            } else {
+                self.selected - 1
+            };
+        }
+    }
+    /// The command under the current selection, if any.
+    pub fn selected_command(&self) -> Option<Command> {
+        self.filtered.get(self.selected).map(|&i| COMMANDS[i].0)
+    }
 }
 
 pub struct FindBarState {
