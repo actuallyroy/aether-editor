@@ -188,6 +188,10 @@ pub(crate) struct App {
     pub(crate) terminal_visible: bool,
     pub(crate) terminal_focused: bool,
     pub(crate) terminal_split: Splitter, // draggable panel height
+    // Real monospace cell advance (px), measured from the shaped terminal buffer.
+    // The cursor and grid sizing use this instead of an estimate so the block
+    // cursor lands exactly on the glyph cell (no per-column drift).
+    pub(crate) terminal_cell_w: f32,
     pub(crate) cursor_blink_on: bool,
     pub(crate) last_blink: Instant,
     pub(crate) last_edit: Instant,  // for files.autoSave (afterDelay)
@@ -272,6 +276,7 @@ impl App {
                 theme::TERMINAL_MAX_HEIGHT,
                 widgets::Axis::Vertical,
             ),
+            terminal_cell_w: theme::FONT_SIZE() * 0.6, // refined after first shape
             cursor_blink_on: true,
             last_blink: Instant::now(),
             last_edit: Instant::now(),
@@ -1331,7 +1336,7 @@ impl App {
         if self.terminal_visible && self.terminal.is_none() {
             let layout = self.layout();
             if let Some(panel) = layout.terminal_panel {
-                let (rows, cols) = terminal_grid_size(panel);
+                let (rows, cols) = terminal_grid_size(panel, self.terminal_cell_w);
                 self.terminal = terminal::Terminal::spawn(rows, cols);
             }
         }
@@ -2522,8 +2527,11 @@ pub(crate) fn ext_filter_rect(tree: Rect) -> Rect {
 }
 
 /// Grid (rows, cols) that fits the terminal panel at the editor font metrics.
-pub(crate) fn terminal_grid_size(panel: Rect) -> (usize, usize) {
-    let char_w = (theme::FONT_SIZE() * 0.6).max(1.0); // monospace advance approximation
+/// Rows/cols that fit `panel` for a monospace cell of `char_w` px wide. Using the
+/// real measured advance keeps the PTY's column count matched to what's actually
+/// rendered, so TUIs (e.g. Claude Code) fill the panel and the cursor lands right.
+pub(crate) fn terminal_grid_size(panel: Rect, char_w: f32) -> (usize, usize) {
+    let char_w = char_w.max(1.0);
     let cols = (((panel.w - 16.0) / char_w) as usize).clamp(8, 400);
     let rows = (((panel.h - 8.0) / theme::LINE_HEIGHT()) as usize).clamp(2, 200);
     (rows, cols)

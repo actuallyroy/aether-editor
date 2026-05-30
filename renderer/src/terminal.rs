@@ -12,18 +12,24 @@ use std::sync::mpsc::{channel, Receiver};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use vte::{Params, Parser, Perform};
 
-/// One terminal cell: a glyph + foreground colour (background omitted for now).
+/// One terminal cell: a glyph + foreground colour, plus an optional background
+/// (None = the panel's default background, so we skip the quad). Backgrounds are
+/// what make reverse-video cursors and colored TUIs (e.g. Claude Code) visible.
 #[derive(Clone, Copy)]
 pub struct Cell {
     pub ch: char,
     pub fg: [f32; 4],
+    pub bg: Option<[f32; 4]>,
 }
 
 const DEFAULT_FG: [f32; 4] = [0.83, 0.83, 0.83, 1.0];
+// Stand-in for the panel background, used when reverse video swaps fg/bg and the
+// cell had no explicit bg. Kept close to theme::PANEL_BG so swapped text stays legible.
+const DEFAULT_BG: [f32; 4] = [0.094, 0.098, 0.102, 1.0];
 
 impl Cell {
     fn blank() -> Self {
-        Cell { ch: ' ', fg: DEFAULT_FG }
+        Cell { ch: ' ', fg: DEFAULT_FG, bg: None }
     }
 }
 
@@ -66,10 +72,13 @@ pub struct Grid {
     pub cur_row: usize,
     pub cur_col: usize,
     cur_fg: [f32; 4],
+    cur_bg: Option<[f32; 4]>, // active background (None = default)
+    reverse: bool,            // SGR 7: swap fg/bg when writing cells
     scroll_top: usize,    // scroll region top row (inclusive)
     scroll_bottom: usize, // scroll region bottom row (inclusive)
     saved_cursor: (usize, usize),
     alt: Option<AltScreen>,
+    cursor_visible: bool, // DECTCEM (CSI ?25h/l): TUIs hide the cursor while redrawing
 }
 
 const MAX_SCROLLBACK: usize = 5000;
@@ -84,10 +93,13 @@ impl Grid {
             cur_row: 0,
             cur_col: 0,
             cur_fg: DEFAULT_FG,
+            cur_bg: None,
+            reverse: false,
             scroll_top: 0,
             scroll_bottom: rows.saturating_sub(1),
             saved_cursor: (0, 0),
             alt: None,
+            cursor_visible: true,
         }
     }
 
@@ -245,28 +257,51 @@ impl Grid {
         let flat: Vec<u16> = params.iter().map(|p| p.first().copied().unwrap_or(0)).collect();
         if flat.is_empty() {
             self.cur_fg = DEFAULT_FG;
+            self.cur_bg = None;
+            self.reverse = false;
         }
         let mut i = 0;
         while i < flat.len() {
             match flat[i] {
-                0 => self.cur_fg = DEFAULT_FG,
+                0 => {
+                    self.cur_fg = DEFAULT_FG;
+                    self.cur_bg = None;
+                    self.reverse = false;
+                }
+                7 => self.reverse = true,       // reverse video on
+                27 => self.reverse = false,     // reverse video off
                 30..=37 => self.cur_fg = ANSI[(flat[i] - 30) as usize],
                 90..=97 => self.cur_fg = ANSI[(flat[i] - 90 + 8) as usize],
                 39 => self.cur_fg = DEFAULT_FG,
-                38 => {
-                    // 38;5;n (256) or 38;2;r;g;b (truecolor) — approximate.
-                    if flat.get(i + 1) == Some(&5) {
-                        if let Some(&n) = flat.get(i + 2) {
-                            self.cur_fg = xterm256(n as u8);
-                        }
+                40..=47 => self.cur_bg = Some(ANSI[(flat[i] - 40) as usize]),
+                100..=107 => self.cur_bg = Some(ANSI[(flat[i] - 100 + 8) as usize]),
+                49 => self.cur_bg = None,
+                38 | 48 => {
+                    // 38/48;5;n (256) or 38/48;2;r;g;b (truecolor) — approximate.
+                    let is_fg = flat[i] == 38;
+                    let color = if flat.get(i + 1) == Some(&5) {
+                        let c = flat.get(i + 2).map(|&n| xterm256(n as u8));
                         i += 2;
+                        c
                     } else if flat.get(i + 1) == Some(&2) {
-                        if let (Some(&r), Some(&g), Some(&b)) =
+                        let c = if let (Some(&r), Some(&g), Some(&b)) =
                             (flat.get(i + 2), flat.get(i + 3), flat.get(i + 4))
                         {
-                            self.cur_fg = [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0];
-                        }
+                            Some([r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0])
+                        } else {
+                            None
+                        };
                         i += 4;
+                        c
+                    } else {
+                        None
+                    };
+                    if let Some(c) = color {
+                        if is_fg {
+                            self.cur_fg = c;
+                        } else {
+                            self.cur_bg = Some(c);
+                        }
                     }
                 }
                 _ => {}
@@ -301,8 +336,15 @@ impl Perform for Grid {
             self.cur_col = 0;
             self.newline();
         }
+        // Reverse video swaps fg/bg: the glyph is painted in the background colour
+        // over a block of the foreground colour (this is how cursors render).
+        let (fg, bg) = if self.reverse {
+            (self.cur_bg.unwrap_or(DEFAULT_BG), Some(self.cur_fg))
+        } else {
+            (self.cur_fg, self.cur_bg)
+        };
         if let Some(cell) = self.cells.get_mut(self.cur_row).and_then(|r| r.get_mut(self.cur_col)) {
-            *cell = Cell { ch: c, fg: self.cur_fg };
+            *cell = Cell { ch: c, fg, bg };
         }
         self.cur_col += 1;
     }
@@ -336,7 +378,8 @@ impl Perform for Grid {
                                 self.leave_alt();
                             }
                         }
-                        _ => {} // 25 (cursor vis), 2004 (bracketed paste), mouse modes — ignored
+                        25 => self.cursor_visible = set, // DECTCEM show/hide cursor
+                        _ => {} // 2004 (bracketed paste), mouse modes — ignored
                     }
                 }
             }
@@ -501,6 +544,12 @@ impl Terminal {
         (self.grid.cur_col, self.grid.cur_row)
     }
 
+    /// Whether the shell wants the cursor drawn (DECTCEM). TUIs hide it during
+    /// redraws and while showing placeholder text, parking it off the input line.
+    pub fn cursor_visible(&self) -> bool {
+        self.grid.cursor_visible
+    }
+
     /// Rich spans for the visible grid: per row, runs of same-colored cells, rows
     /// joined by '\n'. Trailing blanks per row are dropped to keep it compact.
     pub fn visual_spans(&self) -> Vec<(String, [f32; 4])> {
@@ -520,6 +569,29 @@ impl Terminal {
             }
             if ri + 1 < self.grid.cells.len() {
                 out.push(("\n".to_string(), DEFAULT_FG));
+            }
+        }
+        out
+    }
+
+    /// Background fills for the visible grid as `(row, start_col, end_col, color)`
+    /// runs of same-colored cells. Cells with the default background are skipped.
+    /// The renderer turns these into quads behind the text (reverse-video cursors,
+    /// colored TUI panels, selections, etc.).
+    pub fn bg_cells(&self) -> Vec<(usize, usize, usize, [f32; 4])> {
+        let mut out = Vec::new();
+        for (ri, row) in self.grid.cells.iter().enumerate() {
+            let mut col = 0;
+            while col < row.len() {
+                if let Some(bg) = row[col].bg {
+                    let start = col;
+                    while col < row.len() && row[col].bg == Some(bg) {
+                        col += 1;
+                    }
+                    out.push((ri, start, col, bg));
+                } else {
+                    col += 1;
+                }
             }
         }
         out

@@ -60,8 +60,9 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
 
     // Keep the terminal grid sized to its panel.
     if let Some(panel) = layout.terminal_panel {
+        let cell_w = app.terminal_cell_w;
         if let Some(t) = app.terminal.as_mut() {
-            let (rows, cols) = crate::terminal_grid_size(panel);
+            let (rows, cols) = crate::terminal_grid_size(panel, cell_w);
             let (dc, dr) = t.dims();
             if dc != cols || dr != rows {
                 t.resize(rows, cols);
@@ -284,6 +285,18 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     Shaping::Advanced,
                 );
                 gpu.ui.terminal.shape_until_scroll(fs, false);
+                // Capture the font's true monospace advance from the shaped glyphs
+                // so the block cursor maps to columns exactly (no accumulating drift).
+                if let Some(adv) = gpu
+                    .ui
+                    .terminal
+                    .layout_runs()
+                    .flat_map(|run| run.glyphs.iter())
+                    .map(|g| g.w)
+                    .find(|w| *w > 0.0)
+                {
+                    app.terminal_cell_w = adv;
+                }
             }
         }
 
@@ -597,14 +610,25 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         bg_quads.push(panel.quad(theme::PANEL_BG()));
         // Low-contrast divider on the editor/panel seam.
         bg_quads.push(Quad::new(panel.x, panel.y, panel.w, 1.0, theme::PANEL_BORDER()));
-        if app.terminal_focused {
-            if let Some(t) = app.terminal.as_ref() {
+        let char_w = app.terminal_cell_w;
+        let line_h = theme::LINE_HEIGHT();
+        if let Some(t) = app.terminal.as_ref() {
+            // Per-cell background fills (reverse-video cursor, colored TUIs) behind text.
+            for (row, c0, c1, bg) in t.bg_cells() {
+                let x = panel.x + 8.0 + c0 as f32 * char_w;
+                let y = panel.y + 4.0 + row as f32 * line_h;
+                if y + line_h <= panel.y + panel.h {
+                    bg_quads.push(Quad::new(x, y, (c1 - c0) as f32 * char_w, line_h, bg));
+                }
+            }
+            // Our own block cursor only when the shell shows the hardware cursor
+            // (DECTCEM). TUIs hide it and draw their own via reverse video above.
+            if app.terminal_focused && t.cursor_visible() {
                 let (cc, cr) = t.cursor();
-                let char_w = theme::FONT_SIZE() * 0.6;
                 let cx = panel.x + 8.0 + cc as f32 * char_w;
-                let cy = panel.y + 4.0 + cr as f32 * theme::LINE_HEIGHT();
-                if cy + theme::LINE_HEIGHT() <= panel.y + panel.h {
-                    bg_quads.push(Quad::new(cx, cy, char_w.max(2.0), theme::LINE_HEIGHT(), [0.6, 0.6, 0.6, 0.6]));
+                let cy = panel.y + 4.0 + cr as f32 * line_h;
+                if cy + line_h <= panel.y + panel.h {
+                    bg_quads.push(Quad::new(cx, cy, char_w.max(2.0), line_h, [0.6, 0.6, 0.6, 0.6]));
                 }
             }
         }
