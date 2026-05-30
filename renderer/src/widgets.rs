@@ -1744,3 +1744,93 @@ impl ExtensionList {
         }
     }
 }
+
+/// Apply a common editing/navigation key to a focused text input. Returns `None`
+/// if the key wasn't consumed, or `Some(text_changed)` if it was (so callers can
+/// re-filter only when content actually changed). Shared by every input so
+/// selection, clipboard, and caret movement behave identically.
+pub(crate) fn edit_input(
+    input: &mut TextInput,
+    fs: &mut FontSystem,
+    clip: Option<&mut arboard::Clipboard>,
+    event: &winit::event::KeyEvent,
+    ctrl: bool,
+    shift: bool,
+) -> Option<bool> {
+    use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
+    if ctrl {
+        // Match the physical key (Ctrl can turn the logical key into a control char).
+        if let PhysicalKey::Code(code) = event.physical_key {
+            match code {
+                KeyCode::KeyA => {
+                    input.select_all();
+                    return Some(false);
+                }
+                KeyCode::KeyC => {
+                    if let Some(cb) = clip {
+                        let _ = cb.set_text(input.selected_text().to_string());
+                    }
+                    return Some(false);
+                }
+                KeyCode::KeyX => {
+                    if input.has_selection() {
+                        if let Some(cb) = clip {
+                            let _ = cb.set_text(input.selected_text().to_string());
+                        }
+                        input.backspace(fs);
+                        return Some(true);
+                    }
+                    return Some(false);
+                }
+                KeyCode::KeyV => {
+                    if let Some(cb) = clip {
+                        if let Ok(t) = cb.get_text() {
+                            let t: String = t.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+                            input.insert(fs, &t);
+                            return Some(true);
+                        }
+                    }
+                    return Some(false);
+                }
+                _ => return None,
+            }
+        }
+        return None;
+    }
+    match event.logical_key.as_ref() {
+        Key::Named(NamedKey::ArrowLeft) => {
+            input.move_left(shift);
+            Some(false)
+        }
+        Key::Named(NamedKey::ArrowRight) => {
+            input.move_right(shift);
+            Some(false)
+        }
+        Key::Named(NamedKey::Home) => {
+            input.move_home(shift);
+            Some(false)
+        }
+        Key::Named(NamedKey::End) => {
+            input.move_end(shift);
+            Some(false)
+        }
+        Key::Named(NamedKey::Delete) => {
+            input.delete_forward(fs);
+            Some(true)
+        }
+        Key::Named(NamedKey::Backspace) => {
+            input.backspace(fs);
+            Some(true)
+        }
+        _ => {
+            if let Some(t) = event.text.as_ref() {
+                let s: &str = t;
+                if !s.chars().any(|c| c.is_control()) {
+                    input.insert(fs, s);
+                    return Some(true);
+                }
+            }
+            None
+        }
+    }
+}

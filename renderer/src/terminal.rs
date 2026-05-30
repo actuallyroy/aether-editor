@@ -24,8 +24,8 @@ pub struct Pane {
 }
 
 impl Pane {
-    pub fn spawn(rows: usize, cols: usize) -> Option<Pane> {
-        Terminal::spawn(rows, cols).map(|term| Pane {
+    pub fn spawn(rows: usize, cols: usize, cwd: &std::path::Path) -> Option<Pane> {
+        Terminal::spawn(rows, cols, cwd).map(|term| Pane {
             term,
             scroll: ScrollView::new(ScrollOpts {
                 vertical: true,
@@ -557,8 +557,9 @@ pub struct Terminal {
 }
 
 impl Terminal {
-    /// Spawn the platform shell in a ConPTY sized to `rows`×`cols`.
-    pub fn spawn(rows: usize, cols: usize) -> Option<Self> {
+    /// Spawn the platform shell in a ConPTY sized to `rows`×`cols`, starting in
+    /// `cwd` (the workspace root, like VSCode) when it's a real directory.
+    pub fn spawn(rows: usize, cols: usize, cwd: &std::path::Path) -> Option<Self> {
         let pty = native_pty_system();
         let pair = pty
             .openpty(PtySize { rows: rows as u16, cols: cols as u16, pixel_width: 0, pixel_height: 0 })
@@ -569,7 +570,10 @@ impl Terminal {
             .and_then(|s| s.to_str())
             .unwrap_or("shell")
             .to_string();
-        let cmd = CommandBuilder::new(shell);
+        let mut cmd = CommandBuilder::new(shell);
+        if cwd.is_dir() {
+            cmd.cwd(cwd);
+        }
         let child = pair.slave.spawn_command(cmd).ok()?;
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().ok()?;
@@ -701,4 +705,59 @@ impl Terminal {
         });
         self.grid.resize(rows, cols);
     }
+}
+
+/// Translate a key event into the bytes a shell expects on its PTY input. Returns
+/// None for keys we don't forward.
+pub(crate) fn translate_terminal_key(
+    event: &winit::event::KeyEvent,
+    ctrl: bool,
+    _shift: bool,
+) -> Option<Vec<u8>> {
+    use winit::keyboard::{Key, NamedKey};
+    match event.logical_key.as_ref() {
+        Key::Named(NamedKey::Enter) => return Some(b"\r".to_vec()),
+        Key::Named(NamedKey::Backspace) => return Some(vec![0x7f]),
+        Key::Named(NamedKey::Tab) => return Some(b"\t".to_vec()),
+        Key::Named(NamedKey::Escape) => return Some(vec![0x1b]),
+        Key::Named(NamedKey::ArrowUp) => return Some(b"\x1b[A".to_vec()),
+        Key::Named(NamedKey::ArrowDown) => return Some(b"\x1b[B".to_vec()),
+        Key::Named(NamedKey::ArrowRight) => return Some(b"\x1b[C".to_vec()),
+        Key::Named(NamedKey::ArrowLeft) => return Some(b"\x1b[D".to_vec()),
+        Key::Named(NamedKey::Home) => return Some(b"\x1b[H".to_vec()),
+        Key::Named(NamedKey::End) => return Some(b"\x1b[F".to_vec()),
+        Key::Named(NamedKey::Delete) => return Some(b"\x1b[3~".to_vec()),
+        Key::Named(NamedKey::Space) => return Some(b" ".to_vec()),
+        _ => {}
+    }
+    // Ctrl+<letter> → control byte (Ctrl+C = 0x03, etc.).
+    if ctrl {
+        if let winit::keyboard::PhysicalKey::Code(code) = event.physical_key {
+            use winit::keyboard::KeyCode;
+            let letter = match code {
+                KeyCode::KeyA => Some(b'a'),
+                KeyCode::KeyB => Some(b'b'),
+                KeyCode::KeyC => Some(b'c'),
+                KeyCode::KeyD => Some(b'd'),
+                KeyCode::KeyE => Some(b'e'),
+                KeyCode::KeyK => Some(b'k'),
+                KeyCode::KeyL => Some(b'l'),
+                KeyCode::KeyU => Some(b'u'),
+                KeyCode::KeyZ => Some(b'z'),
+                _ => None,
+            };
+            if let Some(l) = letter {
+                return Some(vec![l & 0x1f]);
+            }
+        }
+        return None;
+    }
+    // Printable text.
+    if let Some(t) = event.text.as_ref() {
+        let s: &str = t;
+        if !s.is_empty() && !s.chars().any(|c| c.is_control()) {
+            return Some(s.as_bytes().to_vec());
+        }
+    }
+    None
 }

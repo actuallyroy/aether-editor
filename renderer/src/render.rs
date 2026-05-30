@@ -19,7 +19,7 @@ use crate::quad::Quad;
 use crate::widgets::{Rect, VAlign};
 use crate::{icon, marketplace, theme};
 use crate::{
-    active_activity_idx, create_row_geometry, ext_filter_rect, ext_list_region, x_range_in_run,
+    active_activity_idx, create_row_geometry, ext_list_region, x_range_in_run,
     App, SidebarView, MENU_ACTIONS,
 };
 
@@ -62,8 +62,8 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         app.palette.active,
         // Inlined (not the App method) so these stay disjoint-field reads while
         // `gpu` holds a mutable borrow of app.gpu.
-        if app.terminal_visible {
-            Some(if app.terminal_maximized { 100_000.0 } else { app.terminal_split.size() })
+        if app.terminal.visible {
+            Some(if app.terminal.maximized { 100_000.0 } else { app.terminal.split.size() })
         } else {
             None
         },
@@ -85,9 +85,9 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
 
     // Size the active tab's split panes' grids + scroll viewports to their columns.
     if let Some(panel) = layout.terminal_panel {
-        let area = crate::terminal_pane_area(crate::terminal_content(panel), app.term_groups.len());
+        let area = crate::terminal_pane_area(crate::terminal_content(panel), app.terminal.groups.len());
         let cell_w = app.terminal_cell_w;
-        if let Some(g) = app.term_groups.get_mut(app.active_group) {
+        if let Some(g) = app.terminal.groups.get_mut(app.terminal.active) {
             let rects = crate::terminal_pane_rects(area, g.panes.len());
             for (i, pane) in g.panes.iter_mut().enumerate() {
                 let rect = rects[i];
@@ -106,14 +106,14 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // Size the scroll viewports for the extensions list + README detail page so
     // their offsets are clamped and their thumbs are positioned this frame.
     if app.sidebar_visible && app.sidebar_view == SidebarView::Extensions {
-        let region = ext_list_region(layout.tree_region());
-        let content_h = gpu.ui.ext_rows.content_height();
-        app.ext_scroll.set_metrics(region, (region.w, content_h));
+        if let Some(ep) = app.extensions_panel.as_mut() {
+            ep.update(layout.tree_region());
+        }
     }
-    if app.open_extension.is_some() {
+    if app.detail.open_extension.is_some() {
         let vp = crate::ext_detail::ExtensionDetail::body_viewport(editor_region(&layout));
         let content_h = gpu.ui.ext_detail.body_content_height(&|k| gpu.media.size(k));
-        app.ext_detail_scroll.set_metrics(vp, (vp.w, content_h));
+        app.detail.ext_detail_scroll.set_metrics(vp, (vp.w, content_h));
     } else if let Some(d) = app.workspace.active_doc_mut() {
         // Editor: size the document's scroll viewport (offset clamps here, thumbs
         // position from these metrics). Content height uses logical lines + padding.
@@ -149,13 +149,13 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         gpu.ui.sidebar_header.set(fs, header, theme::UI_FAMILY());
 
         // Extension detail page text (works for local + marketplace extensions).
-        if let Some(v) = open_ext_view(app.open_extension, &app.extensions, &app.ext_remote) {
+        if let Some(v) = open_ext_view(app.detail.open_extension, &app.extensions, &app.ext_remote) {
             let uv = gpu.icon_atlas.get(&v.key);
             let region = editor_region(&layout);
             gpu.ui.ext_detail.set(
                 fs, region, &v.name, &v.publisher, &v.category, &v.description, &v.version,
-                v.downloads, v.rating, v.supported, v.installed, uv, app.ext_readme.as_deref(),
-                app.ext_changelog.as_deref(), &app.ext_features,
+                v.downloads, v.rating, v.supported, v.installed, uv, app.detail.ext_readme.as_deref(),
+                app.detail.ext_changelog.as_deref(), &app.detail.ext_features,
             );
         }
         let ws_name = app
@@ -240,7 +240,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 tab_text.push_str(" •");
             }
         }
-        if let Some(v) = open_ext_view(app.open_extension, &app.extensions, &app.ext_remote) {
+        if let Some(v) = open_ext_view(app.detail.open_extension, &app.extensions, &app.ext_remote) {
             if !app.workspace.documents.is_empty() {
                 tab_text.push('\n');
             }
@@ -319,10 +319,10 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         // Integrated terminal: one buffer per split pane, reshaped only when that
         // pane's grid changed (pane.dirty). Advanced shaping keeps the monospace grid
         // (Basic mis-advances glyphs and drops box-drawing/powerline fallback).
-        if app.terminal_visible {
+        if app.terminal.visible {
             if let Some(panel) = layout.terminal_panel {
-                let area = crate::terminal_pane_area(crate::terminal_content(panel), app.term_groups.len());
-                let n = app.term_groups.get(app.active_group).map_or(0, |g| g.panes.len());
+                let area = crate::terminal_pane_area(crate::terminal_content(panel), app.terminal.groups.len());
+                let n = app.terminal.groups.get(app.terminal.active).map_or(0, |g| g.panes.len());
                 while gpu.ui.terminal_panes.len() < n {
                     let b = crate::widgets::make_ui_buffer_mono(fs, 4000.0, 4000.0);
                     gpu.ui.terminal_panes.push(b);
@@ -336,7 +336,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     ))
                 };
                 let rects = crate::terminal_pane_rects(area, n);
-                let panes = app.term_groups.get_mut(app.active_group).map(|g| &mut g.panes);
+                let panes = app.terminal.groups.get_mut(app.terminal.active).map(|g| &mut g.panes);
                 for (i, pane) in panes.into_iter().flatten().enumerate() {
                     if !pane.dirty {
                         continue;
@@ -370,9 +370,10 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         }
 
         // Terminal tab-list labels (only meaningful with more than one tab).
-        if app.terminal_visible && app.term_groups.len() > 1 {
+        if app.terminal.visible && app.terminal.groups.len() > 1 {
             let key: String = app
-                .term_groups
+                .terminal
+                .groups
                 .iter()
                 .enumerate()
                 .map(|(i, g)| format!("{}: {}", i + 1, g.title()))
@@ -381,14 +382,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             gpu.ui.term_tablist.set_text(fs, &key, crate::TERMINAL_TABLIST_W, 800.0);
         }
 
-        // Find-in-files results list text (collapsible file headers + match lines,
-        // no line numbers). Wide buffer so each row stays on one line (clipped at
-        // the panel edge rather than wrapping, which would break the row math).
+        // Find-in-files panel shapes its own buffers (results list, inputs, labels).
         if app.sidebar_view == SidebarView::Search {
-            let rows = crate::search::build_rows(&app.search_results, &app.search_collapsed);
-            let key: String =
-                rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join("\n");
-            gpu.ui.search_list.set_text(fs, &key, 4000.0, 12000.0);
+            if let Some(sp) = app.search.as_mut() {
+                sp.update(fs, layout.tree_region());
+            }
         }
 
         // Palette list (the input owns its own text now).
@@ -408,7 +406,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         }
 
         // Context menu items.
-        if app.context_menu.is_some() {
+        if app.explorer.context_menu.is_some() {
             let labels: Vec<&str> = MENU_ACTIONS.iter().map(|(_, l)| *l).collect();
             gpu.ui.menu.set_items(fs, &labels);
         }
@@ -458,12 +456,12 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 bg_quads.push(layout.explorer_action_rects()[i].quad(theme::MENU_HOVER()));
             }
             // Inline-create row highlight (at the insert position).
-            if let Some(pc) = app.creating.as_ref() {
+            if let Some(pc) = app.explorer.creating.as_ref() {
                 let (row_rect, _, _) = create_row_geometry(layout.tree_region(), pc.row, pc.depth);
                 bg_quads.push(row_rect.quad(theme::TREE_SELECTED()));
             }
             // Active-file highlight: the tree row matching the open document.
-            if app.creating.is_none() {
+            if app.explorer.creating.is_none() {
                 if let Some(path) = app.workspace.active_doc().and_then(|d| d.path.clone()) {
                     if let Some(idx) = app.workspace.tree.nodes.iter().position(|n| n.path == path) {
                         bg_quads.push(
@@ -485,65 +483,21 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 );
             }
         } else if app.sidebar_view == SidebarView::Extensions {
-            // Extensions view: filter box chrome (fixed at top). The scrollable rows
-            // are drawn in their own clipped pass after the main pass.
-            let fr = ext_filter_rect(layout.tree_region());
-            let border = Rect { x: fr.x - 1.0, y: fr.y - 1.0, w: fr.w + 2.0, h: fr.h + 2.0 };
-            bg_quads.push(border.rounded_quad(theme::SEARCH_BORDER(), 3.0));
-            bg_quads.push(fr.rounded_quad(theme::SEARCH_BG(), 2.0));
-        } else {
-            // Search (find-in-files) view: query box + option toggles.
-            let tree = layout.tree_region();
-            let fr = ext_filter_rect(tree);
-            let border = Rect { x: fr.x - 1.0, y: fr.y - 1.0, w: fr.w + 2.0, h: fr.h + 2.0 };
-            bg_quads.push(border.rounded_quad(theme::SEARCH_BORDER(), 3.0));
-            bg_quads.push(fr.rounded_quad(theme::SEARCH_BG(), 2.0));
-            // Option toggles (inside the box): highlight only when active.
-            let opts = crate::search_opt_rects(tree);
-            let on = [
-                app.search_opts.case_sensitive,
-                app.search_opts.whole_word,
-                app.search_opts.regex,
-            ];
-            for (i, r) in opts.iter().enumerate() {
-                if on[i] {
-                    bg_quads.push(r.rounded_quad(theme::TREE_SELECTED(), 3.0));
-                }
+            // Extensions panel: filter box chrome + selection/caret (fixed at top).
+            // The scrollable rows draw in their own clipped pass after the main pass.
+            if let Some(ep) = app.extensions_panel.as_ref() {
+                ep.draw_quads(layout.tree_region(), app.cursor_blink_on, &mut bg_quads, &mut fg_quads);
             }
-            // Replace box chrome.
-            let rr = crate::search_replace_rect(tree);
-            let rb = Rect { x: rr.x - 1.0, y: rr.y - 1.0, w: rr.w + 2.0, h: rr.h + 2.0 };
-            bg_quads.push(rb.rounded_quad(theme::SEARCH_BORDER(), 3.0));
-            bg_quads.push(rr.rounded_quad(theme::SEARCH_BG(), 2.0));
-            // "Replace All" button.
-            let ba = crate::search_replace_all_rect(tree);
-            bg_quads.push(ba.rounded_quad(theme::DIALOG_BTN(), 3.0));
-            // Results: rows, scroll viewport, and per-match highlight quads.
-            let region = crate::search_results_region(tree);
-            let rows = crate::search::build_rows(&app.search_results, &app.search_collapsed);
-            app.search_scroll
-                .set_metrics(region, (region.w, rows.len() as f32 * theme::SEARCH_ROW_H));
-            let scroll = app.search_scroll.offset().1;
-            let pad = gpu.ui.search_list.pad_x();
-            for (ri, row) in rows.iter().enumerate() {
-                if row.ranges.is_empty() {
-                    continue;
-                }
-                let y = region.y + ri as f32 * theme::SEARCH_ROW_H - scroll;
-                if y + theme::SEARCH_ROW_H < region.y || y > region.y + region.h {
-                    continue; // off-screen
-                }
-                for &(s, e) in &row.ranges {
-                    if let Some((x0, x1)) = gpu.ui.search_list.line_x_range(ri, s, e) {
-                        let qx = region.x + pad + x0;
-                        let right = region.x + region.w;
-                        let w = (x1 - x0).min((right - qx).max(0.0));
-                        if w > 0.0 {
-                            bg_quads.push(Quad::new(qx, y, w, theme::SEARCH_ROW_H, theme::FIND_MATCH()));
-                        }
-                    }
-                }
-            }
+        } else if let Some(sp) = app.search.as_ref() {
+            // Search (find-in-files) panel paints its own chrome, selection, caret,
+            // match highlights, and scrollbar overlay.
+            sp.draw_quads(
+                layout.tree_region(),
+                app.cursor_blink_on,
+                std::time::Instant::now(),
+                &mut bg_quads,
+                &mut fg_quads,
+            );
         }
         // Subtle right border.
         bg_quads.push(Quad::new(
@@ -559,8 +513,8 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // Per-tab styling — geometry from the single-source tab rects. (Inline rather
     // than App::tab_count/active_tab so we don't borrow all of `app` while `gpu` is
     // mutably held; the fields here are disjoint from `app.gpu`.)
-    let n_tabs = app.workspace.documents.len() + app.open_extension.is_some() as usize;
-    let active_tab = if app.open_extension.is_some() {
+    let n_tabs = app.workspace.documents.len() + app.detail.open_extension.is_some() as usize;
+    let active_tab = if app.detail.open_extension.is_some() {
         Some(app.workspace.documents.len())
     } else {
         app.workspace.active
@@ -615,11 +569,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     ]));
 
     // Extension detail page chrome (icon tile, Install, tabs, sidebar separator).
-    if app.open_extension.is_some() {
+    if app.detail.open_extension.is_some() {
         gpu.ui.ext_detail.draw_quads(
             editor_full,
-            app.hovered_page_install,
-            app.hovered_detail_tab,
+            app.detail.hovered_page_install,
+            app.detail.hovered_detail_tab,
             &mut bg_quads,
         );
     }
@@ -629,7 +583,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // strip / title bar above (text is clipped via its TextArea bounds; quads
     // have no implicit clip, so we clamp them here). Skipped while the extension
     // page occupies the editor area.
-    if let Some(d) = app.open_extension.is_none().then(|| app.workspace.active_doc()).flatten() {
+    if let Some(d) = app.detail.open_extension.is_none().then(|| app.workspace.active_doc()).flatten() {
         let etop = layout.editor_text.y;
         let ebot = layout.editor_text.y + layout.editor_text.h;
         let clip_v = |y: f32, h: f32| -> Option<(f32, f32)> {
@@ -728,8 +682,8 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         }
         let char_w = app.terminal_cell_w;
         let line_h = theme::LINE_HEIGHT();
-        let area = crate::terminal_pane_area(content, app.term_groups.len());
-        if let Some(g) = app.term_groups.get(app.active_group) {
+        let area = crate::terminal_pane_area(content, app.terminal.groups.len());
+        if let Some(g) = app.terminal.groups.get(app.terminal.active) {
             let rects = crate::terminal_pane_rects(area, g.panes.len());
             for (i, pane) in g.panes.iter().enumerate() {
                 let rect = rects[i];
@@ -751,7 +705,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 }
                 // Block cursor only in the focused pane, when the shell shows it
                 // (DECTCEM) and we're at the live bottom (not scrolled into history).
-                let focused = app.terminal_focused && i == g.focused;
+                let focused = app.terminal.focused && i == g.focused;
                 if focused && pane.term.cursor_visible() && at_bottom {
                     let (cc, cr) = pane.term.cursor();
                     let cx = rect.x + 8.0 + cc as f32 * char_w;
@@ -765,17 +719,17 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             }
         }
         // Terminal tab list (right side, shown when there's more than one tab).
-        if let Some(tl) = crate::terminal_tablist_rect(content, app.term_groups.len()) {
+        if let Some(tl) = crate::terminal_tablist_rect(content, app.terminal.groups.len()) {
             bg_quads.push(tl.quad(theme::SIDEBAR_BG()));
             bg_quads.push(Quad::new(tl.x, tl.y, 1.0, tl.h, theme::PANEL_BORDER()));
-            let ry = tl.y + app.active_group as f32 * theme::TREE_ROW_HEIGHT;
+            let ry = tl.y + app.terminal.active as f32 * theme::TREE_ROW_HEIGHT;
             bg_quads.push(Quad::new(tl.x, ry, tl.w, theme::TREE_ROW_HEIGHT, theme::TREE_ACTIVE_FILE()));
         }
     }
 
     // README / extension detail page scrollbar (overlay over the editor area).
-    if app.open_extension.is_some() {
-        app.ext_detail_scroll.draw(now, &mut fg_quads);
+    if app.detail.open_extension.is_some() {
+        app.detail.ext_detail_scroll.draw(now, &mut fg_quads);
     }
 
     // Status bar
@@ -829,27 +783,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         } else if let Some(fb) = layout.find_bar.as_ref() {
             fg_quads.push(gpu.ui.find_input.caret_quad(*fb, 8.0));
         }
-        if let Some(pc) = app.creating.as_ref() {
+        if let Some(pc) = app.explorer.creating.as_ref() {
             let (_, _, field) = create_row_geometry(layout.tree_region(), pc.row, pc.depth);
             fg_quads.push(gpu.create_input.caret_quad(field, 0.0));
         }
-        if app.ext_filter_active && app.sidebar_visible && app.sidebar_view == SidebarView::Extensions {
-            let fr = ext_filter_rect(layout.tree_region());
-            fg_quads.push(gpu.ui.ext_filter.caret_quad(fr, 6.0));
-        }
-        if app.search_query_active && app.sidebar_visible && app.sidebar_view == SidebarView::Search {
-            let fr = ext_filter_rect(layout.tree_region());
-            fg_quads.push(gpu.ui.search_input.caret_quad(fr, 6.0));
-        }
-        if app.search_replace_active && app.sidebar_visible && app.sidebar_view == SidebarView::Search {
-            let rr = crate::search_replace_rect(layout.tree_region());
-            fg_quads.push(gpu.ui.search_replace.caret_quad(rr, 6.0));
-        }
-    }
-
-    // Find-in-files results scrollbar (overlay).
-    if app.sidebar_visible && app.sidebar_view == SidebarView::Search {
-        app.search_scroll.draw(now, &mut fg_quads);
+        // (The Extensions and Search panels draw their carets in their own draw_quads.)
     }
 
     // Text-input selection highlights — drawn into bg_quads (under glyphs, over
@@ -860,18 +798,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     if let Some(fb) = layout.find_bar.as_ref() {
         gpu.ui.find_input.selection_quads(*fb, 8.0, &mut bg_quads);
     }
-    if app.ext_filter_active && app.sidebar_visible && app.sidebar_view == SidebarView::Extensions {
-        let fr = ext_filter_rect(layout.tree_region());
-        gpu.ui.ext_filter.selection_quads(fr, 6.0, &mut bg_quads);
-    }
-    if app.search_query_active && app.sidebar_visible && app.sidebar_view == SidebarView::Search {
-        let fr = ext_filter_rect(layout.tree_region());
-        gpu.ui.search_input.selection_quads(fr, 6.0, &mut bg_quads);
-    }
-    if app.search_replace_active && app.sidebar_visible && app.sidebar_view == SidebarView::Search {
-        let rr = crate::search_replace_rect(layout.tree_region());
-        gpu.ui.search_replace.selection_quads(rr, 6.0, &mut bg_quads);
-    }
+    // (The Extensions and Search panels draw their selection highlights in their own draw_quads.)
 
     // ---- Build text areas ----
     let active_idx = app.workspace.active;
@@ -881,7 +808,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         .prepare(&gpu.device, &gpu.queue, &bg_quads, &fg_quads, (cfg_w, cfg_h));
     // The detail-page header icon is drawn via the atlas in the main pass.
     let mut detail_icons: Vec<icon::IconInstance> = Vec::new();
-    if app.open_extension.is_some() {
+    if app.detail.open_extension.is_some() {
         if let Some(inst) = gpu.ui.ext_detail.icon_instance(editor_full) {
             detail_icons.push(inst);
         }
@@ -951,7 +878,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             // Root folder row (chevron + workspace name).
             ui.root_label
                 .draw_left(layout.root_row_rect(), 10.0, theme::FG_TEXT(), &mut areas);
-            if let Some(pc) = app.creating.as_ref() {
+            if let Some(pc) = app.explorer.creating.as_ref() {
                 let rowh = theme::TREE_ROW_HEIGHT;
                 let (_, icon_rect, field) = create_row_geometry(tr, pc.row, pc.depth);
                 if pc.row > 0 {
@@ -971,65 +898,17 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             } else {
                 ui.sidebar.draw(tr, theme::FG_TEXT(), &mut areas);
             }
-        } else if app.sidebar_view == SidebarView::Extensions {
+        } else if let Some(ep) = (app.sidebar_view == SidebarView::Extensions)
+            .then(|| app.extensions_panel.as_ref())
+            .flatten()
+        {
             // Extensions filter box text (fixed). The scrollable row text is drawn
             // in the dedicated clipped pass after the main pass.
-            let fr = ext_filter_rect(tr);
-            let fc = if ui.ext_filter.text().is_empty() { theme::FG_DIM() } else { theme::FG_TEXT() };
-            ui.ext_filter.draw(fr, 6.0, fc, &mut areas);
-        } else {
-            // Search view: query text, option-toggle captions, and the results list.
-            let fr = ext_filter_rect(tr);
-            let fc = if ui.search_input.text().is_empty() { theme::FG_DIM() } else { theme::FG_TEXT() };
-            ui.search_input.draw(fr, 6.0, fc, &mut areas);
-            let opts = crate::search_opt_rects(tr);
-            let on = [
-                app.search_opts.case_sensitive,
-                app.search_opts.whole_word,
-                app.search_opts.regex,
-            ];
-            for (i, r) in opts.iter().enumerate() {
-                let lbl = &ui.search_opt_labels[i];
-                let left = r.x + (r.w - lbl.width()) * 0.5;
-                let color = if on[i] { theme::FG_ACTIVE() } else { theme::FG_DIM() };
-                lbl.push(left, *r, color, &mut areas);
-            }
-            // Replace box text + "Replace All" button caption.
-            let rr = crate::search_replace_rect(tr);
-            let rc = if ui.search_replace.text().is_empty() { theme::FG_DIM() } else { theme::FG_TEXT() };
-            ui.search_replace.draw(rr, 6.0, rc, &mut areas);
-            let ba = crate::search_replace_all_rect(tr);
-            let bl = &ui.replace_all_label;
-            bl.push(ba.x + (ba.w - bl.width()) * 0.5, ba, theme::FG_TEXT(), &mut areas);
-            // Results list, scrolled + clipped to its region. Match lines render in
-            // the normal foreground; file headers are overdrawn brighter and get a
-            // codicon chevron, so file names stand out from their match contents.
-            let region = crate::search_results_region(tr);
-            let scroll = app.search_scroll.offset().1;
-            ui.search_list
-                .draw_at(region, region.y - scroll, theme::FG_TEXT(), &mut areas);
-            let rows = crate::search::build_rows(&app.search_results, &app.search_collapsed);
-            for (ri, row) in rows.iter().enumerate() {
-                if row.line.is_some() {
-                    continue; // only file headers get the bright pass + chevron
-                }
-                let y = region.y + ri as f32 * theme::SEARCH_ROW_H - scroll;
-                if y + theme::SEARCH_ROW_H < region.y || y > region.y + region.h {
-                    continue;
-                }
-                let top = y.max(region.y);
-                let band = Rect {
-                    x: region.x,
-                    y: top,
-                    w: region.w,
-                    h: ((y + theme::SEARCH_ROW_H) - top).max(0.0),
-                };
-                ui.search_list.draw_at(band, region.y - scroll, theme::FG_ACTIVE(), &mut areas);
-                let collapsed = app.search_collapsed.contains(&row.file);
-                let chev = &gpu.search_chevrons[collapsed as usize];
-                let cr = Rect { x: region.x + 4.0, y, w: 16.0, h: theme::SEARCH_ROW_H };
-                chev.draw(cr, theme::FG_DIM(), &mut areas);
-            }
+            ep.draw_text(tr, &mut areas);
+        } else if let Some(sp) = app.search.as_ref() {
+            // Search panel renders its own text (inputs, toggle captions, results
+            // list with bright file headers + chevrons).
+            sp.draw_text(tr, &mut areas);
         }
     }
 
@@ -1077,11 +956,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     }
 
     // Editor area: either the extension detail page or the document.
-    if app.open_extension.is_some() {
+    if app.detail.open_extension.is_some() {
         let size_of = |k: &str| gpu.media.size(k);
         ui.ext_detail.draw_text(
             editor_region(&layout),
-            app.ext_detail_scroll.offset().1,
+            app.detail.ext_detail_scroll.offset().1,
             &size_of,
             &mut areas,
             &mut detail_img_rects,
@@ -1124,7 +1003,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     }
 
     // Panel header (VSCode-style tabs + stub icon buttons) and terminal grid text.
-    if app.terminal_visible {
+    if app.terminal.visible {
         if let Some(panel) = layout.terminal_panel {
             let content = crate::terminal_content(panel);
             let header = Rect { x: panel.x, y: panel.y, w: panel.w, h: theme::TERMINAL_HEADER_H };
@@ -1144,8 +1023,8 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 }
             }
             // Each split pane's grid text in the active tab, clipped to its column.
-            let area = crate::terminal_pane_area(content, app.term_groups.len());
-            let n = app.term_groups.get(app.active_group).map_or(0, |g| g.panes.len());
+            let area = crate::terminal_pane_area(content, app.terminal.groups.len());
+            let n = app.terminal.groups.get(app.terminal.active).map_or(0, |g| g.panes.len());
             for (i, r) in crate::terminal_pane_rects(area, n).into_iter().enumerate() {
                 if let Some(buf) = ui.terminal_panes.get(i) {
                     areas.push(TextArea {
@@ -1165,9 +1044,9 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 }
             }
             // Tab-list labels + per-tab close (×) buttons (right-side switcher).
-            if let Some(tl) = crate::terminal_tablist_rect(content, app.term_groups.len()) {
+            if let Some(tl) = crate::terminal_tablist_rect(content, app.terminal.groups.len()) {
                 ui.term_tablist.draw(tl, theme::FG_TEXT(), &mut areas);
-                for row in 0..app.term_groups.len() {
+                for row in 0..app.terminal.groups.len() {
                     gpu.tab_close_btn.draw(
                         crate::terminal_tab_close_rect(tl, row),
                         theme::FG_TEXT(),
@@ -1227,23 +1106,23 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     gpu.queue.submit(Some(encoder.finish()));
 
     // ---- README images: request any referenced by the active tab, then draw ----
-    if app.open_extension.is_some() {
+    if app.detail.open_extension.is_some() {
         // Drive fetching from ALL image URLs in the active body (not just loaded
         // ones) — otherwise nothing would ever load (the draw list only holds
         // already-loaded images). Clone to drop the gpu.ui borrow before fetching.
         use marketplace::ImgSource;
         let urls: Vec<String> = gpu.ui.ext_detail.image_urls().to_vec();
         for key in &urls {
-            if gpu.media.has(key) || app.requested_images.contains(key) {
+            if gpu.media.has(key) || app.detail.requested_images.contains(key) {
                 continue;
             }
-            app.requested_images.insert(key.clone());
+            app.detail.requested_images.insert(key.clone());
             // Resolve to a source; fetch+decode happens off-thread either way.
             let src = if key.starts_with("http://") || key.starts_with("https://") {
                 Some(ImgSource::Http(key.clone()))
-            } else if let Some(dir) = &app.ext_img_dir {
+            } else if let Some(dir) = &app.detail.ext_img_dir {
                 Some(ImgSource::File(dir.join(key.trim_start_matches("./"))))
-            } else if let Some(base) = &app.ext_img_base {
+            } else if let Some(base) = &app.detail.ext_img_base {
                 marketplace::join_url(base, key).map(ImgSource::Http)
             } else {
                 None
@@ -1255,10 +1134,10 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     }
 
     // Draw loaded images + link underlines in a clipped pass over the README body.
-    if app.open_extension.is_some() {
+    if app.detail.open_extension.is_some() {
         let region = editor_region(&layout);
         let clip = crate::ext_detail::ExtensionDetail::body_viewport(region);
-        let scroll = app.ext_detail_scroll.offset().1;
+        let scroll = app.detail.ext_detail_scroll.offset().1;
         // Link underlines (thin lines under each link fragment, in the link color).
         let lc = theme::FG_ACTIVE();
         let ul_color = [lc.r() as f32 / 255.0, lc.g() as f32 / 255.0, lc.b() as f32 / 255.0, 1.0];
@@ -1305,19 +1184,20 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         && app.sidebar_view == SidebarView::Extensions
     {
         let region = ext_list_region(layout.tree_region());
-        let scroll = app.ext_scroll.offset().1;
+        // The panel supplies the draw data; the GPU pass plumbing stays here.
+        let ep = app.extensions_panel.as_ref();
         let mut eq: Vec<Quad> = Vec::new();
-        gpu.ui.ext_rows.draw_quads(region, scroll, app.hovered_ext, &mut eq);
+        let mut efg: Vec<Quad> = Vec::new(); // scrollbar thumb (clipped by the scissor below)
         let mut einst: Vec<icon::IconInstance> = Vec::new();
-        gpu.ui.ext_rows.icon_instances(region, scroll, &mut einst);
-        // Scrollbar thumb as a foreground quad so it sits above the rows (clipped
-        // to the region by the pass scissor below).
-        let mut efg: Vec<Quad> = Vec::new();
-        app.ext_scroll.draw(now, &mut efg);
+        if let Some(ep) = ep {
+            ep.list_pass_data(layout.tree_region(), now, &mut eq, &mut efg, &mut einst);
+        }
         gpu.quad_renderer.prepare(&gpu.device, &gpu.queue, &eq, &efg, (cfg_w, cfg_h));
         gpu.icon_atlas.prepare(&gpu.device, &gpu.queue, &einst, (cfg_w, cfg_h));
         let mut eareas: Vec<TextArea> = Vec::new();
-        gpu.ui.ext_rows.draw_text(region, scroll, &mut eareas);
+        if let Some(ep) = ep {
+            ep.list_areas(layout.tree_region(), &mut eareas);
+        }
         gpu.text_renderer.prepare(
             &gpu.device,
             &gpu.queue,
@@ -1360,10 +1240,10 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     }
 
     // ---- Context menu overlay (second pass, drawn over everything) ----
-    if let Some(cm) = app.context_menu.as_ref() {
+    if let Some(cm) = app.explorer.context_menu.as_ref() {
         let menu = gpu.ui.menu.rect(cm.anchor, (cfg_w as f32, cfg_h as f32));
         let mut mq: Vec<Quad> = Vec::new();
-        gpu.ui.menu.draw_bg(menu, app.hovered_menu_item, &mut mq);
+        gpu.ui.menu.draw_bg(menu, app.explorer.hovered_menu_item, &mut mq);
         gpu.quad_renderer
             .prepare(&gpu.device, &gpu.queue, &mq, &[], (cfg_w, cfg_h));
         let mut mareas: Vec<TextArea> = Vec::new();

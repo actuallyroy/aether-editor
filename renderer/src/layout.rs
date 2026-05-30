@@ -4,6 +4,7 @@
 
 use crate::theme;
 use crate::widgets::Rect;
+use crate::SidebarView;
 
 pub struct Layout {
     pub title_bar: Rect,
@@ -300,4 +301,145 @@ impl Layout {
             h: s,
         }
     }
+}
+
+// ===== Free-standing region geometry (moved out of main.rs) =====
+// These derive sub-region rects from a parent rect; re-exported at the crate root
+// so existing `crate::<fn>` references keep working.
+
+pub(crate) fn create_row_geometry(tr: Rect, row: usize, depth: usize) -> (Rect, Rect, Rect) {
+    let row_y = tr.y + row as f32 * theme::TREE_ROW_HEIGHT;
+    // Match the file tree: 12px left pad + ~8px per depth, left-aligned icon.
+    let indent = 12.0 + depth as f32 * 8.0;
+    let icon_w = 16.0;
+    let row_rect = Rect { x: tr.x, y: row_y, w: tr.w, h: theme::TREE_ROW_HEIGHT };
+    let icon_rect = Rect { x: tr.x + indent, y: row_y, w: icon_w, h: theme::TREE_ROW_HEIGHT };
+    let field = Rect {
+        x: tr.x + indent + icon_w + 4.0,
+        y: row_y,
+        w: (tr.w - indent - icon_w - 4.0).max(0.0),
+        h: theme::TREE_ROW_HEIGHT,
+    };
+    (row_rect, icon_rect, field)
+}
+
+/// The activity-bar icon index that's currently "active" (highlighted).
+pub(crate) fn active_activity_idx(sidebar_visible: bool, view: SidebarView) -> Option<usize> {
+    if !sidebar_visible {
+        return None;
+    }
+    match view {
+        SidebarView::Explorer => Some(0),
+        SidebarView::Search => Some(1),
+        SidebarView::Extensions => Some(4),
+    }
+}
+
+/// The search/filter box rect at the top of the Extensions sidebar.
+pub(crate) fn ext_filter_rect(tree: Rect) -> Rect {
+    Rect { x: tree.x + 10.0, y: tree.y + 8.0, w: tree.w - 20.0, h: 30.0 }
+}
+
+/// The scrollable extension-row list region (below the filter box).
+pub(crate) fn ext_list_region(tree: Rect) -> Rect {
+    const STRIP: f32 = 46.0; // filter box + padding
+    Rect { x: tree.x, y: tree.y + STRIP, w: tree.w, h: (tree.h - STRIP).max(0.0) }
+}
+
+/// Right-aligned icon-button rects in the terminal panel header, drawn left→right
+/// as: +, split, trash, …, maximize, close (6 buttons — matches `GpuState::terminal_btns`).
+pub(crate) const TERMINAL_HEADER_BTNS: usize = 6;
+pub(crate) fn terminal_header_button_rects(panel: Rect) -> Vec<Rect> {
+    let bw = 28.0;
+    let right = panel.x + panel.w - 8.0;
+    let start_x = right - TERMINAL_HEADER_BTNS as f32 * bw;
+    (0..TERMINAL_HEADER_BTNS)
+        .map(|i| Rect { x: start_x + i as f32 * bw, y: panel.y, w: bw, h: theme::TERMINAL_HEADER_H })
+        .collect()
+}
+
+pub(crate) const TERMINAL_TABLIST_W: f32 = 160.0;
+
+/// The right-side terminal-tab list rect — shown (VSCode-style) only when there's
+/// more than one tab, so a single terminal still uses the full width.
+pub(crate) fn terminal_tablist_rect(content: Rect, group_count: usize) -> Option<Rect> {
+    if group_count <= 1 {
+        return None;
+    }
+    let w = TERMINAL_TABLIST_W.min(content.w * 0.4);
+    Some(Rect { x: content.x + content.w - w, y: content.y, w, h: content.h })
+}
+
+/// The pane area: the content minus the tab list (when the list is shown).
+pub(crate) fn terminal_pane_area(content: Rect, group_count: usize) -> Rect {
+    match terminal_tablist_rect(content, group_count) {
+        Some(tl) => Rect { w: (content.w - tl.w).max(1.0), ..content },
+        None => content,
+    }
+}
+
+/// The close (×) button rect for terminal tab-list row `row`.
+pub(crate) fn terminal_tab_close_rect(tl: Rect, row: usize) -> Rect {
+    let s = 18.0;
+    Rect {
+        x: tl.x + tl.w - s - 6.0,
+        y: tl.y + row as f32 * theme::TREE_ROW_HEIGHT + (theme::TREE_ROW_HEIGHT - s) * 0.5,
+        w: s,
+        h: s,
+    }
+}
+
+/// Split the terminal pane area into `n` side-by-side pane rects (1px gaps).
+pub(crate) fn terminal_pane_rects(content: Rect, n: usize) -> Vec<Rect> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let gap = 1.0;
+    let w = ((content.w - gap * (n - 1) as f32) / n as f32).max(1.0);
+    (0..n)
+        .map(|i| Rect { x: content.x + i as f32 * (w + gap), y: content.y, w, h: content.h })
+        .collect()
+}
+
+/// The terminal text/grid area: the panel minus the header strip at its top.
+pub(crate) fn terminal_content(panel: Rect) -> Rect {
+    let h = theme::TERMINAL_HEADER_H;
+    Rect {
+        x: panel.x,
+        y: panel.y + h,
+        w: panel.w,
+        h: (panel.h - h).max(0.0),
+    }
+}
+
+/// Rows/cols that fit `panel` for a monospace cell of `char_w` px wide. Using the
+/// real measured advance keeps the PTY's column count matched to what's rendered.
+pub(crate) fn terminal_grid_size(panel: Rect, char_w: f32) -> (usize, usize) {
+    let char_w = char_w.max(1.0);
+    let cols = (((panel.w - 16.0) / char_w) as usize).clamp(8, 400);
+    let rows = (((panel.h - 8.0) / theme::LINE_HEIGHT()) as usize).clamp(2, 200);
+    (rows, cols)
+}
+
+/// The x-pixel range (start, end) within a shaped layout run for byte columns
+/// `[col_start, col_end)` — used for selection/match highlight rects.
+pub(crate) fn x_range_in_run(
+    run: &glyphon::cosmic_text::LayoutRun,
+    col_start: usize,
+    col_end: usize,
+) -> (f32, f32) {
+    let mut x_start: Option<f32> = if col_start == 0 { Some(0.0) } else { None };
+    let mut x_end: Option<f32> = None;
+    let mut last_end = 0.0f32;
+    for glyph in run.glyphs.iter() {
+        let g_start = glyph.start as usize;
+        if x_start.is_none() && g_start >= col_start {
+            x_start = Some(glyph.x);
+        }
+        if x_end.is_none() && g_start >= col_end {
+            x_end = Some(glyph.x);
+        }
+        last_end = glyph.x + glyph.w;
+    }
+    (x_start.unwrap_or(last_end), x_end.unwrap_or(last_end))
 }

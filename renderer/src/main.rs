@@ -26,10 +26,10 @@ mod syntax;
 mod terminal;
 mod textmate;
 mod theme;
+mod ui;
 mod widgets;
 mod workspace;
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
@@ -52,7 +52,16 @@ use extensions::{ExtKind, Extension, OpenExt};
 use marketplace::WorkerMsg;
 use gpu::GpuState;
 use layout::Layout;
-use widgets::{Rect, ScrollView, Splitter};
+// Region-geometry helpers live in `layout`; re-exported at the crate root so
+// existing `crate::<fn>` references (render.rs, panels) keep resolving.
+pub(crate) use layout::{
+    active_activity_idx, create_row_geometry, ext_filter_rect, ext_list_region,
+    terminal_content, terminal_grid_size, terminal_header_button_rects, terminal_pane_area,
+    terminal_pane_rects, terminal_tab_close_rect, terminal_tablist_rect, x_range_in_run,
+    TERMINAL_TABLIST_W,
+};
+pub(crate) use terminal::translate_terminal_key;
+pub(crate) use widgets::{edit_input, Rect, Splitter};
 use workspace::Workspace;
 
 
@@ -133,7 +142,9 @@ pub(crate) struct App {
     pub(crate) gpu: Option<GpuState>,
     pub(crate) mouse_pos: PhysicalPosition<f64>,
     pub(crate) mouse_pressed: bool,
-    pub(crate) dragging_editor: bool,
+    /// Editor view interaction state (drag-select, multi-click). Logic lives in
+    /// `ui::editor_view::EditorView`; accessed as `self.editor`.
+    pub(crate) editor: ui::editor_view::EditorView,
     pub(crate) mods: ModifiersState,
     pub(crate) clipboard: Option<Clipboard>,
     pub(crate) sidebar_visible: bool,
@@ -151,56 +162,33 @@ pub(crate) struct App {
     pub(crate) hovered_layout: Option<usize>,
     pub(crate) hovered_explorer: Option<usize>,
     pub(crate) selected_tree: Option<usize>,
-    pub(crate) creating: Option<PendingCreate>,
-    pub(crate) context_menu: Option<ContextMenu>,
-    pub(crate) hovered_menu_item: Option<usize>,
+    /// Explorer file-tree panel — owns the inline create/rename field state.
+    /// Accessed as `self.explorer.creating`.
+    pub(crate) explorer: ui::explorer_panel::ExplorerPanel,
     pub(crate) dialog: Option<DialogState>,
     pub(crate) skip_delete_confirm: bool,
     pub(crate) last_click: Instant,
     pub(crate) last_click_pos: (f32, f32),
-    pub(crate) click_count: u32,
     pub(crate) sidebar_view: SidebarView,
-    // Find-in-files (Search view) state.
-    pub(crate) search_query_active: bool,        // query input has keyboard focus
-    pub(crate) search_replace_active: bool,      // replace input has keyboard focus
-    pub(crate) search_opts: search::SearchOpts,  // case / whole-word / regex toggles
-    pub(crate) search_results: Vec<search::FileMatches>,
-    pub(crate) search_scroll: ScrollView,        // results list viewport
-    pub(crate) find_gen: u64,                    // discards stale find-in-files results
-    pub(crate) find_pending: bool,               // a background search is streaming results
-    pub(crate) search_collapsed: HashSet<usize>, // collapsed result file groups
+    // Find-in-files (Search view): a self-contained panel (built once the GPU/font
+    // system exists, in `resumed`). Owns all of its own state + buffers.
+    pub(crate) search: Option<ui::search_panel::SearchPanel>,
+    pub(crate) extensions_panel: Option<ui::extensions_panel::ExtensionsPanel>,
     pub(crate) extensions: Vec<Extension>,
-    pub(crate) hovered_ext: Option<usize>,
     pub(crate) text_drag: Option<InputId>, // active mouse drag-selection in a text input
-    pub(crate) ext_filter_active: bool,
-    pub(crate) ext_visible: Vec<usize>, // displayed row index -> index into the active source
-    pub(crate) ext_scroll: ScrollView,
     pub(crate) ext_remote: Vec<marketplace::RemoteExt>, // current marketplace search results
-    pub(crate) ext_showing_remote: bool,                // true while a search query is active
-    pub(crate) search_gen: u64,                         // discards stale background search results
     pub(crate) worker_tx: Sender<WorkerMsg>,
     pub(crate) worker_rx: Receiver<WorkerMsg>,
-    pub(crate) open_extension: Option<OpenExt>, // extension detail page open in the editor area
-    pub(crate) ext_readme: Option<String>,      // README text for the open detail page
-    pub(crate) ext_changelog: Option<String>,   // CHANGELOG text for the open detail page
-    pub(crate) ext_features: String,            // generated Features-tab markdown
-    pub(crate) ext_doc_gen: u64,                // discards stale async README/changelog fetches
-    pub(crate) ext_img_dir: Option<PathBuf>,    // base dir for relative README images (local)
-    pub(crate) ext_img_base: Option<String>,    // base URL for relative README images (remote)
-    pub(crate) requested_images: HashSet<String>, // README image keys already fetched/loading
-    pub(crate) ext_detail_scroll: ScrollView,   // detail-page body scroll
-    pub(crate) hovered_detail_tab: Option<ext_detail::DetailTab>,
-    pub(crate) hovered_page_install: bool,
+    /// Extension detail page (README/CHANGELOG/Features). All its state lives in
+    /// `ui::ext_detail_view::ExtDetailView`; accessed as `self.detail.*`.
+    pub(crate) detail: ui::ext_detail_view::ExtDetailView,
     pub(crate) pending_close: bool,
     // Integrated terminal tabs. Each group is a tab (`+` adds one); within a tab,
     // panes are shown side-by-side (split). Only the active group is visible; the
     // rest keep running in the background. No shell is ever discarded.
-    pub(crate) term_groups: Vec<terminal::Group>,
-    pub(crate) active_group: usize,
-    pub(crate) terminal_visible: bool,
-    pub(crate) terminal_focused: bool,
-    pub(crate) terminal_split: Splitter, // draggable panel height
-    pub(crate) terminal_maximized: bool, // header maximize toggle (fills the content area)
+    /// Integrated terminal state — see `ui::terminal_panel::TerminalPanel`. Accessed
+    /// as `self.terminal.{groups,active,visible,focused,split,maximized}`.
+    pub(crate) terminal: ui::terminal_panel::TerminalPanel,
     // Real monospace cell advance (px), measured from the shaped terminal buffer.
     // The cursor and grid sizing use this instead of an estimate so the block
     // cursor lands exactly on the glyph cell (no per-column drift).
@@ -218,11 +206,11 @@ impl App {
         Self {
             cwd: root.clone(),
             initial_file,
-            workspace: Workspace::new(root),
+            workspace: Workspace::new(root.clone()),
             gpu: None,
             mouse_pos: PhysicalPosition::new(0.0, 0.0),
             mouse_pressed: false,
-            dragging_editor: false,
+            editor: ui::editor_view::EditorView::new(),
             mods: ModifiersState::empty(),
             clipboard: Clipboard::new().ok(),
             sidebar_visible: true,
@@ -245,58 +233,23 @@ impl App {
             hovered_layout: None,
             hovered_explorer: None,
             selected_tree: None,
-            creating: None,
-            context_menu: None,
-            hovered_menu_item: None,
+            explorer: ui::explorer_panel::ExplorerPanel::new(),
             dialog: None,
             skip_delete_confirm: false,
             last_click: Instant::now(),
             last_click_pos: (0.0, 0.0),
-            click_count: 0,
             sidebar_view: SidebarView::Explorer,
-            search_query_active: false,
-            search_replace_active: false,
-            search_opts: search::SearchOpts::default(),
-            search_results: Vec::new(),
-            search_scroll: ScrollView::new(widgets::ScrollOpts::vertical()),
-            find_gen: 0,
-            find_pending: false,
-            search_collapsed: HashSet::new(),
+            search: None, // built in `resumed` once the font system exists
+            extensions_panel: None, // built in `resumed`
             extensions: Vec::new(),
-            hovered_ext: None,
             text_drag: None,
-            ext_filter_active: false,
-            ext_visible: Vec::new(),
-            ext_scroll: ScrollView::new(widgets::ScrollOpts::vertical()),
             ext_remote: Vec::new(),
-            ext_showing_remote: false,
-            search_gen: 0,
             worker_tx,
             worker_rx,
-            open_extension: None,
-            ext_readme: None,
-            ext_changelog: None,
-            ext_features: String::new(),
-            ext_doc_gen: 0,
-            ext_img_dir: None,
-            ext_img_base: None,
-            requested_images: HashSet::new(),
-            ext_detail_scroll: ScrollView::new(widgets::ScrollOpts::vertical()),
-            hovered_detail_tab: None,
-            hovered_page_install: false,
+            detail: ui::ext_detail_view::ExtDetailView::new(),
             pending_close: false,
-            term_groups: Vec::new(),
-            active_group: 0,
-            terminal_visible: false,
-            terminal_focused: false,
-            terminal_split: Splitter::new(
-                theme::TERMINAL_HEIGHT,
-                theme::TERMINAL_MIN_HEIGHT,
-                theme::TERMINAL_MAX_HEIGHT,
-                widgets::Axis::Vertical,
-            ),
+            terminal: ui::terminal_panel::TerminalPanel::new(root.clone()),
             terminal_cell_w: theme::FONT_SIZE() * 0.6, // refined after first shape
-            terminal_maximized: false,
             cursor_blink_on: true,
             last_blink: Instant::now(),
             last_edit: Instant::now(),
@@ -343,10 +296,10 @@ impl App {
         }
 
         // Context menu (modal) captures hover when open.
-        if self.context_menu.is_some() {
-            let new_item = self.context_menu_item_at(p);
-            if new_item != self.hovered_menu_item {
-                self.hovered_menu_item = new_item;
+        if self.explorer.menu_open() {
+            let new_item = self.gpu.as_ref().and_then(|g| self.explorer.menu_item_at(p, g));
+            if new_item != self.explorer.hovered_menu_item {
+                self.explorer.hovered_menu_item = new_item;
                 self.redraw();
             }
             let cursor = if new_item.is_some() {
@@ -443,47 +396,46 @@ impl App {
             changed = true;
         }
 
-        let new_ext = if self.sidebar_visible
-            && layout.palette.is_none()
+        // Extensions panel owns its own row-hover state; drive it (and the scroll
+        // fade) below in the hover section.
+        if self.sidebar_visible
             && self.sidebar_view == SidebarView::Extensions
+            && layout.palette.is_none()
         {
-            let region = ext_list_region(layout.tree_region());
-            let scroll = self.ext_scroll.offset().1;
-            self.gpu.as_ref().and_then(|g| g.ui.ext_rows.hit(region, scroll, p))
-        } else {
-            None
-        };
-        if new_ext != self.hovered_ext {
-            self.hovered_ext = new_ext;
-            changed = true;
+            let region = layout.tree_region();
+            if let Some(ep) = self.extensions_panel.as_mut() {
+                if ep.hover(p, region) {
+                    changed = true;
+                }
+            }
         }
 
-        let new_page_install = if self.open_extension.is_some() {
+        let new_page_install = if self.detail.open_extension.is_some() {
             let region = render::editor_region(&layout);
             self.gpu.as_ref().map(|g| g.ui.ext_detail.hit_install(region, p)).unwrap_or(false)
         } else {
             false
         };
 
-        let new_detail_tab = if self.open_extension.is_some() {
+        let new_detail_tab = if self.detail.open_extension.is_some() {
             let region = render::editor_region(&layout);
             self.gpu.as_ref().and_then(|g| g.ui.ext_detail.hit_tab(region, p))
         } else {
             None
         };
-        if new_detail_tab != self.hovered_detail_tab {
-            self.hovered_detail_tab = new_detail_tab;
+        if new_detail_tab != self.detail.hovered_detail_tab {
+            self.detail.hovered_detail_tab = new_detail_tab;
             changed = true;
         }
-        if new_page_install != self.hovered_page_install {
-            self.hovered_page_install = new_page_install;
+        if new_page_install != self.detail.hovered_page_install {
+            self.detail.hovered_page_install = new_page_install;
             changed = true;
         }
 
         // Hovering a README link → pointer cursor.
-        let over_detail_link = if self.open_extension.is_some() {
+        let over_detail_link = if self.detail.open_extension.is_some() {
             let region = render::editor_region(&layout);
-            let scroll = self.ext_detail_scroll.offset().1;
+            let scroll = self.detail.ext_detail_scroll.offset().1;
             self.gpu
                 .as_ref()
                 .map(|g| {
@@ -501,7 +453,7 @@ impl App {
         // whether the pointer is over a scrollbar thumb (so the cursor stays the
         // default arrow rather than the editor I-beam).
         let mut over_scroll_thumb = false;
-        let editing = self.open_extension.is_none();
+        let editing = self.detail.open_extension.is_none();
         let ed_inside = editing && layout.editor_text.contains(p);
         if let Some(d) = self.workspace.active_doc_mut() {
             if d.scroll.hover(ed_inside) {
@@ -511,47 +463,25 @@ impl App {
                 over_scroll_thumb = true;
             }
         }
-        if self.terminal_visible {
-            if let Some(panel) = layout.terminal_panel {
-                let area = terminal_pane_area(terminal_content(panel), self.term_groups.len());
-                let n = self.active_pane_count();
-                let rects = terminal_pane_rects(area, n);
-                if let Some(g) = self.term_groups.get_mut(self.active_group) {
-                    for (i, pane) in g.panes.iter_mut().enumerate() {
-                        let inside = rects.get(i).map_or(false, |r| r.contains(p));
-                        if pane.scroll.hover(inside) {
-                            changed = true;
-                        }
-                        if inside && pane.scroll.cursor(p).is_some() {
-                            over_scroll_thumb = true;
-                        }
-                    }
+        let (term_changed, term_thumb) = self.terminal.hover_panes(p, &layout);
+        if term_changed {
+            changed = true;
+        }
+        if term_thumb {
+            over_scroll_thumb = true;
+        }
+        if self.sidebar_visible && self.sidebar_view == SidebarView::Search {
+            if let Some(sp) = self.search.as_mut() {
+                if sp.hover(p, layout.tree_region()) {
+                    changed = true;
                 }
             }
         }
-        let ext_inside = self.sidebar_visible
-            && self.sidebar_view == SidebarView::Extensions
-            && ext_list_region(layout.tree_region()).contains(p);
-        if self.ext_scroll.hover(ext_inside) {
+        let det_inside = self.detail.open_extension.is_some() && layout.editor_text.contains(p);
+        if self.detail.ext_detail_scroll.hover(det_inside) {
             changed = true;
         }
-        if ext_inside && self.ext_scroll.cursor(p).is_some() {
-            over_scroll_thumb = true;
-        }
-        let search_inside = self.sidebar_visible
-            && self.sidebar_view == SidebarView::Search
-            && search_results_region(layout.tree_region()).contains(p);
-        if self.search_scroll.hover(search_inside) {
-            changed = true;
-        }
-        if search_inside && self.search_scroll.cursor(p).is_some() {
-            over_scroll_thumb = true;
-        }
-        let det_inside = self.open_extension.is_some() && layout.editor_text.contains(p);
-        if self.ext_detail_scroll.hover(det_inside) {
-            changed = true;
-        }
-        if det_inside && self.ext_detail_scroll.cursor(p).is_some() {
+        if det_inside && self.detail.ext_detail_scroll.cursor(p).is_some() {
             over_scroll_thumb = true;
         }
 
@@ -564,19 +494,19 @@ impl App {
         let over_term_handle = layout.palette.is_none()
             && layout
                 .terminal_panel
-                .map_or(false, |panel| self.terminal_split.handle_rect(panel).contains(p));
+                .map_or(false, |panel| self.terminal.split.handle_rect(panel).contains(p));
         // Terminal panel header buttons + tab-list rows are clickable IconButtons/rows.
-        let over_term_btn = self.terminal_visible
+        let over_term_btn = self.terminal.visible
             && layout.palette.is_none()
             && layout.terminal_panel.map_or(false, |panel| {
                 terminal_header_button_rects(panel).iter().any(|r| r.contains(p))
-                    || terminal_tablist_rect(terminal_content(panel), self.term_groups.len())
+                    || terminal_tablist_rect(terminal_content(panel), self.terminal.groups.len())
                         .map_or(false, |tl| tl.contains(p))
             });
         let new_cursor = if self.sidebar_split.is_dragging() || over_handle {
             self.sidebar_split.cursor()
-        } else if self.terminal_split.is_dragging() || over_term_handle {
-            self.terminal_split.cursor()
+        } else if self.terminal.split.is_dragging() || over_term_handle {
+            self.terminal.split.cursor()
         } else if over_term_btn {
             CursorIcon::Pointer
         } else if new_search {
@@ -599,18 +529,29 @@ impl App {
                 .as_ref()
                 .map(|g| g.explorer_btns[i].cursor())
                 .unwrap_or(CursorIcon::Default)
-        } else if self.sidebar_visible
-            && self.sidebar_view == SidebarView::Search
-            && (search_opt_rects(layout.tree_region()).iter().any(|r| r.contains(p))
-                || search_results_region(layout.tree_region()).contains(p))
+        } else if let Some(c) = (self.sidebar_visible && self.sidebar_view == SidebarView::Search)
+            .then(|| self.search.as_ref().and_then(|sp| sp.cursor(p, layout.tree_region())))
+            .flatten()
         {
-            // Search option toggles + result rows are clickable.
-            CursorIcon::Pointer
+            // The Search panel resolves its own cursor (toggles/results = pointer,
+            // inputs = text).
+            c
+        } else if let Some(c) = (self.sidebar_visible && self.sidebar_view == SidebarView::Extensions)
+            .then(|| {
+                self.extensions_panel
+                    .as_ref()
+                    .and_then(|ep| ep.cursor(p, layout.tree_region()))
+            })
+            .flatten()
+        {
+            // The Extensions panel resolves its own cursor (filter = text, rows =
+            // pointer, scrollbar/empty = arrow).
+            c
         } else if self.focused_input_at(&layout, p).is_some() {
             CursorIcon::Text
-        } else if new_ext.is_some() || new_page_install || new_detail_tab.is_some() || over_detail_link {
+        } else if new_page_install || new_detail_tab.is_some() || over_detail_link {
             CursorIcon::Pointer
-        } else if self.open_extension.is_some() && layout.editor_text.contains(p) {
+        } else if self.detail.open_extension.is_some() && layout.editor_text.contains(p) {
             CursorIcon::Default
         } else if let Some(pal) = layout.palette.as_ref() {
             // Palette is modal: pointer over a row, arrow elsewhere.
@@ -700,27 +641,14 @@ impl App {
             self.sidebar_split.size(),
             self.find.active,
             self.palette.active,
-            self.terminal_panel_height(),
+            self.terminal.panel_height(),
         )
     }
 
     fn ensure_cursor_visible(&mut self) {
         let layout = self.layout();
-        let editor_inner_h = layout.editor_text.h - theme::EDITOR_PAD * 2.0;
-        if editor_inner_h <= 0.0 {
-            return;
-        }
-        let Some(doc) = self.workspace.active_doc_mut() else {
-            return;
-        };
-        let (line, _) = doc.head_line_col();
-        let cursor_top = line as f32 * theme::LINE_HEIGHT();
-        let cursor_bottom = cursor_top + theme::LINE_HEIGHT();
-        let scroll_y = doc.scroll_y();
-        if cursor_top < scroll_y {
-            doc.scroll.scroll_to_y(cursor_top.max(0.0));
-        } else if cursor_bottom > scroll_y + editor_inner_h {
-            doc.scroll.scroll_to_y(cursor_bottom - editor_inner_h);
+        if let Some(doc) = self.workspace.active_doc_mut() {
+            ui::editor_view::EditorView::ensure_cursor_visible(doc, &layout);
         }
     }
 
@@ -740,10 +668,14 @@ impl App {
             }
         };
         consider(self.workspace.active_doc().and_then(|d| d.scroll.next_wake(now)));
-        consider(self.ext_scroll.next_wake(now));
-        consider(self.ext_detail_scroll.next_wake(now));
-        consider(self.search_scroll.next_wake(now));
-        if let Some(g) = self.term_groups.get(self.active_group) {
+        consider(self.detail.ext_detail_scroll.next_wake(now));
+        if let Some(ep) = self.extensions_panel.as_ref() {
+            consider(ep.next_wake(now));
+        }
+        if let Some(sp) = self.search.as_ref() {
+            consider(sp.next_wake(now));
+        }
+        if let Some(g) = self.terminal.groups.get(self.terminal.active) {
             for p in &g.panes {
                 consider(p.scroll.next_wake(now));
             }
@@ -754,12 +686,12 @@ impl App {
     /// Total tabs in the strip: documents plus the open extension page (if any),
     /// which lives in its own tab after the documents (VSCode-style).
     pub(crate) fn tab_count(&self) -> usize {
-        self.workspace.documents.len() + self.open_extension.is_some() as usize
+        self.workspace.documents.len() + self.detail.open_extension.is_some() as usize
     }
 
     /// The active tab index — the extension page when open, else the active document.
     pub(crate) fn active_tab(&self) -> Option<usize> {
-        if self.open_extension.is_some() {
+        if self.detail.open_extension.is_some() {
             Some(self.workspace.documents.len())
         } else {
             self.workspace.active
@@ -768,116 +700,36 @@ impl App {
 
     /// The tab index of the open extension page, if any.
     pub(crate) fn ext_tab_index(&self) -> Option<usize> {
-        self.open_extension.map(|_| self.workspace.documents.len())
+        self.detail.open_extension.map(|_| self.workspace.documents.len())
     }
 
     /// Begin an inline New File / New Folder, scoped to the selected folder (or
     /// the parent of a selected file, or the workspace root). Expands the target
     /// folder so the field appears at the top of its contents.
+    // Inline create/rename lives on `ui::explorer_panel::ExplorerPanel`; these are
+    // thin glue that supply the shared workspace + gpu and trigger a redraw.
     fn begin_create(&mut self, is_dir: bool) {
-        let nodes = &self.workspace.tree.nodes;
-        let (parent, row, depth) = match self.selected_tree.and_then(|i| nodes.get(i).map(|n| (i, n))) {
-            Some((i, n)) if n.is_dir => {
-                let path = n.path.clone();
-                let depth = n.depth + 1;
-                self.workspace.tree.expand(&path);
-                (path, i + 1, depth)
-            }
-            Some((i, n)) => {
-                let parent = n
-                    .path
-                    .parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| self.workspace.tree.root.clone());
-                (parent, i, n.depth)
-            }
-            None => (self.workspace.tree.root.clone(), 0, 0),
-        };
-        self.creating = Some(PendingCreate {
-            is_dir,
-            parent,
-            row,
-            depth,
-            rename_from: None,
-        });
+        let sel = self.selected_tree;
         if let Some(g) = self.gpu.as_mut() {
-            g.create_input.clear(&mut g.font_system);
-            g.create_input
-                .set_placeholder(&mut g.font_system, if is_dir { " folder name" } else { " file name" });
-            g.create_input.focus(true);
+            self.explorer.begin_create(is_dir, sel, &mut self.workspace, g);
         }
         self.redraw();
     }
-
-    /// Begin an inline rename of a tree node: the field replaces the node's row,
-    /// pre-filled with its current name.
     fn begin_rename(&mut self, idx: usize) {
-        let Some(n) = self.workspace.tree.nodes.get(idx) else {
-            return;
-        };
-        let parent = n
-            .path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| self.workspace.tree.root.clone());
-        let name = n.name.clone();
-        let pc = PendingCreate {
-            is_dir: n.is_dir,
-            parent,
-            row: idx,
-            depth: n.depth,
-            rename_from: Some(n.path.clone()),
-        };
-        self.creating = Some(pc);
         if let Some(g) = self.gpu.as_mut() {
-            g.create_input.set_text(&mut g.font_system, &name);
-            g.create_input.focus(true);
+            self.explorer.begin_rename(idx, &self.workspace, g);
         }
         self.redraw();
     }
-
-    /// Finish an inline create/rename: apply if a non-empty name was typed
-    /// (opening new files), otherwise just dismiss the field.
     fn commit_create(&mut self) {
-        let Some(pc) = self.creating.take() else {
-            return;
-        };
-        let name = self
-            .gpu
-            .as_ref()
-            .map(|g| g.create_input.text().trim().to_string())
-            .unwrap_or_default();
         if let Some(g) = self.gpu.as_mut() {
-            g.create_input.focus(false);
-        }
-        if !name.is_empty() {
-            if let Some(from) = pc.rename_from {
-                let to = pc.parent.join(&name);
-                if to != from && std::fs::rename(&from, &to).is_ok() {
-                    self.workspace.tree.refresh();
-                    // Re-point any open document at the renamed path.
-                    for d in self.workspace.documents.iter_mut() {
-                        if d.path.as_deref() == Some(from.as_path()) {
-                            d.path = Some(to.clone());
-                            d.name = name.clone();
-                        }
-                    }
-                }
-            } else if let Ok(path) = self.workspace.create_entry(&pc.parent, &name, pc.is_dir) {
-                if !pc.is_dir {
-                    if let Some(g) = self.gpu.as_mut() {
-                        let _ = self.workspace.open_file(&path, &mut g.font_system);
-                    }
-                }
-            }
+            self.explorer.commit_create(&mut self.workspace, g);
         }
         self.redraw();
     }
-
     fn cancel_create(&mut self) {
-        self.creating = None;
         if let Some(g) = self.gpu.as_mut() {
-            g.create_input.focus(false);
+            self.explorer.cancel_create(g);
         }
         self.redraw();
     }
@@ -895,27 +747,17 @@ impl App {
                 .row_at(layout.tree_region(), (x, y), self.workspace.tree.nodes.len())
         });
         self.selected_tree = target;
-        self.context_menu = Some(ContextMenu { anchor: (x, y), target });
+        self.explorer.open_menu((x, y), target);
         self.redraw();
     }
 
-    /// Which menu item is under `p`, delegating geometry to the Menu widget.
-    fn context_menu_item_at(&self, p: (f32, f32)) -> Option<usize> {
-        let cm = self.context_menu.as_ref()?;
-        let g = self.gpu.as_ref()?;
-        let win = (g.config.width as f32, g.config.height as f32);
-        let menu = g.ui.menu.rect(cm.anchor, win);
-        g.ui.menu.item_at(menu, p)
-    }
-
     fn close_context_menu(&mut self) {
-        self.context_menu = None;
-        self.hovered_menu_item = None;
+        self.explorer.close_menu();
         self.redraw();
     }
 
     fn exec_menu_action(&mut self, action: MenuAction) {
-        let target = self.context_menu.as_ref().and_then(|m| m.target);
+        let target = self.explorer.menu_target();
         self.close_context_menu();
         match action {
             MenuAction::NewFile => self.begin_create(false),
@@ -983,130 +825,47 @@ impl App {
     }
 
     /// Rebuild the sidebar's extension-row widgets from current extension data.
-    /// Called when the data changes (after a scan or an install), not per frame.
+    /// Thin wrapper: the `ExtensionsPanel` owns the rows + filter; it borrows the
+    /// shared `extensions`/`ext_remote` data to rebuild.
     fn rebuild_ext_rows(&mut self) {
-        let Some(gpu) = self.gpu.as_mut() else { return };
-        let query = gpu.ui.ext_filter.text().trim().to_lowercase();
-        self.ext_showing_remote = !query.is_empty();
-        let mut visible = Vec::new();
-        let mut specs: Vec<widgets::ExtSpec> = Vec::new();
-        if self.ext_showing_remote {
-            // Marketplace results (already filtered by the remote query).
-            for (idx, e) in self.ext_remote.iter().enumerate() {
-                let name = if e.display.is_empty() { e.name.clone() } else { e.display.clone() };
-                let meta = format!("{} · Marketplace", e.namespace);
-                let desc: String = e.description.chars().take(80).collect();
-                let uv = e
-                    .icon
-                    .as_ref()
-                    .and_then(|b| gpu.icon_atlas.load_bytes(&gpu.queue, &e.id(), b));
-                visible.push(idx);
-                specs.push((name, meta, desc, uv));
-            }
-        } else {
-            // Locally installed extensions.
-            for (idx, e) in self.extensions.iter().enumerate() {
-                let meta = if e.installed {
-                    format!("{} · installed", e.publisher)
-                } else {
-                    format!("{} · {}", e.publisher, e.category())
-                };
-                let desc: String = e.description.chars().take(80).collect();
-                let uv = e.icon_path.as_ref().and_then(|p| gpu.icon_atlas.load(&gpu.queue, &e.name, p));
-                visible.push(idx);
-                specs.push((e.name.clone(), meta, desc, uv));
-            }
+        if let (Some(ep), Some(g)) = (self.extensions_panel.as_mut(), self.gpu.as_mut()) {
+            ep.rebuild(g, &self.extensions, &self.ext_remote);
         }
-        gpu.ui.ext_rows.rebuild(&mut gpu.font_system, &specs);
-        self.ext_visible = visible;
-        // Offset is re-clamped each frame by the ScrollView in render.
     }
 
-    /// Kick off a background OpenVSX search for the current filter text.
-    fn trigger_search(&mut self) {
-        let query = self
-            .gpu
-            .as_ref()
-            .map(|g| g.ui.ext_filter.text().trim().to_string())
-            .unwrap_or_default();
-        if query.is_empty() {
-            return;
-        }
-        self.search_gen += 1;
-        marketplace::search_async(self.worker_tx.clone(), query, self.search_gen);
-    }
 
-    /// Kick off a background find-in-files for the current query + options.
-    fn trigger_find(&mut self) {
-        let query = self
-            .gpu
-            .as_ref()
-            .map(|g| g.ui.search_input.text().trim().to_string())
-            .unwrap_or_default();
-        self.search_results.clear();
-        self.search_collapsed.clear();
-        self.search_scroll.scroll_to_y(0.0);
-        self.find_gen += 1;
-        self.find_pending = false;
-        if query.is_empty() {
-            return;
-        }
-        self.find_pending = true;
-        let root = self.workspace.tree.root.clone();
-        search::search_async(self.worker_tx.clone(), self.find_gen, root, query, self.search_opts);
-    }
-
-    /// Replace All: rewrite every match across the found files with the replacement
-    /// text, then re-run the search and reload any open documents from disk.
-    fn replace_all(&mut self) {
-        let (query, replacement) = match self.gpu.as_ref() {
-            Some(g) => (
-                g.ui.search_input.text().trim().to_string(),
-                g.ui.search_replace.text().to_string(),
-            ),
-            None => return,
-        };
-        if query.is_empty() || self.search_results.is_empty() {
-            return;
-        }
-        let n = search::replace_all(&self.search_results, &query, self.search_opts, &replacement);
-        if n > 0 {
-            // Reload any open document whose file we just rewrote on disk.
-            if let Some(gpu) = self.gpu.as_mut() {
-                for d in self.workspace.documents.iter_mut() {
-                    if let Some(p) = d.path.clone() {
-                        if let Ok(text) = std::fs::read_to_string(&p) {
-                            d.set_text_external(&text, &mut gpu.font_system);
+    /// Apply a side-effect requested by a panel (centralizes cross-cutting actions).
+    pub(crate) fn apply_intent(&mut self, intent: ui::Intent) {
+        match intent {
+            ui::Intent::OpenFile { path, line, col } => self.open_file_at(path, line, col),
+            ui::Intent::OpenExtDetail(which) => self.open_ext_detail(which),
+            ui::Intent::OpenSettings(p) => self.open_settings_file(Some(p)),
+            ui::Intent::ReloadOpenDocs => {
+                if let Some(gpu) = self.gpu.as_mut() {
+                    for d in self.workspace.documents.iter_mut() {
+                        if let Some(p) = d.path.clone() {
+                            if let Ok(text) = std::fs::read_to_string(&p) {
+                                d.set_text_external(&text, &mut gpu.font_system);
+                            }
                         }
                     }
                 }
             }
-            self.trigger_find(); // refresh results against the new contents
+            ui::Intent::Redraw => self.redraw(),
         }
-        self.redraw();
     }
 
-    /// Flattened result rows (file headers + match lines), respecting collapse state.
-    /// Shared by rendering and click hit-testing so indices line up.
-    fn search_rows(&self) -> Vec<search::SearchRow> {
-        search::build_rows(&self.search_results, &self.search_collapsed)
-    }
-
-    /// Open a search result: open the file (if needed) and place the caret at the
-    /// match — line `line` (1-based), byte column `col` within that line.
-    fn open_search_result(&mut self, file_idx: usize, line: usize, col: usize) {
-        let Some(path) = self.search_results.get(file_idx).map(|f| f.path.clone()) else {
-            return;
-        };
+    /// Open `path` and place the caret at (1-based `line`, byte `col`).
+    fn open_file_at(&mut self, path: PathBuf, line: usize, col: usize) {
         if let Some(gpu) = self.gpu.as_mut() {
             if self.workspace.open_file(&path, &mut gpu.font_system).is_ok() {
-                self.open_extension = None;
+                self.detail.open_extension = None;
                 if let Some(d) = self.workspace.active_doc_mut() {
                     let li = line.saturating_sub(1);
                     if li < d.rope.len_lines() {
-                        let line_start = d.rope.line_to_byte(li);
-                        let line_len = d.rope.line(li).len_bytes();
-                        d.place(line_start + col.min(line_len), false);
+                        let ls = d.rope.line_to_byte(li);
+                        let ll = d.rope.line(li).len_bytes();
+                        d.place(ls + col.min(ll), false);
                     }
                 }
             }
@@ -1122,78 +881,18 @@ impl App {
         marketplace::install_async(self.worker_tx.clone(), ext, root);
     }
 
-    /// Open the detail page for an extension and load its README (local read /
-    /// remote fetch), resetting the page scroll.
+    /// Open the detail page for an extension. The view owns the load logic; this is
+    /// thin glue that supplies gpu + the shared extension data and redraws.
     fn open_ext_detail(&mut self, which: OpenExt) {
-        self.open_extension = Some(which);
-        self.ext_detail_scroll.scroll_to_y(0.0);
-        self.ext_readme = None;
-        self.ext_changelog = None;
-        self.ext_img_dir = None;
-        self.ext_img_base = None;
-        self.requested_images.clear();
         if let Some(g) = self.gpu.as_mut() {
-            g.ui.ext_detail.set_tab(ext_detail::DetailTab::Details);
-        }
-        self.ext_features = self.build_features_md(which);
-        self.ext_doc_gen += 1;
-        let gen = self.ext_doc_gen;
-        match which {
-            OpenExt::Local(i) => {
-                let readme = self.extensions.get(i).and_then(|e| e.readme_path.clone());
-                self.ext_img_dir = readme.as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf()));
-                self.ext_readme = readme.and_then(|p| std::fs::read_to_string(&p).ok());
-                self.ext_changelog = self
-                    .extensions
-                    .get(i)
-                    .and_then(|e| e.changelog_path.clone())
-                    .and_then(|p| std::fs::read_to_string(&p).ok());
-            }
-            OpenExt::Remote(i) => {
-                if let Some(e) = self.ext_remote.get(i) {
-                    // Relative README images resolve against the readme URL's dir.
-                    self.ext_img_base = e.readme_url.clone();
-                    if let Some(url) = e.readme_url.clone() {
-                        marketplace::readme_async(self.worker_tx.clone(), url, gen);
-                    }
-                    if let Some(url) = e.changelog_url.clone() {
-                        marketplace::changelog_async(self.worker_tx.clone(), url, gen);
-                    }
-                }
-            }
+            self.detail.open(which, g, &self.extensions, &self.ext_remote, &self.worker_tx);
         }
         self.redraw();
     }
 
-    /// Build the Features-tab markdown from what Nova knows about the extension.
-    fn build_features_md(&self, which: OpenExt) -> String {
-        match which {
-            OpenExt::Local(i) => {
-                let Some(e) = self.extensions.get(i) else { return String::new() };
-                let mut s = String::new();
-                match e.kind {
-                    ExtKind::Theme => s.push_str("### Color Theme\nContributes a color theme Nova can apply natively.\n\n"),
-                    ExtKind::Grammar => s.push_str("### Syntax Highlighting\nShips TextMate grammars Nova runs natively for syntax coloring.\n\n"),
-                    ExtKind::Declarative => s.push_str("### Language Support\nContributes snippets / language configuration.\n\n"),
-                    ExtKind::Code => s.push_str("### Code Extension\nNeeds the JavaScript extension runtime (not yet supported in Nova).\n\n"),
-                }
-                if !e.grammar_paths.is_empty() {
-                    s.push_str(&format!("- {} grammar file(s)\n", e.grammar_paths.len()));
-                }
-                if e.theme_path.is_some() {
-                    s.push_str("- 1 color theme\n");
-                }
-                s
-            }
-            OpenExt::Remote(_) => {
-                "Feature details are available after install.".to_string()
-            }
-        }
-    }
-
     /// Install whatever the detail page currently shows.
     fn install_open(&mut self) {
-        match self.open_extension {
+        match self.detail.open_extension {
             Some(OpenExt::Local(i)) => self.install_extension(i),
             Some(OpenExt::Remote(i)) => self.install_remote(i),
             None => {}
@@ -1204,31 +903,26 @@ impl App {
     /// Precedence matches modal nesting: inline rename > palette > find > the
     /// extensions filter > the editor.
     fn focus(&self) -> Focus {
-        if self.creating.is_some() {
+        if self.explorer.creating.is_some() {
             Focus::Rename
         } else if self.palette.active {
             Focus::Palette
         } else if self.find.active {
             Focus::Find
-        } else if self.terminal_visible && self.terminal_focused && !self.term_groups.is_empty() {
+        } else if self.terminal.visible && self.terminal.focused && !self.terminal.groups.is_empty() {
             Focus::Terminal
-        } else if self.ext_filter_active {
+        } else if self.extensions_panel.as_ref().map_or(false, |ep| ep.focused()) {
             Focus::ExtFilter
-        } else if self.search_query_active {
+        } else if self.search.as_ref().map_or(false, |sp| sp.focused()) {
             Focus::Search
-        } else if self.search_replace_active {
-            Focus::SearchReplace
         } else {
             Focus::Editor
         }
     }
 
     fn set_ext_filter_focus(&mut self, on: bool) {
-        self.ext_filter_active = on;
-        if let Some(g) = self.gpu.as_mut() {
-            // Placeholder is set once at construction so it shows whenever the box
-            // is empty, focused or not.
-            g.ui.ext_filter.focus(on);
+        if let Some(ep) = self.extensions_panel.as_mut() {
+            ep.set_focus(on);
         }
     }
 
@@ -1249,30 +943,12 @@ impl App {
         match id {
             InputId::Palette => layout.palette.as_ref().map(|p| (p.input, 6.0)),
             InputId::Find => layout.find_bar.as_ref().map(|fb| (*fb, 8.0)),
-            InputId::ExtFilter => {
-                (self.sidebar_visible && self.sidebar_view == SidebarView::Extensions)
-                    .then(|| (ext_filter_rect(layout.tree_region()), 6.0))
-            }
-            InputId::Search => {
-                (self.sidebar_visible && self.sidebar_view == SidebarView::Search)
-                    .then(|| (ext_filter_rect(layout.tree_region()), 6.0))
-            }
-            InputId::SearchReplace => {
-                (self.sidebar_visible && self.sidebar_view == SidebarView::Search)
-                    .then(|| (search_replace_rect(layout.tree_region()), 6.0))
-            }
         }
     }
 
     /// The focused input under point `p` (for click-to-position / drag-select).
     fn focused_input_at(&self, layout: &Layout, p: (f32, f32)) -> Option<(InputId, Rect, f32)> {
-        for id in [
-            InputId::Palette,
-            InputId::Find,
-            InputId::ExtFilter,
-            InputId::Search,
-            InputId::SearchReplace,
-        ] {
+        for id in [InputId::Palette, InputId::Find] {
             if let Some((rect, pad)) = self.input_rect_for(id, layout) {
                 if rect.contains(p) {
                     return Some((id, rect, pad));
@@ -1494,148 +1170,50 @@ impl App {
     /// are kept, like VSCode.
     fn open_folder(&mut self, folder: PathBuf) {
         self.cwd = folder.clone();
+        self.terminal.set_cwd(folder.clone()); // new shells start in the new root
         self.workspace.tree = crate::workspace::FileTree::new(folder);
         self.sidebar_view = SidebarView::Explorer;
         self.sidebar_visible = true;
-        self.search_results.clear();
-        self.search_collapsed.clear();
-        self.find_gen += 1;
-        self.find_pending = false;
+        if let Some(sp) = self.search.as_mut() {
+            sp.reset();
+        }
         self.redraw();
     }
 
-    /// Requested terminal panel height: huge when maximized (clamped by the layout
-    /// to leave a sliver of editor), the splitter size otherwise, None when hidden.
-    pub(crate) fn terminal_panel_height(&self) -> Option<f32> {
-        if !self.terminal_visible {
-            return None;
-        }
-        Some(if self.terminal_maximized { 100_000.0 } else { self.terminal_split.size() })
-    }
-
-    /// Number of split panes in the active tab (0 when there's no terminal).
-    fn active_pane_count(&self) -> usize {
-        self.term_groups.get(self.active_group).map_or(0, |g| g.panes.len())
-    }
-
-    /// Spawn a pane sized to fit when the active tab shows `count` side-by-side panes.
-    fn spawn_pane(&self, count: usize) -> Option<terminal::Pane> {
-        let panel = self.layout().terminal_panel?;
-        let area = terminal_pane_area(terminal_content(panel), self.term_groups.len().max(1));
-        let rect = terminal_pane_rects(area, count.max(1))
-            .into_iter()
-            .next()
-            .unwrap_or(area);
-        let (rows, cols) = terminal_grid_size(rect, self.terminal_cell_w);
-        terminal::Pane::spawn(rows, cols)
-    }
-
-    /// Header `+`: open a new terminal tab (a fresh group). The previous tab keeps
-    /// running in the background and stays reachable from the tab list.
+    // Integrated-terminal actions live on `ui::terminal_panel::TerminalPanel`; these
+    // are thin glue that supply the panel rect + cell metric and trigger a redraw.
     fn new_terminal_tab(&mut self) {
-        if let Some(p) = self.spawn_pane(1) {
-            self.term_groups.push(terminal::Group::new(p));
-            self.active_group = self.term_groups.len() - 1;
-            self.terminal_focused = true;
-            self.mark_terminals_dirty(); // tab list appearing reflows pane widths
-        }
+        let panel = self.layout().terminal_panel;
+        self.terminal.new_terminal_tab(panel, self.terminal_cell_w);
         self.redraw();
     }
-
-    /// Header split: add a side-by-side pane to the active tab.
     fn split_terminal(&mut self) {
-        let count = self.active_pane_count() + 1;
-        if let Some(p) = self.spawn_pane(count) {
-            if let Some(g) = self.term_groups.get_mut(self.active_group) {
-                g.panes.push(p);
-                g.focused = g.panes.len() - 1;
-                self.terminal_focused = true;
-            }
-            self.mark_terminals_dirty();
-        }
+        let panel = self.layout().terminal_panel;
+        self.terminal.split_terminal(panel, self.terminal_cell_w);
         self.redraw();
     }
-
-    /// Header trash: kill the focused pane; drop the tab if it was its last pane;
-    /// hide the panel if that was the last tab.
     fn kill_terminal(&mut self) {
-        let Some(g) = self.term_groups.get_mut(self.active_group) else {
-            return;
-        };
-        if g.panes.is_empty() {
-            return;
-        }
-        let i = g.focused.min(g.panes.len() - 1);
-        g.panes.remove(i);
-        if g.panes.is_empty() {
-            self.term_groups.remove(self.active_group);
-            if self.term_groups.is_empty() {
-                self.terminal_visible = false;
-                self.terminal_focused = false;
-                self.terminal_maximized = false;
-            } else {
-                self.active_group = self.active_group.min(self.term_groups.len() - 1);
-            }
-        } else {
-            g.focused = i.min(g.panes.len() - 1);
-        }
-        self.mark_terminals_dirty();
+        self.terminal.kill_terminal();
         self.redraw();
     }
-
-    /// Switch the visible terminal tab.
     fn switch_terminal_tab(&mut self, i: usize) {
-        if i < self.term_groups.len() {
-            self.active_group = i;
-            self.terminal_focused = true;
-            self.mark_terminals_dirty();
-            self.redraw();
-        }
+        self.terminal.switch_tab(i);
+        self.redraw();
     }
-
-    /// Tab-list × button: kill an entire tab (all its panes); hide the panel if it
-    /// was the last tab.
     fn kill_terminal_tab(&mut self, i: usize) {
-        if i >= self.term_groups.len() {
-            return;
-        }
-        self.term_groups.remove(i);
-        if self.term_groups.is_empty() {
-            self.terminal_visible = false;
-            self.terminal_focused = false;
-            self.terminal_maximized = false;
-        } else {
-            self.active_group = self.active_group.min(self.term_groups.len() - 1);
-        }
-        self.mark_terminals_dirty();
+        self.terminal.kill_tab(i);
         self.redraw();
     }
-
-    /// Header maximize: grow the panel to fill the whole content area (toggle).
     fn toggle_terminal_max(&mut self) {
-        self.terminal_maximized = !self.terminal_maximized;
-        self.mark_terminals_dirty();
+        self.terminal.toggle_max();
         self.redraw();
     }
-
-    /// Mark every pane in every tab as needing a reshape (after a layout change).
-    fn mark_terminals_dirty(&mut self) {
-        for g in &mut self.term_groups {
-            for p in &mut g.panes {
-                p.dirty = true;
-            }
-        }
-    }
-
     /// Show/hide the integrated terminal, spawning the first tab on first open.
     fn toggle_terminal(&mut self) {
-        self.terminal_visible = !self.terminal_visible;
-        self.terminal_focused = self.terminal_visible;
-        if self.terminal_visible && self.term_groups.is_empty() {
-            if let Some(p) = self.spawn_pane(1) {
-                self.term_groups.push(terminal::Group::new(p));
-                self.active_group = 0;
-            }
+        if self.terminal.toggle() {
+            // Panel rect is only non-None now that `visible` is true.
+            let panel = self.layout().terminal_panel;
+            self.terminal.spawn_initial(panel, self.terminal_cell_w);
         }
         self.redraw();
     }
@@ -1682,7 +1260,7 @@ impl App {
         let Some(path) = path else { return };
         if let Some(gpu) = self.gpu.as_mut() {
             if self.workspace.open_file(&path, &mut gpu.font_system).is_ok() {
-                self.open_extension = None;
+                self.detail.open_extension = None;
             }
         }
     }
@@ -1791,8 +1369,9 @@ impl App {
         }
 
         // A click while the context menu is open selects an item or dismisses it.
-        if self.context_menu.is_some() {
-            if let Some(i) = self.context_menu_item_at((x, y)) {
+        if self.explorer.menu_open() {
+            let item = self.gpu.as_ref().and_then(|g| self.explorer.menu_item_at((x, y), g));
+            if let Some(i) = item {
                 self.exec_menu_action(MENU_ACTIONS[i].0);
             } else {
                 self.close_context_menu();
@@ -1802,7 +1381,7 @@ impl App {
 
         // A click anywhere while an inline create field is open commits it
         // (creates if a name was typed, discards if empty), then consumes the click.
-        if self.creating.is_some() {
+        if self.explorer.creating.is_some() {
             self.commit_create();
             return;
         }
@@ -1811,33 +1390,11 @@ impl App {
         // click before any region handler (terminal focus, extension rows, editor).
         // Guarded by visibility so a stale off-screen thumb can't grab the click.
         if layout.palette.is_none() {
-            if self.terminal_visible {
-                if let Some(g) = self.term_groups.get_mut(self.active_group) {
-                    for i in 0..g.panes.len() {
-                        if g.panes[i].scroll.press((x, y)) {
-                            g.panes[i].dirty = true;
-                            g.focused = i;
-                            return;
-                        }
-                    }
-                }
-            }
-            if self.sidebar_visible
-                && self.sidebar_view == SidebarView::Extensions
-                && self.ext_scroll.press((x, y))
-            {
-                self.redraw();
+            if self.terminal.pane_scroll_press((x, y)) {
                 return;
             }
-            if self.sidebar_visible
-                && self.sidebar_view == SidebarView::Search
-                && self.search_scroll.press((x, y))
-            {
-                self.redraw();
-                return;
-            }
-            if self.open_extension.is_some() {
-                if self.ext_detail_scroll.press((x, y)) {
+            if self.detail.open_extension.is_some() {
+                if self.detail.ext_detail_scroll.press((x, y)) {
                     self.redraw();
                     return;
                 }
@@ -1854,99 +1411,29 @@ impl App {
         // edge, so check it ahead of the in-panel focus test below.
         if layout.palette.is_none() {
             if let Some(panel) = layout.terminal_panel {
-                if self.terminal_split.press((x, y), panel) {
-                    self.terminal_maximized = false; // dragging restores from maximized
+                if self.terminal.split.press((x, y), panel) {
+                    self.terminal.maximized = false; // dragging restores from maximized
                     return;
                 }
             }
         }
 
-        // Terminal panel: clicking the header runs a stubbed button hit-test; clicking
-        // the content area below takes keyboard focus. Clicking elsewhere releases it.
-        if self.terminal_visible {
-            if let Some(panel) = layout.terminal_panel {
-                let content = terminal_content(panel);
-                if content.contains((x, y)) {
-                    // The right-side tab list: × kills that tab, the row body switches.
-                    if let Some(tl) = terminal_tablist_rect(content, self.term_groups.len()) {
-                        if tl.contains((x, y)) {
-                            let idx = ((y - tl.y) / theme::TREE_ROW_HEIGHT) as usize;
-                            if idx < self.term_groups.len() {
-                                if terminal_tab_close_rect(tl, idx).contains((x, y)) {
-                                    self.kill_terminal_tab(idx);
-                                } else {
-                                    self.switch_terminal_tab(idx);
-                                }
-                            }
-                            return;
-                        }
-                    }
-                    // Otherwise focus whichever split pane was clicked.
-                    let area = terminal_pane_area(content, self.term_groups.len());
-                    let rects = terminal_pane_rects(area, self.active_pane_count());
-                    if let Some(i) = rects.iter().position(|r| r.contains((x, y))) {
-                        if let Some(g) = self.term_groups.get_mut(self.active_group) {
-                            g.focused = i;
-                        }
-                    }
-                    self.terminal_focused = true;
-                    self.redraw();
-                    return;
-                }
-                // Header strip (above content): right-side icon buttons.
-                if panel.contains((x, y)) {
-                    let btns = terminal_header_button_rects(panel);
-                    if let Some(i) = btns.iter().position(|r| r.contains((x, y))) {
-                        match i {
-                            0 => self.new_terminal_tab(),    // + new tab
-                            1 => self.split_terminal(),      // ⊟ split active tab
-                            2 => self.kill_terminal(),       // 🗑 kill focused pane
-                            4 => self.toggle_terminal_max(), // ⌃ maximize/restore
-                            5 => self.toggle_terminal(),     // × hide panel
-                            _ => {}                           // 3 more — menu infra TBD
-                        }
-                    }
-                    return;
-                }
-            }
-            self.terminal_focused = false;
-        }
-
-        // Search option toggles sit inside the query box, so claim them before the
-        // input-focus handler below (which would otherwise eat the click as a caret set).
-        if self.sidebar_visible && self.sidebar_view == SidebarView::Search {
-            if let Some(i) = search_opt_rects(layout.tree_region())
-                .iter()
-                .position(|r| r.contains((x, y)))
-            {
-                match i {
-                    0 => self.search_opts.case_sensitive = !self.search_opts.case_sensitive,
-                    1 => self.search_opts.whole_word = !self.search_opts.whole_word,
-                    2 => self.search_opts.regex = !self.search_opts.regex,
-                    _ => {}
-                }
-                self.trigger_find();
-                self.redraw();
-                return;
-            }
+        // Terminal panel: header buttons, tab list, and pane-focus — the panel owns
+        // its region's press handling. Clicking elsewhere while visible drops focus
+        // (handled inside) without consuming the click.
+        if self.terminal.content_press((x, y), &layout, self.terminal_cell_w) {
+            self.redraw();
+            return;
         }
 
         // Click inside a focused text input: position the caret and begin a
         // drag-selection. (Handled before other regions so it wins the click.)
         if let Some((id, rect, pad)) = self.focused_input_at(&layout, (x, y)) {
-            // Clicking the extensions filter box focuses it; clicking another input
-            // (palette/find) takes focus away from it.
-            self.ext_filter_active = id == InputId::ExtFilter;
-            self.search_query_active = id == InputId::Search;
-            self.search_replace_active = id == InputId::SearchReplace;
             let double = self.register_click(x, y);
             if let Some(g) = self.gpu.as_mut() {
                 let inp = match id {
                     InputId::Palette => &mut g.ui.palette_input,
                     InputId::Find => &mut g.ui.find_input,
-                    InputId::ExtFilter => &mut g.ui.ext_filter,
-                    InputId::Search => &mut g.ui.search_input,
-                    InputId::SearchReplace => &mut g.ui.search_replace,
                 };
                 if double {
                     inp.select_word_at(rect, pad, x);
@@ -2067,74 +1554,67 @@ impl App {
                 }
                 // Switching views clears any prior input focus.
                 self.set_ext_filter_focus(false);
-                self.search_query_active = false;
-                self.search_replace_active = false;
+                if let Some(sp) = self.search.as_mut() {
+                    sp.set_unfocused();
+                }
                 self.redraw();
             }
             return;
         }
 
-        // Extensions panel: clicking a row opens its detail page (Install lives there).
+        // Extensions panel owns its sidebar-content region (filter box, scrollbar,
+        // rows). Only hand it presses inside the sidebar so the chrome stays clickable.
         if self.sidebar_visible
             && self.sidebar_view == SidebarView::Extensions
             && layout.sidebar.contains((x, y))
         {
-            let region = ext_list_region(layout.tree_region());
-            let scroll = self.ext_scroll.offset().1;
-            let hit = self.gpu.as_ref().and_then(|g| g.ui.ext_rows.hit(region, scroll, (x, y)));
-            if let Some(i) = hit {
-                if let Some(&src) = self.ext_visible.get(i) {
-                    let which = if self.ext_showing_remote {
-                        OpenExt::Remote(src)
-                    } else {
-                        OpenExt::Local(src)
-                    };
-                    self.open_ext_detail(which);
-                }
+            let region = layout.tree_region();
+            let double = self.register_click(x, y);
+            let mut intents = Vec::new();
+            let consumed = self
+                .extensions_panel
+                .as_mut()
+                .map_or(false, |ep| ep.on_press((x, y), region, double, &mut intents));
+            for i in intents {
+                self.apply_intent(i);
             }
-            return;
+            if consumed {
+                self.redraw();
+                return;
+            }
         }
 
-        // Search view: option toggles + clicking a result row opens that match.
+        // Search view: the panel owns its sidebar-content region (query/replace
+        // inputs, option toggles, scrollbar, results). Only hand it presses that
+        // land inside the sidebar — so the activity bar, title bar, splitter and
+        // editor (handled above/below) stay clickable.
         if self.sidebar_visible
             && self.sidebar_view == SidebarView::Search
             && layout.sidebar.contains((x, y))
         {
-            let tree = layout.tree_region();
-            if let Some(i) = search_opt_rects(tree).iter().position(|r| r.contains((x, y))) {
-                match i {
-                    0 => self.search_opts.case_sensitive = !self.search_opts.case_sensitive,
-                    1 => self.search_opts.whole_word = !self.search_opts.whole_word,
-                    2 => self.search_opts.regex = !self.search_opts.regex,
-                    _ => {}
-                }
-                self.trigger_find();
+            let region = layout.tree_region();
+            let double = self.register_click(x, y);
+            let root = self.cwd.clone();
+            let mut intents = Vec::new();
+            let mut consumed = false;
+            if let (Some(sp), Some(g)) = (self.search.as_mut(), self.gpu.as_mut()) {
+                consumed = sp.on_press(
+                    (x, y),
+                    region,
+                    double,
+                    &mut g.font_system,
+                    root,
+                    &self.worker_tx,
+                    &mut intents,
+                );
+            }
+            for i in intents {
+                self.apply_intent(i);
+            }
+            if consumed {
                 self.redraw();
                 return;
             }
-            if search_replace_all_rect(tree).contains((x, y)) {
-                self.replace_all();
-                return;
-            }
-            let region = search_results_region(tree);
-            if region.contains((x, y)) {
-                let row = ((y - region.y + self.search_scroll.offset().1) / theme::SEARCH_ROW_H) as usize;
-                if let Some(sr) = self.search_rows().get(row) {
-                    let (file, line, col) = (sr.file, sr.line, sr.col);
-                    match line {
-                        Some(line) => self.open_search_result(file, line, col),
-                        None => {
-                            // File header — toggle its collapse state.
-                            if !self.search_collapsed.insert(file) {
-                                self.search_collapsed.remove(&file);
-                            }
-                            self.redraw();
-                        }
-                    }
-                }
-                return;
-            }
-            return;
         }
 
         // Explorer header action buttons (New File / New Folder / Refresh / Collapse).
@@ -2174,7 +1654,7 @@ impl App {
                     if let Some(gpu) = self.gpu.as_mut() {
                         let _ = self.workspace.open_file(&path, &mut gpu.font_system);
                     }
-                    self.open_extension = None; // opening a file dismisses the ext page
+                    self.detail.open_extension = None; // opening a file dismisses the ext page
                 }
                 self.redraw();
             }
@@ -2189,13 +1669,13 @@ impl App {
                 if Some(idx) == ext_idx {
                     // The extension page's own tab: close it, or it's already shown.
                     if closing {
-                        self.open_extension = None;
+                        self.detail.open_extension = None;
                     }
                 } else if closing {
                     self.request_close(idx);
                 } else {
                     self.workspace.switch_to(idx);
-                    self.open_extension = None;
+                    self.detail.open_extension = None;
                 }
                 self.redraw();
             }
@@ -2204,11 +1684,11 @@ impl App {
 
         // Extension details page (in the editor area): handle its Install button
         // and consume other clicks so they don't fall through to the editor.
-        if self.open_extension.is_some() {
+        if self.detail.open_extension.is_some() {
             let region = render::editor_region(&layout);
             if region.contains((x, y)) {
                 // A click on a README link opens it in the browser.
-                let scroll = self.ext_detail_scroll.offset().1;
+                let scroll = self.detail.ext_detail_scroll.offset().1;
                 let link = self.gpu.as_ref().and_then(|g| {
                     g.ui.ext_detail
                         .link_rects(region, scroll, &|k| g.media.size(k))
@@ -2225,7 +1705,7 @@ impl App {
                     if let Some(g) = self.gpu.as_mut() {
                         g.ui.ext_detail.set_tab(tab);
                     }
-                    self.ext_detail_scroll.scroll_to_y(0.0); // each tab scrolls from the top
+                    self.detail.ext_detail_scroll.scroll_to_y(0.0); // each tab scrolls from the top
                     self.redraw();
                     return;
                 }
@@ -2244,30 +1724,14 @@ impl App {
         }
 
         if layout.editor_text.contains((x, y)) {
-            self.ext_filter_active = false; // editor takes keyboard focus
-            self.search_query_active = false;
-            self.search_replace_active = false;
-            let now = Instant::now();
-            let consecutive = now.duration_since(self.last_click) < Duration::from_millis(400)
-                && (x - self.last_click_pos.0).abs() < 4.0
-                && (y - self.last_click_pos.1).abs() < 4.0;
-            // 1 = place, 2 = word, 3 = line, 4 = whole document (cycles).
-            self.click_count = if consecutive { (self.click_count % 4) + 1 } else { 1 };
-            self.last_click = now;
-            self.last_click_pos = (x, y);
-            self.editor_click(x, y, self.mods.shift_key(), layout);
-            if self.click_count >= 2 {
-                if let Some(d) = self.workspace.active_doc_mut() {
-                    let b = d.sel.head;
-                    match self.click_count {
-                        2 => d.select_word(b),
-                        3 => d.select_line(b),
-                        _ => d.select_all(),
-                    }
-                }
-                self.dragging_editor = false;
-            } else {
-                self.dragging_editor = true;
+            self.set_ext_filter_focus(false); // editor takes keyboard focus
+            if let Some(sp) = self.search.as_mut() {
+                sp.set_unfocused();
+            }
+            let consecutive = self.register_click(x, y);
+            let extend = self.mods.shift_key();
+            if let Some(d) = self.workspace.active_doc_mut() {
+                self.editor.on_press(d, &layout, x, y, extend, consecutive);
             }
             self.redraw();
             return;
@@ -2284,9 +1748,6 @@ impl App {
                         let inp = match id {
                             InputId::Palette => &mut g.ui.palette_input,
                             InputId::Find => &mut g.ui.find_input,
-                            InputId::ExtFilter => &mut g.ui.ext_filter,
-                            InputId::Search => &mut g.ui.search_input,
-                            InputId::SearchReplace => &mut g.ui.search_replace,
                         };
                         inp.extend_to_x(rect, pad, x);
                     }
@@ -2296,31 +1757,30 @@ impl App {
             }
         }
         // Scrollbar thumb drags — one ScrollView is dragging at a time.
-        if self.mouse_pressed {
-            if let Some(g) = self.term_groups.get_mut(self.active_group) {
-                if let Some(p) = g.panes.iter_mut().find(|p| p.scroll.is_dragging()) {
-                    if p.scroll.drag((x, y)) {
-                        p.dirty = true;
-                    }
+        if self.mouse_pressed && self.terminal.pane_scroll_drag((x, y)) {
+            self.redraw();
+            return;
+        }
+        if self.mouse_pressed && self.sidebar_view == SidebarView::Extensions {
+            let region = self.layout().tree_region();
+            if let Some(ep) = self.extensions_panel.as_mut() {
+                if ep.on_drag((x, y), region) {
                     self.redraw();
                     return;
                 }
             }
         }
-        if self.ext_scroll.is_dragging() && self.mouse_pressed {
-            if self.ext_scroll.drag((x, y)) {
-                self.redraw();
+        if self.mouse_pressed && self.sidebar_view == SidebarView::Search {
+            let region = self.layout().tree_region();
+            if let Some(sp) = self.search.as_mut() {
+                if sp.on_drag((x, y), region) {
+                    self.redraw();
+                    return;
+                }
             }
-            return;
         }
-        if self.search_scroll.is_dragging() && self.mouse_pressed {
-            if self.search_scroll.drag((x, y)) {
-                self.redraw();
-            }
-            return;
-        }
-        if self.ext_detail_scroll.is_dragging() && self.mouse_pressed {
-            if self.ext_detail_scroll.drag((x, y)) {
+        if self.detail.ext_detail_scroll.is_dragging() && self.mouse_pressed {
+            if self.detail.ext_detail_scroll.drag((x, y)) {
                 self.redraw();
             }
             return;
@@ -2341,107 +1801,76 @@ impl App {
             }
             return;
         }
-        if self.terminal_split.is_dragging() && self.mouse_pressed {
+        if self.terminal.split.is_dragging() && self.mouse_pressed {
             // Height is measured up from the panel's bottom edge (status bar top).
             let origin = self.layout().status_bar.y;
-            if self.terminal_split.drag(y, origin) {
+            if self.terminal.split.drag(y, origin) {
                 self.redraw();
             }
             return;
         }
-        if self.dragging_editor && self.mouse_pressed {
+        if self.editor.dragging && self.mouse_pressed {
             let layout = self.layout();
-            self.editor_click(x, y, true, layout);
+            if let Some(d) = self.workspace.active_doc_mut() {
+                if self.editor.on_drag(d, &layout, x, y) {
+                    self.redraw();
+                }
+            }
         }
     }
 
     fn on_mouse_release(&mut self) {
-        self.dragging_editor = false;
+        self.editor.on_release();
         self.text_drag = None;
         self.sidebar_split.release();
-        self.terminal_split.release();
-        for g in &mut self.term_groups {
-            for p in &mut g.panes {
-                p.scroll.release();
-            }
+        self.terminal.split.release();
+        self.terminal.release_scrolls();
+        self.detail.ext_detail_scroll.release();
+        if let Some(ep) = self.extensions_panel.as_mut() {
+            ep.on_release();
         }
-        self.ext_scroll.release();
-        self.ext_detail_scroll.release();
-        self.search_scroll.release();
+        if let Some(sp) = self.search.as_mut() {
+            sp.on_release();
+        }
         if let Some(d) = self.workspace.active_doc_mut() {
             d.scroll.release();
         }
     }
 
-    fn editor_click(&mut self, x: f32, y: f32, extend: bool, layout: Layout) {
-        let Some(gpu) = self.gpu.as_mut() else {
-            return;
-        };
-        let Some(d) = self.workspace.active_doc_mut() else {
-            return;
-        };
-        let buf_x = x - (layout.editor_text.x + theme::EDITOR_PAD) + d.scroll_x();
-        let buf_y = y - (layout.editor_text.y + theme::EDITOR_PAD) + d.scroll_y();
-        if let Some(hit) = d.buffer.hit(buf_x, buf_y) {
-            let line = hit.line;
-            if line < d.rope.len_lines() {
-                let line_start = d.rope.line_to_byte(line);
-                let line_len = d.rope.line(line).len_bytes();
-                let col = hit.index.min(line_len);
-                d.place(line_start + col, extend);
-            }
-        }
-        let _ = gpu;
-        self.redraw();
-    }
-
     fn on_scroll(&mut self, dy: f32) {
         let layout = self.layout();
         let p = (self.mouse_pos.x as f32, self.mouse_pos.y as f32);
-        // Terminal scrollback: the ScrollView owns the offset/clamp. Consumes the
-        // event so the editor doesn't scroll underneath.
-        if self.terminal_visible {
-            if let Some(panel) = layout.terminal_panel {
-                let content = terminal_content(panel);
-                if content.contains(p) {
-                    let area = terminal_pane_area(content, self.term_groups.len());
-                    let rects = terminal_pane_rects(area, self.active_pane_count());
-                    if let Some(i) = rects.iter().position(|r| r.contains(p)) {
-                        if let Some(g) = self.term_groups.get_mut(self.active_group) {
-                            if g.panes[i].scroll.on_wheel(0.0, dy) {
-                                g.panes[i].dirty = true;
-                                self.redraw();
-                            }
-                        }
-                    }
+        // Terminal scrollback: the panel owns its pane ScrollViews; consumes the
+        // event (when over the content) so the editor doesn't scroll underneath.
+        if self.terminal.on_scroll(p, &layout, dy) {
+            self.redraw();
+            return;
+        }
+        // Extensions list scrolls when the cursor is over its region (the panel
+        // owns the ScrollView; metrics are set each frame in render).
+        if self.sidebar_visible && self.sidebar_view == SidebarView::Extensions {
+            let region = layout.tree_region();
+            if let Some(ep) = self.extensions_panel.as_mut() {
+                if ep.on_wheel(p, region, dy) {
+                    self.redraw();
                     return;
                 }
             }
         }
-        // Extensions list scrolls when the cursor is over its region. The
-        // ScrollView owns the offset/clamp (metrics are set each frame in render).
-        if self.sidebar_visible && self.sidebar_view == SidebarView::Extensions {
-            let region = ext_list_region(layout.tree_region());
-            if region.contains(p) {
-                if self.ext_scroll.on_wheel(0.0, dy) {
-                    self.redraw();
-                }
-                return;
-            }
-        }
         // Search results scroll when the cursor is over the results region.
         if self.sidebar_visible && self.sidebar_view == SidebarView::Search {
-            if search_results_region(layout.tree_region()).contains(p) {
-                if self.search_scroll.on_wheel(0.0, dy) {
+            let region = layout.tree_region();
+            if let Some(sp) = self.search.as_mut() {
+                if sp.on_wheel(p, region, dy) {
                     self.redraw();
+                    return;
                 }
-                return;
             }
         }
         // The extension detail page (README) scrolls when it's open and the cursor
         // is over the editor area.
-        if self.open_extension.is_some() && layout.editor_text.contains(p) {
-            if self.ext_detail_scroll.on_wheel(0.0, dy) {
+        if self.detail.open_extension.is_some() && layout.editor_text.contains(p) {
+            if self.detail.ext_detail_scroll.on_wheel(0.0, dy) {
                 self.redraw();
             }
             return;
@@ -2483,7 +1912,7 @@ impl App {
         }
 
         // Escape closes an open context menu first.
-        if self.context_menu.is_some() && matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape)) {
+        if self.explorer.menu_open() && matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape)) {
             self.close_context_menu();
             return;
         }
@@ -2505,7 +1934,7 @@ impl App {
         match self.focus() {
             Focus::Terminal => {
                 if let Some(bytes) = translate_terminal_key(&event, ctrl, extend) {
-                    if let Some(g) = self.term_groups.get_mut(self.active_group) {
+                    if let Some(g) = self.terminal.groups.get_mut(self.terminal.active) {
                         if let Some(p) = g.panes.get_mut(g.focused) {
                             p.term.write(&bytes);
                             p.scroll.scroll_to_end(); // typing snaps to the live bottom
@@ -2619,92 +2048,50 @@ impl App {
                 return;
             }
             Focus::ExtFilter => {
-                if matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape)) {
-                    if let Some(g) = self.gpu.as_mut() {
-                        g.ui.ext_filter.clear(&mut g.font_system);
-                    }
-                    self.ext_scroll.scroll_to_y(0.0);
-                    self.rebuild_ext_rows();
+                // The Extensions panel owns its filter box; route the key to it. It
+                // re-runs the marketplace search + rebuilds its rows on change.
+                let mut handled = false;
+                if let (Some(ep), Some(g)) = (self.extensions_panel.as_mut(), self.gpu.as_mut()) {
+                    handled = ep.on_key(
+                        &event,
+                        ctrl,
+                        extend,
+                        g,
+                        &self.extensions,
+                        &self.ext_remote,
+                        &self.worker_tx,
+                        self.clipboard.as_mut(),
+                    );
+                }
+                if handled {
                     self.redraw();
                     return;
-                }
-                let consumed = self.gpu.as_mut().and_then(|g| {
-                    edit_input(&mut g.ui.ext_filter, &mut g.font_system, self.clipboard.as_mut(), &event, ctrl, extend)
-                });
-                match consumed {
-                    Some(changed) => {
-                        if changed {
-                            self.ext_scroll.scroll_to_y(0.0);
-                            self.trigger_search();
-                            self.rebuild_ext_rows();
-                        }
-                        self.redraw();
-                        return;
-                    }
-                    None => {
-                        // Swallow other plain keys (Enter, arrows…) so they can't leak
-                        // to the editor; let Ctrl-combos fall through to shortcuts.
-                        if !ctrl {
-                            return;
-                        }
-                    }
                 }
             }
             Focus::Search => {
-                if matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape)) {
-                    if let Some(g) = self.gpu.as_mut() {
-                        g.ui.search_input.clear(&mut g.font_system);
-                    }
-                    self.search_results.clear();
-                    self.search_scroll.scroll_to_y(0.0);
+                // The Search panel owns both its query and replace boxes; route the
+                // key to it and apply any cross-cutting intents it returns.
+                let root = self.cwd.clone();
+                let mut intents = Vec::new();
+                let mut handled = false;
+                if let (Some(sp), Some(g)) = (self.search.as_mut(), self.gpu.as_mut()) {
+                    handled = sp.on_key(
+                        &event,
+                        ctrl,
+                        extend,
+                        &mut g.font_system,
+                        self.clipboard.as_mut(),
+                        root,
+                        &self.worker_tx,
+                        &mut intents,
+                    );
+                }
+                for i in intents {
+                    self.apply_intent(i);
+                }
+                if handled {
                     self.redraw();
                     return;
-                }
-                let consumed = self.gpu.as_mut().and_then(|g| {
-                    edit_input(&mut g.ui.search_input, &mut g.font_system, self.clipboard.as_mut(), &event, ctrl, extend)
-                });
-                match consumed {
-                    Some(changed) => {
-                        if changed {
-                            self.trigger_find();
-                        }
-                        self.redraw();
-                        return;
-                    }
-                    None => {
-                        if !ctrl {
-                            return;
-                        }
-                    }
-                }
-            }
-            Focus::SearchReplace => {
-                match event.logical_key.as_ref() {
-                    Key::Named(NamedKey::Escape) => {
-                        self.search_replace_active = false;
-                        self.redraw();
-                        return;
-                    }
-                    // Enter in the replace box runs Replace All.
-                    Key::Named(NamedKey::Enter) => {
-                        self.replace_all();
-                        return;
-                    }
-                    _ => {}
-                }
-                let consumed = self.gpu.as_mut().and_then(|g| {
-                    edit_input(&mut g.ui.search_replace, &mut g.font_system, self.clipboard.as_mut(), &event, ctrl, extend)
-                });
-                match consumed {
-                    Some(_) => {
-                        self.redraw();
-                        return;
-                    }
-                    None => {
-                        if !ctrl {
-                            return;
-                        }
-                    }
                 }
             }
             Focus::Editor => {}
@@ -2865,34 +2252,6 @@ impl App {
 
 /// Geometry of the inline New File/Folder row within tree region `tr`:
 /// returns (row rect, icon rect, text-field rect) for the given insert row/depth.
-pub(crate) fn create_row_geometry(tr: Rect, row: usize, depth: usize) -> (Rect, Rect, Rect) {
-    let row_y = tr.y + row as f32 * theme::TREE_ROW_HEIGHT;
-    // Match the file tree: 12px left pad + ~8px per depth, left-aligned icon.
-    let indent = 12.0 + depth as f32 * 8.0;
-    let icon_w = 16.0;
-    let row_rect = Rect { x: tr.x, y: row_y, w: tr.w, h: theme::TREE_ROW_HEIGHT };
-    let icon_rect = Rect { x: tr.x + indent, y: row_y, w: icon_w, h: theme::TREE_ROW_HEIGHT };
-    let field = Rect {
-        x: tr.x + indent + icon_w + 4.0,
-        y: row_y,
-        w: (tr.w - indent - icon_w - 4.0).max(0.0),
-        h: theme::TREE_ROW_HEIGHT,
-    };
-    (row_rect, icon_rect, field)
-}
-
-/// The activity-bar icon index that's currently "active" (highlighted).
-pub(crate) fn active_activity_idx(sidebar_visible: bool, view: SidebarView) -> Option<usize> {
-    if !sidebar_visible {
-        return None;
-    }
-    match view {
-        SidebarView::Explorer => Some(0),
-        SidebarView::Search => Some(1),
-        SidebarView::Extensions => Some(4),
-    }
-}
-
 /// The single source of truth for keyboard focus: which element receives keys.
 /// Derived from the open/active UI state via `App::focus()`, so there's exactly
 /// one answer to "what is focused?" and `on_key` dispatches on it (no implicit
@@ -2904,8 +2263,7 @@ enum Focus {
     Palette,   // command palette
     Find,      // find bar
     ExtFilter, // extensions search box
-    Search,    // find-in-files query box
-    SearchReplace, // find-in-files replace box
+    Search,    // find-in-files panel (owns its own query/replace boxes)
     Terminal,  // integrated terminal
 }
 
@@ -2922,261 +2280,13 @@ fn open_url(url: &str) {
     }
 }
 
-/// Translate a key event into the bytes a shell expects on its PTY input. Returns
-/// None for keys we don't forward.
-fn translate_terminal_key(event: &winit::event::KeyEvent, ctrl: bool, _shift: bool) -> Option<Vec<u8>> {
-    use winit::keyboard::{Key, NamedKey};
-    match event.logical_key.as_ref() {
-        Key::Named(NamedKey::Enter) => return Some(b"\r".to_vec()),
-        Key::Named(NamedKey::Backspace) => return Some(vec![0x7f]),
-        Key::Named(NamedKey::Tab) => return Some(b"\t".to_vec()),
-        Key::Named(NamedKey::Escape) => return Some(vec![0x1b]),
-        Key::Named(NamedKey::ArrowUp) => return Some(b"\x1b[A".to_vec()),
-        Key::Named(NamedKey::ArrowDown) => return Some(b"\x1b[B".to_vec()),
-        Key::Named(NamedKey::ArrowRight) => return Some(b"\x1b[C".to_vec()),
-        Key::Named(NamedKey::ArrowLeft) => return Some(b"\x1b[D".to_vec()),
-        Key::Named(NamedKey::Home) => return Some(b"\x1b[H".to_vec()),
-        Key::Named(NamedKey::End) => return Some(b"\x1b[F".to_vec()),
-        Key::Named(NamedKey::Delete) => return Some(b"\x1b[3~".to_vec()),
-        Key::Named(NamedKey::Space) => return Some(b" ".to_vec()),
-        _ => {}
-    }
-    // Ctrl+<letter> → control byte (Ctrl+C = 0x03, etc.).
-    if ctrl {
-        if let winit::keyboard::PhysicalKey::Code(code) = event.physical_key {
-            use winit::keyboard::KeyCode;
-            let letter = match code {
-                KeyCode::KeyA => Some(b'a'),
-                KeyCode::KeyB => Some(b'b'),
-                KeyCode::KeyC => Some(b'c'),
-                KeyCode::KeyD => Some(b'd'),
-                KeyCode::KeyE => Some(b'e'),
-                KeyCode::KeyK => Some(b'k'),
-                KeyCode::KeyL => Some(b'l'),
-                KeyCode::KeyU => Some(b'u'),
-                KeyCode::KeyZ => Some(b'z'),
-                _ => None,
-            };
-            if let Some(l) = letter {
-                return Some(vec![l & 0x1f]);
-            }
-        }
-        return None;
-    }
-    // Printable text.
-    if let Some(t) = event.text.as_ref() {
-        let s: &str = t;
-        if !s.is_empty() && !s.chars().any(|c| c.is_control()) {
-            return Some(s.as_bytes().to_vec());
-        }
-    }
-    None
-}
-
 /// Identifies the text input under the cursor for click/drag selection.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InputId {
     Palette,
     Find,
-    ExtFilter,
-    Search,
-    SearchReplace,
 }
 
-/// Apply a common editing/navigation key to a focused text input. Returns
-/// `None` if the key wasn't consumed, or `Some(text_changed)` if it was (so the
-/// caller can re-filter only when the content actually changed). Shared by every
-/// input so selection, clipboard, and caret movement behave identically.
-fn edit_input(
-    input: &mut widgets::TextInput,
-    fs: &mut glyphon::FontSystem,
-    clip: Option<&mut Clipboard>,
-    event: &winit::event::KeyEvent,
-    ctrl: bool,
-    shift: bool,
-) -> Option<bool> {
-    use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
-    if ctrl {
-        // Match the physical key (Ctrl can turn the logical key into a control char).
-        if let PhysicalKey::Code(code) = event.physical_key {
-            match code {
-                KeyCode::KeyA => {
-                    input.select_all();
-                    return Some(false);
-                }
-                KeyCode::KeyC => {
-                    if let Some(cb) = clip {
-                        let _ = cb.set_text(input.selected_text().to_string());
-                    }
-                    return Some(false);
-                }
-                KeyCode::KeyX => {
-                    if input.has_selection() {
-                        if let Some(cb) = clip {
-                            let _ = cb.set_text(input.selected_text().to_string());
-                        }
-                        input.backspace(fs);
-                        return Some(true);
-                    }
-                    return Some(false);
-                }
-                KeyCode::KeyV => {
-                    if let Some(cb) = clip {
-                        if let Ok(t) = cb.get_text() {
-                            let t: String = t.chars().filter(|c| *c != '\n' && *c != '\r').collect();
-                            input.insert(fs, &t);
-                            return Some(true);
-                        }
-                    }
-                    return Some(false);
-                }
-                _ => return None,
-            }
-        }
-        return None;
-    }
-    match event.logical_key.as_ref() {
-        Key::Named(NamedKey::ArrowLeft) => {
-            input.move_left(shift);
-            Some(false)
-        }
-        Key::Named(NamedKey::ArrowRight) => {
-            input.move_right(shift);
-            Some(false)
-        }
-        Key::Named(NamedKey::Home) => {
-            input.move_home(shift);
-            Some(false)
-        }
-        Key::Named(NamedKey::End) => {
-            input.move_end(shift);
-            Some(false)
-        }
-        Key::Named(NamedKey::Delete) => {
-            input.delete_forward(fs);
-            Some(true)
-        }
-        Key::Named(NamedKey::Backspace) => {
-            input.backspace(fs);
-            Some(true)
-        }
-        _ => {
-            if let Some(t) = event.text.as_ref() {
-                let s: &str = t;
-                if !s.chars().any(|c| c.is_control()) {
-                    input.insert(fs, s);
-                    return Some(true);
-                }
-            }
-            None
-        }
-    }
-}
-
-/// The search/filter box rect at the top of the Extensions sidebar.
-pub(crate) fn ext_filter_rect(tree: Rect) -> Rect {
-    Rect { x: tree.x + 10.0, y: tree.y + 8.0, w: tree.w - 20.0, h: 30.0 }
-}
-
-/// Search view: the query box (top), the three option toggles (case / word /
-/// regex) below it, and the results region filling the rest. The query box reuses
-/// `ext_filter_rect`'s geometry.
-pub(crate) const SEARCH_OPT_SIZE: f32 = 18.0;
-/// The three option toggles, right-aligned *inside* the query box (VSCode-style).
-pub(crate) fn search_opt_rects(tree: Rect) -> [Rect; 3] {
-    let input = ext_filter_rect(tree);
-    let (s, gap) = (SEARCH_OPT_SIZE, 3.0);
-    let total = 3.0 * s + 2.0 * gap;
-    let start = input.x + input.w - 6.0 - total;
-    let y = input.y + (input.h - s) * 0.5;
-    std::array::from_fn(|i| Rect { x: start + i as f32 * (s + gap), y, w: s, h: s })
-}
-/// The replace box, directly below the query box.
-pub(crate) fn search_replace_rect(tree: Rect) -> Rect {
-    let q = ext_filter_rect(tree);
-    Rect { x: q.x, y: q.y + q.h + 6.0, w: q.w, h: 30.0 }
-}
-/// The "Replace All" button, below the replace box.
-pub(crate) fn search_replace_all_rect(tree: Rect) -> Rect {
-    let r = search_replace_rect(tree);
-    Rect { x: r.x, y: r.y + r.h + 6.0, w: r.w, h: 24.0 }
-}
-pub(crate) fn search_results_region(tree: Rect) -> Rect {
-    let b = search_replace_all_rect(tree);
-    let top = b.y + b.h + 8.0;
-    Rect { x: tree.x, y: top, w: tree.w, h: (tree.y + tree.h - top).max(0.0) }
-}
-
-/// Grid (rows, cols) that fits the terminal panel at the editor font metrics.
-/// Right-aligned icon-button rects in the terminal panel header, drawn left→right
-/// as: +, split, trash, …, maximize, close (6 buttons — matches `GpuState::terminal_btns`).
-pub(crate) const TERMINAL_HEADER_BTNS: usize = 6;
-pub(crate) fn terminal_header_button_rects(panel: Rect) -> Vec<Rect> {
-    let bw = 28.0;
-    let right = panel.x + panel.w - 8.0;
-    let start_x = right - TERMINAL_HEADER_BTNS as f32 * bw;
-    (0..TERMINAL_HEADER_BTNS)
-        .map(|i| Rect { x: start_x + i as f32 * bw, y: panel.y, w: bw, h: theme::TERMINAL_HEADER_H })
-        .collect()
-}
-
-pub(crate) const TERMINAL_TABLIST_W: f32 = 160.0;
-
-/// The right-side terminal-tab list rect — shown (VSCode-style) only when there's
-/// more than one tab, so a single terminal still uses the full width.
-pub(crate) fn terminal_tablist_rect(content: Rect, group_count: usize) -> Option<Rect> {
-    if group_count <= 1 {
-        return None;
-    }
-    let w = TERMINAL_TABLIST_W.min(content.w * 0.4);
-    Some(Rect { x: content.x + content.w - w, y: content.y, w, h: content.h })
-}
-
-/// The pane area: the content minus the tab list (when the list is shown).
-pub(crate) fn terminal_pane_area(content: Rect, group_count: usize) -> Rect {
-    match terminal_tablist_rect(content, group_count) {
-        Some(tl) => Rect { w: (content.w - tl.w).max(1.0), ..content },
-        None => content,
-    }
-}
-
-/// The close (×) button rect for terminal tab-list row `row`.
-pub(crate) fn terminal_tab_close_rect(tl: Rect, row: usize) -> Rect {
-    let s = 18.0;
-    Rect {
-        x: tl.x + tl.w - s - 6.0,
-        y: tl.y + row as f32 * theme::TREE_ROW_HEIGHT + (theme::TREE_ROW_HEIGHT - s) * 0.5,
-        w: s,
-        h: s,
-    }
-}
-
-/// Split the terminal pane area into `n` side-by-side pane rects (1px gaps).
-pub(crate) fn terminal_pane_rects(content: Rect, n: usize) -> Vec<Rect> {
-    if n == 0 {
-        return Vec::new();
-    }
-    let gap = 1.0;
-    let w = ((content.w - gap * (n - 1) as f32) / n as f32).max(1.0);
-    (0..n)
-        .map(|i| Rect { x: content.x + i as f32 * (w + gap), y: content.y, w, h: content.h })
-        .collect()
-}
-
-/// The terminal text/grid area: the panel minus the header strip at its top.
-pub(crate) fn terminal_content(panel: Rect) -> Rect {
-    let h = theme::TERMINAL_HEADER_H;
-    Rect {
-        x: panel.x,
-        y: panel.y + h,
-        w: panel.w,
-        h: (panel.h - h).max(0.0),
-    }
-}
-
-/// Rows/cols that fit `panel` for a monospace cell of `char_w` px wide. Using the
-/// real measured advance keeps the PTY's column count matched to what's actually
-/// rendered, so TUIs (e.g. Claude Code) fill the panel and the cursor lands right.
 /// The earlier of two optional wake times (whichever is present).
 fn min_instant(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
     match (a, b) {
@@ -3184,40 +2294,6 @@ fn min_instant(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
         (x, None) => x,
         (None, y) => y,
     }
-}
-
-pub(crate) fn terminal_grid_size(panel: Rect, char_w: f32) -> (usize, usize) {
-    let char_w = char_w.max(1.0);
-    let cols = (((panel.w - 16.0) / char_w) as usize).clamp(8, 400);
-    let rows = (((panel.h - 8.0) / theme::LINE_HEIGHT()) as usize).clamp(2, 200);
-    (rows, cols)
-}
-
-/// The scrollable extension-row list region (below the filter box).
-pub(crate) fn ext_list_region(tree: Rect) -> Rect {
-    const STRIP: f32 = 46.0; // filter box + padding
-    Rect { x: tree.x, y: tree.y + STRIP, w: tree.w, h: (tree.h - STRIP).max(0.0) }
-}
-
-pub(crate) fn x_range_in_run(
-    run: &glyphon::cosmic_text::LayoutRun,
-    col_start: usize,
-    col_end: usize,
-) -> (f32, f32) {
-    let mut x_start: Option<f32> = if col_start == 0 { Some(0.0) } else { None };
-    let mut x_end: Option<f32> = None;
-    let mut last_end = 0.0f32;
-    for glyph in run.glyphs.iter() {
-        let g_start = glyph.start as usize;
-        if x_start.is_none() && g_start >= col_start {
-            x_start = Some(glyph.x);
-        }
-        if x_end.is_none() && g_start >= col_end {
-            x_end = Some(glyph.x);
-        }
-        last_end = glyph.x + glyph.w;
-    }
-    (x_start.unwrap_or(last_end), x_end.unwrap_or(last_end))
 }
 
 
@@ -3229,7 +2305,7 @@ impl ApplicationHandler for App {
         while let Ok(msg) = self.worker_rx.try_recv() {
             match msg {
                 WorkerMsg::Search { gen, results } => {
-                    if gen == self.search_gen {
+                    if self.extensions_panel.as_ref().map_or(false, |ep| ep.search_gen() == gen) {
                         self.ext_remote = results;
                         self.rebuild_ext_rows();
                         self.redraw();
@@ -3243,14 +2319,14 @@ impl ApplicationHandler for App {
                     self.redraw();
                 }
                 WorkerMsg::Readme { gen, text } => {
-                    if gen == self.ext_doc_gen {
-                        self.ext_readme = text;
+                    if gen == self.detail.ext_doc_gen {
+                        self.detail.ext_readme = text;
                         self.redraw();
                     }
                 }
                 WorkerMsg::Changelog { gen, text } => {
-                    if gen == self.ext_doc_gen {
-                        self.ext_changelog = text;
+                    if gen == self.detail.ext_doc_gen {
+                        self.detail.ext_changelog = text;
                         self.redraw();
                     }
                 }
@@ -3261,14 +2337,14 @@ impl ApplicationHandler for App {
                     self.redraw();
                 }
                 WorkerMsg::SearchHits { gen, files } => {
-                    if gen == self.find_gen {
-                        self.search_results.extend(files);
+                    if let Some(sp) = self.search.as_mut() {
+                        sp.ingest(gen, files);
                         self.redraw();
                     }
                 }
                 WorkerMsg::SearchDone { gen } => {
-                    if gen == self.find_gen {
-                        self.find_pending = false;
+                    if let Some(sp) = self.search.as_mut() {
+                        sp.search_done(gen);
                         self.redraw();
                     }
                 }
@@ -3293,9 +2369,9 @@ impl ApplicationHandler for App {
 
         // Integrated terminal: drain every pane's shell output, and keep ticking
         // while open so new output appears promptly.
-        if self.terminal_visible {
+        if self.terminal.visible {
             let mut changed = false;
-            for g in &mut self.term_groups {
+            for g in &mut self.terminal.groups {
                 for p in &mut g.panes {
                     if p.term.poll() {
                         p.dirty = true;
@@ -3314,13 +2390,13 @@ impl ApplicationHandler for App {
         // While a find-in-files search is streaming, keep waking to drain its
         // results from the worker channel (otherwise idle ControlFlow::Wait would
         // never poll them).
-        if self.find_pending {
+        if self.search.as_ref().map_or(false, |sp| sp.pending()) {
             el.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(30)));
             return;
         }
 
         // If an animated GIF is visible on the detail page, tick ~20fps to play it.
-        let animating = self.open_extension.is_some()
+        let animating = self.detail.open_extension.is_some()
             && self
                 .gpu
                 .as_ref()
@@ -3379,6 +2455,11 @@ impl ApplicationHandler for App {
         match pollster::block_on(GpuState::new(window)) {
             Ok(gpu) => {
                 self.gpu = Some(gpu);
+                if let Some(g) = self.gpu.as_mut() {
+                    self.search = Some(ui::search_panel::SearchPanel::new(&mut g.font_system));
+                    self.extensions_panel =
+                        Some(ui::extensions_panel::ExtensionsPanel::new(&mut g.font_system));
+                }
                 self.open_initial();
             }
             Err(e) => {
