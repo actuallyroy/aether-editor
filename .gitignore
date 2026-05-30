@@ -4,3 +4,6 @@ Cargo.lock.bak
 .vscode/
 .idea/
 *.pdb
+*.stackdump
+windows-mcp-issues.txt
+Cargo.lock

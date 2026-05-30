@@ -18,6 +18,13 @@ pub enum WorkerMsg {
     Installed { result: Result<(), String> },
     Readme { gen: u64, text: Option<String> },
     Changelog { gen: u64, text: Option<String> },
+    Image { key: String, frames: Vec<crate::media::DecodedFrame> },
+}
+
+/// Where a README image comes from: a remote URL or a local file path.
+pub enum ImgSource {
+    Http(String),
+    File(std::path::PathBuf),
 }
 
 /// Run a search on a background thread and send the results back over `tx`. The
@@ -51,6 +58,20 @@ pub fn changelog_async(tx: Sender<WorkerMsg>, url: String, gen: u64) {
     std::thread::spawn(move || {
         let text = get_string(&url);
         let _ = tx.send(WorkerMsg::Changelog { gen, text });
+    });
+}
+
+/// Fetch + DECODE a README image on a background thread (so a big animated GIF
+/// never blocks the UI), then ship the frames to the main thread for cheap upload.
+/// `key` is the markdown's raw image reference (used to match it back).
+pub fn image_async(tx: Sender<WorkerMsg>, key: String, src: ImgSource) {
+    std::thread::spawn(move || {
+        let bytes = match src {
+            ImgSource::Http(url) => get_bytes(&url, 32 * 1024 * 1024),
+            ImgSource::File(path) => std::fs::read(&path).ok(),
+        };
+        let frames = bytes.map(|b| crate::media::decode(&b)).unwrap_or_default();
+        let _ = tx.send(WorkerMsg::Image { key, frames });
     });
 }
 
@@ -175,6 +196,16 @@ pub fn install(ext: &RemoteExt, ext_root: &Path) -> Result<PathBuf, String> {
         }
     }
     Ok(dest)
+}
+
+/// Resolve a (possibly relative) URL `rel` against a document `base` URL.
+/// Absolute `rel` is returned as-is; otherwise it's joined to base's directory.
+pub fn join_url(base: &str, rel: &str) -> Option<String> {
+    if rel.starts_with("http://") || rel.starts_with("https://") {
+        return Some(rel.to_string());
+    }
+    let cut = base.rfind('/')?;
+    Some(format!("{}/{}", &base[..cut], rel.trim_start_matches("./")))
 }
 
 /// Minimal percent-encoding for the query string (encode anything non-alnum).

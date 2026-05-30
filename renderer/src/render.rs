@@ -15,7 +15,7 @@ use crate::extensions::open_ext_view;
 use crate::layout::Layout;
 use crate::quad::Quad;
 use crate::widgets::{Rect, VAlign};
-use crate::{icon, theme};
+use crate::{icon, marketplace, theme};
 use crate::{
     active_activity_idx, create_row_geometry, cursor_pos_in_buffer, ext_filter_rect,
     ext_list_region, x_range_in_run, App, SidebarView, MENU_ACTIONS,
@@ -610,6 +610,9 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
 
     let ui = &gpu.ui;
     let mut areas: Vec<TextArea> = Vec::new();
+    // README image draw rects (collected during the detail-page text draw, drawn in
+    // a clipped media pass after the main pass).
+    let mut detail_img_rects: Vec<(String, Rect)> = Vec::new();
 
     // When the palette (modal) is open, suppress all underlying text so it can't
     // bleed through — text renders in one pass after the bg quads, so the dim
@@ -734,7 +737,14 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
 
     // Editor area: either the extension detail page or the document.
     if app.open_extension.is_some() {
-        ui.ext_detail.draw_text(editor_region(&layout), app.ext_detail_scroll, &mut areas);
+        let size_of = |k: &str| gpu.media.size(k);
+        ui.ext_detail.draw_text(
+            editor_region(&layout),
+            app.ext_detail_scroll,
+            &size_of,
+            &mut areas,
+            &mut detail_img_rects,
+        );
     } else if let Some(i) = active_idx {
         let d = &app.workspace.documents[i];
 
@@ -819,6 +829,79 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         gpu.quad_renderer.render_fg(&mut pass);
     }
     gpu.queue.submit(Some(encoder.finish()));
+
+    // ---- README images: request any referenced by the active tab, then draw ----
+    if app.open_extension.is_some() {
+        // Drive fetching from ALL image URLs in the active body (not just loaded
+        // ones) — otherwise nothing would ever load (the draw list only holds
+        // already-loaded images). Clone to drop the gpu.ui borrow before fetching.
+        use marketplace::ImgSource;
+        let urls: Vec<String> = gpu.ui.ext_detail.image_urls().to_vec();
+        for key in &urls {
+            if gpu.media.has(key) || app.requested_images.contains(key) {
+                continue;
+            }
+            app.requested_images.insert(key.clone());
+            // Resolve to a source; fetch+decode happens off-thread either way.
+            let src = if key.starts_with("http://") || key.starts_with("https://") {
+                Some(ImgSource::Http(key.clone()))
+            } else if let Some(dir) = &app.ext_img_dir {
+                Some(ImgSource::File(dir.join(key.trim_start_matches("./"))))
+            } else if let Some(base) = &app.ext_img_base {
+                marketplace::join_url(base, key).map(ImgSource::Http)
+            } else {
+                None
+            };
+            if let Some(src) = src {
+                marketplace::image_async(app.worker_tx.clone(), key.clone(), src);
+            }
+        }
+    }
+
+    // Draw loaded images + link underlines in a clipped pass over the README body.
+    if app.open_extension.is_some() {
+        let region = editor_region(&layout);
+        let clip = crate::ext_detail::ExtensionDetail::body_viewport(region);
+        let scroll = app.ext_detail_scroll;
+        // Link underlines (thin lines under each link fragment, in the link color).
+        let lc = theme::FG_ACTIVE();
+        let ul_color = [lc.r() as f32 / 255.0, lc.g() as f32 / 255.0, lc.b() as f32 / 255.0, 1.0];
+        let mut underlines: Vec<Quad> = Vec::new();
+        for (r, _url) in gpu.ui.ext_detail.link_rects(region, scroll, &|k| gpu.media.size(k)) {
+            underlines.push(Quad::new(r.x, r.y + r.h - 2.0, r.w, 1.0, ul_color));
+        }
+        if !detail_img_rects.is_empty() || !underlines.is_empty() {
+            let now_ms = app.anim_start.elapsed().as_millis() as u64;
+            gpu.media.prepare(&gpu.device, &gpu.queue, &detail_img_rects, (cfg_w, cfg_h), now_ms);
+            gpu.quad_renderer.prepare(&gpu.device, &gpu.queue, &underlines, &[], (cfg_w, cfg_h));
+            let mut enc = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("nova-media-pass"),
+            });
+            {
+                let mut pass = enc.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("nova-media"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                let sx = clip.x.max(0.0) as u32;
+                let sy = clip.y.max(0.0) as u32;
+                let sw = clip.w.min(cfg_w as f32 - clip.x).max(0.0) as u32;
+                let sh = clip.h.min(cfg_h as f32 - clip.y).max(0.0) as u32;
+                if sw > 0 && sh > 0 {
+                    pass.set_scissor_rect(sx, sy, sw, sh);
+                    gpu.media.render(&mut pass);
+                    gpu.quad_renderer.render_bg(&mut pass);
+                }
+            }
+            gpu.queue.submit(Some(enc.finish()));
+        }
+    }
 
     // ---- Extensions list: clipped, scrollable pass over the sidebar ----
     if app.sidebar_visible

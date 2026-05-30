@@ -237,11 +237,26 @@ impl ExtensionDetail {
         }
     }
 
-    pub fn body_content_height(&self) -> f32 {
-        self.active_body().content_height()
+    pub fn body_content_height(&self, size_of: &dyn Fn(&str) -> Option<(f32, f32)>) -> f32 {
+        self.active_body().content_height(size_of)
+    }
+
+    /// Image URLs referenced by the active tab's body (for prefetching).
+    pub fn image_urls(&self) -> &[String] {
+        self.active_body().image_urls()
+    }
+
+    /// Screen-space (rect, url) for every visible link in the active body — used
+    /// for underline drawing and click hit-testing.
+    pub fn link_rects(&self, region: Rect, scroll: f32, size_of: &dyn Fn(&str) -> Option<(f32, f32)>) -> Vec<(Rect, String)> {
+        self.active_body().link_geometry(Self::body_rect(region), scroll, size_of)
     }
     pub fn body_viewport_height(r: Rect) -> f32 {
         Self::body_rect(r).h
+    }
+    /// The body viewport rect (used to clip the README images when scrolling).
+    pub fn body_viewport(r: Rect) -> Rect {
+        Self::body_rect(r)
     }
 
     // ---- interaction ----
@@ -292,7 +307,14 @@ impl ExtensionDetail {
         quads.push(Quad::new(sx, Self::tabbar_y(r), 1.0, r.y + r.h - Self::tabbar_y(r), theme::BORDER()));
     }
 
-    pub fn draw_text<'a>(&'a self, r: Rect, scroll: f32, areas: &mut Vec<TextArea<'a>>) {
+    pub fn draw_text<'a>(
+        &'a self,
+        r: Rect,
+        scroll: f32,
+        size_of: &dyn Fn(&str) -> Option<(f32, f32)>,
+        areas: &mut Vec<TextArea<'a>>,
+        img_rects: &mut Vec<(String, Rect)>,
+    ) {
         let htext_x = Self::header_text_x(r);
         let avail = Self::install_rect(r).x - htext_x - 16.0;
         self.name.push(htext_x, Rect { x: htext_x, y: r.y + Self::HEADER_TOP, w: avail, h: 34.0 }, theme::FG_ACTIVE(), areas);
@@ -306,8 +328,8 @@ impl ExtensionDetail {
             self.tabs[i].draw_center(tabs[i], color, areas);
         }
 
-        // Active body (scrolled + clipped).
-        self.active_body().draw(Self::body_rect(r), scroll, areas);
+        // Active body (scrolled + clipped); collects image rects for the media layer.
+        self.active_body().draw(Self::body_rect(r), scroll, size_of, areas, img_rects);
 
         // Sidebar metadata.
         let sr = Self::sidebar_rect(r);

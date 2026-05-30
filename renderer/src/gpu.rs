@@ -15,6 +15,7 @@ use wgpu::{
 use winit::window::Window;
 
 use crate::icon::IconAtlas;
+use crate::media::Media;
 use crate::quad::QuadRenderer;
 use crate::theme;
 use crate::ext_detail::ExtensionDetail;
@@ -54,6 +55,7 @@ pub struct GpuState {
     pub text_renderer: TextRenderer,
     pub quad_renderer: QuadRenderer,
     pub icon_atlas: IconAtlas,
+    pub media: Media,
     pub ui: UiBuffers,
     pub activity_btns: Vec<IconButton>,
     pub titlebar_btns: Vec<IconButton>,
@@ -129,6 +131,7 @@ impl GpuState {
             TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
         let quad_renderer = QuadRenderer::new(&device, config.format);
         let icon_atlas = IconAtlas::new(&device, config.format);
+        let media = Media::new(&device, config.format);
 
         let ic = theme::ICON_FAMILY;
         let activity_btns = vec![
@@ -208,6 +211,7 @@ impl GpuState {
             text_renderer,
             quad_renderer,
             icon_atlas,
+            media,
             ui,
             activity_btns,
             titlebar_btns,

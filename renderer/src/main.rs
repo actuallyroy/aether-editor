@@ -17,14 +17,17 @@ mod icon;
 mod layout;
 mod markdown;
 mod marketplace;
+mod media;
 mod quad;
 mod render;
+mod settings;
 mod syntax;
 mod textmate;
 mod theme;
 mod widgets;
 mod workspace;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
@@ -174,12 +177,16 @@ pub(crate) struct App {
     pub(crate) ext_changelog: Option<String>,   // CHANGELOG text for the open detail page
     pub(crate) ext_features: String,            // generated Features-tab markdown
     pub(crate) ext_doc_gen: u64,                // discards stale async README/changelog fetches
+    pub(crate) ext_img_dir: Option<PathBuf>,    // base dir for relative README images (local)
+    pub(crate) ext_img_base: Option<String>,    // base URL for relative README images (remote)
+    pub(crate) requested_images: HashSet<String>, // README image keys already fetched/loading
     pub(crate) ext_detail_scroll: f32,          // detail-page body scroll offset
     pub(crate) hovered_detail_tab: Option<ext_detail::DetailTab>,
     pub(crate) hovered_page_install: bool,
     pub(crate) pending_close: bool,
     pub(crate) cursor_blink_on: bool,
     pub(crate) last_blink: Instant,
+    pub(crate) anim_start: Instant, // monotonic clock for GIF playback
     pub(crate) cursor_icon: CursorIcon,
 }
 
@@ -243,12 +250,16 @@ impl App {
             ext_changelog: None,
             ext_features: String::new(),
             ext_doc_gen: 0,
+            ext_img_dir: None,
+            ext_img_base: None,
+            requested_images: HashSet::new(),
             ext_detail_scroll: 0.0,
             hovered_detail_tab: None,
             hovered_page_install: false,
             pending_close: false,
             cursor_blink_on: true,
             last_blink: Instant::now(),
+            anim_start: Instant::now(),
             cursor_icon: CursorIcon::Default,
         }
     }
@@ -428,6 +439,23 @@ impl App {
             changed = true;
         }
 
+        // Hovering a README link → pointer cursor.
+        let over_detail_link = if self.open_extension.is_some() {
+            let region = render::editor_region(&layout);
+            let scroll = self.ext_detail_scroll;
+            self.gpu
+                .as_ref()
+                .map(|g| {
+                    g.ui.ext_detail
+                        .link_rects(region, scroll, &|k| g.media.size(k))
+                        .iter()
+                        .any(|(r, _)| r.contains(p))
+                })
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
         let over_scrollbar = self
             .editor_scroll_metrics(&layout)
             .and_then(|(t, c, v, s)| self.editor_scroll.thumb(t, c, v, s))
@@ -468,7 +496,7 @@ impl App {
                 .unwrap_or(CursorIcon::Default)
         } else if self.focused_input_at(&layout, p).is_some() {
             CursorIcon::Text
-        } else if new_ext.is_some() || new_page_install || new_detail_tab.is_some() {
+        } else if new_ext.is_some() || new_page_install || new_detail_tab.is_some() || over_detail_link {
             CursorIcon::Pointer
         } else if self.open_extension.is_some() && layout.editor_text.contains(p) {
             CursorIcon::Default
@@ -898,6 +926,9 @@ impl App {
         self.ext_detail_scroll = 0.0;
         self.ext_readme = None;
         self.ext_changelog = None;
+        self.ext_img_dir = None;
+        self.ext_img_base = None;
+        self.requested_images.clear();
         if let Some(g) = self.gpu.as_mut() {
             g.ui.ext_detail.set_tab(ext_detail::DetailTab::Details);
         }
@@ -906,10 +937,9 @@ impl App {
         let gen = self.ext_doc_gen;
         match which {
             OpenExt::Local(i) => {
-                let e = self.extensions.get(i);
-                self.ext_readme = e
-                    .and_then(|e| e.readme_path.clone())
-                    .and_then(|p| std::fs::read_to_string(&p).ok());
+                let readme = self.extensions.get(i).and_then(|e| e.readme_path.clone());
+                self.ext_img_dir = readme.as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf()));
+                self.ext_readme = readme.and_then(|p| std::fs::read_to_string(&p).ok());
                 self.ext_changelog = self
                     .extensions
                     .get(i)
@@ -918,6 +948,8 @@ impl App {
             }
             OpenExt::Remote(i) => {
                 if let Some(e) = self.ext_remote.get(i) {
+                    // Relative README images resolve against the readme URL's dir.
+                    self.ext_img_base = e.readme_url.clone();
                     if let Some(url) = e.readme_url.clone() {
                         marketplace::readme_async(self.worker_tx.clone(), url, gen);
                     }
@@ -1227,8 +1259,21 @@ impl App {
                     self.workspace.active = Some(self.workspace.documents.len() - 1);
                 }
             }
+            Command::OpenSettings => self.open_settings_file(settings::user_settings_path()),
+            Command::OpenDefaultSettings => self.open_settings_file(settings::default_settings_path()),
         }
         self.redraw();
+    }
+
+    /// Open a settings file (user or default) as a document tab, dismissing any
+    /// open extension page so it shows in the editor area.
+    fn open_settings_file(&mut self, path: Option<PathBuf>) {
+        let Some(path) = path else { return };
+        if let Some(gpu) = self.gpu.as_mut() {
+            if self.workspace.open_file(&path, &mut gpu.font_system).is_ok() {
+                self.open_extension = None;
+            }
+        }
     }
 
     fn copy(&mut self) {
@@ -1569,6 +1614,19 @@ impl App {
         if self.open_extension.is_some() {
             let region = render::editor_region(&layout);
             if region.contains((x, y)) {
+                // A click on a README link opens it in the browser.
+                let scroll = self.ext_detail_scroll;
+                let link = self.gpu.as_ref().and_then(|g| {
+                    g.ui.ext_detail
+                        .link_rects(region, scroll, &|k| g.media.size(k))
+                        .into_iter()
+                        .find(|(r, _)| r.contains((x, y)))
+                        .map(|(_, url)| url)
+                });
+                if let Some(url) = link {
+                    open_url(&url);
+                    return;
+                }
                 let tab = self.gpu.as_ref().and_then(|g| g.ui.ext_detail.hit_tab(region, (x, y)));
                 if let Some(tab) = tab {
                     if let Some(g) = self.gpu.as_mut() {
@@ -1739,9 +1797,8 @@ impl App {
                 .gpu
                 .as_ref()
                 .map(|g| {
-                    (g.ui.ext_detail.body_content_height()
-                        - ext_detail::ExtensionDetail::body_viewport_height(region))
-                    .max(0.0)
+                    let ch = g.ui.ext_detail.body_content_height(&|k| g.media.size(k));
+                    (ch - ext_detail::ExtensionDetail::body_viewport_height(region)).max(0.0)
                 })
                 .unwrap_or(0.0);
             self.ext_detail_scroll = (self.ext_detail_scroll - dy).clamp(0.0, max);
@@ -2120,6 +2177,19 @@ enum Focus {
     ExtFilter, // extensions search box
 }
 
+/// Open a URL in the OS default browser. Best-effort, http(s) only (so README
+/// link text can't launch arbitrary commands).
+fn open_url(url: &str) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000; // suppress the console window flash
+    if url.starts_with("http://") || url.starts_with("https://") {
+        let _ = std::process::Command::new("cmd")
+            .args(["/c", "start", "", url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+    }
+}
+
 /// Identifies the text input under the cursor for click/drag selection.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InputId {
@@ -2311,11 +2381,31 @@ impl ApplicationHandler for App {
                         self.redraw();
                     }
                 }
+                WorkerMsg::Image { key, frames } => {
+                    if let Some(g) = self.gpu.as_mut() {
+                        g.media.upload_frames(&g.device, &g.queue, &key, frames);
+                    }
+                    self.redraw();
+                }
             }
         }
 
-        let interval = Duration::from_millis(theme::BLINK_MS);
         let now = Instant::now();
+
+        // If an animated GIF is visible on the detail page, tick ~20fps to play it.
+        let animating = self.open_extension.is_some()
+            && self
+                .gpu
+                .as_ref()
+                .map(|g| g.ui.ext_detail.image_urls().iter().any(|u| g.media.is_animated(u)))
+                .unwrap_or(false);
+        if animating {
+            self.redraw();
+            el.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(66)));
+            return;
+        }
+
+        let interval = Duration::from_millis(theme::BLINK_MS);
         if now.duration_since(self.last_blink) >= interval {
             self.cursor_blink_on = !self.cursor_blink_on;
             self.last_blink = now;

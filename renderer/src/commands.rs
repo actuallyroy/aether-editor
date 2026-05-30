@@ -10,6 +10,8 @@ pub enum Command {
     SelectAll,
     ToggleSidebar,
     NewFile,
+    OpenSettings,
+    OpenDefaultSettings,
 }
 
 pub const COMMANDS: &[(Command, &str, &str)] = &[
@@ -21,6 +23,8 @@ pub const COMMANDS: &[(Command, &str, &str)] = &[
     (Command::Redo, "Edit: Redo", "Ctrl+Y"),
     (Command::SelectAll, "Edit: Select All", "Ctrl+A"),
     (Command::ToggleSidebar, "View: Toggle Sidebar", ""),
+    (Command::OpenSettings, "Preferences: Open Settings (JSON)", ""),
+    (Command::OpenDefaultSettings, "Preferences: Open Default Settings (JSON)", ""),
 ];
 
 pub struct PaletteState {
