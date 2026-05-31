@@ -132,7 +132,8 @@ impl ExtensionDetail {
         let ui = |c: Color| Attrs::new().family(Family::Name(theme::UI_FAMILY())).color(c);
 
         // Name (large).
-        let name_span = [(name.to_string(), ui(theme::FG_ACTIVE()).metrics(Metrics::new(24.0, 32.0)))];
+        let z = theme::ui_zoom();
+        let name_span = [(name.to_string(), ui(theme::FG_ACTIVE()).metrics(Metrics::new(24.0 * z, 32.0 * z)))];
         self.name.set_rich(fs, name, &name_span, ui(theme::FG_ACTIVE()));
 
         // Meta: publisher · vX · ★rating · N installs.

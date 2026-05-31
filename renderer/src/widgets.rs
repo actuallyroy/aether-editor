@@ -382,6 +382,11 @@ impl TextInput {
             // `width` is the unzoomed wrap boundary; scale it so the text wraps at
             // the field's actual (zoomed) width instead of in the middle at high zoom.
             self.buffer.set_size(fs, Some(self.width * theme::ui_zoom()), Some(4000.0));
+        } else {
+            // Single line: unbounded width (no wrap; the draw clips), and a height
+            // that tracks the zoomed line height so the line isn't culled at high
+            // zoom (the buffer keeps its small creation-time height otherwise).
+            self.buffer.set_size(fs, None, Some(theme::UI_LINE_HEIGHT() * 2.0));
         }
         self.buffer.set_text(
             fs,
@@ -1859,11 +1864,22 @@ pub struct ExtensionRow {
 }
 
 impl ExtensionRow {
-    pub const HEIGHT: f32 = 84.0;
-    const PAD_X: f32 = 12.0;
-    const ICON: f32 = 42.0;
-    const GAP: f32 = 12.0;
-    const TOP: f32 = 9.0;
+    /// Row height, scaled by zoom (the three text lines + icon must fit at 200%).
+    pub fn height() -> f32 {
+        84.0 * theme::ui_zoom()
+    }
+    fn pad_x() -> f32 {
+        12.0 * theme::ui_zoom()
+    }
+    fn icon() -> f32 {
+        42.0 * theme::ui_zoom()
+    }
+    fn gap() -> f32 {
+        12.0 * theme::ui_zoom()
+    }
+    fn top() -> f32 {
+        9.0 * theme::ui_zoom()
+    }
 
     pub fn new(fs: &mut FontSystem, name: &str, meta: &str, desc: &str, icon_uv: Option<[f32; 4]>) -> Self {
         let mut nl = TextLabel::new(fs, theme::SIDEBAR_WIDTH(), theme::UI_LINE_HEIGHT());
@@ -1891,14 +1907,22 @@ impl ExtensionRow {
     }
 
     fn icon_rect(b: Rect) -> Rect {
-        Rect { x: b.x + Self::PAD_X, y: b.y + (b.h - Self::ICON) * 0.5, w: Self::ICON, h: Self::ICON }
+        let icon = Self::icon();
+        Rect { x: b.x + Self::pad_x(), y: b.y + (b.h - icon) * 0.5, w: icon, h: icon }
     }
     fn text_x(b: Rect) -> f32 {
-        b.x + Self::PAD_X + Self::ICON + Self::GAP
+        b.x + Self::pad_x() + Self::icon() + Self::gap()
     }
     fn line_rect(b: Rect, n: f32) -> Rect {
         let x = Self::text_x(b);
-        Rect { x, y: b.y + Self::TOP + n * theme::UI_LINE_HEIGHT(), w: b.x + b.w - Self::PAD_X - x, h: theme::UI_LINE_HEIGHT() }
+        Rect { x, y: b.y + Self::top() + n * theme::UI_LINE_HEIGHT(), w: b.x + b.w - Self::pad_x() - x, h: theme::UI_LINE_HEIGHT() }
+    }
+
+    /// Re-shape the row's label text after a zoom change.
+    fn reshape(&mut self, fs: &mut FontSystem) {
+        self.name.reshape(fs);
+        self.meta.reshape(fs);
+        self.desc.reshape(fs);
     }
 
     /// True if `p` is on this row.
@@ -1972,15 +1996,22 @@ impl ExtensionList {
 
     /// Total stacked height of all rows (for scroll clamping).
     pub fn content_height(&self) -> f32 {
-        self.rows.len() as f32 * ExtensionRow::HEIGHT
+        self.rows.len() as f32 * ExtensionRow::height()
+    }
+
+    /// Re-shape every row's text after a zoom change.
+    pub fn rezoom(&mut self, fs: &mut FontSystem) {
+        for r in &mut self.rows {
+            r.reshape(fs);
+        }
     }
 
     fn row_bounds(&self, region: Rect, scroll: f32, i: usize) -> Rect {
         Rect {
             x: region.x,
-            y: region.y - scroll + i as f32 * ExtensionRow::HEIGHT,
+            y: region.y - scroll + i as f32 * ExtensionRow::height(),
             w: region.w,
-            h: ExtensionRow::HEIGHT,
+            h: ExtensionRow::height(),
         }
     }
 

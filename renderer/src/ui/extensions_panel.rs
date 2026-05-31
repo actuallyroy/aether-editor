@@ -110,6 +110,12 @@ impl ExtensionsPanel {
         marketplace::search_async(tx.clone(), query, self.search_gen);
     }
 
+    /// Re-shape the filter input + every row after a zoom change.
+    pub fn rezoom(&mut self, fs: &mut FontSystem) {
+        self.filter.rezoom(fs);
+        self.rows.rezoom(fs);
+    }
+
     // ---- Shaping: keep the scroll metrics in sync with the row content height. ----
     pub fn update(&mut self, region: Rect) {
         let list = ext_list_region(region);
