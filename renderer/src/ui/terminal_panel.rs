@@ -280,8 +280,16 @@ impl TerminalPanel {
         let rects = terminal_pane_rects(area, self.active_pane_count());
         if let Some(i) = rects.iter().position(|r| r.contains(pt)) {
             if let Some(g) = self.groups.get_mut(self.active) {
-                if g.panes[i].scroll.on_wheel(0.0, dy) {
-                    g.panes[i].dirty = true;
+                let pane = &mut g.panes[i];
+                if pane.term.is_alt() {
+                    // A full-screen app owns scrolling — forward the wheel to it
+                    // (a few notches per tick) instead of Nova's empty scrollback.
+                    let up = dy > 0.0;
+                    for _ in 0..3 {
+                        pane.term.forward_wheel(up, 1, 1);
+                    }
+                } else if pane.scroll.on_wheel(0.0, dy) {
+                    pane.dirty = true;
                 }
             }
         }

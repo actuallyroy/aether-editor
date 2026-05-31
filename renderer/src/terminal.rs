@@ -133,6 +133,8 @@ pub struct Grid {
     saved_cursor: (usize, usize),
     alt: Option<AltScreen>,
     cursor_visible: bool, // DECTCEM (CSI ?25h/l): TUIs hide the cursor while redrawing
+    mouse_enabled: bool,  // DECSET 1000/1002/1003: app wants mouse events
+    sgr_mouse: bool,      // DECSET 1006: SGR extended mouse encoding
 }
 
 const MAX_SCROLLBACK: usize = 5000;
@@ -154,6 +156,8 @@ impl Grid {
             saved_cursor: (0, 0),
             alt: None,
             cursor_visible: true,
+            mouse_enabled: false,
+            sgr_mouse: false,
         }
     }
 
@@ -455,7 +459,9 @@ impl Perform for Grid {
                             }
                         }
                         25 => self.cursor_visible = set, // DECTCEM show/hide cursor
-                        _ => {} // 2004 (bracketed paste), mouse modes — ignored
+                        1000 | 1002 | 1003 => self.mouse_enabled = set, // mouse reporting
+                        1006 => self.sgr_mouse = set,                   // SGR mouse encoding
+                        _ => {} // 2004 (bracketed paste) etc. — ignored
                     }
                 }
             }
@@ -630,6 +636,34 @@ impl Terminal {
     pub fn write(&mut self, bytes: &[u8]) {
         let _ = self.writer.write_all(bytes);
         let _ = self.writer.flush();
+    }
+
+    /// True when a full-screen (alt-screen) app is running — it owns scrolling, so
+    /// the wheel should be forwarded to it rather than scrolling Nova's scrollback.
+    pub fn is_alt(&self) -> bool {
+        self.grid.alt.is_some()
+    }
+
+    /// Forward one wheel notch to the running app: an SGR/legacy mouse-wheel event
+    /// if it enabled mouse reporting, else an arrow key (so pagers/editors scroll).
+    pub fn forward_wheel(&mut self, up: bool, col: u16, row: u16) {
+        let seq = if self.grid.mouse_enabled {
+            let b = if up { 64 } else { 65 };
+            if self.grid.sgr_mouse {
+                format!("\x1b[<{};{};{}M", b, col.max(1), row.max(1))
+            } else {
+                let mut s = String::from("\x1b[M");
+                s.push((b as u8 + 32) as char);
+                s.push(((col.clamp(1, 223) as u8) + 32) as char);
+                s.push(((row.clamp(1, 223) as u8) + 32) as char);
+                s
+            }
+        } else if up {
+            "\x1b[A".to_string()
+        } else {
+            "\x1b[B".to_string()
+        };
+        self.write(seq.as_bytes());
     }
 
     /// Total scrollable lines (history + live rows). The alternate screen has no
