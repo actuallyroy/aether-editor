@@ -197,6 +197,9 @@ impl TextLabel {
         let z = theme::ui_zoom();
         self.buffer.set_metrics(fs, Metrics::new(theme::UI_FONT_SIZE(), theme::UI_LINE_HEIGHT()));
         self.buffer.set_size(fs, Some(self.base_w * z), Some(self.base_h * z));
+        // Labels are single-line — never wrap (a long string clips at the rect
+        // rather than spilling onto a second line into neighbouring widgets).
+        self.buffer.set_wrap(fs, Wrap::None);
         self.buffer.set_text(
             fs,
             &self.last,

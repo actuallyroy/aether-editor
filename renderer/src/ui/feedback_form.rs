@@ -81,7 +81,7 @@ impl FeedbackForm {
             focus: Field::Title,
             selecting: None,
             include_sysinfo: true,
-            l_header: mk(fs, "Report an issue or send feedback. Submitted to GitHub via your gh login."),
+            l_header: mk(fs, "Report a bug or request a feature"),
             l_type: mk(fs, "This is a"),
             l_title: mk(fs, "Title"),
             l_details: mk(fs, "Details"),
@@ -187,7 +187,7 @@ impl FeedbackForm {
         self.l_header.push(
             r.box_.x + 24.0 * z2,
             Rect { x: r.box_.x, y: r.box_.y + 14.0 * z2, w: r.box_.w, h: 22.0 * z2 },
-            theme::FG_DIM(),
+            theme::FG_TEXT(),
             areas,
         );
         for (i, c) in r.chips.iter().enumerate() {
