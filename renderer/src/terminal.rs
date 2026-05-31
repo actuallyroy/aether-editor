@@ -564,7 +564,18 @@ impl Terminal {
         let pair = pty
             .openpty(PtySize { rows: rows as u16, cols: cols as u16, pixel_width: 0, pixel_height: 0 })
             .ok()?;
+        // Platform shell: COMSPEC/cmd.exe on Windows, else $SHELL (login shell)
+        // falling back to bash/sh on Unix.
+        #[cfg(windows)]
         let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+        #[cfg(not(windows))]
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| {
+            if std::path::Path::new("/bin/bash").exists() {
+                "/bin/bash".to_string()
+            } else {
+                "/bin/sh".to_string()
+            }
+        });
         let title = std::path::Path::new(&shell)
             .file_stem()
             .and_then(|s| s.to_str())
