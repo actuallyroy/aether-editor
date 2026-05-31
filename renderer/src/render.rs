@@ -302,6 +302,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         if cache.tabs != tab_text {
             // Wide (no wrap) + tall so every tab's label line is shaped on its own
             // line; per-tab bounds clip horizontally & vertically.
+            gpu.ui.tabs.set_metrics(fs, glyphon::Metrics::new(theme::UI_FONT_SIZE(), theme::UI_LINE_HEIGHT()));
             gpu.ui.tabs.set_size(fs, Some(4000.0), Some(4000.0));
             gpu.ui.tabs.set_text(
                 fs,

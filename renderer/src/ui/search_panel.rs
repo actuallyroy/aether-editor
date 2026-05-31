@@ -173,6 +173,20 @@ impl SearchPanel {
         }
     }
 
+    /// Re-shape every owned buffer after a zoom change (inputs/labels/icons keep
+    /// their content but need fresh metrics).
+    pub fn rezoom(&mut self, fs: &mut FontSystem) {
+        self.query.rezoom(fs);
+        self.replace.rezoom(fs);
+        for l in &mut self.opt_labels {
+            l.reshape(fs);
+        }
+        for c in &mut self.chevrons {
+            c.reshape(fs);
+        }
+        self.replace_all_label.reshape(fs);
+    }
+
     // ---- Shaping ----
     pub fn update(&mut self, fs: &mut FontSystem, region: Rect) {
         let rows = self.rows();

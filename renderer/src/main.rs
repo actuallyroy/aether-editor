@@ -1580,6 +1580,9 @@ impl App {
                 b.reshape(&mut g.font_system);
             }
             g.tab_close_btn.reshape(&mut g.font_system);
+            g.search.reshape(&mut g.font_system); // top command-center search bar
+            // Tabs buffer re-shapes only on content change — force it on zoom.
+            self.ui_cache.tabs.clear();
             g.ui.img_minus.reshape(&mut g.font_system);
             g.ui.img_plus.reshape(&mut g.font_system);
             g.ui.img_fit.reshape(&mut g.font_system);
@@ -1593,6 +1596,9 @@ impl App {
         }
         if let (Some(f), Some(g)) = (self.feedback_form.as_mut(), self.gpu.as_mut()) {
             f.rezoom(&mut g.font_system);
+        }
+        if let (Some(sp), Some(g)) = (self.search.as_mut(), self.gpu.as_mut()) {
+            sp.rezoom(&mut g.font_system);
         }
         // Terminal: re-seed the cell advance and mark panes dirty so their grids
         // re-shape + reflow (cols/rows) at the new font size.

@@ -419,17 +419,39 @@ impl TextInput {
         let line = self.text[..caret].matches('\n').count();
         let col = caret - self.line_start_byte(line);
         let (mut last_bottom, mut last_h) = (0.0, lh);
+        // A logical line may soft-wrap into several layout runs (same `line_i`).
+        // Walk them in order and land on the visual row that actually contains the
+        // caret byte, instead of snapping to the first row.
+        let mut found_line = false;
+        let mut end_of_line = (0.0, 0.0, lh);
         for run in self.buffer.layout_runs() {
-            if run.line_i == line {
-                for g in run.glyphs.iter() {
-                    if g.start as usize >= col {
-                        return (g.x, run.line_top, run.line_height);
-                    }
+            if run.line_i != line {
+                if found_line {
+                    break; // we've passed this logical line's runs
                 }
-                return (run.line_w, run.line_top, run.line_height);
+                last_bottom = run.line_top + run.line_height;
+                last_h = run.line_height;
+                continue;
             }
-            last_bottom = run.line_top + run.line_height;
-            last_h = run.line_height;
+            found_line = true;
+            // First glyph at/after the caret column → caret sits at its left edge.
+            for g in run.glyphs.iter() {
+                if g.start as usize >= col {
+                    return (g.x, run.line_top, run.line_height);
+                }
+            }
+            // Caret is past every glyph on this row. If it's beyond this row's last
+            // byte, a later wrapped row holds it — keep going; otherwise it's the
+            // end of this row.
+            let row_end = run.glyphs.last().map(|g| g.end as usize);
+            end_of_line = (run.line_w, run.line_top, run.line_height);
+            match row_end {
+                Some(end) if col > end => continue,
+                _ => return end_of_line,
+            }
+        }
+        if found_line {
+            return end_of_line; // caret at the end of the last wrapped row
         }
         (0.0, last_bottom, last_h) // caret on an empty trailing line
     }
@@ -814,11 +836,17 @@ impl SearchField {
 
     pub fn draw<'a>(&'a self, rect: Rect, areas: &mut Vec<TextArea<'a>>) {
         // Leading search glyph at the left edge.
-        let icon_rect = Rect { x: rect.x + 4.0, y: rect.y, w: 22.0, h: rect.h };
+        let icon_rect = Rect { x: rect.x + theme::zpx(4.0), y: rect.y, w: theme::zpx(22.0), h: rect.h };
         self.icon.draw(icon_rect, theme::TITLE_FG(), areas);
         // Centered label, kept clear of the icon.
-        let pad = ((rect.w - self.label.width()) * 0.5).max(28.0);
+        let pad = ((rect.w - self.label.width()) * 0.5).max(theme::zpx(28.0));
         self.label.draw(rect, pad, theme::FG_TEXT(), areas);
+    }
+
+    /// Re-shape the icon glyph + label at the current zoom.
+    pub fn reshape(&mut self, fs: &mut FontSystem) {
+        self.icon.reshape(fs);
+        self.label.rezoom(fs);
     }
 }
 
