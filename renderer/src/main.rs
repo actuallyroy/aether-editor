@@ -2639,13 +2639,25 @@ enum Focus {
 /// Open a URL in the OS default browser. Best-effort, http(s) only (so README
 /// link text can't launch arbitrary commands).
 fn open_url(url: &str) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000; // suppress the console window flash
-    if url.starts_with("http://") || url.starts_with("https://") {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000; // suppress the console window flash
         let _ = std::process::Command::new("cmd")
             .args(["/c", "start", "", url])
             .creation_flags(CREATE_NO_WINDOW)
             .spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(url).spawn();
     }
 }
 
