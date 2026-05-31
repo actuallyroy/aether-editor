@@ -13,6 +13,7 @@ mod document;
 mod ext_detail;
 mod ext_runtime;
 mod extensions;
+mod feedback_upload;
 mod gpu;
 mod icon;
 mod git;
@@ -201,6 +202,9 @@ pub(crate) struct App {
     pub(crate) open_menu: Option<usize>,        // which top menu's dropdown is open
     pub(crate) menu_dd_hover: Option<usize>,    // hovered entry within the open dropdown
     pub(crate) feedback_form: Option<ui::feedback_form::FeedbackForm>, // modal feedback form
+    /// Pending feedback issue (title, body) awaiting a screenshot capture on the
+    /// next render frame; consumed by `render` which captures + uploads off-thread.
+    pub(crate) pending_capture: Option<(String, String)>,
     pub(crate) update_available: Option<String>, // newer release version, if any
     pub(crate) hovered_layout: Option<usize>,
     pub(crate) hovered_explorer: Option<usize>,
@@ -278,6 +282,7 @@ impl App {
             open_menu: None,
             menu_dd_hover: None,
             feedback_form: None,
+            pending_capture: None,
             update_available: None,
             hovered_layout: None,
             hovered_explorer: None,
@@ -1134,9 +1139,17 @@ impl App {
         use ui::feedback_form::FormAction;
         match act {
             FormAction::Submit => {
-                if let Some((title, body)) = self.feedback_form.as_ref().and_then(|f| f.issue()) {
+                let form = self.feedback_form.as_ref();
+                if let Some((title, body)) = form.and_then(|f| f.issue()) {
+                    let shot = form.map_or(false, |f| f.wants_screenshot());
                     self.feedback_form = None;
-                    self.submit_issue(title, body);
+                    if shot {
+                        // Defer: the next render frame captures the editor, then
+                        // uploads + files the issue off-thread (see render.rs).
+                        self.pending_capture = Some((title, body));
+                    } else {
+                        self.submit_issue(title, body);
+                    }
                 }
                 // Empty title → keep the form open.
             }
@@ -2839,7 +2852,7 @@ enum Focus {
 /// Resolve the `gh` executable. macOS GUI apps don't inherit the shell PATH, so a
 /// bare "gh" often isn't found (it lives in /opt/homebrew/bin etc.) — check the
 /// common locations and fall back to a login-shell lookup before giving up.
-fn gh_program() -> String {
+pub(crate) fn gh_program() -> String {
     #[cfg(not(windows))]
     {
         for p in ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh", "/home/linuxbrew/.linuxbrew/bin/gh"] {
@@ -2974,6 +2987,13 @@ impl ApplicationHandler for App {
                         self.show_info_dialog("Update failed. Please try again or download from GitHub.");
                     }
                 }
+                WorkerMsg::FeedbackDone { result } => match result {
+                    Ok(url) if url.starts_with("http") => open_url(&url),
+                    Ok(_) => self.show_info_dialog("Thanks! Your feedback was submitted."),
+                    Err(_) => self.show_info_dialog(
+                        "Couldn't submit feedback. Check that GitHub CLI (gh) is installed and you're logged in.",
+                    ),
+                },
             }
         }
 

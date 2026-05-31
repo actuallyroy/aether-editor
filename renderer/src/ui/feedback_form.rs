@@ -39,7 +39,8 @@ struct Rects {
     chips: [Rect; 3],
     title: Rect,
     details: Rect,
-    sysinfo: Rect, // checkbox row (toggles on click anywhere on it)
+    sysinfo: Rect,    // checkbox row (toggles on click anywhere on it)
+    screenshot: Rect, // "attach a screenshot" checkbox row
     submit: Rect,
     cancel: Rect,
 }
@@ -51,11 +52,13 @@ pub struct FeedbackForm {
     focus: Field,
     selecting: Option<Field>, // field currently being drag-selected
     include_sysinfo: bool,
+    include_screenshot: bool,
     l_header: TextLabel,
     l_type: TextLabel,
     l_title: TextLabel,
     l_details: TextLabel,
     l_sysinfo: TextLabel,
+    l_screenshot: TextLabel,
     l_submit: TextLabel,
     l_cancel: TextLabel,
     l_check: TextLabel,
@@ -81,11 +84,13 @@ impl FeedbackForm {
             focus: Field::Title,
             selecting: None,
             include_sysinfo: true,
+            include_screenshot: true,
             l_header: mk(fs, "Report a bug or request a feature"),
             l_type: mk(fs, "This is a"),
             l_title: mk(fs, "Title"),
             l_details: mk(fs, "Details"),
             l_sysinfo: mk(fs, "Include system information (Nova version, OS)"),
+            l_screenshot: mk(fs, "Attach a screenshot of the editor"),
             l_submit: mk(fs, "Create on GitHub"),
             l_cancel: mk(fs, "Cancel"),
             l_check: {
@@ -121,9 +126,11 @@ impl FeedbackForm {
         y += row + gap;
         // Details
         y += label_h;
-        let details = Rect { x: lx, y, w: fw, h: (by + bh - pad - row - 36.0 * z) - y };
+        // Reserve room below details for the two checkbox rows + the button row.
+        let details = Rect { x: lx, y, w: fw, h: (by + bh - pad - row - 36.0 * z - (label_h + 6.0 * z)) - y };
         let after_details = details.y + details.h + gap;
         let sysinfo = Rect { x: lx, y: after_details, w: fw, h: label_h };
+        let screenshot = Rect { x: lx, y: sysinfo.y + label_h + 6.0 * z, w: fw, h: label_h };
         // Buttons (bottom-right)
         let btn_h = 30.0 * z;
         let by2 = by + bh - pad - btn_h;
@@ -131,7 +138,7 @@ impl FeedbackForm {
         let cancel_w = 90.0 * z;
         let submit = Rect { x: bx + bw - pad - submit_w, y: by2, w: submit_w, h: btn_h };
         let cancel = Rect { x: submit.x - 10.0 * z - cancel_w, y: by2, w: cancel_w, h: btn_h };
-        Rects { box_: Rect { x: bx, y: by, w: bw, h: bh }, chips, title, details, sysinfo, submit, cancel }
+        Rects { box_: Rect { x: bx, y: by, w: bw, h: bh }, chips, title, details, sysinfo, screenshot, submit, cancel }
     }
 
     pub fn draw_quads(&self, win: (f32, f32), blink: bool, bg: &mut Vec<Quad>, fg: &mut Vec<Quad>) {
@@ -156,17 +163,19 @@ impl FeedbackForm {
             bg.push(Quad::new(f.x, f.y, 1.0, f.h, border));
             bg.push(Quad::new(f.x + f.w - 1.0, f.y, 1.0, f.h, border));
         }
-        // Checkbox square: blue when checked, dark with a visible border when not.
+        // Checkbox squares: blue when checked, dark with a visible border when not.
         let sz = 16.0 * theme::ui_zoom();
-        let cb = Rect { x: r.sysinfo.x, y: r.sysinfo.y + 2.0, w: sz, h: sz };
-        bg.push(cb.rounded_quad(if self.include_sysinfo { theme::BADGE_BG() } else { [0.10, 0.10, 0.12, 1.0] }, 3.0));
-        if !self.include_sysinfo {
-            let bd = theme::FG_DIM();
-            let bdc = [bd.r() as f32 / 255.0, bd.g() as f32 / 255.0, bd.b() as f32 / 255.0, 1.0];
-            bg.push(Quad::new(cb.x, cb.y, cb.w, 1.0, bdc));
-            bg.push(Quad::new(cb.x, cb.y + cb.h - 1.0, cb.w, 1.0, bdc));
-            bg.push(Quad::new(cb.x, cb.y, 1.0, cb.h, bdc));
-            bg.push(Quad::new(cb.x + cb.w - 1.0, cb.y, 1.0, cb.h, bdc));
+        for (row, checked) in [(r.sysinfo, self.include_sysinfo), (r.screenshot, self.include_screenshot)] {
+            let cb = Rect { x: row.x, y: row.y + 2.0, w: sz, h: sz };
+            bg.push(cb.rounded_quad(if checked { theme::BADGE_BG() } else { [0.10, 0.10, 0.12, 1.0] }, 3.0));
+            if !checked {
+                let bd = theme::FG_DIM();
+                let bdc = [bd.r() as f32 / 255.0, bd.g() as f32 / 255.0, bd.b() as f32 / 255.0, 1.0];
+                bg.push(Quad::new(cb.x, cb.y, cb.w, 1.0, bdc));
+                bg.push(Quad::new(cb.x, cb.y + cb.h - 1.0, cb.w, 1.0, bdc));
+                bg.push(Quad::new(cb.x, cb.y, 1.0, cb.h, bdc));
+                bg.push(Quad::new(cb.x + cb.w - 1.0, cb.y, 1.0, cb.h, bdc));
+            }
         }
         // Buttons.
         bg.push(r.submit.rounded_quad(theme::DIALOG_BTN_HOVER(), 4.0));
@@ -191,6 +200,7 @@ impl FeedbackForm {
             &mut self.l_title,
             &mut self.l_details,
             &mut self.l_sysinfo,
+            &mut self.l_screenshot,
             &mut self.l_submit,
             &mut self.l_cancel,
             &mut self.l_check,
@@ -225,11 +235,16 @@ impl FeedbackForm {
         self.title.draw(r.title, pad, tc, areas);
         let dc = if self.details.text().is_empty() { theme::FG_DIM() } else { theme::FG_TEXT() };
         self.details.draw(r.details, pad, dc, areas);
-        // Checkbox tick + label.
-        if self.include_sysinfo {
-            self.l_check.push(r.sysinfo.x + 1.0, Rect { w: 16.0 * theme::ui_zoom(), ..r.sysinfo }, theme::BADGE_FG(), areas);
+        // Checkbox ticks + labels (system info, screenshot).
+        for (row, checked, label) in [
+            (r.sysinfo, self.include_sysinfo, &self.l_sysinfo),
+            (r.screenshot, self.include_screenshot, &self.l_screenshot),
+        ] {
+            if checked {
+                self.l_check.push(row.x + 1.0, Rect { w: 16.0 * theme::ui_zoom(), ..row }, theme::BADGE_FG(), areas);
+            }
+            label.push(row.x + 24.0 * theme::ui_zoom(), row, theme::FG_TEXT(), areas);
         }
-        self.l_sysinfo.push(r.sysinfo.x + 24.0 * theme::ui_zoom(), r.sysinfo, theme::FG_TEXT(), areas);
         // Buttons.
         self.l_submit.push(r.submit.x + (r.submit.w - self.l_submit.width()) * 0.5, r.submit, theme::FG_ACTIVE(), areas);
         self.l_cancel.push(r.cancel.x + (r.cancel.w - self.l_cancel.width()) * 0.5, r.cancel, theme::FG_TEXT(), areas);
@@ -266,6 +281,10 @@ impl FeedbackForm {
             self.include_sysinfo = !self.include_sysinfo;
             return FormAction::None;
         }
+        if r.screenshot.contains(pt) {
+            self.include_screenshot = !self.include_screenshot;
+            return FormAction::None;
+        }
         if r.submit.contains(pt) {
             return FormAction::Submit;
         }
@@ -299,6 +318,7 @@ impl FeedbackForm {
             CursorIcon::Text
         } else if r.chips.iter().any(|c| c.contains(pt))
             || r.sysinfo.contains(pt)
+            || r.screenshot.contains(pt)
             || r.submit.contains(pt)
             || r.cancel.contains(pt)
         {
@@ -368,5 +388,10 @@ impl FeedbackForm {
             ));
         }
         Some((format!("{prefix}{title}"), body))
+    }
+
+    /// Whether the user wants a screenshot of the editor attached.
+    pub fn wants_screenshot(&self) -> bool {
+        self.include_screenshot
     }
 }

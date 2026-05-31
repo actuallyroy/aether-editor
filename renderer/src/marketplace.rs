@@ -27,6 +27,9 @@ pub enum WorkerMsg {
     UpdateAvailable { version: String },
     UpdateNone,
     UpdateDone { ok: bool },
+    // Feedback form: screenshot uploaded (if any) + GitHub issue created — Ok(url)
+    // on success, Err(message) otherwise.
+    FeedbackDone { result: Result<String, String> },
 }
 
 /// Where a README image comes from: a remote URL or a local file path.

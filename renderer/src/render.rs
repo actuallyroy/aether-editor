@@ -1267,7 +1267,30 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
 
     // ---- Submit ----
     let frame = gpu.surface.get_current_texture()?;
-    let view = frame.texture.create_view(&TextureViewDescriptor::default());
+    // A pending feedback screenshot redirects this frame into an offscreen
+    // COPY_SRC texture (the surface texture can't be read back), so we can grab it
+    // as PNG after the passes run.
+    let capture = app.pending_capture.take();
+    let cap_tex = capture.is_some().then(|| {
+        gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("nova-capture"),
+            size: wgpu::Extent3d {
+                width: gpu.config.width,
+                height: gpu.config.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: gpu.config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        })
+    });
+    let view = match &cap_tex {
+        Some(t) => t.create_view(&TextureViewDescriptor::default()),
+        None => frame.texture.create_view(&TextureViewDescriptor::default()),
+    };
     let mut encoder = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
         label: Some("nova-encoder"),
     });
@@ -1677,7 +1700,83 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         gpu.queue.submit(Some(encf.finish()));
     }
 
-    frame.present();
+    // Feedback screenshot: read back the offscreen frame as PNG and hand it to the
+    // off-thread uploader, then drop the (unrendered) surface frame and repaint
+    // normally next frame. Otherwise present as usual.
+    if let (Some(tex), Some((title, body))) = (cap_tex, capture) {
+        let png = capture_texture_png(gpu, &tex);
+        crate::feedback_upload::submit_async(png, title, body, crate::gh_program(), app.worker_tx.clone());
+        gpu.window.request_redraw();
+    } else {
+        frame.present();
+    }
     gpu.atlas.trim();
     Ok(())
+}
+
+/// Read an offscreen RGBA/BGRA texture back into PNG bytes. Returns None on any
+/// GPU/encode error (the issue is still filed, just without the screenshot).
+fn capture_texture_png(gpu: &crate::gpu::GpuState, tex: &wgpu::Texture) -> Option<Vec<u8>> {
+    use std::io::Cursor;
+    let (w, h) = (gpu.config.width, gpu.config.height);
+    let unpadded = w * 4;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded = unpadded.div_ceil(align) * align;
+    let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("nova-capture-readback"),
+        size: (padded * h) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut enc = gpu
+        .device
+        .create_command_encoder(&CommandEncoderDescriptor { label: Some("nova-capture-copy") });
+    enc.copy_texture_to_buffer(
+        wgpu::ImageCopyTexture {
+            texture: tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::ImageCopyBuffer {
+            buffer: &buffer,
+            layout: wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(padded),
+                rows_per_image: Some(h),
+            },
+        },
+        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+    );
+    gpu.queue.submit(Some(enc.finish()));
+
+    let slice = buffer.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| {
+        let _ = tx.send(r);
+    });
+    gpu.device.poll(wgpu::Maintain::Wait);
+    rx.recv().ok()?.ok()?;
+
+    let data = slice.get_mapped_range();
+    let mut rgba = Vec::with_capacity((unpadded * h) as usize);
+    for row in 0..h {
+        let start = (row * padded) as usize;
+        rgba.extend_from_slice(&data[start..start + unpadded as usize]);
+    }
+    drop(data);
+    buffer.unmap();
+
+    // Surface textures are typically BGRA — swap to RGBA for the PNG encoder.
+    if matches!(gpu.config.format, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb) {
+        for px in rgba.chunks_exact_mut(4) {
+            px.swap(0, 2);
+        }
+    }
+    let img = image::RgbaImage::from_raw(w, h, rgba)?;
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(img)
+        .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+        .ok()?;
+    Some(png)
 }
