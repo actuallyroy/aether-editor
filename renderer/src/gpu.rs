@@ -39,6 +39,9 @@ pub struct UiBuffers {
     pub img_plus: TextLabel,   // image zoom-in control
     pub img_fit: TextLabel,    // image fit control
     pub img_pct: TextLabel,    // image zoom percentage (set per frame)
+    pub zoom_minus: TextLabel, // status-bar window-zoom control
+    pub zoom_plus: TextLabel,
+    pub zoom_pct: TextLabel,
     pub palette_input: TextInput,
     pub palette_list: ListView,
     pub find_input: TextInput,
@@ -176,7 +179,7 @@ impl GpuState {
         let terminal_tabs = theme::PANEL_TABS
             .iter()
             .map(|label| {
-                let mut l = TextLabel::new(&mut font_system, 200.0, theme::TERMINAL_HEADER_H);
+                let mut l = TextLabel::new(&mut font_system, 200.0, theme::TERMINAL_HEADER_H());
                 l.set(&mut font_system, label, theme::UI_FAMILY());
                 l
             })
@@ -193,35 +196,35 @@ impl GpuState {
             IconButton::new(&mut font_system, theme::ICON_FILE, ic, 16.0),
             IconButton::new(&mut font_system, theme::ICON_FOLDER_CLOSED, ic, 16.0),
         ];
-        let create_input = TextInput::new(&mut font_system, theme::SIDEBAR_WIDTH, theme::TREE_ROW_HEIGHT);
+        let create_input = TextInput::new(&mut font_system, theme::SIDEBAR_WIDTH(), theme::TREE_ROW_HEIGHT());
 
         let ui = UiBuffers {
-            sidebar_header: TextLabel::new(&mut font_system, theme::SIDEBAR_WIDTH, 60.0),
-            root_label: TextLabel::new(&mut font_system, theme::SIDEBAR_WIDTH, theme::TREE_ROW_HEIGHT),
+            sidebar_header: TextLabel::new(&mut font_system, theme::SIDEBAR_WIDTH(), 60.0),
+            root_label: TextLabel::new(&mut font_system, theme::SIDEBAR_WIDTH(), theme::TREE_ROW_HEIGHT()),
             sidebar: ListView::new(
                 &mut font_system,
-                theme::SIDEBAR_WIDTH,
+                theme::SIDEBAR_WIDTH(),
                 800.0,
-                theme::TREE_ROW_HEIGHT,
+                theme::TREE_ROW_HEIGHT(),
                 12.0,
             ),
-            tabs: make_ui_buffer(&mut font_system, 4000.0, theme::TAB_HEIGHT),
-            status: TextLabel::new(&mut font_system, 4000.0, theme::STATUS_BAR_HEIGHT),
-            status_right: TextLabel::new(&mut font_system, 4000.0, theme::STATUS_BAR_HEIGHT),
-            line_numbers: Gutter::new(&mut font_system, theme::GUTTER_WIDTH),
-            line_numbers2: Gutter::new(&mut font_system, theme::GUTTER_WIDTH),
-            palette_input: TextInput::new(&mut font_system, 600.0, theme::PALETTE_INPUT_HEIGHT),
+            tabs: make_ui_buffer(&mut font_system, 4000.0, theme::TAB_HEIGHT()),
+            status: TextLabel::new(&mut font_system, 4000.0, theme::STATUS_BAR_HEIGHT()),
+            status_right: TextLabel::new(&mut font_system, 4000.0, theme::STATUS_BAR_HEIGHT()),
+            line_numbers: Gutter::new(&mut font_system, theme::GUTTER_WIDTH()),
+            line_numbers2: Gutter::new(&mut font_system, theme::GUTTER_WIDTH()),
+            palette_input: TextInput::new(&mut font_system, 600.0, theme::PALETTE_INPUT_HEIGHT()),
             palette_list: ListView::new(
                 &mut font_system,
                 600.0,
                 800.0,
-                theme::PALETTE_ROW_HEIGHT,
+                theme::PALETTE_ROW_HEIGHT(),
                 6.0,
             ),
-            find_input: TextInput::new(&mut font_system, 800.0, theme::FIND_BAR_HEIGHT),
+            find_input: TextInput::new(&mut font_system, 800.0, theme::FIND_BAR_HEIGHT()),
             menu: Menu::new(&mut font_system, 200.0),
             menu_dropdown: Menu::new(&mut font_system, 220.0),
-            scm_badge: TextLabel::new(&mut font_system, 40.0, theme::ACTIVITY_ICON_SIZE),
+            scm_badge: TextLabel::new(&mut font_system, 40.0, theme::ACTIVITY_ICON_SIZE()),
             img_minus: {
                 let mut l = TextLabel::new(&mut font_system, 38.0, 30.0);
                 l.set(&mut font_system, "\u{2212}", theme::UI_FAMILY());
@@ -238,6 +241,17 @@ impl GpuState {
                 l
             },
             img_pct: TextLabel::new(&mut font_system, 64.0, 30.0),
+            zoom_minus: {
+                let mut l = TextLabel::new(&mut font_system, 24.0, theme::STATUS_BAR_HEIGHT());
+                l.set(&mut font_system, "\u{2212}", theme::UI_FAMILY());
+                l
+            },
+            zoom_plus: {
+                let mut l = TextLabel::new(&mut font_system, 24.0, theme::STATUS_BAR_HEIGHT());
+                l.set(&mut font_system, "+", theme::UI_FAMILY());
+                l
+            },
+            zoom_pct: TextLabel::new(&mut font_system, 52.0, theme::STATUS_BAR_HEIGHT()),
             dialog: Dialog::new(&mut font_system),
             ext_detail: ExtensionDetail::new(&mut font_system),
             terminal_panes: Vec::new(), // grown on demand as panes are split
@@ -245,7 +259,7 @@ impl GpuState {
                 &mut font_system,
                 crate::TERMINAL_TABLIST_W,
                 800.0,
-                theme::TREE_ROW_HEIGHT,
+                theme::TREE_ROW_HEIGHT(),
                 10.0,
             ),
         };

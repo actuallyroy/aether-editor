@@ -231,9 +231,9 @@ impl App {
             clipboard: Clipboard::new().ok(),
             sidebar_visible: true,
             sidebar_split: Splitter::new(
-                theme::SIDEBAR_WIDTH,
-                theme::SIDEBAR_MIN_WIDTH,
-                theme::SIDEBAR_MAX_WIDTH,
+                theme::SIDEBAR_WIDTH(),
+                theme::SIDEBAR_MIN_WIDTH(),
+                theme::SIDEBAR_MAX_WIDTH(),
                 widgets::Axis::Horizontal,
             ),
             palette: PaletteState::new(),
@@ -1364,6 +1364,48 @@ impl App {
     /// Re-read settings.json and apply everything: sidebar visibility, color theme,
     /// and editor font (size/family/line-height) by reshaping open documents and the
     /// gutter. tabSize/insertSpaces/cursorBlinking are read on demand elsewhere.
+    /// Set the global UI zoom and re-shape every cached text buffer at the new size.
+    fn set_zoom(&mut self, zoom: f32) {
+        theme::set_ui_zoom(zoom); // bumps the shape epoch
+        if let Some(g) = self.gpu.as_mut() {
+            for d in self.workspace.documents.iter_mut() {
+                d.reshape(&mut g.font_system);
+            }
+            g.ui.line_numbers.invalidate();
+            g.ui.line_numbers2.invalidate();
+            g.menubar.reshape(&mut g.font_system);
+            for b in g.activity_btns.iter_mut() {
+                b.reshape(&mut g.font_system);
+            }
+            for b in g.explorer_btns.iter_mut() {
+                b.reshape(&mut g.font_system);
+            }
+            for b in g.titlebar_btns.iter_mut() {
+                b.reshape(&mut g.font_system);
+            }
+            for b in g.layout_btns.iter_mut() {
+                b.reshape(&mut g.font_system);
+            }
+            g.tab_close_btn.reshape(&mut g.font_system);
+            g.ui.img_minus.reshape(&mut g.font_system);
+            g.ui.img_plus.reshape(&mut g.font_system);
+            g.ui.img_fit.reshape(&mut g.font_system);
+            g.ui.zoom_minus.reshape(&mut g.font_system);
+            g.ui.zoom_plus.reshape(&mut g.font_system);
+            g.ui.palette_input.rezoom(&mut g.font_system);
+            g.ui.find_input.rezoom(&mut g.font_system);
+        }
+        if let (Some(scp), Some(g)) = (self.source_control.as_mut(), self.gpu.as_mut()) {
+            scp.reshape(&mut g.font_system);
+        }
+        self.redraw();
+    }
+
+    fn zoom_step(&mut self, delta: f32) {
+        let z = (theme::ui_zoom() + delta).clamp(0.5, 3.0);
+        self.set_zoom(z);
+    }
+
     fn apply_settings(&mut self) {
         let s = settings::reload();
         self.sidebar_visible = s.workbench_sidebar_visible;
@@ -1738,6 +1780,14 @@ impl App {
         }
 
         if layout.status_bar.contains((x, y)) {
+            let cells = render::zoom_ctrl_cells(layout.status_bar);
+            if cells[0].contains((x, y)) {
+                self.zoom_step(-0.1);
+            } else if cells[2].contains((x, y)) {
+                self.zoom_step(0.1);
+            } else if cells[1].contains((x, y)) {
+                self.set_zoom(1.0); // click the % to reset
+            }
             return;
         }
 
@@ -2046,7 +2096,7 @@ impl App {
             }
         }
         if self.sidebar_split.is_dragging() && self.mouse_pressed {
-            if self.sidebar_split.drag(x, theme::ACTIVITY_BAR_WIDTH) {
+            if self.sidebar_split.drag(x, theme::ACTIVITY_BAR_WIDTH()) {
                 self.redraw();
             }
             return;
@@ -2387,6 +2437,18 @@ impl App {
                     }
                     KeyCode::KeyA => {
                         self.exec_command(Command::SelectAll);
+                        return;
+                    }
+                    KeyCode::Equal => {
+                        self.zoom_step(0.1); // Ctrl+= / Ctrl++ zoom in
+                        return;
+                    }
+                    KeyCode::Minus => {
+                        self.zoom_step(-0.1); // Ctrl+- zoom out
+                        return;
+                    }
+                    KeyCode::Digit0 => {
+                        self.set_zoom(1.0); // Ctrl+0 reset zoom
                         return;
                     }
                     KeyCode::KeyC => {

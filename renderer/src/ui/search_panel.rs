@@ -48,17 +48,17 @@ impl SearchPanel {
             l.set(fs, s, theme::UI_FAMILY());
             l
         };
-        let mut query = TextInput::new(fs, theme::SIDEBAR_WIDTH, 30.0);
+        let mut query = TextInput::new(fs, theme::SIDEBAR_WIDTH(), 30.0);
         query.set_placeholder(fs, " Search");
-        let mut replace = TextInput::new(fs, theme::SIDEBAR_WIDTH, 30.0);
+        let mut replace = TextInput::new(fs, theme::SIDEBAR_WIDTH(), 30.0);
         replace.set_placeholder(fs, " Replace");
-        let mut replace_all_label = TextLabel::new(fs, theme::SIDEBAR_WIDTH, 24.0);
+        let mut replace_all_label = TextLabel::new(fs, theme::SIDEBAR_WIDTH(), 24.0);
         replace_all_label.set(fs, "Replace All", theme::UI_FAMILY());
         let ic = theme::ICON_FAMILY;
         Self {
             query,
             replace,
-            list: ListView::new(fs, theme::SIDEBAR_WIDTH, 4000.0, theme::SEARCH_ROW_H, 10.0),
+            list: ListView::new(fs, theme::SIDEBAR_WIDTH(), 4000.0, theme::SEARCH_ROW_H(), 10.0),
             opt_labels: [
                 mk_label(fs, "Aa"),
                 mk_label(fs, "\\b"),
@@ -179,7 +179,7 @@ impl SearchPanel {
         self.list.set_text(fs, &key, 4000.0, 12000.0);
         let region = Self::results_region(region);
         self.scroll
-            .set_metrics(region, (region.w, rows.len() as f32 * theme::SEARCH_ROW_H));
+            .set_metrics(region, (region.w, rows.len() as f32 * theme::SEARCH_ROW_H()));
     }
 
     // ---- Drawing (split to match the renderer's quad-phase then text-phase) ----
@@ -230,8 +230,8 @@ impl SearchPanel {
             if row.ranges.is_empty() {
                 continue;
             }
-            let y = region2.y + ri as f32 * theme::SEARCH_ROW_H - scroll;
-            if y + theme::SEARCH_ROW_H < region2.y || y > region2.y + region2.h {
+            let y = region2.y + ri as f32 * theme::SEARCH_ROW_H() - scroll;
+            if y + theme::SEARCH_ROW_H() < region2.y || y > region2.y + region2.h {
                 continue;
             }
             for &(s, e) in &row.ranges {
@@ -240,7 +240,7 @@ impl SearchPanel {
                     let right = region2.x + region2.w;
                     let w = (x1 - x0).min((right - qx).max(0.0));
                     if w > 0.0 {
-                        bg.push(Quad::new(qx, y, w, theme::SEARCH_ROW_H, theme::FIND_MATCH()));
+                        bg.push(Quad::new(qx, y, w, theme::SEARCH_ROW_H(), theme::FIND_MATCH()));
                     }
                 }
             }
@@ -275,8 +275,8 @@ impl SearchPanel {
             if row.line.is_some() {
                 continue;
             }
-            let y = region2.y + ri as f32 * theme::SEARCH_ROW_H - scroll;
-            if y + theme::SEARCH_ROW_H < region2.y || y > region2.y + region2.h {
+            let y = region2.y + ri as f32 * theme::SEARCH_ROW_H() - scroll;
+            if y + theme::SEARCH_ROW_H() < region2.y || y > region2.y + region2.h {
                 continue;
             }
             let top = y.max(region2.y);
@@ -284,11 +284,11 @@ impl SearchPanel {
                 x: region2.x,
                 y: top,
                 w: region2.w,
-                h: ((y + theme::SEARCH_ROW_H) - top).max(0.0),
+                h: ((y + theme::SEARCH_ROW_H()) - top).max(0.0),
             };
             self.list.draw_at(band, region2.y - scroll, theme::FG_ACTIVE(), areas);
             let chev = &self.chevrons[self.collapsed.contains(&row.file) as usize];
-            let cr = Rect { x: region2.x + 4.0, y, w: 16.0, h: theme::SEARCH_ROW_H };
+            let cr = Rect { x: region2.x + 4.0, y, w: 16.0, h: theme::SEARCH_ROW_H() };
             chev.draw(cr, theme::FG_DIM(), areas);
         }
     }
@@ -381,7 +381,7 @@ impl SearchPanel {
         // Results list — toggle a file header or open a match.
         let region2 = Self::results_region(region);
         if region2.contains(pt) {
-            let row = ((pt.1 - region2.y + self.scroll.offset().1) / theme::SEARCH_ROW_H) as usize;
+            let row = ((pt.1 - region2.y + self.scroll.offset().1) / theme::SEARCH_ROW_H()) as usize;
             if let Some(sr) = self.rows().get(row) {
                 match sr.line {
                     Some(line) => {

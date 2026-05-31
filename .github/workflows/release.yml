@@ -1,0 +1,88 @@
+name: Release
+
+# Build release binaries for Windows + Linux. Runs on a version tag (vX.Y.Z) and
+# can be triggered manually. Tag pushes also publish a GitHub Release with the
+# binaries attached. The codicon font is embedded (include_bytes!), so each build
+# is a single self-contained executable — no assets to ship alongside it.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            bin: nova.exe
+            asset: nova-windows-x86_64.exe
+          - os: ubuntu-latest
+            bin: nova
+            asset: nova-linux-x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      # Linux build deps: rfd (GTK file dialogs), winit/glyphon (xkbcommon,
+      # wayland, fontconfig), and a C/C++ toolchain for the bundled C deps
+      # (tree-sitter grammars, QuickJS via rquickjs).
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libgtk-3-dev \
+            libxkbcommon-dev libwayland-dev libxcb1-dev \
+            libfontconfig1-dev \
+            clang libclang-dev
+
+      - name: Build release
+        run: cargo build --release -p nova-renderer
+
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

@@ -36,7 +36,7 @@ pub struct ExtensionsPanel {
 
 impl ExtensionsPanel {
     pub fn new(fs: &mut FontSystem) -> Self {
-        let mut filter = TextInput::new(fs, theme::SIDEBAR_WIDTH, 30.0);
+        let mut filter = TextInput::new(fs, theme::SIDEBAR_WIDTH(), 30.0);
         filter.set_placeholder(fs, " Search Extensions in Marketplace");
         Self {
             filter,

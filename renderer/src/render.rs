@@ -65,14 +65,27 @@ pub(crate) fn image_rect(iw: f32, ih: f32, region: Rect, scale: f32, pan: (f32, 
     Rect { x: cx - w * 0.5 + pan.0, y: cy - h * 0.5 + pan.1, w, h }
 }
 
+/// Status-bar window-zoom control cells [minus, percent, plus], at the right edge.
+pub(crate) fn zoom_ctrl_cells(status: Rect) -> [Rect; 3] {
+    let z = theme::ui_zoom();
+    let h = status.h;
+    let (cw, pw) = (22.0 * z, 52.0 * z);
+    let right = status.x + status.w - 8.0 * z;
+    let plus = Rect { x: right - cw, y: status.y, w: cw, h };
+    let pct = Rect { x: plus.x - pw, y: status.y, w: pw, h };
+    let minus = Rect { x: pct.x - cw, y: status.y, w: cw, h };
+    [minus, pct, plus]
+}
+
 /// Zoom-control overlay cells [zoom_out, percent, zoom_in, fit], a pill at the
 /// bottom-centre of the image region.
 pub(crate) fn image_ctrl_cells(region: Rect) -> [Rect; 4] {
-    let h = 30.0;
-    let widths = [38.0, 64.0, 38.0, 50.0];
+    let z = theme::ui_zoom();
+    let h = 30.0 * z;
+    let widths = [38.0 * z, 64.0 * z, 38.0 * z, 50.0 * z];
     let total: f32 = widths.iter().sum();
     let x0 = region.x + (region.w - total) * 0.5;
-    let y = region.y + region.h - h - 16.0;
+    let y = region.y + region.h - h - 16.0 * z;
     let mut x = x0;
     let mut out = [Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }; 4];
     for (i, w) in widths.iter().enumerate() {
@@ -106,7 +119,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // editor.wordWrap — wrap the active document to the editor width (or disable).
     {
         let wrap = if crate::settings::word_wrap() {
-            Some((layout.editor_text.w - theme::EDITOR_PAD * 2.0).max(50.0))
+            Some((layout.editor_text.w - theme::EDITOR_PAD() * 2.0).max(50.0))
         } else {
             None
         };
@@ -156,8 +169,8 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     } else if let Some(d) = app.workspace.active_doc_mut() {
         // Editor: size the document's scroll viewport (offset clamps here, thumbs
         // position from these metrics). Content height uses logical lines + padding.
-        let content_h = d.rope.len_lines() as f32 * theme::LINE_HEIGHT() + theme::EDITOR_PAD * 2.0;
-        let content_w = d.max_line_width() + theme::EDITOR_PAD * 2.0;
+        let content_h = d.rope.len_lines() as f32 * theme::LINE_HEIGHT() + theme::EDITOR_PAD() * 2.0;
+        let content_w = d.max_line_width() + theme::EDITOR_PAD() * 2.0;
         d.scroll.set_metrics(layout.editor_text, (content_w, content_h));
     }
 
@@ -350,6 +363,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         };
         gpu.ui.status.set(fs, &status_text, theme::UI_FAMILY());
         gpu.ui.status_right.set(fs, &status_right_text, theme::UI_FAMILY());
+        gpu.ui.zoom_pct.set(fs, &format!("{}%", (theme::ui_zoom() * 100.0).round() as i32), theme::UI_FAMILY());
 
         // Source Control change-count badge text (capped at 99+).
         let scm_count = app.source_control.as_ref().map_or(0, |s| s.change_count());
@@ -518,10 +532,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     let scm_count = app.source_control.as_ref().map_or(0, |s| s.change_count());
     if scm_count > 0 {
         if let Some(r) = act_rects.get(2) {
-            let bw = gpu.ui.scm_badge.width() + 8.0;
-            let bh = 16.0;
-            let bx = r.x + r.w - bw - 2.0;
-            let by = r.y + r.h - bh - 8.0;
+            let z = theme::ui_zoom();
+            let bw = gpu.ui.scm_badge.width() + 8.0 * z;
+            let bh = 16.0 * z;
+            let bx = r.x + r.w - bw - 2.0 * z;
+            let by = r.y + r.h - bh - 8.0 * z;
             bg_quads.push(Rect { x: bx, y: by, w: bw, h: bh }.rounded_quad(theme::BADGE_BG(), bh * 0.5));
         }
     }
@@ -682,7 +697,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         // Skipped in diff views (the per-line add/del backgrounds carry the meaning).
         if crate::settings::render_line_highlight() && d.diff.is_none() {
             let (ltop, lh) = d.line_visual_bounds(cur_line);
-            let line_y = layout.editor_text.y + theme::EDITOR_PAD + ltop - d.scroll_y();
+            let line_y = layout.editor_text.y + theme::EDITOR_PAD() + ltop - d.scroll_y();
             if let Some((qy, qh)) = clip_v(line_y, lh) {
                 bg_quads.push(Quad::new(editor_full.x, qy, editor_full.w, qh, theme::LINE_HIGHLIGHT()));
             }
@@ -695,11 +710,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         if let Some(diff) = d.diff.as_ref() {
             use crate::diff::RowKind;
             let half = (editor_full.w * 0.5).floor();
-            let (lt_x, lt_w) = (editor_full.x + theme::GUTTER_WIDTH, (half - theme::GUTTER_WIDTH).max(0.0));
-            let (rt_x, rt_w) = (editor_full.x + half + theme::GUTTER_WIDTH, (editor_full.w - half - theme::GUTTER_WIDTH).max(0.0));
+            let (lt_x, lt_w) = (editor_full.x + theme::GUTTER_WIDTH(), (half - theme::GUTTER_WIDTH()).max(0.0));
+            let (rt_x, rt_w) = (editor_full.x + half + theme::GUTTER_WIDTH(), (editor_full.w - half - theme::GUTTER_WIDTH()).max(0.0));
             for run in d.buffer.layout_runs() {
                 let Some(row) = diff.rows.get(run.line_i) else { continue };
-                let y = editor_full.y + theme::EDITOR_PAD + run.line_top - d.scroll_y();
+                let y = editor_full.y + theme::EDITOR_PAD() + run.line_top - d.scroll_y();
                 let Some((qy, qh)) = clip_v(y, run.line_height) else { continue };
                 match row.kind {
                     RowKind::Hunk => bg_quads.push(Quad::new(editor_full.x, qy, editor_full.w, qh, theme::DIFF_HUNK_BG())),
@@ -722,7 +737,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         let rulers = crate::settings::rulers();
         if rulers > 0 {
             let char_w = theme::FONT_SIZE() * 0.6; // monospace advance approximation
-            let rx = layout.editor_text.x + theme::EDITOR_PAD + rulers as f32 * char_w - d.scroll_x();
+            let rx = layout.editor_text.x + theme::EDITOR_PAD() + rulers as f32 * char_w - d.scroll_x();
             if rx > layout.editor_text.x && rx < layout.editor_text.x + layout.editor_text.w {
                 bg_quads.push(Quad::new(rx, layout.editor_text.y, 1.0, layout.editor_text.h, theme::BORDER()));
             }
@@ -751,10 +766,10 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 };
                 let (xs, xe) = x_range_in_run(&run, col_start, col_end);
                 let w = (xe - xs).max(2.0);
-                let sel_y = layout.editor_text.y + theme::EDITOR_PAD + run.line_top - d.scroll_y();
+                let sel_y = layout.editor_text.y + theme::EDITOR_PAD() + run.line_top - d.scroll_y();
                 if let Some((qy, qh)) = clip_v(sel_y, run.line_height) {
                     bg_quads.push(Quad::new(
-                        layout.editor_text.x + theme::EDITOR_PAD + xs - d.scroll_x(),
+                        layout.editor_text.x + theme::EDITOR_PAD() + xs - d.scroll_x(),
                         qy,
                         w,
                         qh,
@@ -768,12 +783,12 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         // tabs (images, diffs) have nothing to edit, so they show no caret.
         if app.cursor_blink_on && !d.read_only {
             let (cx, cy, ch) = d.caret_visual();
-            let cursor_y = layout.editor_text.y + theme::EDITOR_PAD + cy - d.scroll_y();
+            let cursor_y = layout.editor_text.y + theme::EDITOR_PAD() + cy - d.scroll_y();
             if let Some((qy, qh)) = clip_v(cursor_y, ch) {
                 fg_quads.push(Quad::new(
-                    layout.editor_text.x + theme::EDITOR_PAD + cx - d.scroll_x(),
+                    layout.editor_text.x + theme::EDITOR_PAD() + cx - d.scroll_x(),
                     qy,
-                    theme::CURSOR_WIDTH,
+                    theme::CURSOR_WIDTH(),
                     qh,
                     theme::CURSOR(),
                 ));
@@ -792,7 +807,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         bg_quads.push(Quad::new(panel.x, panel.y, panel.w, 1.0, theme::PANEL_BORDER()));
         bg_quads.push(Quad::new(content.x, content.y - 1.0, content.w, 1.0, theme::PANEL_BORDER()));
         // Active panel tab underline (text + buttons are drawn in the areas phase).
-        let header = Rect { x: panel.x, y: panel.y, w: panel.w, h: theme::TERMINAL_HEADER_H };
+        let header = Rect { x: panel.x, y: panel.y, w: panel.w, h: theme::TERMINAL_HEADER_H() };
         if let Some(r) = panel_tab_rects(header, &gpu.terminal_tabs).get(theme::PANEL_ACTIVE_TAB) {
             bg_quads.push(Quad::new(r.x, header.y + header.h - 2.0, r.w, 2.0, [0.9, 0.9, 0.9, 1.0]));
         }
@@ -838,8 +853,8 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         if let Some(tl) = crate::terminal_tablist_rect(content, app.terminal.groups.len()) {
             bg_quads.push(tl.quad(theme::SIDEBAR_BG()));
             bg_quads.push(Quad::new(tl.x, tl.y, 1.0, tl.h, theme::PANEL_BORDER()));
-            let ry = tl.y + app.terminal.active as f32 * theme::TREE_ROW_HEIGHT;
-            bg_quads.push(Quad::new(tl.x, ry, tl.w, theme::TREE_ROW_HEIGHT, theme::TREE_ACTIVE_FILE()));
+            let ry = tl.y + app.terminal.active as f32 * theme::TREE_ROW_HEIGHT();
+            bg_quads.push(Quad::new(tl.x, ry, tl.w, theme::TREE_ROW_HEIGHT(), theme::TREE_ACTIVE_FILE()));
         }
     }
 
@@ -984,10 +999,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     let scm_count = app.source_control.as_ref().map_or(0, |s| s.change_count());
     if scm_count > 0 {
         if let Some(r) = act_rects.get(2) {
-            let bw = ui.scm_badge.width() + 8.0;
-            let bh = 16.0;
-            let bx = r.x + r.w - bw - 2.0;
-            let by = r.y + r.h - bh - 8.0;
+            let z = theme::ui_zoom();
+            let bw = ui.scm_badge.width() + 8.0 * z;
+            let bh = 16.0 * z;
+            let bx = r.x + r.w - bw - 2.0 * z;
+            let by = r.y + r.h - bh - 8.0 * z;
             let badge = Rect { x: bx, y: by, w: bw, h: bh };
             ui.scm_badge
                 .push(bx + (bw - ui.scm_badge.width()) * 0.5, badge, theme::BADGE_FG(), &mut areas);
@@ -1008,7 +1024,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             ui.root_label
                 .draw_left(layout.root_row_rect(), 10.0, theme::FG_TEXT(), &mut areas);
             if let Some(pc) = app.explorer.creating.as_ref() {
-                let rowh = theme::TREE_ROW_HEIGHT;
+                let rowh = theme::TREE_ROW_HEIGHT();
                 let (_, icon_rect, field) = create_row_geometry(tr, pc.row, pc.depth);
                 if pc.row > 0 {
                     let clip_a = Rect { x: tr.x, y: tr.y, w: tr.w, h: pc.row as f32 * rowh };
@@ -1053,13 +1069,13 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     let tab_rects = layout.tab_rects(n_tabs);
     for (i, tab) in tab_rects.iter().enumerate() {
         let active = active_tab == Some(i);
-        let line_top = i as f32 * theme::UI_LINE_HEIGHT;
+        let line_top = i as f32 * theme::UI_LINE_HEIGHT();
         let color = if active {
             theme::TAB_FG_ACTIVE()
         } else {
             theme::TAB_FG_INACTIVE()
         };
-        let label_top = tab.text_top(theme::UI_LINE_HEIGHT, VAlign::Center);
+        let label_top = tab.text_top(theme::UI_LINE_HEIGHT(), VAlign::Center);
         areas.push(TextArea {
             buffer: &ui.tabs,
             left: tab.x + 12.0,
@@ -1071,7 +1087,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 left: tab.x as i32 + 6,
                 top: (label_top - 2.0) as i32,
                 right: (tab.x + tab.w - 26.0) as i32,
-                bottom: (label_top + theme::UI_LINE_HEIGHT) as i32,
+                bottom: (label_top + theme::UI_LINE_HEIGHT()) as i32,
             },
             default_color: color,
             custom_glyphs: &[],
@@ -1109,7 +1125,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             // Side-by-side diff: two gutters + two text panes over the full region.
             let full = editor_region(&layout);
             let half = (full.w * 0.5).floor();
-            let g = theme::GUTTER_WIDTH;
+            let g = theme::GUTTER_WIDTH();
             let lg = Rect { x: full.x, y: full.y, w: g, h: full.h };
             let lt = Rect { x: full.x + g, y: full.y, w: (half - g).max(0.0), h: full.h };
             let rg = Rect { x: full.x + half, y: full.y, w: g, h: full.h };
@@ -1119,8 +1135,8 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             for (buf, r) in [(&d.buffer, lt), (right, rt)] {
                 areas.push(TextArea {
                     buffer: buf,
-                    left: r.x + theme::EDITOR_PAD - d.scroll_x(),
-                    top: r.y + theme::EDITOR_PAD - d.scroll_y(),
+                    left: r.x + theme::EDITOR_PAD() - d.scroll_x(),
+                    top: r.y + theme::EDITOR_PAD() - d.scroll_y(),
                     scale: 1.0,
                     bounds: TextBounds { left: r.x as i32, top: r.y as i32, right: (r.x + r.w) as i32, bottom: (r.y + r.h) as i32 },
                     default_color: theme::FG_TEXT(),
@@ -1136,8 +1152,8 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             // Document text
             areas.push(TextArea {
                 buffer: &d.buffer,
-                left: layout.editor_text.x + theme::EDITOR_PAD - d.scroll_x(),
-                top: layout.editor_text.y + theme::EDITOR_PAD - d.scroll_y(),
+                left: layout.editor_text.x + theme::EDITOR_PAD() - d.scroll_x(),
+                top: layout.editor_text.y + theme::EDITOR_PAD() - d.scroll_y(),
                 scale: 1.0,
                 bounds: TextBounds {
                     left: layout.editor_text.x as i32,
@@ -1155,8 +1171,18 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // reusable TextLabel (left-padded and right-padded alignment helpers).
     ui.status
         .draw_left(layout.status_bar, 12.0, theme::STATUS_BAR_FG(), &mut areas);
+    // Window-zoom control (− % +) pinned to the right; status info is padded left of it.
+    let zoom_cells = zoom_ctrl_cells(layout.status_bar);
     ui.status_right
-        .draw_right(layout.status_bar, 8.0, theme::STATUS_BAR_FG(), &mut areas);
+        .draw_right(layout.status_bar, 8.0 + (layout.status_bar.x + layout.status_bar.w - zoom_cells[0].x), theme::STATUS_BAR_FG(), &mut areas);
+    let sfg = theme::STATUS_BAR_FG();
+    for (lbl, c) in [
+        (&ui.zoom_minus, zoom_cells[0]),
+        (&ui.zoom_pct, zoom_cells[1]),
+        (&ui.zoom_plus, zoom_cells[2]),
+    ] {
+        lbl.push(c.x + (c.w - lbl.width()) * 0.5, c, sfg, &mut areas);
+    }
 
     // Find bar
     if let Some(fb) = layout.find_bar.as_ref() {
@@ -1167,7 +1193,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     if app.terminal.visible {
         if let Some(panel) = layout.terminal_panel {
             let content = crate::terminal_content(panel);
-            let header = Rect { x: panel.x, y: panel.y, w: panel.w, h: theme::TERMINAL_HEADER_H };
+            let header = Rect { x: panel.x, y: panel.y, w: panel.w, h: theme::TERMINAL_HEADER_H() };
             // Tab labels (active = bright, others dimmed).
             for (i, r) in panel_tab_rects(header, &gpu.terminal_tabs).into_iter().enumerate() {
                 let color = if i == theme::PANEL_ACTIVE_TAB {

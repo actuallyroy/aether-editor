@@ -40,11 +40,11 @@ impl Layout {
         // dual old │ new line-number columns.
         diff_gutter: bool,
     ) -> Self {
-        let tb = theme::TITLE_BAR_H;
+        let tb = theme::TITLE_BAR_H();
         let title_bar = Rect { x: 0.0, y: 0.0, w, h: tb };
-        let panel_h = h - theme::STATUS_BAR_HEIGHT - tb;
+        let panel_h = h - theme::STATUS_BAR_HEIGHT() - tb;
         // workbench.activityBar.visible — collapse to 0 width when hidden.
-        let activity_w = if crate::settings::activitybar_visible() { theme::ACTIVITY_BAR_WIDTH } else { 0.0 };
+        let activity_w = if crate::settings::activitybar_visible() { theme::ACTIVITY_BAR_WIDTH() } else { 0.0 };
         let activity_bar = Rect {
             x: 0.0,
             y: tb,
@@ -62,27 +62,27 @@ impl Layout {
             x: editor_left,
             y: tb,
             w: (w - editor_left).max(0.0),
-            h: theme::TAB_HEIGHT,
+            h: theme::TAB_HEIGHT(),
         };
         let find_bar = if find_active {
             Some(Rect {
                 x: editor_left,
                 y: tb + tab_strip.h,
                 w: tab_strip.w,
-                h: theme::FIND_BAR_HEIGHT,
+                h: theme::FIND_BAR_HEIGHT(),
             })
         } else {
             None
         };
-        let editor_y = tb + tab_strip.h + if find_active { theme::FIND_BAR_HEIGHT } else { 0.0 };
+        let editor_y = tb + tab_strip.h + if find_active { theme::FIND_BAR_HEIGHT() } else { 0.0 };
         // Terminal panel sits above the status bar; the editor shrinks to fit. A
         // maximize request (huge height) is clamped here to fill the whole content
         // area (editor_h → 0); normal drag is bounded by the splitter's own max.
         let term_h = match terminal_height {
-            Some(req) => req.min((h - editor_y - theme::STATUS_BAR_HEIGHT).max(0.0)),
+            Some(req) => req.min((h - editor_y - theme::STATUS_BAR_HEIGHT()).max(0.0)),
             None => 0.0,
         };
-        let editor_h = (h - editor_y - theme::STATUS_BAR_HEIGHT - term_h).max(0.0);
+        let editor_h = (h - editor_y - theme::STATUS_BAR_HEIGHT() - term_h).max(0.0);
         let terminal_panel = if term_h > 0.0 {
             Some(Rect {
                 x: editor_left,
@@ -99,7 +99,7 @@ impl Layout {
         let gutter_w = if !crate::settings::line_numbers() || diff_gutter {
             0.0
         } else {
-            theme::GUTTER_WIDTH
+            theme::GUTTER_WIDTH()
         };
         let gutter = Rect {
             x: editor_left,
@@ -115,15 +115,15 @@ impl Layout {
         };
         let status_bar = Rect {
             x: 0.0,
-            y: h - theme::STATUS_BAR_HEIGHT,
+            y: h - theme::STATUS_BAR_HEIGHT(),
             w,
-            h: theme::STATUS_BAR_HEIGHT,
+            h: theme::STATUS_BAR_HEIGHT(),
         };
         let palette = if palette_active {
-            let pw = theme::PALETTE_WIDTH.min(w - 40.0);
+            let pw = theme::PALETTE_WIDTH().min(w - 40.0);
             let visible = 8usize;
-            let ph = theme::PALETTE_INPUT_HEIGHT
-                + theme::PALETTE_ROW_HEIGHT * visible as f32
+            let ph = theme::PALETTE_INPUT_HEIGHT()
+                + theme::PALETTE_ROW_HEIGHT() * visible as f32
                 + 8.0;
             let bx = (w - pw) * 0.5;
             let by = 80.0;
@@ -137,13 +137,13 @@ impl Layout {
                 x: box_.x + 4.0,
                 y: box_.y + 4.0,
                 w: box_.w - 8.0,
-                h: theme::PALETTE_INPUT_HEIGHT,
+                h: theme::PALETTE_INPUT_HEIGHT(),
             };
             let list = Rect {
                 x: box_.x + 4.0,
                 y: input.y + input.h + 4.0,
                 w: box_.w - 8.0,
-                h: theme::PALETTE_ROW_HEIGHT * visible as f32,
+                h: theme::PALETTE_ROW_HEIGHT() * visible as f32,
             };
             Some(PaletteLayout { box_, input, list })
         } else {
@@ -170,15 +170,15 @@ impl Layout {
         (0..7)
             .map(|i| {
                 let y = if i < 5 {
-                    ab.y + i as f32 * theme::ACTIVITY_CELL
+                    ab.y + i as f32 * theme::ACTIVITY_CELL()
                 } else {
-                    ab.y + ab.h - (7 - i) as f32 * theme::ACTIVITY_CELL
+                    ab.y + ab.h - (7 - i) as f32 * theme::ACTIVITY_CELL()
                 };
                 Rect {
                     x: ab.x,
                     y,
                     w: ab.w,
-                    h: theme::ACTIVITY_CELL,
+                    h: theme::ACTIVITY_CELL(),
                 }
             })
             .collect()
@@ -189,10 +189,10 @@ impl Layout {
     pub fn title_btn_rects(&self) -> Vec<Rect> {
         (0..3)
             .map(|b| Rect {
-                x: self.title_bar.w - (3 - b) as f32 * theme::TITLE_BTN_W,
+                x: self.title_bar.w - (3 - b) as f32 * theme::TITLE_BTN_W(),
                 y: self.title_bar.y,
-                w: theme::TITLE_BTN_W,
-                h: theme::TITLE_BAR_H,
+                w: theme::TITLE_BTN_W(),
+                h: theme::TITLE_BAR_H(),
             })
             .collect()
     }
@@ -203,8 +203,8 @@ impl Layout {
         if n == 0 {
             return Vec::new();
         }
-        let ideal = theme::TAB_MAX_WIDTH.min(self.tab_strip.w / n as f32);
-        let tab_w = ideal.max(theme::TAB_MIN_WIDTH).min(theme::TAB_MAX_WIDTH);
+        let ideal = theme::TAB_MAX_WIDTH().min(self.tab_strip.w / n as f32);
+        let tab_w = ideal.max(theme::TAB_MIN_WIDTH()).min(theme::TAB_MAX_WIDTH());
         (0..n)
             .map(|i| Rect {
                 x: self.tab_strip.x + i as f32 * tab_w,
@@ -218,13 +218,13 @@ impl Layout {
     /// The layout-toggle buttons (left of the window controls).
     pub fn layout_btn_rects(&self) -> Vec<Rect> {
         let cw = 36.0;
-        let right = self.title_bar.w - 3.0 * theme::TITLE_BTN_W;
+        let right = self.title_bar.w - 3.0 * theme::TITLE_BTN_W();
         (0..3)
             .map(|i| Rect {
                 x: right - (3 - i) as f32 * cw,
                 y: self.title_bar.y,
                 w: cw,
-                h: theme::TITLE_BAR_H,
+                h: theme::TITLE_BAR_H(),
             })
             .collect()
     }
@@ -235,17 +235,18 @@ impl Layout {
             x: 0.0,
             y: self.title_bar.y,
             w: self.title_bar.w,
-            h: theme::TITLE_BAR_H,
+            h: theme::TITLE_BAR_H(),
         }
     }
 
     /// The centered command-center search box in the title bar.
     pub fn header_search_rect(&self) -> Rect {
-        let w = (self.title_bar.w * 0.34).clamp(280.0, 560.0);
-        let h = 22.0;
+        let z = theme::ui_zoom();
+        let w = (self.title_bar.w * 0.34).clamp(280.0 * z, 560.0 * z);
+        let h = 22.0 * z;
         Rect {
             x: (self.title_bar.w - w) * 0.5,
-            y: self.title_bar.y + (theme::TITLE_BAR_H - h) * 0.5,
+            y: self.title_bar.y + (theme::TITLE_BAR_H() - h) * 0.5,
             w,
             h,
         }
@@ -255,15 +256,15 @@ impl Layout {
     pub fn root_row_rect(&self) -> Rect {
         Rect {
             x: self.sidebar.x,
-            y: self.sidebar.y + theme::SIDEBAR_HEADER_H,
+            y: self.sidebar.y + theme::SIDEBAR_HEADER_H(),
             w: self.sidebar.w,
-            h: theme::TREE_ROW_HEIGHT,
+            h: theme::TREE_ROW_HEIGHT(),
         }
     }
 
     /// The file-tree list region: the sidebar below the header + root row.
     pub fn tree_region(&self) -> Rect {
-        let top = self.sidebar.y + theme::SIDEBAR_HEADER_H + theme::TREE_ROW_HEIGHT;
+        let top = self.sidebar.y + theme::SIDEBAR_HEADER_H() + theme::TREE_ROW_HEIGHT();
         Rect {
             x: self.sidebar.x,
             y: top,
@@ -278,7 +279,7 @@ impl Layout {
         let cw = 26.0;
         let n = 4;
         let right = self.sidebar.x + self.sidebar.w - 6.0;
-        let y = self.sidebar.y + (theme::SIDEBAR_HEADER_H - cw) * 0.5;
+        let y = self.sidebar.y + (theme::SIDEBAR_HEADER_H() - cw) * 0.5;
         (0..n)
             .map(|i| Rect {
                 x: right - (n - i) as f32 * cw,
@@ -295,7 +296,7 @@ impl Layout {
             x: self.sidebar.x,
             y: self.sidebar.y,
             w: self.sidebar.w,
-            h: theme::SIDEBAR_HEADER_H,
+            h: theme::SIDEBAR_HEADER_H(),
         }
     }
 
@@ -317,17 +318,17 @@ impl Layout {
 // so existing `crate::<fn>` references keep working.
 
 pub(crate) fn create_row_geometry(tr: Rect, row: usize, depth: usize) -> (Rect, Rect, Rect) {
-    let row_y = tr.y + row as f32 * theme::TREE_ROW_HEIGHT;
+    let row_y = tr.y + row as f32 * theme::TREE_ROW_HEIGHT();
     // Match the file tree: 12px left pad + ~8px per depth, left-aligned icon.
     let indent = 12.0 + depth as f32 * 8.0;
     let icon_w = 16.0;
-    let row_rect = Rect { x: tr.x, y: row_y, w: tr.w, h: theme::TREE_ROW_HEIGHT };
-    let icon_rect = Rect { x: tr.x + indent, y: row_y, w: icon_w, h: theme::TREE_ROW_HEIGHT };
+    let row_rect = Rect { x: tr.x, y: row_y, w: tr.w, h: theme::TREE_ROW_HEIGHT() };
+    let icon_rect = Rect { x: tr.x + indent, y: row_y, w: icon_w, h: theme::TREE_ROW_HEIGHT() };
     let field = Rect {
         x: tr.x + indent + icon_w + 4.0,
         y: row_y,
         w: (tr.w - indent - icon_w - 4.0).max(0.0),
-        h: theme::TREE_ROW_HEIGHT,
+        h: theme::TREE_ROW_HEIGHT(),
     };
     (row_rect, icon_rect, field)
 }
@@ -364,7 +365,7 @@ pub(crate) fn terminal_header_button_rects(panel: Rect) -> Vec<Rect> {
     let right = panel.x + panel.w - 8.0;
     let start_x = right - TERMINAL_HEADER_BTNS as f32 * bw;
     (0..TERMINAL_HEADER_BTNS)
-        .map(|i| Rect { x: start_x + i as f32 * bw, y: panel.y, w: bw, h: theme::TERMINAL_HEADER_H })
+        .map(|i| Rect { x: start_x + i as f32 * bw, y: panel.y, w: bw, h: theme::TERMINAL_HEADER_H() })
         .collect()
 }
 
@@ -393,7 +394,7 @@ pub(crate) fn terminal_tab_close_rect(tl: Rect, row: usize) -> Rect {
     let s = 18.0;
     Rect {
         x: tl.x + tl.w - s - 6.0,
-        y: tl.y + row as f32 * theme::TREE_ROW_HEIGHT + (theme::TREE_ROW_HEIGHT - s) * 0.5,
+        y: tl.y + row as f32 * theme::TREE_ROW_HEIGHT() + (theme::TREE_ROW_HEIGHT() - s) * 0.5,
         w: s,
         h: s,
     }
@@ -413,7 +414,7 @@ pub(crate) fn terminal_pane_rects(content: Rect, n: usize) -> Vec<Rect> {
 
 /// The terminal text/grid area: the panel minus the header strip at its top.
 pub(crate) fn terminal_content(panel: Rect) -> Rect {
-    let h = theme::TERMINAL_HEADER_H;
+    let h = theme::TERMINAL_HEADER_H();
     Rect {
         x: panel.x,
         y: panel.y + h,

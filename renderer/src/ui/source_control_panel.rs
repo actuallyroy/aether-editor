@@ -16,13 +16,15 @@ use crate::theme;
 use crate::ui::Intent;
 use crate::widgets::{ListView, Rect, TextInput, TextLabel};
 
-const ROW_H: f32 = 22.0;
-const PAD_X: f32 = 30.0; // row text indent
-const STATUS_W: f32 = 22.0; // status-letter column at the right edge
-const ACTION_W: f32 = 20.0; // per hover-action icon
-// Text never grows under the status letter + the (up to 3) hover-action icons:
-// STATUS_W (22) + 3*ACTION_W (60) + an 8px gap.
-const RIGHT_RESERVE: f32 = 90.0;
+// Geometry is reactive, not frozen: row height tracks the sidebar's (which scales
+// with UI zoom) and the paddings scale with zoom too, so the whole panel stays
+// proportional at any zoom — no hardcoded pixel sizes.
+fn row_h() -> f32 { theme::TREE_ROW_HEIGHT() }
+fn pad_x() -> f32 { 30.0 * theme::ui_zoom() } // row text indent
+fn status_w() -> f32 { 22.0 * theme::ui_zoom() } // status-letter column at the right edge
+fn action_w() -> f32 { 20.0 * theme::ui_zoom() } // per hover-action icon
+// Text never grows under the status letter + the (up to 3) hover-action icons.
+fn right_reserve() -> f32 { status_w() + 3.0 * action_w() + 8.0 * theme::ui_zoom() }
 
 /// A changed file as shown in one group. `fname_len` is recomputed by `update`
 /// each time the sidebar width changes (so the ellipsis is reactive to resize).
@@ -93,27 +95,27 @@ pub struct SourceControlPanel {
 impl SourceControlPanel {
     pub fn new(fs: &mut FontSystem, root: PathBuf) -> Self {
         let mk = |fs: &mut FontSystem, s: &str| {
-            let mut l = TextLabel::new(fs, theme::SIDEBAR_WIDTH, ROW_H);
+            let mut l = TextLabel::new(fs, theme::SIDEBAR_WIDTH(), row_h());
             l.set(fs, s, theme::UI_FAMILY());
             l
         };
         let icon = |fs: &mut FontSystem, c: char| {
-            let mut l = TextLabel::new(fs, 24.0, ROW_H);
+            let mut l = TextLabel::new(fs, 24.0, row_h());
             l.set(fs, &c.to_string(), theme::ICON_FAMILY);
             l
         };
         let badges = std::array::from_fn(|i| {
-            let mut l = TextLabel::new(fs, 24.0, ROW_H);
+            let mut l = TextLabel::new(fs, 24.0, row_h());
             l.set(fs, BADGE_LETTERS[i], theme::UI_FAMILY());
             l
         });
-        let mut msg = TextInput::new(fs, theme::SIDEBAR_WIDTH, 30.0);
+        let mut msg = TextInput::new(fs, theme::SIDEBAR_WIDTH(), 30.0);
         msg.set_placeholder(fs, " Message (Ctrl+Enter to commit)");
         Self {
             msg,
             msg_active: false,
-            staged: ListView::new(fs, theme::SIDEBAR_WIDTH, 4000.0, ROW_H, PAD_X),
-            unstaged: ListView::new(fs, theme::SIDEBAR_WIDTH, 4000.0, ROW_H, PAD_X),
+            staged: ListView::new(fs, theme::SIDEBAR_WIDTH(), 4000.0, row_h(), pad_x()),
+            unstaged: ListView::new(fs, theme::SIDEBAR_WIDTH(), 4000.0, row_h(), pad_x()),
             staged_rows: Vec::new(),
             unstaged_rows: Vec::new(),
             last_w: -1.0,
@@ -142,6 +144,32 @@ impl SourceControlPanel {
     /// Number of unique changed files (for the Source Control activity-bar badge).
     pub fn change_count(&self) -> usize {
         self.change_count
+    }
+
+    /// Re-shape all owned text after a UI-zoom change.
+    pub fn reshape(&mut self, fs: &mut FontSystem) {
+        self.msg.rezoom(fs);
+        for l in [
+            &mut self.l_changes,
+            &mut self.l_staged,
+            &mut self.l_unstaged,
+            &mut self.l_commit,
+            &mut self.count_staged,
+            &mut self.count_unstaged,
+            &mut self.ic_open,
+            &mut self.ic_discard,
+            &mut self.ic_stage,
+            &mut self.ic_unstage,
+            &mut self.ic_refresh,
+            &mut self.ic_more,
+            &mut self.ic_chevron,
+        ] {
+            l.reshape(fs);
+        }
+        for b in &mut self.badges {
+            b.reshape(fs);
+        }
+        self.last_w = -1.0; // force row reflow (ListView re-shapes via shape epoch)
     }
 
     pub fn set_root(&mut self, root: PathBuf) {
@@ -183,7 +211,7 @@ impl SourceControlPanel {
         self.hovered = None;
         self.last_w = -1.0; // force re-ellipsize on the next `update`
         // Shape immediately at the last known width so a refresh isn't blank for a frame.
-        let w = if self.last_w > 0.0 { self.last_w } else { theme::SIDEBAR_WIDTH };
+        let w = if self.last_w > 0.0 { self.last_w } else { theme::SIDEBAR_WIDTH() };
         self.reflow(fs, w);
     }
 
@@ -212,7 +240,7 @@ impl SourceControlPanel {
     }
 
     fn reflow(&mut self, fs: &mut FontSystem, w: f32) {
-        let avail = (w - PAD_X - RIGHT_RESERVE).max(20.0);
+        let avail = (w - pad_x() - right_reserve()).max(20.0);
         for rows in [&mut self.staged_rows, &mut self.unstaged_rows] {
             for r in rows.iter_mut() {
                 r.fname_len = Self::display(&r.fname, &r.dir, avail).1;
@@ -225,15 +253,15 @@ impl SourceControlPanel {
                 .join("\n")
         };
         let (sk, uk) = (key(&self.staged_rows), key(&self.unstaged_rows));
-        self.staged.set_text(fs, &sk, theme::SIDEBAR_WIDTH, 4000.0);
-        self.unstaged.set_text(fs, &uk, theme::SIDEBAR_WIDTH, 4000.0);
+        self.staged.set_text(fs, &sk, theme::SIDEBAR_WIDTH(), 4000.0);
+        self.unstaged.set_text(fs, &uk, theme::SIDEBAR_WIDTH(), 4000.0);
     }
 
     /// "filename  dir" truncated with an ellipsis to fit `avail` px (leaving room
     /// for the status + hover action icons). Returns the string + byte length of the
     /// bright file-name prefix within it.
     fn display(fname: &str, dir: &str, avail: f32) -> (String, usize) {
-        let budget = (avail / 6.5).max(4.0) as usize;
+        let budget = (avail / (6.5 * theme::ui_zoom())).max(4.0) as usize;
         let full = if dir.is_empty() { fname.to_string() } else { format!("{}  {}", fname, dir) };
         if full.chars().count() <= budget {
             return (full, fname.len());
@@ -251,30 +279,34 @@ impl SourceControlPanel {
 
     // ---- Geometry ----
     fn changes_hdr(r: Rect) -> Rect {
-        Rect { x: r.x + 8.0, y: r.y + 4.0, w: r.w - 12.0, h: ROW_H }
+        let z = theme::ui_zoom();
+        Rect { x: r.x + 8.0 * z, y: r.y + 4.0 * z, w: r.w - 12.0 * z, h: row_h() }
     }
     fn msg_rect(r: Rect) -> Rect {
-        Rect { x: r.x + 10.0, y: r.y + ROW_H + 8.0, w: r.w - 20.0, h: 30.0 }
+        let z = theme::ui_zoom();
+        Rect { x: r.x + 10.0 * z, y: r.y + row_h() + 8.0 * z, w: r.w - 20.0 * z, h: 30.0 * z }
     }
     fn commit_rect(r: Rect) -> Rect {
+        let z = theme::ui_zoom();
         let m = Self::msg_rect(r);
-        Rect { x: m.x, y: m.y + m.h + 6.0, w: m.w, h: 28.0 }
+        Rect { x: m.x, y: m.y + m.h + 6.0 * z, w: m.w, h: 28.0 * z }
     }
     fn staged_hdr(r: Rect) -> Rect {
+        let z = theme::ui_zoom();
         let c = Self::commit_rect(r);
-        Rect { x: r.x + 8.0, y: c.y + c.h + 10.0, w: r.w - 16.0, h: ROW_H }
+        Rect { x: r.x + 8.0 * z, y: c.y + c.h + 10.0 * z, w: r.w - 16.0 * z, h: row_h() }
     }
     fn staged_list(&self, r: Rect) -> Rect {
         let h = Self::staged_hdr(r);
-        Rect { x: r.x, y: h.y + ROW_H, w: r.w, h: self.staged_rows.len() as f32 * ROW_H }
+        Rect { x: r.x, y: h.y + row_h(), w: r.w, h: self.staged_rows.len() as f32 * row_h() }
     }
     fn unstaged_hdr(&self, r: Rect) -> Rect {
         let sl = self.staged_list(r);
-        Rect { x: r.x + 8.0, y: sl.y + sl.h + 8.0, w: r.w - 16.0, h: ROW_H }
+        Rect { x: r.x + 8.0 * theme::ui_zoom(), y: sl.y + sl.h + 8.0 * theme::ui_zoom(), w: r.w - 16.0 * theme::ui_zoom(), h: row_h() }
     }
     fn unstaged_list(&self, r: Rect) -> Rect {
         let h = self.unstaged_hdr(r);
-        Rect { x: r.x, y: h.y + ROW_H, w: r.w, h: self.unstaged_rows.len() as f32 * ROW_H }
+        Rect { x: r.x, y: h.y + row_h(), w: r.w, h: self.unstaged_rows.len() as f32 * row_h() }
     }
 
     /// Hover-action icon rects for a row, right-to-left ending before the status.
@@ -284,28 +316,30 @@ impl SourceControlPanel {
         } else {
             &[Act::Open, Act::Discard, Act::Stage]
         };
-        let end = region.x + region.w - STATUS_W - 4.0;
-        let start = end - acts.len() as f32 * ACTION_W;
+        let end = region.x + region.w - status_w() - 4.0 * theme::ui_zoom();
+        let start = end - acts.len() as f32 * action_w();
         acts.iter()
             .enumerate()
-            .map(|(i, &a)| (a, Rect { x: start + i as f32 * ACTION_W, y, w: ACTION_W, h: ROW_H }))
+            .map(|(i, &a)| (a, Rect { x: start + i as f32 * action_w(), y, w: action_w(), h: row_h() }))
             .collect()
     }
 
     /// [refresh, more] toolbar rects, right-aligned in the CHANGES header row.
     fn toolbar_rects(r: Rect) -> [Rect; 2] {
+        let bw = 22.0 * theme::ui_zoom();
         let ch = Self::changes_hdr(r);
-        let more = Rect { x: ch.x + ch.w - 22.0, y: ch.y, w: 22.0, h: ROW_H };
-        let refresh = Rect { x: more.x - 22.0, y: ch.y, w: 22.0, h: ROW_H };
+        let more = Rect { x: ch.x + ch.w - bw, y: ch.y, w: bw, h: row_h() };
+        let refresh = Rect { x: more.x - bw, y: ch.y, w: bw, h: row_h() };
         [refresh, more]
     }
     fn commit_main(r: Rect) -> Rect {
         let c = Self::commit_rect(r);
-        Rect { w: c.w - 28.0, ..c }
+        Rect { w: c.w - 28.0 * theme::ui_zoom(), ..c }
     }
     fn commit_chevron(r: Rect) -> Rect {
         let c = Self::commit_rect(r);
-        Rect { x: c.x + c.w - 28.0, w: 28.0, ..c }
+        let cw = 28.0 * theme::ui_zoom();
+        Rect { x: c.x + c.w - cw, w: cw, ..c }
     }
     /// Group-header composite actions (left of the count pill, on hover):
     /// Staged → Unstage All; Changes → Discard All + Stage All.
@@ -317,10 +351,10 @@ impl SourceControlPanel {
         };
         let acts: &[Act] = if staged { &[Act::Unstage] } else { &[Act::Discard, Act::Stage] };
         let end = hdr.x + hdr.w - (count.width() + 12.0) - 6.0;
-        let start = end - acts.len() as f32 * ACTION_W;
+        let start = end - acts.len() as f32 * action_w();
         acts.iter()
             .enumerate()
-            .map(|(i, &a)| (a, Rect { x: start + i as f32 * ACTION_W, y: hdr.y, w: ACTION_W, h: ROW_H }))
+            .map(|(i, &a)| (a, Rect { x: start + i as f32 * action_w(), y: hdr.y, w: action_w(), h: row_h() }))
             .collect()
     }
 
@@ -345,14 +379,14 @@ impl SourceControlPanel {
             (self.unstaged_hdr(region), &self.count_unstaged),
         ] {
             let w = label.width() + 12.0;
-            let pill = Rect { x: hdr.x + hdr.w - w, y: hdr.y + 3.0, w, h: ROW_H - 6.0 };
+            let pill = Rect { x: hdr.x + hdr.w - w, y: hdr.y + 3.0, w, h: row_h() - 6.0 };
             bg.push(pill.rounded_quad([0.20, 0.30, 0.42, 1.0], pill.h * 0.5));
         }
         // Hovered-row highlight (so the action icons read as part of an active row).
         if let Some((staged, idx)) = self.hovered {
             let lr = if staged { self.staged_list(region) } else { self.unstaged_list(region) };
-            let y = lr.y + idx as f32 * ROW_H;
-            bg.push(Quad::new(region.x, y, region.w, ROW_H, theme::TREE_HOVER()));
+            let y = lr.y + idx as f32 * row_h();
+            bg.push(Quad::new(region.x, y, region.w, row_h(), theme::TREE_HOVER()));
         }
     }
 
@@ -409,7 +443,7 @@ impl SourceControlPanel {
 
     fn push_count<'b>(&self, label: &'b TextLabel, hdr: Rect, areas: &mut Vec<TextArea<'b>>) {
         let w = label.width() + 12.0;
-        let pill = Rect { x: hdr.x + hdr.w - w, y: hdr.y, w, h: ROW_H };
+        let pill = Rect { x: hdr.x + hdr.w - w, y: hdr.y, w, h: row_h() };
         label.push(pill.x + (pill.w - label.width()) * 0.5, pill, theme::FG_DIM(), areas);
     }
 
@@ -435,20 +469,20 @@ impl SourceControlPanel {
             return;
         }
         // Clip the row text to leave the status/action column clear.
-        let text_clip = Rect { w: (region.w - STATUS_W - 4.0).max(0.0), ..region };
+        let text_clip = Rect { w: (region.w - status_w() - 4.0).max(0.0), ..region };
         list.draw_at(text_clip, region.y, theme::FG_DIM(), areas);
         let pad = list.pad_x();
         for (i, r) in rows.iter().enumerate() {
-            let y = region.y + i as f32 * ROW_H;
+            let y = region.y + i as f32 * row_h();
             // Bright file-name prefix (same origin, clipped to its width).
             if let Some((_x0, x1)) = list.line_x_range(i, 0, r.fname_len) {
                 let w = (pad + x1).min(text_clip.w);
-                let band = Rect { x: region.x, y, w, h: ROW_H };
+                let band = Rect { x: region.x, y, w, h: row_h() };
                 list.draw_at(band, region.y, theme::FG_TEXT(), areas);
             }
             // Status letter at the far right.
             let (rr, gg, bb) = BADGE_RGB[r.badge];
-            let st = Rect { x: region.x + region.w - STATUS_W, y, w: 18.0, h: ROW_H };
+            let st = Rect { x: region.x + region.w - status_w(), y, w: 18.0, h: row_h() };
             self.badges[r.badge].push(st.x, st, Color::rgb(rr, gg, bb), areas);
             // Hover actions for this row.
             if hovered_idx == Some(i) {
@@ -541,7 +575,7 @@ impl SourceControlPanel {
             let list = if staged { &self.staged } else { &self.unstaged };
             if let Some(i) = list.row_at(lr, pt, rows.len()) {
                 let row = &rows[i];
-                let y = lr.y + i as f32 * ROW_H;
+                let y = lr.y + i as f32 * row_h();
                 // Action icon hit?
                 for (act, ar) in Self::action_rects(lr, y, staged) {
                     if ar.contains(pt) {

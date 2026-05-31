@@ -23,8 +23,8 @@ impl EditorView {
     /// Hit-test `(x, y)` against the document's shaped buffer and move the caret
     /// there, extending the selection when `extend`.
     fn place_caret(doc: &mut Document, layout: &Layout, x: f32, y: f32, extend: bool) {
-        let buf_x = x - (layout.editor_text.x + theme::EDITOR_PAD) + doc.scroll_x();
-        let buf_y = y - (layout.editor_text.y + theme::EDITOR_PAD) + doc.scroll_y();
+        let buf_x = x - (layout.editor_text.x + theme::EDITOR_PAD()) + doc.scroll_x();
+        let buf_y = y - (layout.editor_text.y + theme::EDITOR_PAD()) + doc.scroll_y();
         if let Some(hit) = doc.buffer.hit(buf_x, buf_y) {
             let line = hit.line;
             if line < doc.rope.len_lines() {
@@ -70,7 +70,7 @@ impl EditorView {
 
     /// Scroll the document so the caret's line stays within the editor viewport.
     pub fn ensure_cursor_visible(doc: &mut Document, layout: &Layout) {
-        let editor_inner_h = layout.editor_text.h - theme::EDITOR_PAD * 2.0;
+        let editor_inner_h = layout.editor_text.h - theme::EDITOR_PAD() * 2.0;
         if editor_inner_h <= 0.0 {
             return;
         }

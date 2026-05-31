@@ -418,26 +418,56 @@ pub fn file_icon_color(name: &str) -> Color {
     }
 }
 
-// ---- Dimensions / fonts / glyphs (compile-time; themes never change these) ----
+// ---- Dimensions / fonts / glyphs ----
+//
+// SIZE dimensions are runtime functions multiplied by a global UI zoom (VSCode's
+// window.zoomLevel) so the whole window scales crisply. Glyph codepoints, font
+// families, and timing (ms) stay compile-time const.
 
-pub const SCROLLBAR_WIDTH: f32 = 14.0;
-pub const SEARCH_ROW_H: f32 = UI_LINE_HEIGHT; // find-in-files result row height (one text line)
+/// Global UI zoom factor (1.0 = 100%). Scales every dimension + font size.
+fn zoom_cell() -> &'static RwLock<f32> {
+    static Z: OnceLock<RwLock<f32>> = OnceLock::new();
+    Z.get_or_init(|| RwLock::new(1.0))
+}
+pub fn ui_zoom() -> f32 {
+    *zoom_cell().read().unwrap()
+}
+pub fn set_ui_zoom(z: f32) {
+    *zoom_cell().write().unwrap() = z.clamp(0.5, 3.0);
+    bump_shape_epoch();
+}
+
+// Bumped whenever a change requires every cached text buffer to re-shape (zoom).
+// Widgets compare their stored epoch and re-shape (with fresh metrics) when stale.
+fn epoch_cell() -> &'static std::sync::atomic::AtomicU64 {
+    static E: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    &E
+}
+pub fn shape_epoch() -> u64 {
+    epoch_cell().load(std::sync::atomic::Ordering::Relaxed)
+}
+fn bump_shape_epoch() {
+    epoch_cell().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn SCROLLBAR_WIDTH() -> f32 { 14.0 * ui_zoom() }
+pub fn SEARCH_ROW_H() -> f32 { UI_LINE_HEIGHT() } // find-in-files result row height
 // Auto-hide overlay scrollbars: held fully visible for HOLD ms after the last
-// scroll/hover, then fade to invisible over FADE ms.
+// scroll/hover, then fade to invisible over FADE ms. (Timing, not scaled.)
 pub const SCROLLBAR_FADE_HOLD_MS: f32 = 900.0;
 pub const SCROLLBAR_FADE_MS: f32 = 300.0;
-pub const DIALOG_BTN_H: f32 = 30.0;
+pub fn DIALOG_BTN_H() -> f32 { 30.0 * ui_zoom() }
 
 // Editor font metrics are runtime (driven by `editor.fontSize` / `editor.lineHeight`).
 #[allow(non_snake_case)]
-pub fn FONT_SIZE() -> f32 { crate::settings::font_size() }
+pub fn FONT_SIZE() -> f32 { crate::settings::font_size() * ui_zoom() }
 #[allow(non_snake_case)]
-pub fn LINE_HEIGHT() -> f32 { crate::settings::line_height() }
-pub const UI_FONT_SIZE: f32 = 13.0;
-pub const UI_LINE_HEIGHT: f32 = 22.0;
-pub const ICON_SIZE: f32 = 16.0;
-pub const ACTIVITY_ICON_SIZE: f32 = 22.0;
-pub const ACTIVITY_CELL: f32 = 48.0;
+pub fn LINE_HEIGHT() -> f32 { crate::settings::line_height() * ui_zoom() }
+pub fn UI_FONT_SIZE() -> f32 { 13.0 * ui_zoom() }
+pub fn UI_LINE_HEIGHT() -> f32 { 22.0 * ui_zoom() }
+pub fn ICON_SIZE() -> f32 { 16.0 * ui_zoom() }
+pub fn ACTIVITY_ICON_SIZE() -> f32 { 22.0 * ui_zoom() }
+pub fn ACTIVITY_CELL() -> f32 { 48.0 * ui_zoom() }
 
 // Editor mono family is runtime (driven by `editor.fontFamily`).
 #[allow(non_snake_case)]
@@ -482,39 +512,39 @@ pub const ICON_FILE: char = '\u{ea7b}';
 
 pub const BLINK_MS: u64 = 530;
 
-pub const TITLE_BAR_H: f32 = 30.0;
-pub const MENU_ITEM_H: f32 = 22.0; // = UI_LINE_HEIGHT so text rows align with item rects
+pub fn TITLE_BAR_H() -> f32 { 30.0 * ui_zoom() }
+pub fn MENU_ITEM_H() -> f32 { 22.0 * ui_zoom() } // = UI_LINE_HEIGHT so rows align with items
 // Window controls — Codicon chrome-* glyphs (rendered in ICON_FAMILY).
 pub const ICON_MIN: char = '\u{eaba}';
 pub const ICON_MAX: char = '\u{eab9}';
 pub const ICON_RESTORE: char = '\u{eabb}';
 pub const ICON_WIN_CLOSE: char = '\u{eab8}';
-pub const TITLE_BTN_W: f32 = 46.0;
+pub fn TITLE_BTN_W() -> f32 { 46.0 * ui_zoom() }
 
-pub const ACTIVITY_BAR_WIDTH: f32 = 48.0;
-pub const SIDEBAR_WIDTH: f32 = 240.0;
-pub const SIDEBAR_MIN_WIDTH: f32 = 120.0;
-pub const SIDEBAR_MAX_WIDTH: f32 = 600.0;
-pub const SIDEBAR_RESIZE_HANDLE: f32 = 6.0;
-pub const TAB_HEIGHT: f32 = 34.0;
-pub const STATUS_BAR_HEIGHT: f32 = 22.0;
-pub const GUTTER_WIDTH: f32 = 56.0;
-pub const EDITOR_PAD: f32 = 12.0;
-pub const CURSOR_WIDTH: f32 = 2.0;
-pub const TREE_INDENT: f32 = 16.0;
-pub const TREE_ROW_HEIGHT: f32 = 22.0;
-pub const SIDEBAR_HEADER_H: f32 = 30.0;
-pub const TAB_MIN_WIDTH: f32 = 120.0;
-pub const TAB_MAX_WIDTH: f32 = 220.0;
-pub const FIND_BAR_HEIGHT: f32 = 36.0;
-pub const TERMINAL_HEIGHT: f32 = 240.0; // initial/default panel height
-pub const TERMINAL_MIN_HEIGHT: f32 = 80.0;
-pub const TERMINAL_MAX_HEIGHT: f32 = 700.0;
-pub const TERMINAL_HEADER_H: f32 = 32.0; // VSCode-style panel header (tabs + buttons)
+pub fn ACTIVITY_BAR_WIDTH() -> f32 { 48.0 * ui_zoom() }
+pub fn SIDEBAR_WIDTH() -> f32 { 240.0 * ui_zoom() }
+pub fn SIDEBAR_MIN_WIDTH() -> f32 { 120.0 * ui_zoom() }
+pub fn SIDEBAR_MAX_WIDTH() -> f32 { 600.0 * ui_zoom() }
+pub fn SIDEBAR_RESIZE_HANDLE() -> f32 { 6.0 * ui_zoom() }
+pub fn TAB_HEIGHT() -> f32 { 34.0 * ui_zoom() }
+pub fn STATUS_BAR_HEIGHT() -> f32 { 22.0 * ui_zoom() }
+pub fn GUTTER_WIDTH() -> f32 { 56.0 * ui_zoom() }
+pub fn EDITOR_PAD() -> f32 { 12.0 * ui_zoom() }
+pub fn CURSOR_WIDTH() -> f32 { 2.0 * ui_zoom() }
+pub fn TREE_INDENT() -> f32 { 16.0 * ui_zoom() }
+pub fn TREE_ROW_HEIGHT() -> f32 { 22.0 * ui_zoom() }
+pub fn SIDEBAR_HEADER_H() -> f32 { 30.0 * ui_zoom() }
+pub fn TAB_MIN_WIDTH() -> f32 { 120.0 * ui_zoom() }
+pub fn TAB_MAX_WIDTH() -> f32 { 220.0 * ui_zoom() }
+pub fn FIND_BAR_HEIGHT() -> f32 { 36.0 * ui_zoom() }
+pub fn TERMINAL_HEIGHT() -> f32 { 240.0 * ui_zoom() } // initial/default panel height
+pub fn TERMINAL_MIN_HEIGHT() -> f32 { 80.0 * ui_zoom() }
+pub fn TERMINAL_MAX_HEIGHT() -> f32 { 700.0 * ui_zoom() }
+pub fn TERMINAL_HEADER_H() -> f32 { 32.0 * ui_zoom() } // panel header (tabs + buttons)
 
 /// Bottom-panel tabs (VSCode layout). Index 3 (TERMINAL) is the active stub.
 pub const PANEL_TABS: &[&str] = &["PROBLEMS", "OUTPUT", "DEBUG CONSOLE", "TERMINAL", "PORTS"];
 pub const PANEL_ACTIVE_TAB: usize = 3;
-pub const PALETTE_WIDTH: f32 = 560.0;
-pub const PALETTE_ROW_HEIGHT: f32 = 24.0;
-pub const PALETTE_INPUT_HEIGHT: f32 = 30.0;
+pub fn PALETTE_WIDTH() -> f32 { 560.0 * ui_zoom() }
+pub fn PALETTE_ROW_HEIGHT() -> f32 { 24.0 * ui_zoom() }
+pub fn PALETTE_INPUT_HEIGHT() -> f32 { 30.0 * ui_zoom() }

@@ -129,7 +129,7 @@ impl Markdown {
             blocks.push(Block::Text { buffer, height, links: std::mem::take(links) });
             spans.clear();
         };
-        let base_m = Metrics::new(theme::UI_FONT_SIZE, theme::UI_LINE_HEIGHT);
+        let base_m = Metrics::new(theme::UI_FONT_SIZE(), theme::UI_LINE_HEIGHT());
         // Link tracking: byte offset within the current block's accumulated text.
         let byte_len = |spans: &[(String, Attrs<'static>)]| spans.iter().map(|(s, _)| s.len()).sum::<usize>();
         let mut cur_links: Vec<LinkRun> = Vec::new();

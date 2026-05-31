@@ -12,7 +12,7 @@ use crate::quad::Quad;
 use crate::theme;
 
 pub fn make_ui_buffer(fs: &mut FontSystem, w: f32, h: f32) -> Buffer {
-    let mut b = Buffer::new(fs, Metrics::new(theme::UI_FONT_SIZE, theme::UI_LINE_HEIGHT));
+    let mut b = Buffer::new(fs, Metrics::new(theme::UI_FONT_SIZE(), theme::UI_LINE_HEIGHT()));
     b.set_size(fs, Some(w), Some(h));
     b
 }
@@ -66,13 +66,19 @@ pub enum VAlign {
 /// buffer to sidestep glyphon's multi-line layout quirks.
 pub struct IconButton {
     buffer: Buffer,
-    size: f32,
+    size: f32,        // current (zoomed) glyph size
+    base: f32,        // unzoomed glyph size (for re-scaling)
+    glyph: char,
+    family: String,
+    epoch: u64,
     pub cursor: CursorIcon,
     pub align: VAlign,
 }
 
 impl IconButton {
     pub fn new(fs: &mut FontSystem, glyph: char, family: &str, size: f32) -> Self {
+        // `size` is captured at the current zoom; recover the unzoomed base.
+        let base = size / theme::ui_zoom();
         let mut buffer = Buffer::new(fs, Metrics::new(size, size + 2.0));
         buffer.set_size(fs, Some(128.0), Some(size + 8.0));
         let mut tmp = [0u8; 4];
@@ -87,9 +93,32 @@ impl IconButton {
         Self {
             buffer,
             size,
+            base,
+            glyph,
+            family: family.to_string(),
+            epoch: theme::shape_epoch(),
             cursor: CursorIcon::Pointer,
             align: VAlign::Center,
         }
+    }
+
+    /// Re-shape the glyph at the current zoom (call after a zoom change).
+    pub fn reshape(&mut self, fs: &mut FontSystem) {
+        if self.epoch == theme::shape_epoch() {
+            return;
+        }
+        self.epoch = theme::shape_epoch();
+        self.size = self.base * theme::ui_zoom();
+        self.buffer.set_metrics(fs, Metrics::new(self.size, self.size + 2.0));
+        self.buffer.set_size(fs, Some(128.0 * theme::ui_zoom()), Some(self.size + 8.0));
+        let mut tmp = [0u8; 4];
+        self.buffer.set_text(
+            fs,
+            self.glyph.encode_utf8(&mut tmp),
+            Attrs::new().family(Family::Name(&self.family)),
+            Shaping::Advanced,
+        );
+        self.buffer.shape_until_scroll(fs, false);
     }
 
     pub fn cursor(&self) -> CursorIcon {
@@ -134,38 +163,69 @@ impl IconButton {
 pub struct TextLabel {
     buffer: Buffer,
     last: String,
+    family: String, // family of the last plain `set` (for re-shape on zoom)
+    epoch: u64,     // theme::shape_epoch() this buffer was last shaped at
+    base_w: f32,    // unzoomed buffer area (scaled by zoom on re-shape)
+    base_h: f32,
     pub align: VAlign,
 }
 
 impl TextLabel {
     pub fn new(fs: &mut FontSystem, w: f32, h: f32) -> Self {
+        let z = theme::ui_zoom();
         Self {
             buffer: make_ui_buffer(fs, w, h),
             last: String::new(),
+            family: String::new(),
+            epoch: theme::shape_epoch(),
+            base_w: w / z,
+            base_h: h / z,
             align: VAlign::Center,
         }
     }
 
     pub fn set(&mut self, fs: &mut FontSystem, text: &str, family: &str) {
-        if self.last == text {
+        if self.last == text && self.family == family && self.epoch == theme::shape_epoch() {
             return;
         }
+        self.last = text.to_string();
+        self.family = family.to_string();
+        self.shape_plain(fs);
+    }
+
+    fn shape_plain(&mut self, fs: &mut FontSystem) {
+        let z = theme::ui_zoom();
+        self.buffer.set_metrics(fs, Metrics::new(theme::UI_FONT_SIZE(), theme::UI_LINE_HEIGHT()));
+        self.buffer.set_size(fs, Some(self.base_w * z), Some(self.base_h * z));
         self.buffer.set_text(
             fs,
-            text,
-            Attrs::new().family(Family::Name(family)),
+            &self.last,
+            Attrs::new().family(Family::Name(&self.family)),
             Shaping::Advanced,
         );
         self.buffer.shape_until_scroll(fs, false);
-        self.last = text.to_string();
+        self.epoch = theme::shape_epoch();
+    }
+
+    /// Re-shape after a zoom change (from the stored plain text). No-op for empty
+    /// or rich labels (those re-shape from their per-frame `set`/`set_rich`).
+    pub fn reshape(&mut self, fs: &mut FontSystem) {
+        if !self.last.is_empty() && !self.family.is_empty() {
+            self.shape_plain(fs);
+        }
     }
 
     /// Rich (multi-span, multi-color) variant. `key` is an opaque change-detection
     /// string so we reshape only when the content changes.
     pub fn set_rich(&mut self, fs: &mut FontSystem, key: &str, spans: &[(String, Attrs)], default: Attrs) {
-        if self.last == key {
+        if self.last == key && self.epoch == theme::shape_epoch() {
             return;
         }
+        self.epoch = theme::shape_epoch();
+        self.family.clear(); // rich content; not re-shapable from `reshape`
+        let z = theme::ui_zoom();
+        self.buffer.set_metrics(fs, Metrics::new(theme::UI_FONT_SIZE(), theme::UI_LINE_HEIGHT()));
+        self.buffer.set_size(fs, Some(self.base_w * z), Some(self.base_h * z));
         self.buffer.set_rich_text(
             fs,
             spans.iter().map(|(s, a)| (s.as_str(), *a)),
@@ -188,7 +248,7 @@ impl TextLabel {
         areas.push(TextArea {
             buffer: &self.buffer,
             left,
-            top: rect.text_top(theme::UI_LINE_HEIGHT, self.align),
+            top: rect.text_top(theme::UI_LINE_HEIGHT(), self.align),
             scale: 1.0,
             bounds: TextBounds {
                 left: rect.x as i32,
@@ -243,6 +303,7 @@ pub struct TextInput {
     placeholder: String,
     focused: bool,
     shown: String, // last shaped content (change detection)
+    epoch: u64,
     cursor: CursorIcon,
     pub align: VAlign,
     caret: usize,  // byte index of the caret in `text`
@@ -257,11 +318,17 @@ impl TextInput {
             placeholder: String::new(),
             focused: false,
             shown: String::new(),
+            epoch: theme::shape_epoch(),
             cursor: CursorIcon::Text,
             align: VAlign::Center,
             caret: 0,
             anchor: 0,
         }
+    }
+
+    /// Re-shape after a zoom change (forces fresh metrics next reshape).
+    pub fn rezoom(&mut self, fs: &mut FontSystem) {
+        self.reshape(fs);
     }
 
     pub fn cursor(&self) -> CursorIcon {
@@ -286,9 +353,11 @@ impl TextInput {
         } else {
             self.text.clone()
         };
-        if self.shown == content {
+        if self.shown == content && self.epoch == theme::shape_epoch() {
             return;
         }
+        self.epoch = theme::shape_epoch();
+        self.buffer.set_metrics(fs, Metrics::new(theme::UI_FONT_SIZE(), theme::UI_LINE_HEIGHT()));
         self.buffer.set_text(
             fs,
             &content,
@@ -525,7 +594,7 @@ impl TextInput {
     /// A thin caret bar at the caret position.
     pub fn caret_quad(&self, rect: Rect, pad_x: f32) -> Quad {
         let x = rect.x + pad_x + self.x_for_byte(self.caret);
-        let h = theme::UI_LINE_HEIGHT - 6.0;
+        let h = theme::UI_LINE_HEIGHT() - 6.0;
         let y = rect.text_top(h, self.align);
         Quad::new(x, y, 1.5, h, theme::CURSOR())
     }
@@ -538,7 +607,7 @@ impl TextInput {
         let (a, b) = self.sel_range();
         let x0 = rect.x + pad_x + self.x_for_byte(a);
         let x1 = rect.x + pad_x + self.x_for_byte(b);
-        let h = theme::UI_LINE_HEIGHT - 2.0;
+        let h = theme::UI_LINE_HEIGHT() - 2.0;
         let y = rect.text_top(h, self.align);
         out.push(Quad::new(x0, y, (x1 - x0).max(1.0), h, theme::SELECTION()));
     }
@@ -547,7 +616,7 @@ impl TextInput {
         areas.push(TextArea {
             buffer: &self.buffer,
             left: rect.x + pad_x,
-            top: rect.text_top(theme::UI_LINE_HEIGHT, self.align),
+            top: rect.text_top(theme::UI_LINE_HEIGHT(), self.align),
             scale: 1.0,
             bounds: TextBounds {
                 left: rect.x as i32,
@@ -577,7 +646,7 @@ impl SearchField {
         icon.cursor = CursorIcon::Pointer;
         Self {
             icon,
-            label: TextInput::new(fs, 700.0, theme::TITLE_BAR_H),
+            label: TextInput::new(fs, 700.0, theme::TITLE_BAR_H()),
             cursor: CursorIcon::Pointer,
         }
     }
@@ -631,7 +700,7 @@ impl MenuBar {
         let labels = MENU_ITEMS
             .iter()
             .map(|t| {
-                let mut l = TextLabel::new(fs, 240.0, theme::TITLE_BAR_H);
+                let mut l = TextLabel::new(fs, 240.0, theme::TITLE_BAR_H());
                 l.set(fs, t, theme::UI_FAMILY());
                 l
             })
@@ -644,6 +713,12 @@ impl MenuBar {
 
     pub fn cursor(&self) -> CursorIcon {
         self.cursor
+    }
+
+    pub fn reshape(&mut self, fs: &mut FontSystem) {
+        for l in &mut self.labels {
+            l.reshape(fs);
+        }
     }
 
     /// Per-item rects laid out from the left edge of `bar`.
@@ -780,7 +855,7 @@ impl Gutter {
         areas.push(TextArea {
             buffer: &self.buffer,
             left: region.x,
-            top: region.y + theme::EDITOR_PAD - scroll_y,
+            top: region.y + theme::EDITOR_PAD() - scroll_y,
             scale: 1.0,
             bounds: TextBounds {
                 left: region.x as i32,
@@ -801,20 +876,27 @@ impl Gutter {
 pub struct ListView {
     buffer: Buffer,
     last_key: String,
-    row_h: f32,
-    pad_x: f32,
+    epoch: u64,
+    base_row_h: f32, // unzoomed; row_h() scales by the current UI zoom
+    base_pad_x: f32,
     cursor: CursorIcon,
 }
 
 impl ListView {
     pub fn new(fs: &mut FontSystem, w: f32, h: f32, row_h: f32, pad_x: f32) -> Self {
+        let z = theme::ui_zoom();
         Self {
             buffer: make_ui_buffer(fs, w, h),
             last_key: String::new(),
-            row_h,
-            pad_x,
+            epoch: theme::shape_epoch(),
+            base_row_h: row_h / z,
+            base_pad_x: pad_x / z,
             cursor: CursorIcon::Pointer,
         }
+    }
+
+    fn row_h(&self) -> f32 {
+        self.base_row_h * theme::ui_zoom()
     }
 
     pub fn cursor(&self) -> CursorIcon {
@@ -822,9 +904,11 @@ impl ListView {
     }
 
     pub fn set_text(&mut self, fs: &mut FontSystem, key: &str, w: f32, h: f32) {
-        if self.last_key == key {
+        if self.last_key == key && self.epoch == theme::shape_epoch() {
             return;
         }
+        self.epoch = theme::shape_epoch();
+        self.buffer.set_metrics(fs, Metrics::new(theme::UI_FONT_SIZE(), theme::UI_LINE_HEIGHT()));
         self.buffer.set_size(fs, Some(w), Some(h));
         self.buffer.set_text(
             fs,
@@ -837,9 +921,11 @@ impl ListView {
     }
 
     pub fn set_rich(&mut self, fs: &mut FontSystem, key: &str, spans: &[(String, Attrs)], w: f32, h: f32) {
-        if self.last_key == key {
+        if self.last_key == key && self.epoch == theme::shape_epoch() {
             return;
         }
+        self.epoch = theme::shape_epoch();
+        self.buffer.set_metrics(fs, Metrics::new(theme::UI_FONT_SIZE(), theme::UI_LINE_HEIGHT()));
         self.buffer.set_size(fs, Some(w), Some(h));
         let default = Attrs::new()
             .family(Family::Name(theme::UI_FAMILY()))
@@ -855,11 +941,12 @@ impl ListView {
     }
 
     pub fn row_rect(&self, region: Rect, i: usize) -> Rect {
+        let rh = self.row_h();
         Rect {
             x: region.x,
-            y: region.y + i as f32 * self.row_h,
+            y: region.y + i as f32 * rh,
             w: region.w,
-            h: self.row_h,
+            h: rh,
         }
     }
 
@@ -868,7 +955,7 @@ impl ListView {
         if !region.contains(p) {
             return None;
         }
-        let idx = ((p.1 - region.y) / self.row_h) as usize;
+        let idx = ((p.1 - region.y) / self.row_h()) as usize;
         (idx < count).then_some(idx)
     }
 
@@ -898,7 +985,7 @@ impl ListView {
 
     /// Left padding (px) the buffer is drawn at within its region.
     pub fn pad_x(&self) -> f32 {
-        self.pad_x
+        self.base_pad_x * theme::ui_zoom()
     }
 
     /// Draw the buffer with row 0 placed at `top`, clipped to `clip`. Lets a
@@ -906,7 +993,7 @@ impl ListView {
     pub fn draw_at<'a>(&'a self, clip: Rect, top: f32, color: glyphon::Color, areas: &mut Vec<TextArea<'a>>) {
         areas.push(TextArea {
             buffer: &self.buffer,
-            left: clip.x + self.pad_x,
+            left: clip.x + self.pad_x(),
             top,
             scale: 1.0,
             bounds: TextBounds {
@@ -934,7 +1021,7 @@ pub struct Menu {
 impl Menu {
     pub fn new(fs: &mut FontSystem, width: f32) -> Self {
         Self {
-            list: ListView::new(fs, width, 400.0, theme::MENU_ITEM_H, 12.0),
+            list: ListView::new(fs, width, 400.0, theme::MENU_ITEM_H(), 12.0),
             count: 0,
             width,
         }
@@ -953,7 +1040,7 @@ impl Menu {
 
     /// The popup box rect for `anchor`, clamped within the window `win`.
     pub fn rect(&self, anchor: (f32, f32), win: (f32, f32)) -> Rect {
-        let h = self.count as f32 * theme::MENU_ITEM_H + 8.0;
+        let h = self.count as f32 * theme::MENU_ITEM_H() + 8.0;
         Rect {
             x: anchor.0.min(win.0 - self.width - 4.0).max(0.0),
             y: anchor.1.min(win.1 - h - 4.0).max(0.0),
@@ -1010,7 +1097,7 @@ impl Dialog {
     pub fn set(&mut self, fs: &mut FontSystem, message: &str, buttons: &[&str], check: Option<&str>) {
         self.message.set(fs, message, theme::UI_FAMILY());
         if self.buttons.len() != buttons.len() {
-            self.buttons = buttons.iter().map(|_| TextLabel::new(fs, 200.0, theme::DIALOG_BTN_H)).collect();
+            self.buttons = buttons.iter().map(|_| TextLabel::new(fs, 200.0, theme::DIALOG_BTN_H())).collect();
         }
         for (b, l) in self.buttons.iter_mut().zip(buttons) {
             b.set(fs, l, theme::UI_FAMILY());
@@ -1027,7 +1114,7 @@ impl Dialog {
 
     pub fn button_rects(&self, b: Rect) -> Vec<Rect> {
         let bw = 100.0;
-        let bh = theme::DIALOG_BTN_H;
+        let bh = theme::DIALOG_BTN_H();
         let gap = 10.0;
         let n = self.buttons.len();
         let y = b.y + b.h - bh - 16.0;
@@ -1079,14 +1166,14 @@ impl Dialog {
     }
 
     pub fn draw<'a>(&'a self, b: Rect, has_check: bool, areas: &mut Vec<TextArea<'a>>) {
-        let msg = Rect { x: b.x + 18.0, y: b.y + 14.0, w: b.w - 36.0, h: theme::UI_LINE_HEIGHT };
+        let msg = Rect { x: b.x + 18.0, y: b.y + 14.0, w: b.w - 36.0, h: theme::UI_LINE_HEIGHT() };
         self.message.draw_left(msg, 0.0, theme::FG_TEXT(), areas);
         for (lab, r) in self.buttons.iter().zip(self.button_rects(b)) {
             lab.draw_center(r, theme::FG_TEXT(), areas);
         }
         if has_check {
             let cb = self.check_box(b);
-            let lr = Rect { x: cb.x + cb.w + 8.0, y: cb.y - 2.0, w: 220.0, h: theme::UI_LINE_HEIGHT };
+            let lr = Rect { x: cb.x + cb.w + 8.0, y: cb.y - 2.0, w: 220.0, h: theme::UI_LINE_HEIGHT() };
             self.check.draw_left(lr, 0.0, theme::FG_DIM(), areas);
         }
     }
@@ -1247,19 +1334,19 @@ impl Splitter {
     /// Thin hit strip straddling the active edge of `region`: the right edge for
     /// a horizontal (width) splitter, the top edge for a vertical (height) one.
     pub fn handle_rect(&self, region: Rect) -> Rect {
-        let half = theme::SIDEBAR_RESIZE_HANDLE * 0.5;
+        let half = theme::SIDEBAR_RESIZE_HANDLE() * 0.5;
         match self.axis {
             Axis::Horizontal => Rect {
                 x: region.x + region.w - half,
                 y: region.y,
-                w: theme::SIDEBAR_RESIZE_HANDLE,
+                w: theme::SIDEBAR_RESIZE_HANDLE(),
                 h: region.h,
             },
             Axis::Vertical => Rect {
                 x: region.x,
                 y: region.y - half,
                 w: region.w,
-                h: theme::SIDEBAR_RESIZE_HANDLE,
+                h: theme::SIDEBAR_RESIZE_HANDLE(),
             },
         }
     }
@@ -1419,18 +1506,18 @@ impl ScrollView {
 
     fn vtrack(&self) -> Rect {
         Rect {
-            x: self.viewport.x + self.viewport.w - theme::SCROLLBAR_WIDTH,
+            x: self.viewport.x + self.viewport.w - theme::SCROLLBAR_WIDTH(),
             y: self.viewport.y,
-            w: theme::SCROLLBAR_WIDTH,
+            w: theme::SCROLLBAR_WIDTH(),
             h: self.viewport.h,
         }
     }
     fn htrack(&self) -> Rect {
         Rect {
             x: self.viewport.x,
-            y: self.viewport.y + self.viewport.h - theme::SCROLLBAR_WIDTH,
-            w: self.viewport.w - theme::SCROLLBAR_WIDTH,
-            h: theme::SCROLLBAR_WIDTH,
+            y: self.viewport.y + self.viewport.h - theme::SCROLLBAR_WIDTH(),
+            w: self.viewport.w - theme::SCROLLBAR_WIDTH(),
+            h: theme::SCROLLBAR_WIDTH(),
         }
     }
 
@@ -1607,13 +1694,13 @@ impl ExtensionRow {
     const TOP: f32 = 9.0;
 
     pub fn new(fs: &mut FontSystem, name: &str, meta: &str, desc: &str, icon_uv: Option<[f32; 4]>) -> Self {
-        let mut nl = TextLabel::new(fs, theme::SIDEBAR_WIDTH, theme::UI_LINE_HEIGHT);
+        let mut nl = TextLabel::new(fs, theme::SIDEBAR_WIDTH(), theme::UI_LINE_HEIGHT());
         nl.align = VAlign::Center;
         nl.set(fs, name, theme::UI_FAMILY());
-        let mut ml = TextLabel::new(fs, theme::SIDEBAR_WIDTH, theme::UI_LINE_HEIGHT);
+        let mut ml = TextLabel::new(fs, theme::SIDEBAR_WIDTH(), theme::UI_LINE_HEIGHT());
         ml.align = VAlign::Center;
         ml.set(fs, meta, theme::UI_FAMILY());
-        let mut dl = TextLabel::new(fs, 800.0, theme::UI_LINE_HEIGHT);
+        let mut dl = TextLabel::new(fs, 800.0, theme::UI_LINE_HEIGHT());
         dl.align = VAlign::Center;
         dl.set(fs, desc, theme::UI_FAMILY());
         Self {
@@ -1639,7 +1726,7 @@ impl ExtensionRow {
     }
     fn line_rect(b: Rect, n: f32) -> Rect {
         let x = Self::text_x(b);
-        Rect { x, y: b.y + Self::TOP + n * theme::UI_LINE_HEIGHT, w: b.x + b.w - Self::PAD_X - x, h: theme::UI_LINE_HEIGHT }
+        Rect { x, y: b.y + Self::TOP + n * theme::UI_LINE_HEIGHT(), w: b.x + b.w - Self::PAD_X - x, h: theme::UI_LINE_HEIGHT() }
     }
 
     /// True if `p` is on this row.

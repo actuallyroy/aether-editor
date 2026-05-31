@@ -40,9 +40,9 @@ impl TerminalPanel {
             visible: false,
             focused: false,
             split: Splitter::new(
-                theme::TERMINAL_HEIGHT,
-                theme::TERMINAL_MIN_HEIGHT,
-                theme::TERMINAL_MAX_HEIGHT,
+                theme::TERMINAL_HEIGHT(),
+                theme::TERMINAL_MIN_HEIGHT(),
+                theme::TERMINAL_MAX_HEIGHT(),
                 Axis::Vertical,
             ),
             maximized: false,
@@ -222,7 +222,7 @@ impl TerminalPanel {
             // The right-side tab list: × kills that tab, the row body switches.
             if let Some(tl) = terminal_tablist_rect(content, self.groups.len()) {
                 if tl.contains(pt) {
-                    let idx = ((pt.1 - tl.y) / theme::TREE_ROW_HEIGHT) as usize;
+                    let idx = ((pt.1 - tl.y) / theme::TREE_ROW_HEIGHT()) as usize;
                     if idx < self.groups.len() {
                         if terminal_tab_close_rect(tl, idx).contains(pt) {
                             self.kill_tab(idx);
