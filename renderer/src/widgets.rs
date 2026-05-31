@@ -647,7 +647,7 @@ impl MenuBar {
     }
 
     /// Per-item rects laid out from the left edge of `bar`.
-    fn item_rects(&self, bar: Rect) -> Vec<Rect> {
+    pub fn item_rects(&self, bar: Rect) -> Vec<Rect> {
         let pad = 9.0;
         let mut x = bar.x + 6.0;
         self.labels

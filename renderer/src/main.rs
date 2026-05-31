@@ -19,6 +19,7 @@ mod git;
 mod layout;
 mod markdown;
 mod marketplace;
+mod menus;
 mod media;
 mod quad;
 mod render;
@@ -161,6 +162,8 @@ pub(crate) struct App {
     pub(crate) hovered_titlebtn: Option<usize>,
     pub(crate) hovered_search: bool,
     pub(crate) hovered_menu: Option<usize>,
+    pub(crate) open_menu: Option<usize>,        // which top menu's dropdown is open
+    pub(crate) menu_dd_hover: Option<usize>,    // hovered entry within the open dropdown
     pub(crate) hovered_layout: Option<usize>,
     pub(crate) hovered_explorer: Option<usize>,
     pub(crate) selected_tree: Option<usize>,
@@ -233,6 +236,8 @@ impl App {
             hovered_titlebtn: None,
             hovered_search: false,
             hovered_menu: None,
+            open_menu: None,
+            menu_dd_hover: None,
             hovered_layout: None,
             hovered_explorer: None,
             selected_tree: None,
@@ -375,6 +380,20 @@ impl App {
         if new_menu != self.hovered_menu {
             self.hovered_menu = new_menu;
             changed = true;
+        }
+        // While a dropdown is open, hovering another title switches to it (VSCode
+        // behaviour), and track the hovered entry for the highlight.
+        if self.open_menu.is_some() {
+            if let Some(t) = new_menu {
+                if self.open_menu != Some(t) {
+                    self.open_app_menu(t);
+                }
+            }
+            let hov = self.menu_dd_item_at(p.0, p.1);
+            if hov != self.menu_dd_hover {
+                self.menu_dd_hover = hov;
+                changed = true;
+            }
         }
 
         let new_layout = if layout.palette.is_none() {
@@ -757,6 +776,54 @@ impl App {
     fn close_context_menu(&mut self) {
         self.explorer.close_menu();
         self.redraw();
+    }
+
+    // ---- Top menu-bar dropdowns (File / Edit / …) ----
+
+    /// Open the dropdown for top-level menu `idx`, loading its entries into the
+    /// shared dropdown widget. Closes any open file-explorer context menu.
+    fn open_app_menu(&mut self, idx: usize) {
+        let labels: Vec<&str> = menus::entries(idx).iter().map(|e| e.label).collect();
+        if let Some(g) = self.gpu.as_mut() {
+            g.ui.menu_dropdown.set_items(&mut g.font_system, &labels);
+        }
+        self.explorer.close_menu();
+        self.open_menu = Some(idx);
+        self.menu_dd_hover = None;
+        self.redraw();
+    }
+
+    fn close_app_menu(&mut self) {
+        if self.open_menu.take().is_some() {
+            self.menu_dd_hover = None;
+            self.redraw();
+        }
+    }
+
+    /// Screen rect of the currently open dropdown box (anchored under its title).
+    fn menu_dd_rect(&self) -> Option<crate::widgets::Rect> {
+        let idx = self.open_menu?;
+        let g = self.gpu.as_ref()?;
+        let layout = self.layout();
+        let rects = g.menubar.item_rects(layout.menu_bar_rect());
+        let r = rects.get(idx)?;
+        let win = (g.config.width as f32, g.config.height as f32);
+        Some(g.ui.menu_dropdown.rect((r.x, r.y + r.h), win))
+    }
+
+    fn menu_dd_item_at(&self, x: f32, y: f32) -> Option<usize> {
+        let r = self.menu_dd_rect()?;
+        let g = self.gpu.as_ref()?;
+        g.ui.menu_dropdown.item_at(r, (x, y))
+    }
+
+    fn exec_menu_cmd(&mut self, m: menus::MenuCmd) {
+        self.close_app_menu();
+        match m {
+            menus::MenuCmd::Cmd(c) => self.exec_command(c),
+            menus::MenuCmd::Palette => self.open_palette(),
+            menus::MenuCmd::Exit => self.pending_close = true,
+        }
     }
 
     fn exec_menu_action(&mut self, action: MenuAction) {
@@ -1419,6 +1486,31 @@ impl App {
             return;
         }
 
+        // A click while a top menu-bar dropdown is open: another title switches,
+        // a dropdown entry runs, anywhere else dismisses.
+        if let Some(open) = self.open_menu {
+            let layout = self.layout();
+            let title = self
+                .gpu
+                .as_ref()
+                .and_then(|g| g.menubar.item_at(layout.menu_bar_rect(), (x, y)));
+            if let Some(t) = title {
+                if t == open {
+                    self.close_app_menu();
+                } else {
+                    self.open_app_menu(t);
+                }
+            } else if let Some(i) = self.menu_dd_item_at(x, y) {
+                if let Some(e) = menus::entries(open).get(i) {
+                    let cmd = e.cmd;
+                    self.exec_menu_cmd(cmd);
+                }
+            } else {
+                self.close_app_menu();
+            }
+            return;
+        }
+
         // A click anywhere while an inline create field is open commits it
         // (creates if a name was typed, discards if empty), then consumes the click.
         if self.explorer.creating.is_some() {
@@ -1514,14 +1606,13 @@ impl App {
                 }
                 return;
             }
-            // Menu items open the command palette for now (dropdown menus TBD).
-            let on_menu = self
+            // Menu titles open their dropdown.
+            if let Some(idx) = self
                 .gpu
                 .as_ref()
-                .map(|g| g.menubar.item_at(layout.menu_bar_rect(), (x, y)).is_some())
-                .unwrap_or(false);
-            if on_menu {
-                self.open_palette();
+                .and_then(|g| g.menubar.item_at(layout.menu_bar_rect(), (x, y)))
+            {
+                self.open_app_menu(idx);
                 return;
             }
             match self.title_btn_at(x, y, &layout) {
@@ -1987,6 +2078,11 @@ impl App {
         // Escape closes an open context menu first.
         if self.explorer.menu_open() && matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape)) {
             self.close_context_menu();
+            return;
+        }
+
+        if self.open_menu.is_some() && matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape)) {
+            self.close_app_menu();
             return;
         }
 

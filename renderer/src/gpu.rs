@@ -33,6 +33,7 @@ pub struct UiBuffers {
     pub status_right: TextLabel,
     pub line_numbers: Gutter,
     pub line_numbers2: Gutter, // right pane's gutter in a side-by-side diff
+    pub menu_dropdown: Menu,   // top menu-bar dropdown (File/Edit/…)
     pub palette_input: TextInput,
     pub palette_list: ListView,
     pub find_input: TextInput,
@@ -214,6 +215,7 @@ impl GpuState {
             ),
             find_input: TextInput::new(&mut font_system, 800.0, theme::FIND_BAR_HEIGHT),
             menu: Menu::new(&mut font_system, 200.0),
+            menu_dropdown: Menu::new(&mut font_system, 220.0),
             dialog: Dialog::new(&mut font_system),
             ext_detail: ExtensionDetail::new(&mut font_system),
             terminal_panes: Vec::new(), // grown on demand as panes are split

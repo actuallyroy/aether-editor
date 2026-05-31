@@ -434,9 +434,9 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // Header command-center search box.
     gpu.search
         .draw_bg(layout.header_search_rect(), app.hovered_search, &mut bg_quads);
-    // Menu-bar hover + layout-toggle hover.
+    // Menu-bar hover + layout-toggle hover. The open dropdown's title stays lit.
     gpu.menubar
-        .draw_bg(layout.menu_bar_rect(), app.hovered_menu, &mut bg_quads);
+        .draw_bg(layout.menu_bar_rect(), app.open_menu.or(app.hovered_menu), &mut bg_quads);
     if let Some(i) = app.hovered_layout {
         bg_quads.push(layout.layout_btn_rects()[i].quad(theme::TITLE_BTN_HOVER()));
     }
@@ -1360,6 +1360,49 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 .render(&gpu.atlas, &gpu.viewport, &mut pass)?;
         }
         gpu.queue.submit(Some(enc2.finish()));
+    }
+
+    // ---- Top menu-bar dropdown overlay (drawn over everything) ----
+    if let Some(open) = app.open_menu {
+        let rects = gpu.menubar.item_rects(layout.menu_bar_rect());
+        if let Some(r) = rects.get(open) {
+            let anchor = (r.x, r.y + r.h);
+            let menu = gpu.ui.menu_dropdown.rect(anchor, (cfg_w as f32, cfg_h as f32));
+            let mut mq: Vec<Quad> = Vec::new();
+            gpu.ui.menu_dropdown.draw_bg(menu, app.menu_dd_hover, &mut mq);
+            gpu.quad_renderer
+                .prepare(&gpu.device, &gpu.queue, &mq, &[], (cfg_w, cfg_h));
+            let mut mareas: Vec<TextArea> = Vec::new();
+            gpu.ui.menu_dropdown.draw(menu, &mut mareas);
+            gpu.text_renderer.prepare(
+                &gpu.device,
+                &gpu.queue,
+                &mut gpu.font_system,
+                &mut gpu.atlas,
+                &gpu.viewport,
+                mareas,
+                &mut gpu.swash_cache,
+            )?;
+            let mut encm = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("nova-menudd-pass"),
+            });
+            {
+                let mut pass = encm.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("nova-menudd"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                gpu.quad_renderer.render_bg(&mut pass);
+                gpu.text_renderer.render(&gpu.atlas, &gpu.viewport, &mut pass)?;
+            }
+            gpu.queue.submit(Some(encm.finish()));
+        }
     }
 
     // ---- Modal dialog overlay (third pass) ----
