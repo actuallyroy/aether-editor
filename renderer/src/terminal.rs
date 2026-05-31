@@ -135,6 +135,12 @@ pub struct Grid {
     cursor_visible: bool, // DECTCEM (CSI ?25h/l): TUIs hide the cursor while redrawing
     mouse_enabled: bool,  // DECSET 1000/1002/1003: app wants mouse events
     sgr_mouse: bool,      // DECSET 1006: SGR extended mouse encoding
+    // Deferred autowrap (VT "pending wrap"): writing the last column does NOT wrap
+    // immediately — it arms this flag, and the wrap only happens when the *next*
+    // printable char arrives. Any cursor-positioning op disarms it, so an inline
+    // renderer (Ink/claude code) that moves the cursor after filling the last column
+    // doesn't trigger a spurious newline/scroll that floods the scrollback.
+    wrap_pending: bool,
 }
 
 const MAX_SCROLLBACK: usize = 5000;
@@ -158,6 +164,7 @@ impl Grid {
             cursor_visible: true,
             mouse_enabled: false,
             sgr_mouse: false,
+            wrap_pending: false,
         }
     }
 
@@ -175,6 +182,7 @@ impl Grid {
         self.scroll_bottom = rows.saturating_sub(1);
         self.cur_row = self.cur_row.min(rows.saturating_sub(1));
         self.cur_col = self.cur_col.min(cols.saturating_sub(1));
+        self.wrap_pending = false;
     }
 
     /// The `rows` visible lines starting at `top_line` in the combined
@@ -214,6 +222,7 @@ impl Grid {
         self.cur_col = 0;
         self.scroll_top = 0;
         self.scroll_bottom = self.rows.saturating_sub(1);
+        self.wrap_pending = false;
     }
 
     fn leave_alt(&mut self) {
@@ -227,6 +236,7 @@ impl Grid {
             self.cur_col = a.cur_col.min(self.cols.saturating_sub(1));
             self.scroll_top = a.scroll_top.min(self.rows.saturating_sub(1));
             self.scroll_bottom = a.scroll_bottom.min(self.rows.saturating_sub(1));
+            self.wrap_pending = false;
         }
     }
 
@@ -412,9 +422,12 @@ fn xterm256(n: u8) -> [f32; 4] {
 
 impl Perform for Grid {
     fn print(&mut self, c: char) {
-        if self.cur_col >= self.cols {
+        // Deferred autowrap: the wrap from the previous last-column write happens now,
+        // when an actual printable char arrives (a cursor move would have disarmed it).
+        if self.wrap_pending {
             self.cur_col = 0;
             self.newline();
+            self.wrap_pending = false;
         }
         // Reverse video swaps fg/bg: the glyph is painted in the background colour
         // over a block of the foreground colour (this is how cursors render).
@@ -426,10 +439,20 @@ impl Perform for Grid {
         if let Some(cell) = self.cells.get_mut(self.cur_row).and_then(|r| r.get_mut(self.cur_col)) {
             *cell = Cell { ch: c, fg, bg };
         }
-        self.cur_col += 1;
+        // At the last column, arm the pending wrap instead of moving past it; otherwise
+        // advance normally.
+        if self.cur_col + 1 >= self.cols {
+            self.wrap_pending = true;
+        } else {
+            self.cur_col += 1;
+        }
     }
 
     fn execute(&mut self, byte: u8) {
+        // C0 controls that move the cursor disarm a deferred autowrap.
+        if matches!(byte, b'\n' | b'\r' | 0x08 | b'\t') {
+            self.wrap_pending = false;
+        }
         match byte {
             b'\n' => self.newline(),
             b'\r' => self.cur_col = 0,
@@ -466,6 +489,11 @@ impl Perform for Grid {
                 }
             }
             return;
+        }
+        // Any explicit cursor positioning disarms a deferred autowrap (so a renderer
+        // that fills the last column then repositions doesn't wrap spuriously).
+        if matches!(action, 'H' | 'f' | 'A' | 'B' | 'C' | 'D' | 'G' | 'd' | 'r' | 'u') {
+            self.wrap_pending = false;
         }
         match action {
             'm' => self.sgr(params),
@@ -528,6 +556,9 @@ impl Perform for Grid {
     }
 
     fn esc_dispatch(&mut self, _inter: &[u8], _ignore: bool, byte: u8) {
+        if matches!(byte, b'8' | b'D' | b'M') {
+            self.wrap_pending = false;
+        }
         match byte {
             b'7' => self.saved_cursor = (self.cur_row, self.cur_col), // DECSC
             b'8' => {
