@@ -14,7 +14,7 @@ struct VOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) color: vec4<f32>,
     @location(1) local: vec2<f32>,  // pixel offset within the rect
-    @location(2) half: vec2<f32>,   // half-size of the rect
+    @location(2) half_size: vec2<f32>,   // half-size of the rect (avoid `half`, reserved in MSL)
     @location(3) radius: f32,
 };
 
@@ -39,7 +39,7 @@ fn vs_main(in: VIn, @builtin(vertex_index) vid: u32) -> VOut {
     out.pos = vec4<f32>(ndc, 0.0, 1.0);
     out.color = in.color;
     out.local = local;
-    out.half = in.rect.zw * 0.5;
+    out.half_size = in.rect.zw * 0.5;
     out.radius = in.params.x;
     return out;
 }
@@ -52,9 +52,9 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
         return in.color;
     }
     // Signed distance to a rounded box, with ~1px antialiased edge coverage.
-    let r = min(in.radius, min(in.half.x, in.half.y));
-    let p = in.local - in.half;
-    let q = abs(p) - in.half + vec2<f32>(r, r);
+    let r = min(in.radius, min(in.half_size.x, in.half_size.y));
+    let p = in.local - in.half_size;
+    let q = abs(p) - in.half_size + vec2<f32>(r, r);
     let d = length(max(q, vec2<f32>(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - r;
     let a = clamp(0.5 - d, 0.0, 1.0);
     return vec4<f32>(in.color.rgb, in.color.a * a);
