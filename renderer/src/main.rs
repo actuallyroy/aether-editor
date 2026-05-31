@@ -21,6 +21,7 @@ mod markdown;
 mod marketplace;
 mod menus;
 mod perf;
+mod update;
 mod media;
 mod quad;
 mod render;
@@ -161,6 +162,8 @@ pub(crate) enum SidebarView {
 pub(crate) enum DialogAction {
     DeleteNode(usize),
     CloseDoc(usize),
+    InstallUpdate,
+    Dismiss, // info-only dialog; any button just closes it
 }
 
 pub(crate) struct DialogState {
@@ -197,6 +200,7 @@ pub(crate) struct App {
     pub(crate) open_menu: Option<usize>,        // which top menu's dropdown is open
     pub(crate) menu_dd_hover: Option<usize>,    // hovered entry within the open dropdown
     pub(crate) feedback_form: Option<ui::feedback_form::FeedbackForm>, // modal feedback form
+    pub(crate) update_available: Option<String>, // newer release version, if any
     pub(crate) hovered_layout: Option<usize>,
     pub(crate) hovered_explorer: Option<usize>,
     pub(crate) selected_tree: Option<usize>,
@@ -273,6 +277,7 @@ impl App {
             open_menu: None,
             menu_dd_hover: None,
             feedback_form: None,
+            update_available: None,
             hovered_layout: None,
             hovered_explorer: None,
             selected_tree: None,
@@ -873,6 +878,25 @@ impl App {
             menus::MenuCmd::Cmd(c) => self.exec_command(c),
             menus::MenuCmd::Palette => self.open_palette(),
             menus::MenuCmd::Feedback => self.open_feedback(),
+            menus::MenuCmd::CheckUpdate => {
+                self.close_app_menu();
+                match self.update_available.clone() {
+                    Some(v) => self.show_update_prompt(&v),
+                    None => {
+                        update::check_async(self.worker_tx.clone(), true);
+                        self.show_info_dialog("Checking for updates…");
+                    }
+                }
+            }
+            menus::MenuCmd::About => {
+                self.close_app_menu();
+                self.show_info_dialog(&format!(
+                    "Nova v{} · {} ({})",
+                    update::current_version(),
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                ));
+            }
             menus::MenuCmd::Exit => self.pending_close = true,
         }
     }
@@ -1334,8 +1358,46 @@ impl App {
                     _ => {}
                 }
             }
+            DialogAction::InstallUpdate => {
+                // 0 = Install & Restart, 1 = Later
+                if i == 0 {
+                    update::install_async(self.worker_tx.clone());
+                    self.show_info_dialog("Downloading update… the app will restart when it's ready.");
+                }
+            }
+            DialogAction::Dismiss => {}
         }
         self.redraw();
+    }
+
+    /// Prompt to install an available update.
+    fn show_update_prompt(&mut self, version: &str) {
+        let msg = format!(
+            "Nova v{version} is available (you have v{}). Install and restart?",
+            update::current_version()
+        );
+        if let Some(g) = self.gpu.as_mut() {
+            g.ui.dialog.set(&mut g.font_system, &msg, &["Install & Restart", "Later"], None);
+        }
+        self.dialog = Some(DialogState { action: DialogAction::InstallUpdate, has_check: false, checked: false, hovered: None });
+        self.redraw();
+    }
+
+    /// Show an info-only dialog with a single dismiss button.
+    fn show_info_dialog(&mut self, msg: &str) {
+        if let Some(g) = self.gpu.as_mut() {
+            g.ui.dialog.set(&mut g.font_system, msg, &["OK"], None);
+        }
+        self.dialog = Some(DialogState { action: DialogAction::Dismiss, has_check: false, checked: false, hovered: None });
+        self.redraw();
+    }
+
+    /// Relaunch the (freshly updated) executable and exit this process.
+    fn restart_app(&self) {
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = std::process::Command::new(exe).spawn();
+        }
+        std::process::exit(0);
     }
 
     /// Open the command palette and focus its input.
@@ -2851,6 +2913,20 @@ impl ApplicationHandler for App {
                         self.redraw();
                     }
                 }
+                WorkerMsg::UpdateAvailable { version } => {
+                    self.update_available = Some(version.clone());
+                    self.show_update_prompt(&version);
+                }
+                WorkerMsg::UpdateNone => {
+                    self.show_info_dialog(&format!("You're on the latest version (v{}).", update::current_version()));
+                }
+                WorkerMsg::UpdateDone { ok } => {
+                    if ok {
+                        self.restart_app();
+                    } else {
+                        self.show_info_dialog("Update failed. Please try again or download from GitHub.");
+                    }
+                }
             }
         }
 
@@ -2971,6 +3047,8 @@ impl ApplicationHandler for App {
                 self.open_initial();
                 // Populate the Source Control change-count badge at startup.
                 self.refresh_source_control();
+                // Check GitHub for a newer release in the background.
+                update::check_async(self.worker_tx.clone(), false);
             }
             Err(e) => {
                 eprintln!("init failed: {e:?}");

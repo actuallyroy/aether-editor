@@ -22,6 +22,11 @@ pub enum WorkerMsg {
     // Find-in-files (see search.rs): streamed batches of matches + a completion marker.
     SearchHits { gen: u64, files: Vec<crate::search::FileMatches> },
     SearchDone { gen: u64 },
+    // Auto-update (see update.rs): a newer release is available / a manual check
+    // found none / an install finished.
+    UpdateAvailable { version: String },
+    UpdateNone,
+    UpdateDone { ok: bool },
 }
 
 /// Where a README image comes from: a remote URL or a local file path.

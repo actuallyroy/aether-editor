@@ -8,9 +8,11 @@ use crate::commands::Command;
 #[derive(Clone, Copy)]
 pub enum MenuCmd {
     Cmd(Command),
-    Palette,  // open the command palette
-    Feedback, // open the feedback / report-issue tab
-    Exit,     // quit the app
+    Palette,     // open the command palette
+    Feedback,    // open the feedback / report-issue tab
+    CheckUpdate, // check GitHub for a newer release
+    About,       // show version info
+    Exit,        // quit the app
 }
 
 pub struct Entry {
@@ -23,7 +25,7 @@ const fn e(label: &'static str, cmd: MenuCmd) -> Entry {
 }
 
 use Command::*;
-use MenuCmd::{Cmd, Exit, Feedback, Palette};
+use MenuCmd::{About, CheckUpdate, Cmd, Exit, Feedback, Palette};
 
 const FILE: &[Entry] = &[
     e("New File", Cmd(NewFile)),
@@ -56,6 +58,8 @@ const RUN: &[Entry] = &[e("Toggle Terminal", Cmd(ToggleTerminal))];
 const TERMINAL: &[Entry] = &[e("New Terminal", Cmd(ToggleTerminal))];
 
 const HELP: &[Entry] = &[
+    e("About Nova", About),
+    e("Check for Updates…", CheckUpdate),
     e("Send Feedback / Report Issue…", Feedback),
     e("Show All Commands", Palette),
 ];
