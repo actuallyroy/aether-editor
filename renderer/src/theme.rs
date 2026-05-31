@@ -432,6 +432,11 @@ fn zoom_cell() -> &'static RwLock<f32> {
 pub fn ui_zoom() -> f32 {
     *zoom_cell().read().unwrap()
 }
+/// Scale a raw pixel value by the current UI zoom. Use this for any layout
+/// offset/size that should grow with zoom instead of hardcoding a literal.
+pub fn zpx(px: f32) -> f32 {
+    px * ui_zoom()
+}
 pub fn set_ui_zoom(z: f32) {
     *zoom_cell().write().unwrap() = z.clamp(0.5, 3.0);
     bump_shape_epoch();

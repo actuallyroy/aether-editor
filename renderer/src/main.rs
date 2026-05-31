@@ -27,6 +27,7 @@ mod quad;
 mod render;
 mod search;
 mod settings;
+mod state;
 mod syntax;
 mod terminal;
 mod textmate;
@@ -689,6 +690,11 @@ impl App {
         let s = settings::reload();
         self.sidebar_visible = s.workbench_sidebar_visible;
         self.apply_theme_by_name(&s.workbench_color_theme);
+
+        // Restore the persisted UI zoom before the first layout/draw.
+        if let Some(z) = state::State::load().zoom {
+            self.set_zoom(z);
+        }
 
         let Some(gpu) = self.gpu.as_mut() else {
             return;
@@ -1505,7 +1511,18 @@ impl App {
             sp.reset();
         }
         self.refresh_source_control(); // update the change-count badge for the new repo
+        self.persist_state(); // remember this folder for the next launch
         self.redraw();
+    }
+
+    /// Persist machine-managed session state (zoom + last workspace) to
+    /// `~/.nova/state.json` so the next launch restores it.
+    fn persist_state(&self) {
+        state::State {
+            zoom: Some(theme::ui_zoom()),
+            last_workspace: Some(self.cwd.clone()),
+        }
+        .save();
     }
 
     // Integrated-terminal actions live on `ui::terminal_panel::TerminalPanel`; these
@@ -1546,6 +1563,9 @@ impl App {
             for b in g.layout_btns.iter_mut() {
                 b.reshape(&mut g.font_system);
             }
+            for b in g.terminal_btns.iter_mut() {
+                b.reshape(&mut g.font_system);
+            }
             g.tab_close_btn.reshape(&mut g.font_system);
             g.ui.img_minus.reshape(&mut g.font_system);
             g.ui.img_plus.reshape(&mut g.font_system);
@@ -1558,6 +1578,9 @@ impl App {
         if let (Some(scp), Some(g)) = (self.source_control.as_mut(), self.gpu.as_mut()) {
             scp.reshape(&mut g.font_system);
         }
+        if let (Some(f), Some(g)) = (self.feedback_form.as_mut(), self.gpu.as_mut()) {
+            f.rezoom(&mut g.font_system);
+        }
         // Terminal: re-seed the cell advance and mark panes dirty so their grids
         // re-shape + reflow (cols/rows) at the new font size.
         self.terminal_cell_w = theme::FONT_SIZE() * 0.6;
@@ -1566,6 +1589,7 @@ impl App {
                 pane.dirty = true;
             }
         }
+        self.persist_state(); // remember the zoom level for the next launch
         self.redraw();
     }
 
@@ -3172,10 +3196,15 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|| PathBuf::from("."));
             (parent, Some(p))
         }
-        _ => (
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            None,
-        ),
+        // No path arg: reopen the last workspace folder if it still exists,
+        // else fall back to the current directory.
+        _ => {
+            let last = state::State::load().last_workspace.filter(|p| p.is_dir());
+            (
+                last.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
+                None,
+            )
+        }
     };
     let event_loop = EventLoop::new()?;
     let mut app = App::new(root, initial_file);

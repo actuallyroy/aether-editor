@@ -83,26 +83,27 @@ impl SearchPanel {
 
     // ---- Geometry (all derived from the sidebar tree region) ----
     fn query_rect(r: Rect) -> Rect {
-        Rect { x: r.x + 10.0, y: r.y + 8.0, w: r.w - 20.0, h: 30.0 }
+        Rect { x: r.x + theme::zpx(10.0), y: r.y + theme::zpx(8.0), w: r.w - theme::zpx(20.0), h: theme::zpx(30.0) }
     }
     fn opt_rects(r: Rect) -> [Rect; 3] {
         let q = Self::query_rect(r);
-        let (gap, total) = (3.0, 3.0 * OPT + 2.0 * 3.0);
-        let start = q.x + q.w - 6.0 - total;
-        let y = q.y + (q.h - OPT) * 0.5;
-        std::array::from_fn(|i| Rect { x: start + i as f32 * (OPT + gap), y, w: OPT, h: OPT })
+        let opt = theme::zpx(OPT);
+        let (gap, total) = (theme::zpx(3.0), 3.0 * opt + 2.0 * theme::zpx(3.0));
+        let start = q.x + q.w - theme::zpx(6.0) - total;
+        let y = q.y + (q.h - opt) * 0.5;
+        std::array::from_fn(|i| Rect { x: start + i as f32 * (opt + gap), y, w: opt, h: opt })
     }
     fn replace_rect(r: Rect) -> Rect {
         let q = Self::query_rect(r);
-        Rect { x: q.x, y: q.y + q.h + 6.0, w: q.w, h: 30.0 }
+        Rect { x: q.x, y: q.y + q.h + theme::zpx(6.0), w: q.w, h: theme::zpx(30.0) }
     }
     fn replace_all_rect(r: Rect) -> Rect {
         let rr = Self::replace_rect(r);
-        Rect { x: rr.x, y: rr.y + rr.h + 6.0, w: rr.w, h: 24.0 }
+        Rect { x: rr.x, y: rr.y + rr.h + theme::zpx(6.0), w: rr.w, h: theme::zpx(24.0) }
     }
     fn results_region(r: Rect) -> Rect {
         let b = Self::replace_all_rect(r);
-        let top = b.y + b.h + 8.0;
+        let top = b.y + b.h + theme::zpx(8.0);
         Rect { x: r.x, y: top, w: r.w, h: (r.y + r.h - top).max(0.0) }
     }
 
@@ -211,15 +212,15 @@ impl SearchPanel {
         bg.push(Self::replace_all_rect(region).rounded_quad(theme::DIALOG_BTN(), 3.0));
 
         if self.query_active {
-            self.query.selection_quads(q, 6.0, bg);
+            self.query.selection_quads(q, theme::zpx(6.0), bg);
             if blink {
-                fg.push(self.query.caret_quad(q, 6.0));
+                fg.push(self.query.caret_quad(q, theme::zpx(6.0)));
             }
         }
         if self.replace_active {
-            self.replace.selection_quads(rr, 6.0, bg);
+            self.replace.selection_quads(rr, theme::zpx(6.0), bg);
             if blink {
-                fg.push(self.replace.caret_quad(rr, 6.0));
+                fg.push(self.replace.caret_quad(rr, theme::zpx(6.0)));
             }
         }
 
@@ -255,9 +256,9 @@ impl SearchPanel {
         let rr = Self::replace_rect(region);
         let on = [self.opts.case_sensitive, self.opts.whole_word, self.opts.regex];
         let qc = if self.query.text().is_empty() { theme::FG_DIM() } else { theme::FG_TEXT() };
-        self.query.draw(q, 6.0, qc, areas);
+        self.query.draw(q, theme::zpx(6.0), qc, areas);
         let rc = if self.replace.text().is_empty() { theme::FG_DIM() } else { theme::FG_TEXT() };
-        self.replace.draw(rr, 6.0, rc, areas);
+        self.replace.draw(rr, theme::zpx(6.0), rc, areas);
         for (i, r) in Self::opt_rects(region).iter().enumerate() {
             let lbl = &self.opt_labels[i];
             let left = r.x + (r.w - lbl.width()) * 0.5;
@@ -288,7 +289,7 @@ impl SearchPanel {
             };
             self.list.draw_at(band, region2.y - scroll, theme::FG_ACTIVE(), areas);
             let chev = &self.chevrons[self.collapsed.contains(&row.file) as usize];
-            let cr = Rect { x: region2.x + 4.0, y, w: 16.0, h: theme::SEARCH_ROW_H() };
+            let cr = Rect { x: region2.x + theme::zpx(4.0), y, w: theme::zpx(16.0), h: theme::SEARCH_ROW_H() };
             chev.draw(cr, theme::FG_DIM(), areas);
         }
     }
@@ -359,9 +360,9 @@ impl SearchPanel {
             self.query_active = true;
             self.replace_active = false;
             if double {
-                self.query.select_word_at(q, 6.0, pt.0);
+                self.query.select_word_at(q, theme::zpx(6.0), pt.0);
             } else {
-                self.query.set_caret_from_x(q, 6.0, pt.0);
+                self.query.set_caret_from_x(q, theme::zpx(6.0), pt.0);
             }
             self.dragging = Some(0);
             return true;
@@ -371,9 +372,9 @@ impl SearchPanel {
             self.replace_active = true;
             self.query_active = false;
             if double {
-                self.replace.select_word_at(rr, 6.0, pt.0);
+                self.replace.select_word_at(rr, theme::zpx(6.0), pt.0);
             } else {
-                self.replace.set_caret_from_x(rr, 6.0, pt.0);
+                self.replace.set_caret_from_x(rr, theme::zpx(6.0), pt.0);
             }
             self.dragging = Some(1);
             return true;
@@ -406,8 +407,8 @@ impl SearchPanel {
     pub fn on_drag(&mut self, pt: (f32, f32), region: Rect) -> bool {
         if let Some(which) = self.dragging {
             match which {
-                0 => self.query.extend_to_x(Self::query_rect(region), 6.0, pt.0),
-                _ => self.replace.extend_to_x(Self::replace_rect(region), 6.0, pt.0),
+                0 => self.query.extend_to_x(Self::query_rect(region), theme::zpx(6.0), pt.0),
+                _ => self.replace.extend_to_x(Self::replace_rect(region), theme::zpx(6.0), pt.0),
             }
             return true;
         }

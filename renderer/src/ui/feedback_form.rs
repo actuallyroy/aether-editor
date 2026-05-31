@@ -180,6 +180,28 @@ impl FeedbackForm {
         }
     }
 
+    /// Re-shape every buffer after a zoom change (inputs wrap/size at the new
+    /// metrics; labels re-shape from their stored text).
+    pub fn rezoom(&mut self, fs: &mut FontSystem) {
+        self.title.rezoom(fs);
+        self.details.rezoom(fs);
+        for l in [
+            &mut self.l_header,
+            &mut self.l_type,
+            &mut self.l_title,
+            &mut self.l_details,
+            &mut self.l_sysinfo,
+            &mut self.l_submit,
+            &mut self.l_cancel,
+            &mut self.l_check,
+        ] {
+            l.reshape(fs);
+        }
+        for c in self.chips.iter_mut() {
+            c.reshape(fs);
+        }
+    }
+
     pub fn draw_text<'a>(&'a self, win: (f32, f32), areas: &mut Vec<TextArea<'a>>) {
         let r = self.rects(win);
         let pad = 8.0 * theme::ui_zoom();

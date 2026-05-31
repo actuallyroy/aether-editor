@@ -26,14 +26,14 @@ use crate::{
 /// Left-to-right rects for the panel-header tab labels, sized to each label's
 /// measured width. Shared by the underline (quad phase) and the text (areas phase).
 fn panel_tab_rects(header: Rect, tabs: &[crate::widgets::TextLabel]) -> Vec<Rect> {
-    const PAD_L: f32 = 12.0;
-    const GAP: f32 = 18.0;
-    let mut x = header.x + PAD_L;
+    let pad_l = theme::zpx(12.0);
+    let gap = theme::zpx(18.0);
+    let mut x = header.x + pad_l;
     let mut out = Vec::with_capacity(tabs.len());
     for t in tabs {
         let w = t.width();
         out.push(Rect { x, y: header.y, w, h: header.h });
-        x += w + GAP;
+        x += w + gap;
     }
     out
 }
@@ -462,7 +462,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 .map(|(i, g)| format!("{}: {}", i + 1, g.title()))
                 .collect::<Vec<_>>()
                 .join("\n");
-            gpu.ui.term_tablist.set_text(fs, &key, crate::TERMINAL_TABLIST_W, 800.0);
+            gpu.ui.term_tablist.set_text(fs, &key, theme::zpx(crate::TERMINAL_TABLIST_W), 800.0);
         }
 
         // Find-in-files panel shapes its own buffers (results list, inputs, labels).
@@ -829,9 +829,9 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 let at_bottom = pane.scroll.at_end();
                 // Per-cell background fills (reverse-video cursor, colored TUIs), clipped to the pane.
                 for (row, c0, c1, bg) in pane.term.bg_cells(top_line) {
-                    let x = rect.x + 8.0 + c0 as f32 * char_w;
+                    let x = rect.x + theme::zpx(8.0) + c0 as f32 * char_w;
                     let w = ((c1 - c0) as f32 * char_w).min((right - x).max(0.0));
-                    let y = rect.y + 4.0 + row as f32 * line_h;
+                    let y = rect.y + theme::zpx(4.0) + row as f32 * line_h;
                     if w > 0.0 && y + line_h <= rect.y + rect.h {
                         bg_quads.push(Quad::new(x, y, w, line_h, bg));
                     }
@@ -841,8 +841,8 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 let focused = app.terminal.focused && i == g.focused;
                 if focused && pane.term.cursor_visible() && at_bottom {
                     let (cc, cr) = pane.term.cursor();
-                    let cx = rect.x + 8.0 + cc as f32 * char_w;
-                    let cy = rect.y + 4.0 + cr as f32 * line_h;
+                    let cx = rect.x + theme::zpx(8.0) + cc as f32 * char_w;
+                    let cy = rect.y + theme::zpx(4.0) + cr as f32 * line_h;
                     if cx < right && cy + line_h <= rect.y + rect.h {
                         bg_quads.push(Quad::new(cx, cy, char_w.max(2.0), line_h, [0.6, 0.6, 0.6, 0.6]));
                     }
@@ -912,9 +912,9 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // Text-input carets (blink-gated, drawn on top via fg_quads).
     if app.cursor_blink_on {
         if let Some(pal) = layout.palette.as_ref() {
-            fg_quads.push(gpu.ui.palette_input.caret_quad(pal.input, 6.0));
+            fg_quads.push(gpu.ui.palette_input.caret_quad(pal.input, theme::zpx(6.0)));
         } else if let Some(fb) = layout.find_bar.as_ref() {
-            fg_quads.push(gpu.ui.find_input.caret_quad(*fb, 8.0));
+            fg_quads.push(gpu.ui.find_input.caret_quad(*fb, theme::zpx(8.0)));
         }
         if let Some(pc) = app.explorer.creating.as_ref() {
             let (_, _, field) = create_row_geometry(layout.tree_region(), pc.row, pc.depth);
@@ -926,10 +926,10 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // Text-input selection highlights — drawn into bg_quads (under glyphs, over
     // the input box). Not blink-gated.
     if let Some(pal) = layout.palette.as_ref() {
-        gpu.ui.palette_input.selection_quads(pal.input, 6.0, &mut bg_quads);
+        gpu.ui.palette_input.selection_quads(pal.input, theme::zpx(6.0), &mut bg_quads);
     }
     if let Some(fb) = layout.find_bar.as_ref() {
-        gpu.ui.find_input.selection_quads(*fb, 8.0, &mut bg_quads);
+        gpu.ui.find_input.selection_quads(*fb, theme::zpx(8.0), &mut bg_quads);
     }
     // (The Extensions and Search panels draw their selection highlights in their own draw_quads.)
 
@@ -1015,7 +1015,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // Sidebar header + (Explorer tree | Extensions list)
     if app.sidebar_visible {
         ui.sidebar_header
-            .push(layout.sidebar.x + 12.0, layout.sidebar_header_rect(), theme::FG_DIM(), &mut areas);
+            .push(layout.sidebar.x + theme::zpx(12.0), layout.sidebar_header_rect(), theme::FG_DIM(), &mut areas);
         let tr = layout.tree_region();
         if app.sidebar_view == SidebarView::Explorer {
             let er = layout.explorer_action_rects();
@@ -1024,7 +1024,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             }
             // Root folder row (chevron + workspace name).
             ui.root_label
-                .draw_left(layout.root_row_rect(), 10.0, theme::FG_TEXT(), &mut areas);
+                .draw_left(layout.root_row_rect(), theme::zpx(10.0), theme::FG_TEXT(), &mut areas);
             if let Some(pc) = app.explorer.creating.as_ref() {
                 let rowh = theme::TREE_ROW_HEIGHT();
                 let (_, icon_rect, field) = create_row_geometry(tr, pc.row, pc.depth);
@@ -1080,15 +1080,15 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         let label_top = tab.text_top(theme::UI_LINE_HEIGHT(), VAlign::Center);
         areas.push(TextArea {
             buffer: &ui.tabs,
-            left: tab.x + 12.0,
+            left: tab.x + theme::zpx(12.0),
             top: label_top - line_top,
             scale: 1.0,
             // Clip to just this label's line band (the buffer holds every tab's
             // label, one per line) so neighbours don't bleed in.
             bounds: TextBounds {
-                left: tab.x as i32 + 6,
+                left: tab.x as i32 + theme::zpx(6.0) as i32,
                 top: (label_top - 2.0) as i32,
-                right: (tab.x + tab.w - 26.0) as i32,
+                right: (tab.x + tab.w - theme::zpx(26.0)) as i32,
                 bottom: (label_top + theme::UI_LINE_HEIGHT()) as i32,
             },
             default_color: color,
@@ -1172,7 +1172,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // Status bar — left: path; right: position/encoding/etc. Both via the
     // reusable TextLabel (left-padded and right-padded alignment helpers).
     ui.status
-        .draw_left(layout.status_bar, 12.0, theme::STATUS_BAR_FG(), &mut areas);
+        .draw_left(layout.status_bar, theme::zpx(12.0), theme::STATUS_BAR_FG(), &mut areas);
     // Window-zoom control (− % +) pinned to the right; status info is padded left of it.
     let zoom_cells = zoom_ctrl_cells(layout.status_bar);
     ui.status_right
@@ -1188,7 +1188,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
 
     // Find bar
     if let Some(fb) = layout.find_bar.as_ref() {
-        ui.find_input.draw(*fb, 8.0, theme::FG_TEXT(), &mut areas);
+        ui.find_input.draw(*fb, theme::zpx(8.0), theme::FG_TEXT(), &mut areas);
     }
 
     // Panel header (VSCode-style tabs + stub icon buttons) and terminal grid text.
@@ -1218,8 +1218,8 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 if let Some(buf) = ui.terminal_panes.get(i) {
                     areas.push(TextArea {
                         buffer: buf,
-                        left: r.x + 8.0,
-                        top: r.y + 4.0,
+                        left: r.x + theme::zpx(8.0),
+                        top: r.y + theme::zpx(4.0),
                         scale: 1.0,
                         bounds: TextBounds {
                             left: r.x as i32,
@@ -1250,7 +1250,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // Palette text
     if let Some(pal) = layout.palette.as_ref() {
         ui.palette_input
-            .draw(pal.input, 6.0, theme::FG_TEXT(), &mut areas);
+            .draw(pal.input, theme::zpx(6.0), theme::FG_TEXT(), &mut areas);
         ui.palette_list
             .draw(pal.list, theme::FG_TEXT(), &mut areas);
     }

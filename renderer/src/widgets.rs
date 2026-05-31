@@ -379,7 +379,9 @@ impl TextInput {
         // Multi-line: wrap at the field width and lay out plenty of rows (so text
         // past the first screenful is still shaped + visible, not clipped away).
         if self.multiline {
-            self.buffer.set_size(fs, Some(self.width), Some(4000.0));
+            // `width` is the unzoomed wrap boundary; scale it so the text wraps at
+            // the field's actual (zoomed) width instead of in the middle at high zoom.
+            self.buffer.set_size(fs, Some(self.width * theme::ui_zoom()), Some(4000.0));
         }
         self.buffer.set_text(
             fs,

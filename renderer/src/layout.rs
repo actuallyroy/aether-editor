@@ -120,13 +120,13 @@ impl Layout {
             h: theme::STATUS_BAR_HEIGHT(),
         };
         let palette = if palette_active {
-            let pw = theme::PALETTE_WIDTH().min(w - 40.0);
+            let pw = theme::PALETTE_WIDTH().min(w - theme::zpx(40.0));
             let visible = 8usize;
             let ph = theme::PALETTE_INPUT_HEIGHT()
                 + theme::PALETTE_ROW_HEIGHT() * visible as f32
-                + 8.0;
+                + theme::zpx(8.0);
             let bx = (w - pw) * 0.5;
-            let by = 80.0;
+            let by = theme::zpx(80.0);
             let box_ = Rect {
                 x: bx,
                 y: by,
@@ -134,15 +134,15 @@ impl Layout {
                 h: ph,
             };
             let input = Rect {
-                x: box_.x + 4.0,
-                y: box_.y + 4.0,
-                w: box_.w - 8.0,
+                x: box_.x + theme::zpx(4.0),
+                y: box_.y + theme::zpx(4.0),
+                w: box_.w - theme::zpx(8.0),
                 h: theme::PALETTE_INPUT_HEIGHT(),
             };
             let list = Rect {
-                x: box_.x + 4.0,
-                y: input.y + input.h + 4.0,
-                w: box_.w - 8.0,
+                x: box_.x + theme::zpx(4.0),
+                y: input.y + input.h + theme::zpx(4.0),
+                w: box_.w - theme::zpx(8.0),
                 h: theme::PALETTE_ROW_HEIGHT() * visible as f32,
             };
             Some(PaletteLayout { box_, input, list })
@@ -217,7 +217,7 @@ impl Layout {
 
     /// The layout-toggle buttons (left of the window controls).
     pub fn layout_btn_rects(&self) -> Vec<Rect> {
-        let cw = 36.0;
+        let cw = theme::zpx(36.0);
         let right = self.title_bar.w - 3.0 * theme::TITLE_BTN_W();
         (0..3)
             .map(|i| Rect {
@@ -276,9 +276,9 @@ impl Layout {
     /// The Explorer header action buttons (New File / New Folder / Refresh /
     /// Collapse All), right-aligned in the sidebar header.
     pub fn explorer_action_rects(&self) -> Vec<Rect> {
-        let cw = 26.0;
+        let cw = theme::zpx(26.0);
         let n = 4;
-        let right = self.sidebar.x + self.sidebar.w - 6.0;
+        let right = self.sidebar.x + self.sidebar.w - theme::zpx(6.0);
         let y = self.sidebar.y + (theme::SIDEBAR_HEADER_H() - cw) * 0.5;
         (0..n)
             .map(|i| Rect {
@@ -303,9 +303,9 @@ impl Layout {
     /// The close-button cell within a tab — a square icon-button rect pinned to
     /// the tab's right edge. Drives both the × glyph and its hit region.
     pub fn tab_close_rect(tab: Rect) -> Rect {
-        let s = 20.0;
+        let s = theme::zpx(20.0);
         Rect {
-            x: tab.x + tab.w - s - 6.0,
+            x: tab.x + tab.w - s - theme::zpx(6.0),
             y: tab.y + (tab.h - s) * 0.5,
             w: s,
             h: s,
@@ -320,14 +320,14 @@ impl Layout {
 pub(crate) fn create_row_geometry(tr: Rect, row: usize, depth: usize) -> (Rect, Rect, Rect) {
     let row_y = tr.y + row as f32 * theme::TREE_ROW_HEIGHT();
     // Match the file tree: 12px left pad + ~8px per depth, left-aligned icon.
-    let indent = 12.0 + depth as f32 * 8.0;
-    let icon_w = 16.0;
+    let indent = theme::zpx(12.0) + depth as f32 * theme::zpx(8.0);
+    let icon_w = theme::zpx(16.0);
     let row_rect = Rect { x: tr.x, y: row_y, w: tr.w, h: theme::TREE_ROW_HEIGHT() };
     let icon_rect = Rect { x: tr.x + indent, y: row_y, w: icon_w, h: theme::TREE_ROW_HEIGHT() };
     let field = Rect {
-        x: tr.x + indent + icon_w + 4.0,
+        x: tr.x + indent + icon_w + theme::zpx(4.0),
         y: row_y,
-        w: (tr.w - indent - icon_w - 4.0).max(0.0),
+        w: (tr.w - indent - icon_w - theme::zpx(4.0)).max(0.0),
         h: theme::TREE_ROW_HEIGHT(),
     };
     (row_rect, icon_rect, field)
@@ -348,21 +348,21 @@ pub(crate) fn active_activity_idx(sidebar_visible: bool, view: SidebarView) -> O
 
 /// The search/filter box rect at the top of the Extensions sidebar.
 pub(crate) fn ext_filter_rect(tree: Rect) -> Rect {
-    Rect { x: tree.x + 10.0, y: tree.y + 8.0, w: tree.w - 20.0, h: 30.0 }
+    Rect { x: tree.x + theme::zpx(10.0), y: tree.y + theme::zpx(8.0), w: tree.w - theme::zpx(20.0), h: theme::zpx(30.0) }
 }
 
 /// The scrollable extension-row list region (below the filter box).
 pub(crate) fn ext_list_region(tree: Rect) -> Rect {
-    const STRIP: f32 = 46.0; // filter box + padding
-    Rect { x: tree.x, y: tree.y + STRIP, w: tree.w, h: (tree.h - STRIP).max(0.0) }
+    let strip = theme::zpx(46.0); // filter box + padding
+    Rect { x: tree.x, y: tree.y + strip, w: tree.w, h: (tree.h - strip).max(0.0) }
 }
 
 /// Right-aligned icon-button rects in the terminal panel header, drawn left→right
 /// as: +, split, trash, …, maximize, close (6 buttons — matches `GpuState::terminal_btns`).
 pub(crate) const TERMINAL_HEADER_BTNS: usize = 6;
 pub(crate) fn terminal_header_button_rects(panel: Rect) -> Vec<Rect> {
-    let bw = 28.0;
-    let right = panel.x + panel.w - 8.0;
+    let bw = theme::zpx(28.0);
+    let right = panel.x + panel.w - theme::zpx(8.0);
     let start_x = right - TERMINAL_HEADER_BTNS as f32 * bw;
     (0..TERMINAL_HEADER_BTNS)
         .map(|i| Rect { x: start_x + i as f32 * bw, y: panel.y, w: bw, h: theme::TERMINAL_HEADER_H() })
@@ -377,7 +377,7 @@ pub(crate) fn terminal_tablist_rect(content: Rect, group_count: usize) -> Option
     if group_count <= 1 {
         return None;
     }
-    let w = TERMINAL_TABLIST_W.min(content.w * 0.4);
+    let w = theme::zpx(TERMINAL_TABLIST_W).min(content.w * 0.4);
     Some(Rect { x: content.x + content.w - w, y: content.y, w, h: content.h })
 }
 
@@ -391,9 +391,9 @@ pub(crate) fn terminal_pane_area(content: Rect, group_count: usize) -> Rect {
 
 /// The close (×) button rect for terminal tab-list row `row`.
 pub(crate) fn terminal_tab_close_rect(tl: Rect, row: usize) -> Rect {
-    let s = 18.0;
+    let s = theme::zpx(18.0);
     Rect {
-        x: tl.x + tl.w - s - 6.0,
+        x: tl.x + tl.w - s - theme::zpx(6.0),
         y: tl.y + row as f32 * theme::TREE_ROW_HEIGHT() + (theme::TREE_ROW_HEIGHT() - s) * 0.5,
         w: s,
         h: s,
@@ -427,8 +427,8 @@ pub(crate) fn terminal_content(panel: Rect) -> Rect {
 /// real measured advance keeps the PTY's column count matched to what's rendered.
 pub(crate) fn terminal_grid_size(panel: Rect, char_w: f32) -> (usize, usize) {
     let char_w = char_w.max(1.0);
-    let cols = (((panel.w - 16.0) / char_w) as usize).clamp(8, 400);
-    let rows = (((panel.h - 8.0) / theme::LINE_HEIGHT()) as usize).clamp(2, 200);
+    let cols = (((panel.w - theme::zpx(16.0)) / char_w) as usize).clamp(8, 400);
+    let rows = (((panel.h - theme::zpx(8.0)) / theme::LINE_HEIGHT()) as usize).clamp(2, 200);
     (rows, cols)
 }
 
