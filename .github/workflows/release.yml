@@ -28,6 +28,9 @@ jobs:
           - os: ubuntu-latest
             bin: nova
             asset: nova-linux-x86_64
+          - os: macos-latest
+            bin: nova
+            asset: nova-macos-arm64
 
     steps:
       - uses: actions/checkout@v4

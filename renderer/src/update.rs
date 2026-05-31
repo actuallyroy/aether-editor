@@ -15,12 +15,17 @@ pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// Substring our release assets contain for this platform (`nova-windows-x86_64.exe`).
+/// Substring our release assets contain for this platform + arch, matching the
+/// workflow's asset names (`nova-windows-x86_64.exe`, `nova-macos-arm64`, …).
 fn target() -> &'static str {
     if cfg!(windows) {
         "windows-x86_64"
     } else if cfg!(target_os = "macos") {
-        "macos-x86_64"
+        if cfg!(target_arch = "aarch64") {
+            "macos-arm64"
+        } else {
+            "macos-x86_64"
+        }
     } else {
         "linux-x86_64"
     }
