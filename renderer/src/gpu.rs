@@ -136,6 +136,11 @@ impl GpuState {
         font_system
             .db_mut()
             .load_font_data(include_bytes!("../assets/codicon.ttf").to_vec());
+        // Bundle Cascadia Code (SIL OFL) so the editor's default mono font is the
+        // same everywhere, with no reliance on system-installed fonts.
+        font_system
+            .db_mut()
+            .load_font_data(include_bytes!("../assets/CascadiaCode.ttf").to_vec());
         let swash_cache = SwashCache::new();
         let cache = Cache::new(&device);
         let viewport = Viewport::new(&device, &cache);

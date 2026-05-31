@@ -38,7 +38,7 @@ impl Default for Settings {
         Self {
             editor_font_size: 14.0,
             editor_line_height: 20.0,
-            editor_font_family: "Consolas".into(),
+            editor_font_family: "Cascadia Code".into(),
             editor_tab_size: 4,
             editor_insert_spaces: true,
             editor_word_wrap: false,
@@ -148,7 +148,7 @@ pub fn line_height() -> f32 {
 /// settings reload only on startup / save.
 fn mono_family_cell() -> &'static RwLock<&'static str> {
     static M: OnceLock<RwLock<&'static str>> = OnceLock::new();
-    M.get_or_init(|| RwLock::new("Consolas"))
+    M.get_or_init(|| RwLock::new("Cascadia Code"))
 }
 pub fn mono_family() -> &'static str {
     *mono_family_cell().read().unwrap()
@@ -292,7 +292,7 @@ pub fn default_settings_jsonc() -> &'static str {
     "editor.lineHeight": 20,
 
     // The monospace font family used in the editor.
-    "editor.fontFamily": "Consolas",
+    "editor.fontFamily": "Cascadia Code",
 
     // The number of spaces a tab is equal to.
     "editor.tabSize": 4,
