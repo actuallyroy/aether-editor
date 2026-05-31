@@ -1095,7 +1095,7 @@ impl App {
     /// prefilled new-issue page in the browser if `gh` isn't available.
     fn submit_issue(&mut self, title: String, body: String) {
         const REPO: &str = "actuallyroy/nova-editor";
-        let mut cmd = std::process::Command::new("gh");
+        let mut cmd = std::process::Command::new(gh_program());
         cmd.args(["issue", "create", "--repo", REPO, "--title", &title, "--body", &body]);
         #[cfg(windows)]
         {
@@ -2409,7 +2409,9 @@ impl App {
             return;
         }
         let extend = self.mods.shift_key();
-        let ctrl = self.mods.control_key();
+        // The primary shortcut modifier: Ctrl everywhere, plus Cmd (super) on macOS
+        // so Cmd+C/V/A/S/F/Enter/zoom work natively there.
+        let ctrl = self.mods.control_key() || (cfg!(target_os = "macos") && self.mods.super_key());
 
         // The feedback form is modal: route keys to it (Esc closes, Ctrl+Enter submits).
         if self.feedback_form.is_some() {
@@ -2810,6 +2812,27 @@ enum Focus {
 
 /// Open a URL in the OS default browser. Best-effort, http(s) only (so README
 /// link text can't launch arbitrary commands).
+/// Resolve the `gh` executable. macOS GUI apps don't inherit the shell PATH, so a
+/// bare "gh" often isn't found (it lives in /opt/homebrew/bin etc.) — check the
+/// common locations and fall back to a login-shell lookup before giving up.
+fn gh_program() -> String {
+    #[cfg(not(windows))]
+    {
+        for p in ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh", "/home/linuxbrew/.linuxbrew/bin/gh"] {
+            if std::path::Path::new(p).exists() {
+                return p.to_string();
+            }
+        }
+        if let Ok(out) = std::process::Command::new("/bin/sh").args(["-lc", "command -v gh"]).output() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !s.is_empty() {
+                return s;
+            }
+        }
+    }
+    "gh".to_string()
+}
+
 /// Percent-encode a string for use in a URL query value.
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 2);

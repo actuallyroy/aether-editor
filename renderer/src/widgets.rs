@@ -307,6 +307,7 @@ pub struct TextInput {
     cursor: CursorIcon,
     pub align: VAlign,
     multiline: bool, // wrap + grow vertically; caret tracks the shaped layout
+    width: f32,      // content width (for re-applying the wrap width on reshape)
     caret: usize,  // byte index of the caret in `text`
     anchor: usize, // selection anchor; == caret when there's no selection
 }
@@ -323,6 +324,7 @@ impl TextInput {
             cursor: CursorIcon::Text,
             align: VAlign::Center,
             multiline: false,
+            width: w,
             caret: 0,
             anchor: 0,
         }
@@ -371,6 +373,11 @@ impl TextInput {
         self.buffer.set_metrics(fs, Metrics::new(theme::UI_FONT_SIZE(), theme::UI_LINE_HEIGHT()));
         self.buffer
             .set_wrap(fs, if self.multiline { Wrap::WordOrGlyph } else { Wrap::None });
+        // Multi-line: wrap at the field width and lay out plenty of rows (so text
+        // past the first screenful is still shaped + visible, not clipped away).
+        if self.multiline {
+            self.buffer.set_size(fs, Some(self.width), Some(4000.0));
+        }
         self.buffer.set_text(
             fs,
             &content,
@@ -1142,7 +1149,7 @@ impl ListView {
 pub struct Menu {
     list: ListView,
     count: usize,
-    width: f32,
+    base_w: f32, // unzoomed width; width() scales it so items don't wrap when zoomed
 }
 
 impl Menu {
@@ -1150,8 +1157,12 @@ impl Menu {
         Self {
             list: ListView::new(fs, width, 400.0, theme::MENU_ITEM_H(), 12.0),
             count: 0,
-            width,
+            base_w: width / theme::ui_zoom(),
         }
+    }
+
+    fn width(&self) -> f32 {
+        self.base_w * theme::ui_zoom()
     }
 
     pub fn set_items(&mut self, fs: &mut FontSystem, labels: &[&str]) {
@@ -1161,17 +1172,18 @@ impl Menu {
             t.push_str(l);
             t.push('\n');
         }
-        self.list.set_text(fs, &t, self.width, 400.0);
+        self.list.set_text(fs, &t, self.width(), 4000.0);
         self.count = labels.len();
     }
 
     /// The popup box rect for `anchor`, clamped within the window `win`.
     pub fn rect(&self, anchor: (f32, f32), win: (f32, f32)) -> Rect {
         let h = self.count as f32 * theme::MENU_ITEM_H() + 8.0;
+        let w = self.width();
         Rect {
-            x: anchor.0.min(win.0 - self.width - 4.0).max(0.0),
+            x: anchor.0.min(win.0 - w - 4.0).max(0.0),
             y: anchor.1.min(win.1 - h - 4.0).max(0.0),
-            w: self.width,
+            w,
             h,
         }
     }
