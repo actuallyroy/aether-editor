@@ -329,10 +329,11 @@ impl ExtensionDetail {
         img_rects: &mut Vec<(String, Rect)>,
     ) {
         let htext_x = Self::header_text_x(r);
-        let avail = Self::install_rect(r).x - htext_x - 16.0;
-        self.name.push(htext_x, Rect { x: htext_x, y: r.y + Self::header_top(), w: avail, h: 34.0 }, theme::FG_ACTIVE(), areas);
-        self.meta.push(htext_x, Rect { x: htext_x, y: r.y + Self::header_top() + 36.0, w: avail, h: 22.0 }, theme::FG_DIM(), areas);
-        self.desc.push(htext_x, Rect { x: htext_x, y: r.y + Self::header_top() + 58.0, w: avail, h: 40.0 }, theme::FG_TEXT(), areas);
+        let avail = Self::install_rect(r).x - htext_x - theme::zpx(16.0);
+        let top = r.y + Self::header_top();
+        self.name.push(htext_x, Rect { x: htext_x, y: top, w: avail, h: theme::zpx(34.0) }, theme::FG_ACTIVE(), areas);
+        self.meta.push(htext_x, Rect { x: htext_x, y: top + theme::zpx(36.0), w: avail, h: theme::zpx(22.0) }, theme::FG_DIM(), areas);
+        self.desc.push(htext_x, Rect { x: htext_x, y: top + theme::zpx(58.0), w: avail, h: theme::zpx(40.0) }, theme::FG_TEXT(), areas);
 
         // Tab labels.
         let tabs = self.tab_rects(r);

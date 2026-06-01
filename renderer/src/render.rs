@@ -163,6 +163,12 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         let content_h = app.workspace.tree.nodes.len() as f32 * theme::TREE_ROW_HEIGHT();
         app.explorer.scroll.set_metrics(tr, (tr.w, content_h));
     }
+    // Keep the terminal panel's resize bounds tied to the window height (and zoom),
+    // so it can grow to most of the window instead of a fixed zoom-1 cap.
+    {
+        let max_h = (gpu.config.height as f32 - theme::zpx(200.0)).max(theme::TERMINAL_MIN_HEIGHT());
+        app.terminal.split.set_bounds(theme::TERMINAL_MIN_HEIGHT(), max_h);
+    }
     if app.sidebar_visible && app.sidebar_view == SidebarView::SourceControl {
         if let Some(scp) = app.source_control.as_mut() {
             scp.update(&mut gpu.font_system, layout.tree_region());

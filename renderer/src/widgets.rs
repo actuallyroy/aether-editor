@@ -1503,6 +1503,15 @@ impl Splitter {
         self.size
     }
 
+    /// Update the clamp bounds (e.g. when the window or zoom changes) and re-clamp
+    /// the current size into them. The construction-time bounds are otherwise fixed,
+    /// which would cap a zoom-scaled panel at its zoom-1 limit.
+    pub fn set_bounds(&mut self, min: f32, max: f32) {
+        self.min = min;
+        self.max = max.max(min);
+        self.size = self.size.clamp(self.min, self.max);
+    }
+
     pub fn cursor(&self) -> CursorIcon {
         match self.axis {
             Axis::Horizontal => CursorIcon::ColResize,
