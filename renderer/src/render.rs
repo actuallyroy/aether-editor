@@ -183,7 +183,15 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         // position from these metrics). Content height uses logical lines + padding.
         let content_h = d.rope.len_lines() as f32 * theme::LINE_HEIGHT() + theme::EDITOR_PAD() * 2.0;
         let content_w = d.max_line_width() + theme::EDITOR_PAD() * 2.0;
-        d.scroll.set_metrics(layout.editor_text, (content_w, content_h));
+        // In a side-by-side diff each pane is ~half the editor width, so the
+        // horizontal scroll range must be measured against the pane width (else a
+        // line that fits the full editor but overflows a pane yields no scroll).
+        let vp = if d.diff.is_some() {
+            Rect { w: layout.editor_text.w * 0.5, ..layout.editor_text }
+        } else {
+            layout.editor_text
+        };
+        d.scroll.set_metrics(vp, (content_w, content_h));
     }
 
     // ---- Update UI buffer texts (only on cache miss) ----

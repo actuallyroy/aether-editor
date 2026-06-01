@@ -322,10 +322,13 @@ impl Document {
 
     /// Widest shaped line in pixels (for horizontal scrolling).
     pub fn max_line_width(&self) -> f32 {
-        self.buffer
-            .layout_runs()
-            .map(|r| r.line_w)
-            .fold(0.0_f32, f32::max)
+        let left = self.buffer.layout_runs().map(|r| r.line_w).fold(0.0_f32, f32::max);
+        // In a side-by-side diff the right pane has its own buffer; the widest line
+        // across both panes drives the (shared) horizontal scroll range.
+        match self.diff_right.as_ref() {
+            Some(right) => right.layout_runs().map(|r| r.line_w).fold(left, f32::max),
+            None => left,
+        }
     }
 
     /// Current scroll offset (px). Backed by the document's `ScrollView`.
