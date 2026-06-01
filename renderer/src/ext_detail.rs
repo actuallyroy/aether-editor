@@ -59,14 +59,16 @@ pub struct ExtensionDetail {
 }
 
 impl ExtensionDetail {
-    const PAD: f32 = 24.0;
-    const ICON: f32 = 72.0;
-    const HEADER_TOP: f32 = 24.0;
-    const TABBAR_H: f32 = 34.0;
-    const SIDEBAR_W: f32 = 270.0;
-    const CONTENT_GAP: f32 = 24.0;
-    const BTN_W: f32 = 130.0;
-    const BTN_H: f32 = 34.0;
+    // All layout dimensions scale with the UI zoom (so the header/tabs/body don't
+    // overlap at high zoom while the text scales).
+    fn pad() -> f32 { 24.0 * theme::ui_zoom() }
+    fn icon() -> f32 { 72.0 * theme::ui_zoom() }
+    fn header_top() -> f32 { 24.0 * theme::ui_zoom() }
+    fn tabbar_h() -> f32 { 34.0 * theme::ui_zoom() }
+    fn sidebar_w() -> f32 { 270.0 * theme::ui_zoom() }
+    fn content_gap() -> f32 { 24.0 * theme::ui_zoom() }
+    fn btn_w() -> f32 { 130.0 * theme::ui_zoom() }
+    fn btn_h() -> f32 { 34.0 * theme::ui_zoom() }
 
     pub fn new(fs: &mut FontSystem) -> Self {
         let mk = |fs: &mut FontSystem, w: f32, h: f32| {
@@ -74,14 +76,14 @@ impl ExtensionDetail {
             l.align = VAlign::Top;
             l
         };
-        let mut install = TextLabel::new(fs, 140.0, Self::BTN_H);
+        let mut install = TextLabel::new(fs, 140.0, Self::btn_h());
         install.set(fs, "Install", theme::UI_FAMILY());
-        let mut installed_lbl = TextLabel::new(fs, 140.0, Self::BTN_H);
+        let mut installed_lbl = TextLabel::new(fs, 140.0, Self::btn_h());
         installed_lbl.set(fs, "Installed", theme::UI_FAMILY());
         let tabs = [
-            { let mut l = TextLabel::new(fs, 140.0, Self::TABBAR_H); l.set(fs, "DETAILS", theme::UI_FAMILY()); l },
-            { let mut l = TextLabel::new(fs, 140.0, Self::TABBAR_H); l.set(fs, "FEATURES", theme::UI_FAMILY()); l },
-            { let mut l = TextLabel::new(fs, 140.0, Self::TABBAR_H); l.set(fs, "CHANGELOG", theme::UI_FAMILY()); l },
+            { let mut l = TextLabel::new(fs, 140.0, Self::tabbar_h()); l.set(fs, "DETAILS", theme::UI_FAMILY()); l },
+            { let mut l = TextLabel::new(fs, 140.0, Self::tabbar_h()); l.set(fs, "FEATURES", theme::UI_FAMILY()); l },
+            { let mut l = TextLabel::new(fs, 140.0, Self::tabbar_h()); l.set(fs, "CHANGELOG", theme::UI_FAMILY()); l },
         ];
         Self {
             name: mk(fs, 1000.0, 36.0),
@@ -93,7 +95,7 @@ impl ExtensionDetail {
             details: Markdown::new(fs),
             features: Markdown::new(fs),
             changelog: Markdown::new(fs),
-            sidebar: mk(fs, Self::SIDEBAR_W, 600.0),
+            sidebar: mk(fs, Self::sidebar_w(), 600.0),
             tab: DetailTab::Details,
             icon_uv: None,
             icon_color: [0.3, 0.3, 0.3, 1.0],
@@ -107,6 +109,16 @@ impl ExtensionDetail {
     }
     pub fn set_tab(&mut self, tab: DetailTab) {
         self.tab = tab;
+    }
+
+    /// Re-shape the static labels (Install / tab names) after a zoom change. The
+    /// name/meta/desc/sidebar/body re-shape on their own since `set` runs each frame.
+    pub fn reshape(&mut self, fs: &mut FontSystem) {
+        self.install.reshape(fs);
+        self.installed_lbl.reshape(fs);
+        for t in &mut self.tabs {
+            t.reshape(fs);
+        }
     }
 
     /// Update all content from extension data + the loaded docs.
@@ -188,43 +200,43 @@ impl ExtensionDetail {
     // ---- geometry ----
 
     fn icon_rect(r: Rect) -> Rect {
-        Rect { x: r.x + Self::PAD, y: r.y + Self::HEADER_TOP, w: Self::ICON, h: Self::ICON }
+        Rect { x: r.x + Self::pad(), y: r.y + Self::header_top(), w: Self::icon(), h: Self::icon() }
     }
     fn sidebar_x(r: Rect) -> f32 {
-        r.x + r.w - Self::SIDEBAR_W
+        r.x + r.w - Self::sidebar_w()
     }
     fn header_text_x(r: Rect) -> f32 {
-        r.x + Self::PAD + Self::ICON + 20.0
+        r.x + Self::pad() + Self::icon() + theme::zpx(20.0)
     }
     fn install_rect(r: Rect) -> Rect {
-        Rect { x: Self::sidebar_x(r) - Self::CONTENT_GAP - Self::BTN_W, y: r.y + Self::HEADER_TOP + 4.0, w: Self::BTN_W, h: Self::BTN_H }
+        Rect { x: Self::sidebar_x(r) - Self::content_gap() - Self::btn_w(), y: r.y + Self::header_top() + theme::zpx(4.0), w: Self::btn_w(), h: Self::btn_h() }
     }
     fn tabbar_y(r: Rect) -> f32 {
-        r.y + Self::HEADER_TOP + Self::ICON + 18.0
+        r.y + Self::header_top() + Self::icon() + theme::zpx(18.0)
     }
     fn content_y(r: Rect) -> f32 {
-        Self::tabbar_y(r) + Self::TABBAR_H + 14.0
+        Self::tabbar_y(r) + Self::tabbar_h() + theme::zpx(14.0)
     }
     fn main_x(r: Rect) -> f32 {
-        r.x + Self::PAD
+        r.x + Self::pad()
     }
     fn body_rect(r: Rect) -> Rect {
         let x = Self::main_x(r);
         let y = Self::content_y(r);
-        let w = (Self::sidebar_x(r) - Self::CONTENT_GAP - x).max(80.0);
-        Rect { x, y, w, h: (r.y + r.h - y - Self::PAD).max(40.0) }
+        let w = (Self::sidebar_x(r) - Self::content_gap() - x).max(80.0);
+        Rect { x, y, w, h: (r.y + r.h - y - Self::pad()).max(40.0) }
     }
     fn sidebar_rect(r: Rect) -> Rect {
-        Rect { x: Self::sidebar_x(r) + 16.0, y: Self::content_y(r), w: Self::SIDEBAR_W - 28.0, h: r.h - Self::content_y(r) }
+        Rect { x: Self::sidebar_x(r) + theme::zpx(16.0), y: Self::content_y(r), w: Self::sidebar_w() - theme::zpx(28.0), h: r.h - Self::content_y(r) }
     }
     /// Tab hit/draw rects (label width + padding), laid left-to-right.
     fn tab_rects(&self, r: Rect) -> [Rect; 3] {
         let y = Self::tabbar_y(r);
         let mut x = Self::main_x(r);
-        let mut out = [Rect { x: 0.0, y, w: 0.0, h: Self::TABBAR_H }; 3];
+        let mut out = [Rect { x: 0.0, y, w: 0.0, h: Self::tabbar_h() }; 3];
         for (i, t) in self.tabs.iter().enumerate() {
-            let w = t.width() + 28.0;
-            out[i] = Rect { x, y, w, h: Self::TABBAR_H };
+            let w = t.width() + theme::zpx(28.0);
+            out[i] = Rect { x, y, w, h: Self::tabbar_h() };
             x += w;
         }
         out
@@ -291,9 +303,9 @@ impl ExtensionDetail {
         }
         // Tab bar bottom border across the main column.
         let tabs = self.tab_rects(r);
-        let bar_y = Self::tabbar_y(r) + Self::TABBAR_H;
+        let bar_y = Self::tabbar_y(r) + Self::tabbar_h();
         let main_x = Self::main_x(r);
-        let bar_w = Self::sidebar_x(r) - Self::CONTENT_GAP - main_x;
+        let bar_w = Self::sidebar_x(r) - Self::content_gap() - main_x;
         quads.push(Quad::new(main_x, bar_y - 1.0, bar_w, 1.0, theme::BORDER()));
         // Hovered tab subtle bg + active tab accent underline.
         for (i, t) in DetailTab::ALL.iter().enumerate() {
@@ -304,7 +316,7 @@ impl ExtensionDetail {
         let a = tabs[self.tab.index()];
         quads.push(Quad::new(a.x, bar_y - 2.0, a.w, 2.0, color_quad(theme::FG_ACTIVE())));
         // Vertical separator before the sidebar.
-        let sx = Self::sidebar_x(r) - Self::CONTENT_GAP * 0.5;
+        let sx = Self::sidebar_x(r) - Self::content_gap() * 0.5;
         quads.push(Quad::new(sx, Self::tabbar_y(r), 1.0, r.y + r.h - Self::tabbar_y(r), theme::BORDER()));
     }
 
@@ -318,9 +330,9 @@ impl ExtensionDetail {
     ) {
         let htext_x = Self::header_text_x(r);
         let avail = Self::install_rect(r).x - htext_x - 16.0;
-        self.name.push(htext_x, Rect { x: htext_x, y: r.y + Self::HEADER_TOP, w: avail, h: 34.0 }, theme::FG_ACTIVE(), areas);
-        self.meta.push(htext_x, Rect { x: htext_x, y: r.y + Self::HEADER_TOP + 36.0, w: avail, h: 22.0 }, theme::FG_DIM(), areas);
-        self.desc.push(htext_x, Rect { x: htext_x, y: r.y + Self::HEADER_TOP + 58.0, w: avail, h: 40.0 }, theme::FG_TEXT(), areas);
+        self.name.push(htext_x, Rect { x: htext_x, y: r.y + Self::header_top(), w: avail, h: 34.0 }, theme::FG_ACTIVE(), areas);
+        self.meta.push(htext_x, Rect { x: htext_x, y: r.y + Self::header_top() + 36.0, w: avail, h: 22.0 }, theme::FG_DIM(), areas);
+        self.desc.push(htext_x, Rect { x: htext_x, y: r.y + Self::header_top() + 58.0, w: avail, h: 40.0 }, theme::FG_TEXT(), areas);
 
         // Tab labels.
         let tabs = self.tab_rects(r);

@@ -128,6 +128,12 @@ pub fn dir() -> Option<PathBuf> {
 }
 
 /// Scan installed VSCode extensions; supported ones sorted first, then by name.
+/// Parse a version like "1.10.2" into comparable numeric components (non-numeric
+/// parts → 0), so "1.10.0" > "1.9.0".
+fn version_tuple(v: &str) -> Vec<u32> {
+    v.split('.').map(|p| p.trim().parse().unwrap_or(0)).collect()
+}
+
 pub fn scan() -> Vec<Extension> {
     let Some(dir) = extensions_dir() else {
         return Vec::new();
@@ -152,6 +158,20 @@ pub fn scan() -> Vec<Extension> {
             out.push(e);
         }
     }
+    // VS Code keeps every installed *version* of an extension in its own folder
+    // (e.g. claude-code-1.0.1, claude-code-1.0.2); collapse to the highest version
+    // per (publisher, name) so each extension shows once.
+    let mut best: std::collections::HashMap<(String, String), Extension> = std::collections::HashMap::new();
+    for e in out {
+        let key = (e.publisher.to_lowercase(), e.name.to_lowercase());
+        match best.get(&key) {
+            Some(prev) if version_tuple(&prev.version) >= version_tuple(&e.version) => {}
+            _ => {
+                best.insert(key, e);
+            }
+        }
+    }
+    let mut out: Vec<Extension> = best.into_values().collect();
     out.sort_by(|a, b| {
         b.supported()
             .cmp(&a.supported())

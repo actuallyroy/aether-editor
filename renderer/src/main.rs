@@ -1594,6 +1594,7 @@ impl App {
             g.ui.palette_input.rezoom(&mut g.font_system);
             g.ui.find_input.rezoom(&mut g.font_system);
             g.create_input.rezoom(&mut g.font_system);
+            g.ui.ext_detail.reshape(&mut g.font_system);
         }
         if let (Some(scp), Some(g)) = (self.source_control.as_mut(), self.gpu.as_mut()) {
             scp.reshape(&mut g.font_system);
