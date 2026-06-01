@@ -350,7 +350,7 @@ impl SourceControlPanel {
             (self.unstaged_hdr(r), &self.count_unstaged)
         };
         let acts: &[Act] = if staged { &[Act::Unstage] } else { &[Act::Discard, Act::Stage] };
-        let end = hdr.x + hdr.w - (count.width() + 12.0) - 6.0;
+        let end = hdr.x + hdr.w - (count.width() + theme::zpx(12.0)) - theme::zpx(6.0);
         let start = end - acts.len() as f32 * action_w();
         acts.iter()
             .enumerate()
@@ -365,21 +365,21 @@ impl SourceControlPanel {
         bg.push(border.rounded_quad(theme::SEARCH_BORDER(), 3.0));
         bg.push(m.rounded_quad(theme::SEARCH_BG(), 2.0));
         if self.msg_active {
-            self.msg.selection_quads(m, 6.0, bg);
+            self.msg.selection_quads(m, theme::zpx(6.0), bg);
             if blink {
-                fg.push(self.msg.caret_quad(m, 6.0));
+                fg.push(self.msg.caret_quad(m, theme::zpx(6.0)));
             }
         }
         bg.push(Self::commit_rect(region).rounded_quad([0.06, 0.40, 0.62, 1.0], 3.0));
         // Split divider between the Commit label and its dropdown chevron.
         let cc = Self::commit_chevron(region);
-        bg.push(Quad::new(cc.x, cc.y + 5.0, 1.0, cc.h - 10.0, [0.03, 0.28, 0.46, 1.0]));
+        bg.push(Quad::new(cc.x, cc.y + theme::zpx(5.0), 1.0, cc.h - theme::zpx(10.0), [0.03, 0.28, 0.46, 1.0]));
         for (hdr, label) in [
             (Self::staged_hdr(region), &self.count_staged),
             (self.unstaged_hdr(region), &self.count_unstaged),
         ] {
-            let w = label.width() + 12.0;
-            let pill = Rect { x: hdr.x + hdr.w - w, y: hdr.y + 3.0, w, h: row_h() - 6.0 };
+            let w = label.width() + theme::zpx(12.0);
+            let pill = Rect { x: hdr.x + hdr.w - w, y: hdr.y + theme::zpx(3.0), w, h: row_h() - theme::zpx(6.0) };
             bg.push(pill.rounded_quad([0.20, 0.30, 0.42, 1.0], pill.h * 0.5));
         }
         // Hovered-row highlight (so the action icons read as part of an active row).
@@ -400,7 +400,7 @@ impl SourceControlPanel {
 
         let m = Self::msg_rect(region);
         let mc = if self.msg.text().is_empty() { theme::FG_DIM() } else { theme::FG_TEXT() };
-        self.msg.draw(m, 6.0, mc, areas);
+        self.msg.draw(m, theme::zpx(6.0), mc, areas);
         // Commit split button: label centered in the main part + dropdown chevron.
         let cm = Self::commit_main(region);
         self.l_commit.push(cm.x + (cm.w - self.l_commit.width()) * 0.5, cm, theme::FG_TEXT(), areas);
@@ -522,7 +522,7 @@ impl SourceControlPanel {
         if Self::msg_rect(region).contains(pt) {
             self.msg_active = true;
             self.msg.focus(true);
-            self.msg.set_caret_from_x(Self::msg_rect(region), 6.0, pt.0);
+            self.msg.set_caret_from_x(Self::msg_rect(region), theme::zpx(6.0), pt.0);
             return true;
         }
         // Top toolbar.

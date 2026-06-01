@@ -130,9 +130,9 @@ impl ExtensionsPanel {
         bg.push(border.rounded_quad(theme::SEARCH_BORDER(), 3.0));
         bg.push(fr.rounded_quad(theme::SEARCH_BG(), 2.0));
         if self.filter_active {
-            self.filter.selection_quads(fr, 6.0, bg);
+            self.filter.selection_quads(fr, theme::zpx(6.0), bg);
             if blink {
-                fg.push(self.filter.caret_quad(fr, 6.0));
+                fg.push(self.filter.caret_quad(fr, theme::zpx(6.0)));
             }
         }
     }
@@ -140,7 +140,7 @@ impl ExtensionsPanel {
     pub fn draw_text<'b>(&'b self, region: Rect, areas: &mut Vec<TextArea<'b>>) {
         let fr = ext_filter_rect(region);
         let fc = if self.filter.text().is_empty() { theme::FG_DIM() } else { theme::FG_TEXT() };
-        self.filter.draw(fr, 6.0, fc, areas);
+        self.filter.draw(fr, theme::zpx(6.0), fc, areas);
     }
 
     // ---- Clipped list pass data (drawn by the renderer into a scissored pass). ----

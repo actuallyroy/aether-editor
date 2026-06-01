@@ -845,7 +845,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     let cx = rect.x + theme::zpx(8.0) + cc as f32 * char_w;
                     let cy = rect.y + theme::zpx(4.0) + cr as f32 * line_h;
                     if cx < right && cy + line_h <= rect.y + rect.h {
-                        bg_quads.push(Quad::new(cx, cy, char_w.max(2.0), line_h, [0.6, 0.6, 0.6, 0.6]));
+                        bg_quads.push(Quad::new(cx, cy, char_w.max(theme::zpx(2.0)), line_h, [0.6, 0.6, 0.6, 0.6]));
                     }
                 }
                 // Auto-hiding scrollback scrollbar (overlay) for this pane.

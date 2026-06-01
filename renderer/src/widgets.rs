@@ -654,7 +654,7 @@ impl TextInput {
 
     fn local_top(&self, rect: Rect) -> f32 {
         if self.multiline {
-            rect.y + 4.0
+            rect.y + theme::zpx(4.0)
         } else {
             rect.text_top(theme::UI_LINE_HEIGHT(), self.align)
         }
@@ -738,7 +738,7 @@ impl TextInput {
         if self.multiline {
             let (cx, top, lh) = self.caret_xy();
             let h = (lh - 4.0).max(6.0);
-            return Quad::new(rect.x + pad_x + cx, rect.y + 4.0 + top + 2.0, 1.5, h, theme::CURSOR());
+            return Quad::new(rect.x + pad_x + cx, rect.y + theme::zpx(4.0) + top + 2.0, 1.5, h, theme::CURSOR());
         }
         let x = rect.x + pad_x + self.x_for_byte(self.caret);
         let h = theme::UI_LINE_HEIGHT() - 6.0;
@@ -775,7 +775,7 @@ impl TextInput {
 
     pub fn draw<'a>(&'a self, rect: Rect, pad_x: f32, color: glyphon::Color, areas: &mut Vec<TextArea<'a>>) {
         let top = if self.multiline {
-            rect.y + 4.0
+            rect.y + theme::zpx(4.0)
         } else {
             rect.text_top(theme::UI_LINE_HEIGHT(), self.align)
         };
@@ -895,8 +895,8 @@ impl MenuBar {
 
     /// Per-item rects laid out from the left edge of `bar`.
     pub fn item_rects(&self, bar: Rect) -> Vec<Rect> {
-        let pad = 9.0;
-        let mut x = bar.x + 6.0;
+        let pad = theme::zpx(9.0);
+        let mut x = bar.x + theme::zpx(6.0);
         self.labels
             .iter()
             .map(|l| {
@@ -1216,18 +1216,18 @@ impl Menu {
 
     /// The popup box rect for `anchor`, clamped within the window `win`.
     pub fn rect(&self, anchor: (f32, f32), win: (f32, f32)) -> Rect {
-        let h = self.count as f32 * theme::MENU_ITEM_H() + 8.0;
+        let h = self.count as f32 * theme::MENU_ITEM_H() + theme::zpx(8.0);
         let w = self.width();
         Rect {
-            x: anchor.0.min(win.0 - w - 4.0).max(0.0),
-            y: anchor.1.min(win.1 - h - 4.0).max(0.0),
+            x: anchor.0.min(win.0 - w - theme::zpx(4.0)).max(0.0),
+            y: anchor.1.min(win.1 - h - theme::zpx(4.0)).max(0.0),
             w,
             h,
         }
     }
 
     fn inner(&self, menu: Rect) -> Rect {
-        Rect { x: menu.x, y: menu.y + 4.0, w: menu.w, h: menu.h - 8.0 }
+        Rect { x: menu.x, y: menu.y + theme::zpx(4.0), w: menu.w, h: menu.h - theme::zpx(8.0) }
     }
 
     pub fn item_at(&self, menu: Rect, p: (f32, f32)) -> Option<usize> {

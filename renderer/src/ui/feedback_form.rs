@@ -166,7 +166,7 @@ impl FeedbackForm {
         // Checkbox squares: blue when checked, dark with a visible border when not.
         let sz = 16.0 * theme::ui_zoom();
         for (row, checked) in [(r.sysinfo, self.include_sysinfo), (r.screenshot, self.include_screenshot)] {
-            let cb = Rect { x: row.x, y: row.y + 2.0, w: sz, h: sz };
+            let cb = Rect { x: row.x, y: row.y + theme::zpx(2.0), w: sz, h: sz };
             bg.push(cb.rounded_quad(if checked { theme::BADGE_BG() } else { [0.10, 0.10, 0.12, 1.0] }, 3.0));
             if !checked {
                 let bd = theme::FG_DIM();
