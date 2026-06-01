@@ -157,6 +157,12 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             ep.update(layout.tree_region());
         }
     }
+    // File-tree scroll viewport (content = one row per tree node).
+    if app.sidebar_visible && app.sidebar_view == SidebarView::Explorer {
+        let tr = layout.tree_region();
+        let content_h = app.workspace.tree.nodes.len() as f32 * theme::TREE_ROW_HEIGHT();
+        app.explorer.scroll.set_metrics(tr, (tr.w, content_h));
+    }
     if app.sidebar_visible && app.sidebar_view == SidebarView::SourceControl {
         if let Some(scp) = app.source_control.as_mut() {
             scp.update(&mut gpu.font_system, layout.tree_region());
@@ -547,37 +553,45 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     if app.sidebar_visible {
         bg_quads.push(layout.sidebar.quad(theme::SIDEBAR_BG()));
         if app.sidebar_view == SidebarView::Explorer {
+            let tr = layout.tree_region();
+            let sy = app.explorer.scroll.offset().1;
+            // Shift a row rect by the scroll offset and clip it to the tree viewport
+            // (so highlights for off-screen rows don't bleed into the header).
+            let clip_row = |mut r: Rect| -> Option<Rect> {
+                r.y -= sy;
+                let top = r.y.max(tr.y);
+                let bot = (r.y + r.h).min(tr.y + tr.h);
+                (bot > top).then_some(Rect { y: top, h: bot - top, ..r })
+            };
             // Explorer header action hover.
             if let Some(i) = app.hovered_explorer {
                 bg_quads.push(layout.explorer_action_rects()[i].quad(theme::MENU_HOVER()));
             }
             // Inline-create row highlight (at the insert position).
             if let Some(pc) = app.explorer.creating.as_ref() {
-                let (row_rect, _, _) = create_row_geometry(layout.tree_region(), pc.row, pc.depth);
-                bg_quads.push(row_rect.quad(theme::TREE_SELECTED()));
+                let (row_rect, _, _) = create_row_geometry(tr, pc.row, pc.depth);
+                if let Some(rr) = clip_row(row_rect) {
+                    bg_quads.push(rr.quad(theme::TREE_SELECTED()));
+                }
             }
             // Active-file highlight: the tree row matching the open document.
             if app.explorer.creating.is_none() {
                 if let Some(path) = app.workspace.active_doc().and_then(|d| d.path.clone()) {
                     if let Some(idx) = app.workspace.tree.nodes.iter().position(|n| n.path == path) {
-                        bg_quads.push(
-                            gpu.ui
-                                .sidebar
-                                .row_rect(layout.tree_region(), idx)
-                                .quad(theme::TREE_ACTIVE_FILE()),
-                        );
+                        if let Some(rr) = clip_row(gpu.ui.sidebar.row_rect(tr, idx)) {
+                            bg_quads.push(rr.quad(theme::TREE_ACTIVE_FILE()));
+                        }
                     }
                 }
             }
             // Tree row hover (below the header) — row rect from the ListView.
             if let Some(idx) = app.hovered_tree {
-                bg_quads.push(
-                    gpu.ui
-                        .sidebar
-                        .row_rect(layout.tree_region(), idx)
-                        .quad(theme::TREE_HOVER()),
-                );
+                if let Some(rr) = clip_row(gpu.ui.sidebar.row_rect(tr, idx)) {
+                    bg_quads.push(rr.quad(theme::TREE_HOVER()));
+                }
             }
+            // Auto-hiding file-tree scrollbar.
+            app.explorer.scroll.draw(now, &mut fg_quads);
         } else if app.sidebar_view == SidebarView::Extensions {
             // Extensions panel: filter box chrome + selection/caret (fixed at top).
             // The scrollable rows draw in their own clipped pass after the main pass.
@@ -1026,25 +1040,31 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             // Root folder row (chevron + workspace name).
             ui.root_label
                 .draw_left(layout.root_row_rect(), theme::zpx(10.0), theme::FG_TEXT(), &mut areas);
+            let sy = app.explorer.scroll.offset().1;
             if let Some(pc) = app.explorer.creating.as_ref() {
                 let rowh = theme::TREE_ROW_HEIGHT();
-                let (_, icon_rect, field) = create_row_geometry(tr, pc.row, pc.depth);
-                if pc.row > 0 {
-                    let clip_a = Rect { x: tr.x, y: tr.y, w: tr.w, h: pc.row as f32 * rowh };
-                    ui.sidebar.draw_at(clip_a, tr.y, theme::FG_TEXT(), &mut areas);
+                // Scrolled tree origin: rows (and the inline create field) shift up by `sy`.
+                let stop = tr.y - sy;
+                let (_, icon_rect, field) = create_row_geometry(Rect { y: stop, ..tr }, pc.row, pc.depth);
+                let split = stop + pc.row as f32 * rowh; // top of the create row
+                if split > tr.y {
+                    let clip_a = Rect { x: tr.x, y: tr.y, w: tr.w, h: (split - tr.y).min(tr.h) };
+                    ui.sidebar.draw_at(clip_a, stop, theme::FG_TEXT(), &mut areas);
                 }
                 gpu.create_icons[pc.is_dir as usize].draw(icon_rect, theme::ICON_FILE_COLOR(), &mut areas);
                 gpu.create_input.draw(field, 0.0, theme::FG_TEXT(), &mut areas);
-                let below_y = tr.y + (pc.row as f32 + 1.0) * rowh;
+                let below_y = (split + rowh).max(tr.y);
                 let clip_b = Rect {
                     x: tr.x,
                     y: below_y,
                     w: tr.w,
                     h: (tr.y + tr.h - below_y).max(0.0),
                 };
-                ui.sidebar.draw_at(clip_b, tr.y + rowh, theme::FG_TEXT(), &mut areas);
+                // The rows after the create row keep their natural positions; draw the
+                // buffer shifted so row (pc.row+1) lands at `below_y`'s logical slot.
+                ui.sidebar.draw_at(clip_b, stop + rowh, theme::FG_TEXT(), &mut areas);
             } else {
-                ui.sidebar.draw(tr, theme::FG_TEXT(), &mut areas);
+                ui.sidebar.draw_at(tr, tr.y - sy, theme::FG_TEXT(), &mut areas);
             }
         } else if let Some(ep) = (app.sidebar_view == SidebarView::Extensions)
             .then(|| app.extensions_panel.as_ref())

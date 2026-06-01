@@ -7,21 +7,28 @@
 // (`gpu.create_input`) stays in `gpu` since it's a glyph buffer.
 
 use crate::gpu::GpuState;
+use crate::widgets::{ScrollOpts, ScrollView};
 use crate::workspace::Workspace;
 use crate::{ContextMenu, PendingCreate};
 
-#[derive(Default)]
 pub struct ExplorerPanel {
     /// Inline new-file / new-folder / rename field, when active.
     pub creating: Option<PendingCreate>,
     /// Right-click context menu over the tree, when open.
     pub context_menu: Option<ContextMenu>,
     pub hovered_menu_item: Option<usize>,
+    /// Vertical scroll for the file tree (content can exceed the viewport).
+    pub scroll: ScrollView,
 }
 
 impl ExplorerPanel {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            creating: None,
+            context_menu: None,
+            hovered_menu_item: None,
+            scroll: ScrollView::new(ScrollOpts::vertical()),
+        }
     }
 
     /// Start an inline create relative to the current tree selection: inside the

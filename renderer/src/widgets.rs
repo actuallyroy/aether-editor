@@ -1124,10 +1124,16 @@ impl ListView {
 
     /// Row index under `p` within `region`, bounded to `count` rows.
     pub fn row_at(&self, region: Rect, p: (f32, f32), count: usize) -> Option<usize> {
+        self.row_at_scrolled(region, 0.0, p, count)
+    }
+
+    /// Row under `p` when the list is scrolled by `scroll_y` (content shifted up).
+    /// `region` is the visible viewport (used for the bounds check).
+    pub fn row_at_scrolled(&self, region: Rect, scroll_y: f32, p: (f32, f32), count: usize) -> Option<usize> {
         if !region.contains(p) {
             return None;
         }
-        let idx = ((p.1 - region.y) / self.row_h()) as usize;
+        let idx = ((p.1 - region.y + scroll_y) / self.row_h()) as usize;
         (idx < count).then_some(idx)
     }
 

@@ -400,9 +400,12 @@ impl App {
 
         let new_tree = if self.sidebar_visible {
             self.gpu.as_ref().and_then(|gpu| {
-                gpu.ui
-                    .sidebar
-                    .row_at(layout.tree_region(), p, self.workspace.tree.nodes.len())
+                gpu.ui.sidebar.row_at_scrolled(
+                    layout.tree_region(),
+                    self.explorer.scroll.offset().1,
+                    p,
+                    self.workspace.tree.nodes.len(),
+                )
             })
         } else {
             None
@@ -553,6 +556,15 @@ impl App {
         }
         if term_thumb {
             over_scroll_thumb = true;
+        }
+        if self.sidebar_visible && self.sidebar_view == SidebarView::Explorer {
+            let inside = layout.tree_region().contains(p);
+            if self.explorer.scroll.hover(inside) {
+                changed = true;
+            }
+            if inside && self.explorer.scroll.cursor(p).is_some() {
+                over_scroll_thumb = true;
+            }
         }
         if self.sidebar_visible && self.sidebar_view == SidebarView::Search {
             if let Some(sp) = self.search.as_mut() {
@@ -830,9 +842,12 @@ impl App {
             return;
         }
         let target = self.gpu.as_ref().and_then(|g| {
-            g.ui
-                .sidebar
-                .row_at(layout.tree_region(), (x, y), self.workspace.tree.nodes.len())
+            g.ui.sidebar.row_at_scrolled(
+                layout.tree_region(),
+                self.explorer.scroll.offset().1,
+                (x, y),
+                self.workspace.tree.nodes.len(),
+            )
         });
         self.selected_tree = target;
         self.explorer.open_menu((x, y), target);
@@ -2159,10 +2174,18 @@ impl App {
         }
 
         if self.sidebar_visible && layout.sidebar.contains((x, y)) {
+            // Tree scrollbar thumb/track press claims the click before row selection.
+            if self.sidebar_view == SidebarView::Explorer && self.explorer.scroll.press((x, y)) {
+                self.redraw();
+                return;
+            }
             let row = self.gpu.as_ref().and_then(|gpu| {
-                gpu.ui
-                    .sidebar
-                    .row_at(layout.tree_region(), (x, y), self.workspace.tree.nodes.len())
+                gpu.ui.sidebar.row_at_scrolled(
+                    layout.tree_region(),
+                    self.explorer.scroll.offset().1,
+                    (x, y),
+                    self.workspace.tree.nodes.len(),
+                )
             });
             if let Some(idx) = row {
                 self.selected_tree = Some(idx);
@@ -2320,6 +2343,13 @@ impl App {
                 }
             }
         }
+        // File-tree scrollbar thumb drag.
+        if self.mouse_pressed && self.explorer.scroll.is_dragging() {
+            if self.explorer.scroll.drag((x, y)) {
+                self.redraw();
+            }
+            return;
+        }
         if self.detail.ext_detail_scroll.is_dragging() && self.mouse_pressed {
             if self.detail.ext_detail_scroll.drag((x, y)) {
                 self.redraw();
@@ -2371,6 +2401,7 @@ impl App {
         self.terminal.split.release();
         self.terminal.release_scrolls();
         self.detail.ext_detail_scroll.release();
+        self.explorer.scroll.release();
         if let Some(ep) = self.extensions_panel.as_mut() {
             ep.on_release();
         }
@@ -2390,6 +2421,14 @@ impl App {
         if self.terminal.on_scroll(p, &layout, dy) {
             self.redraw();
             return;
+        }
+        // File tree scrolls when the cursor is over the tree region.
+        if self.sidebar_visible && self.sidebar_view == SidebarView::Explorer {
+            let region = layout.tree_region();
+            if region.contains(p) && self.explorer.scroll.on_wheel(0.0, dy) {
+                self.redraw();
+                return;
+            }
         }
         // Extensions list scrolls when the cursor is over its region (the panel
         // owns the ScrollView; metrics are set each frame in render).
