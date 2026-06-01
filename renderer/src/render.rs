@@ -278,12 +278,15 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 }
                 spans.push((format!("{}\n", node.name), ui_attrs));
             }
+            // Lay the buffer out tall enough for every row (not just the visible
+            // viewport) so scrolling past the first screenful isn't clipped.
+            let full_h = app.workspace.tree.nodes.len() as f32 * theme::TREE_ROW_HEIGHT() + 200.0;
             gpu.ui.sidebar.set_rich(
                 fs,
                 &sidebar_key,
                 &spans,
                 layout.sidebar.w,
-                layout.sidebar.h.max(800.0),
+                full_h.max(layout.sidebar.h),
             );
         }
 
