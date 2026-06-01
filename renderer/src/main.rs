@@ -17,6 +17,7 @@ mod feedback_upload;
 mod gpu;
 mod icon;
 mod git;
+mod highlight;
 mod layout;
 mod lsp;
 mod markdown;

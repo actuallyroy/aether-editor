@@ -76,9 +76,22 @@ pub struct Document {
     pub diagnostics: Vec<crate::lsp::Diagnostic>, // current LSP diagnostics for this doc
     pub lsp_dirty: bool,                 // text changed since the last didChange was sent
     pub lsp_open: bool,                  // a didOpen has been sent to a server for this doc
+    hl: Option<crate::highlight::LineCache>, // syntect incremental highlighter (None = no grammar)
+    hl_dirty_from: usize,                // lowest line changed since the last highlight (usize::MAX = none)
 }
 
-fn apply_buffer_text(buffer: &mut Buffer, fs: &mut FontSystem, text: &str, lines: usize, lang: Lang, ext: &str, wrap_width: Option<f32>) {
+/// Set the buffer's metrics/wrap/size and its (rich) text. `spans` are precomputed
+/// by the caller (via the syntect `LineCache`); when `None`, falls back to markdown
+/// line styling or plain text.
+fn apply_buffer_text(
+    buffer: &mut Buffer,
+    fs: &mut FontSystem,
+    text: &str,
+    lines: usize,
+    lang: Lang,
+    wrap_width: Option<f32>,
+    spans: Option<Vec<(String, Attrs<'static>)>>,
+) {
     // Pick up the current editor font size / line height (driven by settings).
     buffer.set_metrics(fs, Metrics::new(theme::FONT_SIZE(), theme::LINE_HEIGHT()));
     // editor.wordWrap: Some(width) wraps at that width; None = unbounded (no wrap).
@@ -86,11 +99,8 @@ fn apply_buffer_text(buffer: &mut Buffer, fs: &mut FontSystem, text: &str, lines
     let h = (lines as f32 + 2.0) * theme::LINE_HEIGHT() + 200.0;
     buffer.set_size(fs, wrap_width, Some(h));
     let mono = Attrs::new().family(Family::Name(theme::MONO_FAMILY()));
-    // An installed extension grammar (parsed natively) takes priority for its
-    // file types; then markdown; then tree-sitter; else plain.
-    let spans = crate::textmate::spans_for(ext, text)
-        .or_else(|| (lang == Lang::Markdown).then(|| md_spans(text)))
-        .or_else(|| syntax::highlight_spans(lang, text));
+    // syntect spans (Layer 1) if available; else markdown line styling; else plain.
+    let spans = spans.or_else(|| (lang == Lang::Markdown).then(|| md_spans(text)));
     if let Some(spans) = spans {
         buffer.set_rich_text(
             fs,
@@ -164,7 +174,10 @@ impl Document {
         } else {
             crate::settings::eol()
         };
-        apply_buffer_text(&mut buffer, fs, &display, display.matches('\n').count(), lang, &ext, wrap_width);
+        // Layer-1 highlighter: a syntect grammar for this file type (None → plain/markdown).
+        let mut hl = crate::highlight::LineCache::new(&ext);
+        let spans = hl.as_mut().map(|h| h.highlight(&display, 0));
+        apply_buffer_text(&mut buffer, fs, &display, display.matches('\n').count(), lang, wrap_width, spans);
         let name = match &path {
             Some(p) => p
                 .file_name()
@@ -197,6 +210,8 @@ impl Document {
             diagnostics: Vec::new(),
             lsp_dirty: false,
             lsp_open: false,
+            hl,
+            hl_dirty_from: usize::MAX,
         }
     }
 
@@ -246,6 +261,8 @@ impl Document {
             diagnostics: Vec::new(),
             lsp_dirty: false,
             lsp_open: false,
+            hl: None,
+            hl_dirty_from: usize::MAX,
         }
     }
 
@@ -284,7 +301,7 @@ impl Document {
         let mk = |fs: &mut FontSystem, text: &str| {
             let mut b = Buffer::new(fs, Metrics::new(theme::FONT_SIZE(), theme::LINE_HEIGHT()));
             let display = text.replace('\r', "");
-            apply_buffer_text(&mut b, fs, &display, display.matches('\n').count(), Lang::PlainText, "", None);
+            apply_buffer_text(&mut b, fs, &display, display.matches('\n').count(), Lang::PlainText, None, None);
             b
         };
         let buffer = mk(fs, &diff.left_text);
@@ -314,6 +331,8 @@ impl Document {
             diagnostics: Vec::new(),
             lsp_dirty: false,
             lsp_open: false,
+            hl: None,
+            hl_dirty_from: usize::MAX,
         }
     }
 
@@ -410,8 +429,17 @@ impl Document {
         let lines = self.rope.len_lines();
         let t_str = t0.elapsed();
         let t1 = std::time::Instant::now();
-        apply_buffer_text(&mut self.buffer, fs, &text, lines, self.lang, &self.ext, self.wrap_width);
+        // Layer-1 highlight, incrementally from the lowest edited line (usize::MAX =
+        // no text change since last highlight → returns cached spans, no re-tokenize).
+        let dirty = std::mem::replace(&mut self.hl_dirty_from, usize::MAX);
+        let spans = self.hl.as_mut().map(|h| h.highlight(&text, dirty));
+        apply_buffer_text(&mut self.buffer, fs, &text, lines, self.lang, self.wrap_width, spans);
         crate::perf::log(&format!("reshape({lines} lines): to_string {:?}, highlight+shape {:?}", t_str, t1.elapsed()));
+    }
+
+    /// Force a full re-highlight on the next reshape (e.g. after a theme change).
+    pub fn invalidate_highlight(&mut self) {
+        self.hl_dirty_from = 0;
     }
 
     /// Replace the entire document from an external on-disk change (e.g. Replace
@@ -457,6 +485,9 @@ impl Document {
         // (App sends it debounced from the idle tick).
         self.version += 1;
         self.lsp_dirty = true;
+        // Highlight: re-tokenize only from the edited line forward on the next reshape.
+        let edited_line = self.rope.byte_to_line(at_byte.min(self.rope.len_bytes()));
+        self.hl_dirty_from = self.hl_dirty_from.min(edited_line);
     }
 
     /// `file://` URI for this document, if it has a path.

@@ -1,6 +1,6 @@
 [package]
 name = "nova-renderer"
-version = "0.1.24"
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -27,6 +27,9 @@ vte = "0.13"
 ropey = "1.6"
 rquickjs = "0.8"
 serde_json = "1.0.150"
+# VS Code-style TextMate highlighting (pure-Rust fancy-regex backend — no C deps,
+# keeps the cross-platform release matrix safe). Bundles common-language syntaxes.
+syntect = { version = "5", default-features = false, features = ["parsing", "regex-fancy", "default-syntaxes"] }
 tree-sitter = "0.24"
 tree-sitter-highlight = "0.24"
 tree-sitter-json = "0.23"
