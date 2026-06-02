@@ -586,6 +586,29 @@ impl Document {
         line_start + byte
     }
 
+    /// The diagnostic message under a buffer-relative point (for hover tooltips),
+    /// if the point lands within a diagnostic's range. `buf_x/buf_y` are relative to
+    /// the text's top-left (caller subtracts the editor pad + adds scroll).
+    pub fn diagnostic_at(&self, buf_x: f32, buf_y: f32) -> Option<String> {
+        if self.diagnostics.is_empty() {
+            return None;
+        }
+        let hit = self.buffer.hit(buf_x, buf_y)?;
+        let line = hit.line;
+        if line >= self.rope.len_lines() {
+            return None;
+        }
+        let byte = self.rope.line_to_byte(line) + hit.index.min(self.rope.line(line).len_bytes());
+        let mut msgs: Vec<&str> = Vec::new();
+        for d in &self.diagnostics {
+            let (lo, hi) = self.diag_byte_range(d);
+            if byte >= lo && byte < hi.max(lo + 1) {
+                msgs.push(d.message.trim());
+            }
+        }
+        (!msgs.is_empty()).then(|| msgs.join("\n"))
+    }
+
     /// Absolute byte (lo, hi) range of a diagnostic, for highlight rendering.
     pub fn diag_byte_range(&self, d: &crate::lsp::Diagnostic) -> (usize, usize) {
         (self.lsp_byte(d.start_line, d.start_char), self.lsp_byte(d.end_line, d.end_char))

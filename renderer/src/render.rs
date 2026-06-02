@@ -385,6 +385,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         } else {
             ("Nova".to_string(), String::new())
         };
+        // Hovering a diagnostic squiggle surfaces its message in place of the path.
+        let status_text = match &app.hover_tip {
+            Some((msg, ..)) => format!("  ⚠ {}", msg.replace('\n', "  •  ")),
+            None => status_text,
+        };
         gpu.ui.status.set(fs, &status_text, theme::UI_FAMILY());
         gpu.ui.status_right.set(fs, &status_right_text, theme::UI_FAMILY());
         gpu.ui.zoom_pct.set(fs, &format!("{}%", (theme::ui_zoom() * 100.0).round() as i32), theme::UI_FAMILY());

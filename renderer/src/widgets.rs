@@ -1081,6 +1081,9 @@ impl ListView {
         }
         self.epoch = theme::shape_epoch();
         self.buffer.set_metrics(fs, Metrics::new(theme::UI_FONT_SIZE(), theme::UI_LINE_HEIGHT()));
+        // One row per line: never wrap (long names clip at the row, not spill to a
+        // second line and misalign the list).
+        self.buffer.set_wrap(fs, Wrap::None);
         self.buffer.set_size(fs, Some(w), Some(h));
         self.buffer.set_text(
             fs,
@@ -1098,6 +1101,7 @@ impl ListView {
         }
         self.epoch = theme::shape_epoch();
         self.buffer.set_metrics(fs, Metrics::new(theme::UI_FONT_SIZE(), theme::UI_LINE_HEIGHT()));
+        self.buffer.set_wrap(fs, Wrap::None); // one row per line (see set_text)
         self.buffer.set_size(fs, Some(w), Some(h));
         let default = Attrs::new()
             .family(Family::Name(theme::UI_FAMILY()))

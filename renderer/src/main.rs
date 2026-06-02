@@ -197,6 +197,9 @@ pub(crate) struct App {
     pub(crate) hovered_tab: Option<usize>,
     pub(crate) hovered_tab_close: Option<usize>,
     pub(crate) hovered_tree: Option<usize>,
+    /// Diagnostic hover tooltip: (message, screen x, screen y) when the pointer rests
+    /// over a diagnostic range in the editor.
+    pub(crate) hover_tip: Option<(String, f32, f32)>,
     pub(crate) hovered_activity: Option<usize>,
     pub(crate) hovered_titlebtn: Option<usize>,
     pub(crate) hovered_search: bool,
@@ -283,6 +286,7 @@ impl App {
             hovered_tab: None,
             hovered_tab_close: None,
             hovered_tree: None,
+            hover_tip: None,
             hovered_activity: None,
             hovered_titlebtn: None,
             hovered_search: false,
@@ -560,6 +564,20 @@ impl App {
                 over_scroll_thumb = true;
             }
         }
+        // Diagnostic hover tooltip: the message under the pointer, if over a squiggle.
+        let new_tip = if ed_inside && !over_scroll_thumb {
+            self.workspace.active_doc().and_then(|d| {
+                let bx = p.0 - (layout.editor_text.x + theme::EDITOR_PAD()) + d.scroll_x();
+                let by = p.1 - (layout.editor_text.y + theme::EDITOR_PAD()) + d.scroll_y();
+                d.diagnostic_at(bx, by).map(|msg| (msg, p.0, p.1))
+            })
+        } else {
+            None
+        };
+        if new_tip.as_ref().map(|t| &t.0) != self.hover_tip.as_ref().map(|t| &t.0) {
+            changed = true;
+        }
+        self.hover_tip = new_tip;
         let (term_changed, term_thumb) = self.terminal.hover_panes(p, &layout);
         if term_changed {
             changed = true;
