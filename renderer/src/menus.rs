@@ -58,7 +58,7 @@ const RUN: &[Entry] = &[e("Toggle Terminal", Cmd(ToggleTerminal))];
 const TERMINAL: &[Entry] = &[e("New Terminal", Cmd(ToggleTerminal))];
 
 const HELP: &[Entry] = &[
-    e("About Nova", About),
+    e("About Aether", About),
     e("Check for Updates…", CheckUpdate),
     e("Send Feedback / Report Issue…", Feedback),
     e("Show All Commands", Palette),

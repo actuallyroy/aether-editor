@@ -1,6 +1,6 @@
 // A minimal TextMate-grammar interpreter: parses a VSCode `*.tmLanguage.json`
 // and tokenizes text line-by-line via its `match` patterns + capture scopes,
-// mapping scopes to Nova's theme token colors. This is the "parse the extension's
+// mapping scopes to Aether's theme token colors. This is the "parse the extension's
 // grammar and run it in Rust" path — no JS engine needed.
 //
 // Scope: top-level `match` rules with optional `captures` (covers rainbow-csv and
@@ -64,7 +64,7 @@ impl Grammar {
     }
 }
 
-/// Map a TextMate scope to a Nova theme color (by leading standard segment).
+/// Map a TextMate scope to a Aether theme color (by leading standard segment).
 fn scope_color(scope: &str) -> Color {
     let s = scope;
     if s.starts_with("comment") {

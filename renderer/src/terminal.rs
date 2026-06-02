@@ -700,7 +700,7 @@ impl Terminal {
     }
 
     /// True when a full-screen (alt-screen) app is running — it owns scrolling, so
-    /// the wheel should be forwarded to it rather than scrolling Nova's scrollback.
+    /// the wheel should be forwarded to it rather than scrolling Aether's scrollback.
     pub fn is_alt(&self) -> bool {
         self.grid.alt.is_some()
     }

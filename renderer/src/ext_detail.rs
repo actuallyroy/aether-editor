@@ -198,7 +198,7 @@ impl ExtensionDetail {
         let status = if installed {
             "Installed"
         } else if supported {
-            "Supported in Nova"
+            "Supported in Aether"
         } else {
             "Needs runtime"
         };

@@ -1,5 +1,5 @@
 // Reads VSCode extensions installed under ~/.vscode/extensions and classifies
-// which ones Nova can support. Tier-1 declarative contributions (color themes,
+// which ones Aether can support. Tier-1 declarative contributions (color themes,
 // grammars, snippets, languages) are "supported"; extensions that need a JS host
 // or webviews are not (yet).
 
@@ -64,7 +64,7 @@ pub fn open_ext_view(
         OpenExt::Remote(i) => {
             let e = remote.get(i)?;
             let name = if e.display.is_empty() { e.name.clone() } else { e.display.clone() };
-            // Installed iff Nova's own store has this exact marketplace id. Nova wrote
+            // Installed iff Aether's own store has this exact marketplace id. Aether wrote
             // the folder name as `namespace.name`, so the slug matches `e.id()` exactly —
             // no fragile display-name comparison across two registries.
             let installed = extensions.iter().any(|x| x.slug.eq_ignore_ascii_case(&e.id()));
@@ -106,7 +106,7 @@ pub struct ThemeDef {
 pub struct Extension {
     pub name: String,
     /// Marketplace id (`namespace.name`, lowercased) derived from the install
-    /// folder name Nova wrote — the stable key for matching against search results.
+    /// folder name Aether wrote — the stable key for matching against search results.
     pub slug: String,
     pub publisher: String,
     pub description: String,
@@ -119,7 +119,7 @@ pub struct Extension {
     pub icon_path: Option<PathBuf>, // raster icon shipped by the extension, if any
     pub readme_path: Option<PathBuf>, // README.md shipped by the extension, if any
     pub changelog_path: Option<PathBuf>, // CHANGELOG.md shipped by the extension, if any
-    pub installed: bool, // user clicked Install in Nova this session
+    pub installed: bool, // user clicked Install in Aether this session
 }
 
 impl Extension {
@@ -136,25 +136,25 @@ impl Extension {
     }
 }
 
-/// Nova's own extension store, `~/.nova/extensions`. Distinct from VS Code's so
-/// the Extensions view + Installed/Install state reflect only what Nova installed,
+/// Aether's own extension store, `~/.aether/extensions`. Distinct from VS Code's so
+/// the Extensions view + Installed/Install state reflect only what Aether installed,
 /// not whatever the user's separate VS Code install happens to have on disk.
 /// `None` until something is installed (used by the sidebar scan).
 pub(crate) fn extensions_dir() -> Option<PathBuf> {
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
-    let dir = PathBuf::from(home).join(".nova").join("extensions");
+    let dir = PathBuf::from(home).join(".aether").join("extensions");
     dir.is_dir().then_some(dir)
 }
 
-/// The Nova extensions directory, creating it if needed (for installs).
+/// The Aether extensions directory, creating it if needed (for installs).
 pub fn dir() -> Option<PathBuf> {
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
-    let dir = PathBuf::from(home).join(".nova").join("extensions");
+    let dir = PathBuf::from(home).join(".aether").join("extensions");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }
 
-/// Remove an installed extension from Nova's store by its marketplace `slug`
+/// Remove an installed extension from Aether's store by its marketplace `slug`
 /// (`namespace.name`). Deletes every `<slug>-<version>/` folder for it. A running
 /// language server already loaded from the folder keeps going until the next launch.
 pub fn uninstall(slug: &str) -> std::io::Result<()> {
@@ -249,7 +249,7 @@ fn parse(v: &Value, ext_dir: &std::path::Path) -> Option<Extension> {
         if d.starts_with('%') { String::new() } else { d.to_string() }
     };
     let version = v["version"].as_str().unwrap_or("").to_string();
-    // Nova installs to `<namespace>.<name>-<version>/`; recover the marketplace id
+    // Aether installs to `<namespace>.<name>-<version>/`; recover the marketplace id
     // (`namespace.name`) by stripping the trailing version from the folder name.
     let slug = ext_dir
         .file_name()

@@ -13,7 +13,7 @@ const UPLOAD_PRESET: &str = "ml_default";
 /// Upload PNG bytes to Cloudinary (unsigned). Returns the `secure_url` on success.
 fn upload_png(png: &[u8]) -> Result<String, String> {
     let url = format!("https://api.cloudinary.com/v1_1/{CLOUD_NAME}/image/upload");
-    let boundary = "----novaFeedbackBoundary7MA4YWxkTrZu0gW";
+    let boundary = "----aetherFeedbackBoundary7MA4YWxkTrZu0gW";
 
     // Build the multipart/form-data body by hand (ureq has no multipart helper):
     // an `upload_preset` text field + the binary `file` part.
@@ -67,7 +67,7 @@ pub fn submit_async(
             }
         }
         // 2) File the issue.
-        const REPO: &str = "actuallyroy/nova-editor";
+        const REPO: &str = "actuallyroy/aether-editor";
         let mut cmd = std::process::Command::new(&gh_program);
         cmd.args(["issue", "create", "--repo", REPO, "--title", &title, "--body", &body]);
         #[cfg(windows)]

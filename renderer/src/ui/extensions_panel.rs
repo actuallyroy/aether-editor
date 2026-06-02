@@ -99,14 +99,13 @@ impl ExtensionsPanel {
             // Marketplace results (already filtered by the remote query).
             for (idx, e) in ext_remote.iter().enumerate() {
                 let name = if e.display.is_empty() { e.name.clone() } else { e.display.clone() };
-                // Mark results already in Nova's store by stable marketplace id.
+                // Mark results already in Aether's store by stable marketplace id.
                 let installed = extensions.iter().any(|x| x.slug.eq_ignore_ascii_case(&e.id()));
                 let meta = format!("{} · {}", e.namespace, if installed { "Installed" } else { "Marketplace" });
                 let desc: String = e.description.chars().take(80).collect();
-                let uv = e
-                    .icon
-                    .as_ref()
-                    .and_then(|b| gpu.icon_atlas.load_bytes(&gpu.queue, &e.id(), b));
+                // Icon is loaded into the atlas lazily (WorkerMsg::ExtIcon); read whatever
+                // has arrived so far — None shows the placeholder until it streams in.
+                let uv = gpu.icon_atlas.get(&e.id());
                 visible.push(idx);
                 specs.push((name, meta, desc, uv));
             }

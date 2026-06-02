@@ -1,4 +1,4 @@
-// A minimal Language Server Protocol (LSP) client. Nova speaks LSP to a language
+// A minimal Language Server Protocol (LSP) client. Aether speaks LSP to a language
 // server it launches as a child process (stdio, Content-Length framed JSON-RPC),
 // so language-server-backed VS Code extensions (ESLint first) work without a
 // Node extension host. No async runtime — blocking I/O on dedicated threads, with
@@ -77,7 +77,7 @@ pub fn path_to_uri(path: &Path) -> String {
 
 /// Compare two `file://` URIs for the same file, tolerating the normalization a
 /// language server applies (drive-letter case on Windows, `%3A`/`%20` encoding,
-/// slash direction). Without this, ESLint's `file:///e:/…` won't match Nova's
+/// slash direction). Without this, ESLint's `file:///e:/…` won't match Aether's
 /// `file:///E:/…` and diagnostics get silently dropped.
 pub fn same_uri(a: &str, b: &str) -> bool {
     fn norm(u: &str) -> String {
@@ -120,7 +120,7 @@ pub fn language_id(ext: &str) -> Option<&'static str> {
 // struct — adding rust-analyzer / pyright / gopls / clangd is a new `ServerSpec`
 // entry, no new code paths. `resolve` finds the executable + args (None ⇒ skip),
 // `init_options`/`config_reply` carry any server-specific protocol bits, and the
-// `pull_*` flags say which features Nova requests (diagnostics / semantic tokens).
+// `pull_*` flags say which features Aether requests (diagnostics / semantic tokens).
 
 pub struct ServerSpec {
     pub name: &'static str,
@@ -293,7 +293,7 @@ pub fn typescript_ls_cli() -> Option<PathBuf> {
 /// `initializationOptions` for typescript-language-server (minimal; it auto-detects
 /// tsserver from the workspace or its bundled copy).
 pub fn ts_init_options(_root: &Path) -> Value {
-    json!({ "hostInfo": "nova", "preferences": {} })
+    json!({ "hostInfo": "aether", "preferences": {} })
 }
 
 /// Resolve the `rust-analyzer` binary: PATH, ~/.cargo/bin, rustup, common dirs.
@@ -964,7 +964,7 @@ fn parse_diag_array(arr: Option<&Value>) -> Vec<Diagnostic> {
     out
 }
 
-/// The capabilities Nova advertises. Conservative for Phase 1 (sync + diagnostics);
+/// The capabilities Aether advertises. Conservative for Phase 1 (sync + diagnostics);
 /// hover/completion/codeAction get added as those phases land.
 fn client_capabilities() -> Value {
     json!({
@@ -1007,7 +1007,7 @@ pub fn eslint_init_options(root: &Path) -> Value {
     })
 }
 
-/// The per-document config Nova returns for ESLint's `workspace/configuration`.
+/// The per-document config Aether returns for ESLint's `workspace/configuration`.
 pub fn eslint_config_reply() -> Value {
     json!({
         "validate": "on",

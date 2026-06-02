@@ -1,7 +1,7 @@
 // Auto-update against GitHub Releases. Checks the latest release on a background
 // thread; if newer than the running build, downloads the matching binary and
 // replaces the running executable in place (via the `self_update` crate), then
-// the app offers to restart. Assets are named `nova-<os>-x86_64[.exe]`, so the
+// the app offers to restart. Assets are named `aether-<os>-x86_64[.exe]`, so the
 // target string below matches our release asset naming.
 
 use std::sync::mpsc::Sender;
@@ -9,14 +9,14 @@ use std::sync::mpsc::Sender;
 use crate::marketplace::WorkerMsg;
 
 const OWNER: &str = "actuallyroy";
-const NAME: &str = "nova-editor";
+const NAME: &str = "aether-editor";
 
 pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
 /// Substring our release assets contain for this platform + arch, matching the
-/// workflow's asset names (`nova-windows-x86_64.exe`, `nova-macos-arm64`, …).
+/// workflow's asset names (`aether-windows-x86_64.exe`, `aether-macos-arm64`, …).
 fn target() -> &'static str {
     if cfg!(windows) {
         "windows-x86_64"
@@ -74,7 +74,7 @@ fn install() -> Result<(), Box<dyn std::error::Error>> {
     self_update::backends::github::Update::configure()
         .repo_owner(OWNER)
         .repo_name(NAME)
-        .bin_name("nova")
+        .bin_name("aether")
         .target(target())
         .show_download_progress(false)
         .no_confirm(true)

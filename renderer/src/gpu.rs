@@ -101,7 +101,7 @@ impl GpuState {
         let (device, queue) = adapter
             .request_device(
                 &DeviceDescriptor {
-                    label: Some("nova-device"),
+                    label: Some("aether-device"),
                     ..Default::default()
                 },
                 None,

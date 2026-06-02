@@ -1531,6 +1531,17 @@ impl Splitter {
         self.size
     }
 
+    /// Scale the size + bounds by `factor` (for a zoom change), so a sidebar/panel that
+    /// was N px at one zoom keeps its proportion at the new zoom instead of staying a
+    /// fixed pixel width (which looks tiny once the content scales up).
+    pub fn scale(&mut self, factor: f32) {
+        if factor > 0.0 && (factor - 1.0).abs() > f32::EPSILON {
+            self.size *= factor;
+            self.min *= factor;
+            self.max *= factor;
+        }
+    }
+
     /// Update the clamp bounds (e.g. when the window or zoom changes) and re-clamp
     /// the current size into them. The construction-time bounds are otherwise fixed,
     /// which would cap a zoom-scaled panel at its zoom-1 limit.

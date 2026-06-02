@@ -84,7 +84,7 @@ pub fn build_rows(results: &[FileMatches], collapsed: &HashSet<usize>) -> Vec<Se
 }
 
 /// Directories never worth searching, and a per-file size ceiling.
-const SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".nova", "dist", "build", "out"];
+const SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".aether", "dist", "build", "out"];
 const MAX_FILE_BYTES: u64 = 2_000_000;
 const MAX_TOTAL_MATCHES: usize = 5000;
 const BATCH_FILES: usize = 12;

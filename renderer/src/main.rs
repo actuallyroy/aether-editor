@@ -1,9 +1,9 @@
 // Hide the console window — without this the binary uses the console subsystem
 // and Windows spawns a terminal alongside the GUI. We still capture stderr when
-// we launch nova via a redirected pipe, so no debug visibility is lost.
+// we launch aether via a redirected pipe, so no debug visibility is lost.
 #![windows_subsystem = "windows"]
 
-// Nova — Phase 1 vertical slice with VSCode-shaped UI shell.
+// Aether — Phase 1 vertical slice with VSCode-shaped UI shell.
 // Activity bar, sidebar file tree, tab strip, editor (gutter + text),
 // status bar, command palette (Ctrl+Shift+P), find bar (Ctrl+F).
 
@@ -120,7 +120,7 @@ pub(crate) const MENU_ACTIONS: &[(MenuAction, &str)] = &[
     (MenuAction::CopyPath, "Copy Path"),
 ];
 
-/// Rasterize the bundled Nova logo (SVG) to a window/taskbar icon. The SVG is the
+/// Rasterize the bundled Aether logo (SVG) to a window/taskbar icon. The SVG is the
 /// single source of truth; returns None if rendering fails (icon is non-critical).
 fn app_icon() -> Option<winit::window::Icon> {
     use resvg::{tiny_skia, usvg};
@@ -342,9 +342,15 @@ impl App {
         }
     }
 
+    /// Make the caret solid and restart its blink timer — call on any caret movement
+    /// (keystroke, click) so it doesn't blink out mid-edit. Covers both the editor and
+    /// terminal carets (they blink on separate phases).
     fn reset_blink(&mut self) {
+        let now = Instant::now();
         self.cursor_blink_on = true;
-        self.last_blink = Instant::now();
+        self.last_blink = now;
+        self.term_blink_on = true;
+        self.term_last_blink = now;
     }
 
     fn recompute_hover(&mut self) {
@@ -827,16 +833,8 @@ impl App {
                 let _ = self.workspace.open_file(&prd, &mut gpu.font_system);
             }
         }
-        if self.workspace.documents.is_empty() {
-            let doc = Document::new(
-                None,
-                "Welcome to Nova\n\nUse the sidebar to open files.\nCtrl+Shift+P for command palette.\n"
-                    .to_string(),
-                &mut gpu.font_system,
-            );
-            self.workspace.documents.push(doc);
-            self.workspace.active = Some(0);
-        }
+        // No welcome/Untitled doc on launch — if nothing was opened, show an empty
+        // editor. The user opens files from the sidebar or command palette.
     }
 
     fn layout(&self) -> Layout {
@@ -1019,7 +1017,7 @@ impl App {
             menus::MenuCmd::About => {
                 self.close_app_menu();
                 self.show_info_dialog(&format!(
-                    "Nova v{} · {} ({})",
+                    "Aether v{} · {} ({})",
                     update::current_version(),
                     std::env::consts::OS,
                     std::env::consts::ARCH
@@ -1073,7 +1071,7 @@ impl App {
         }
     }
 
-    /// "Install" a supported extension into Nova. For color themes this loads and
+    /// "Install" a supported extension into Aether. For color themes this loads and
     /// applies the theme immediately; other supported kinds just mark installed
     /// (their declarative contributions aren't loaded yet).
     fn install_extension(&mut self, i: usize) {
@@ -1239,7 +1237,7 @@ impl App {
     /// File a GitHub issue via the user's `gh` CLI login. Falls back to opening the
     /// prefilled new-issue page in the browser if `gh` isn't available.
     fn submit_issue(&mut self, title: String, body: String) {
-        const REPO: &str = "actuallyroy/nova-editor";
+        const REPO: &str = "actuallyroy/aether-editor";
         let mut cmd = std::process::Command::new(gh_program());
         cmd.args(["issue", "create", "--repo", REPO, "--title", &title, "--body", &body]);
         #[cfg(windows)]
@@ -1319,7 +1317,7 @@ impl App {
         }
         let Some(ext) = self.ext_remote.get(idx).cloned() else { return };
         let Some(root) = extensions::dir() else {
-            self.show_info_dialog("Couldn't locate the extensions folder (~/.nova/extensions).");
+            self.show_info_dialog("Couldn't locate the extensions folder (~/.aether/extensions).");
             return;
         };
         let label = if ext.display.is_empty() { ext.name.clone() } else { ext.display.clone() };
@@ -1346,7 +1344,7 @@ impl App {
         }
     }
 
-    /// Uninstall whatever the detail page currently shows: delete it from Nova's
+    /// Uninstall whatever the detail page currently shows: delete it from Aether's
     /// store, rescan, refresh the panel, and re-open the detail so it flips to
     /// "Install". A running language server keeps going until the next launch.
     fn uninstall_open(&mut self) {
@@ -1569,7 +1567,7 @@ impl App {
     /// Prompt to install an available update.
     fn show_update_prompt(&mut self, version: &str) {
         let msg = format!(
-            "Nova v{version} is available (you have v{}). Install and restart?",
+            "Aether v{version} is available (you have v{}). Install and restart?",
             update::current_version()
         );
         if let Some(g) = self.gpu.as_mut() {
@@ -1612,7 +1610,7 @@ impl App {
     fn theme_items(&self, only_ext: Option<usize>) -> Vec<commands::PickItem> {
         let mut items = Vec::new();
         if only_ext.is_none() {
-            items.push(commands::PickItem { label: "Nova Dark".into(), detail: "dark · built-in".into() });
+            items.push(commands::PickItem { label: "Aether Dark".into(), detail: "dark · built-in".into() });
         }
         for (idx, e) in self.extensions.iter().enumerate() {
             if only_ext.map_or(false, |o| o != idx) {
@@ -1674,6 +1672,22 @@ impl App {
     fn exec_command(&mut self, cmd: Command) {
         match cmd {
             Command::Save => {
+                // Untitled docs (no path) can't be written — prompt Save As first,
+                // assign the chosen path, then fall through to the normal save.
+                let needs_path = self.workspace.active_doc().map_or(false, |d| d.path.is_none());
+                if needs_path {
+                    let start_dir = self.workspace.tree.root.clone();
+                    match rfd::FileDialog::new().set_directory(&start_dir).save_file() {
+                        Some(path) => {
+                            if let (Some(g), Some(d)) =
+                                (self.gpu.as_mut(), self.workspace.active_doc_mut())
+                            {
+                                d.set_path(path, &mut g.font_system);
+                            }
+                        }
+                        None => return, // user cancelled
+                    }
+                }
                 let saved_path = self.workspace.active_doc().and_then(|d| d.path.clone());
                 if let Some(d) = self.workspace.active_doc_mut() {
                     let _ = d.save();
@@ -1762,7 +1776,7 @@ impl App {
     }
 
     /// Persist machine-managed session state (zoom + last workspace) to
-    /// `~/.nova/state.json` so the next launch restores it.
+    /// `~/.aether/state.json` so the next launch restores it.
     fn persist_state(&self) {
         state::State {
             zoom: Some(theme::ui_zoom()),
@@ -1789,6 +1803,12 @@ impl App {
     /// gutter. tabSize/insertSpaces/cursorBlinking are read on demand elsewhere.
     /// Set the global UI zoom and re-shape every cached text buffer at the new size.
     fn set_zoom(&mut self, zoom: f32) {
+        // Rescale the draggable panels so they keep their proportion at the new zoom
+        // (the sidebar/terminal splitters store raw pixels set at zoom 1).
+        let prev = theme::ui_zoom();
+        if prev > 0.0 {
+            self.sidebar_split.scale(zoom / prev);
+        }
         theme::set_ui_zoom(zoom); // bumps the shape epoch
         if let Some(g) = self.gpu.as_mut() {
             for d in self.workspace.documents.iter_mut() {
@@ -1864,7 +1884,7 @@ impl App {
     /// Drive language-server document sync from the idle tick (delegated to the
     /// manager, which owns the open/change/pull logic).
     fn sync_lsp(&mut self) {
-        // Language servers come only from Nova's own store (+ PATH for standalone
+        // Language servers come only from Aether's own store (+ PATH for standalone
         // binaries). We deliberately do NOT scan the user's VS Code extensions.
         let Some(ext_dir) = crate::extensions::extensions_dir() else { return };
         self.lsp.sync(&mut self.workspace.documents, &self.cwd, &[ext_dir], &self.worker_tx);
@@ -1883,10 +1903,10 @@ impl App {
         self.redraw();
     }
 
-    /// Apply a color theme by its `workbench.colorTheme` name. "Nova Dark" is the
+    /// Apply a color theme by its `workbench.colorTheme` name. "Aether Dark" is the
     /// built-in default; other names match against installed theme extensions.
     fn apply_theme_by_name(&self, name: &str) {
-        if name.eq_ignore_ascii_case("Nova Dark") || name.is_empty() {
+        if name.eq_ignore_ascii_case("Aether Dark") || name.is_empty() {
             theme::set(theme::Theme::dark());
             return;
         }
@@ -3340,6 +3360,17 @@ impl ApplicationHandler for App {
                         self.redraw();
                     }
                 }
+                WorkerMsg::ExtIcon { gen, id, bytes } => {
+                    // A lazily-fetched search-result icon arrived: cache it in the atlas
+                    // and rebuild rows so it appears. Gen-gated to drop stale searches' icons.
+                    if self.extensions_panel.as_ref().map_or(false, |ep| ep.search_gen() == gen) {
+                        if let Some(g) = self.gpu.as_mut() {
+                            g.icon_atlas.load_bytes(&g.queue, &id, &bytes);
+                        }
+                        self.rebuild_ext_rows();
+                        self.redraw();
+                    }
+                }
                 WorkerMsg::Installed { result } => {
                     self.installing = None;
                     match result {
@@ -3579,7 +3610,7 @@ impl ApplicationHandler for App {
             return;
         }
         let attrs = Window::default_attributes()
-            .with_title("Nova")
+            .with_title("Aether")
             .with_decorations(false)
             .with_window_icon(app_icon())
             .with_inner_size(LogicalSize::new(1400.0, 900.0));
@@ -3689,6 +3720,8 @@ impl ApplicationHandler for App {
 
 fn main() -> Result<()> {
     env_logger::init();
+    // Move a legacy ~/.nova config dir to ~/.aether before anything reads config.
+    settings::migrate_legacy_config_dir();
     // Optional path arg: a directory becomes the workspace root; a file is opened
     // (and its parent becomes the root). Falls back to the current directory.
     let arg = std::env::args().nth(1).map(PathBuf::from);

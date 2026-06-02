@@ -417,7 +417,7 @@ impl TerminalPanel {
                 let pane = &mut g.panes[i];
                 if pane.term.is_alt() {
                     // A full-screen app owns scrolling — forward the wheel to it
-                    // (a few notches per tick) instead of Nova's empty scrollback.
+                    // (a few notches per tick) instead of Aether's empty scrollback.
                     let up = dy > 0.0;
                     for _ in 0..3 {
                         pane.term.forward_wheel(up, 1, 1);

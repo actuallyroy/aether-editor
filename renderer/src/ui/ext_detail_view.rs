@@ -96,7 +96,7 @@ impl ExtDetailView {
         }
     }
 
-    /// Build the Features-tab markdown from what Nova knows about the extension.
+    /// Build the Features-tab markdown from what Aether knows about the extension.
     /// Resolves the underlying installed extension — directly for a Local entry, or a
     /// Remote (search) entry that happens to be installed — so an installed extension
     /// shows real features even when opened from search results.
@@ -113,10 +113,10 @@ impl ExtDetailView {
         };
         let mut s = String::new();
         match e.kind {
-            ExtKind::Theme => s.push_str("### Color Theme\nContributes a color theme Nova can apply natively.\n\n"),
-            ExtKind::Grammar => s.push_str("### Syntax Highlighting\nShips TextMate grammars Nova runs natively for syntax coloring.\n\n"),
+            ExtKind::Theme => s.push_str("### Color Theme\nContributes a color theme Aether can apply natively.\n\n"),
+            ExtKind::Grammar => s.push_str("### Syntax Highlighting\nShips TextMate grammars Aether runs natively for syntax coloring.\n\n"),
             ExtKind::Declarative => s.push_str("### Language Support\nContributes snippets / language configuration.\n\n"),
-            ExtKind::Code => s.push_str("### Code Extension\nNeeds the JavaScript extension runtime (not yet supported in Nova).\n\n"),
+            ExtKind::Code => s.push_str("### Code Extension\nNeeds the JavaScript extension runtime (not yet supported in Aether).\n\n"),
         }
         if !e.grammar_paths.is_empty() {
             s.push_str(&format!("- {} grammar file(s)\n", e.grammar_paths.len()));

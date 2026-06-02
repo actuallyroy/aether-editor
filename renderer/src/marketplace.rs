@@ -15,6 +15,7 @@ const BASE: &str = "https://open-vsx.org";
 /// so the UI never blocks on the network.
 pub enum WorkerMsg {
     Search { gen: u64, results: Vec<RemoteExt> },
+    ExtIcon { gen: u64, id: String, bytes: Vec<u8> }, // lazily-fetched search-result icon
     Installed { result: Result<(), String> },
     Readme { gen: u64, text: Option<String> },
     Changelog { gen: u64, text: Option<String> },
@@ -50,7 +51,20 @@ pub enum ImgSource {
 pub fn search_async(tx: Sender<WorkerMsg>, query: String, gen: u64) {
     std::thread::spawn(move || {
         let results = search(&query, 25);
+        // Collect icon URLs before moving `results` into the Search message.
+        let icons: Vec<(String, String)> = results
+            .iter()
+            .take(20)
+            .filter_map(|r| r.icon_url.clone().map(|u| (r.id(), u)))
+            .collect();
+        // Show the list immediately…
         let _ = tx.send(WorkerMsg::Search { gen, results });
+        // …then stream icons in over the shared keep-alive connection.
+        for (id, url) in icons {
+            if let Some(bytes) = get_bytes(&url, 512 * 1024) {
+                let _ = tx.send(WorkerMsg::ExtIcon { gen, id, bytes });
+            }
+        }
     });
 }
 
@@ -113,7 +127,8 @@ pub fn image_async(tx: Sender<WorkerMsg>, key: String, src: ImgSource) {
     });
 }
 
-/// One marketplace search result (icon bytes fetched eagerly, best-effort).
+/// One marketplace search result. The icon is fetched lazily (its URL is kept here;
+/// bytes stream in after the result list shows, via `WorkerMsg::ExtIcon`).
 #[derive(Clone)]
 pub struct RemoteExt {
     pub name: String,
@@ -126,7 +141,7 @@ pub struct RemoteExt {
     pub download_url: Option<String>,
     pub readme_url: Option<String>,
     pub changelog_url: Option<String>,
-    pub icon: Option<Vec<u8>>, // raw PNG/JPG bytes, decoded on the GPU thread
+    pub icon_url: Option<String>, // raster icon URL, fetched lazily per result
 }
 
 impl RemoteExt {
@@ -177,21 +192,18 @@ pub fn search(query: &str, size: usize) -> Vec<RemoteExt> {
     };
     let mut out = Vec::new();
     if let Some(arr) = v["extensions"].as_array() {
-        for (i, e) in arr.iter().enumerate() {
+        for e in arr.iter() {
             let name = e["name"].as_str().unwrap_or("").to_string();
             let namespace = e["namespace"].as_str().unwrap_or("").to_string();
             if name.is_empty() || namespace.is_empty() {
                 continue;
             }
             let files = &e["files"];
-            let icon_url = files.get("icon").and_then(|u| u.as_str());
-            // Only fetch a handful of raster icons to keep search snappy.
-            let icon = icon_url
-                .filter(|u| {
-                    let l = u.to_lowercase();
-                    i < 12 && (l.ends_with(".png") || l.ends_with(".jpg") || l.ends_with(".jpeg"))
-                })
-                .and_then(|u| get_bytes(u, 512 * 1024));
+            // Keep only raster icon URLs (no SVG rasterizer yet); fetched lazily later.
+            let icon_url = files.get("icon").and_then(|u| u.as_str()).filter(|u| {
+                let l = u.to_lowercase();
+                l.ends_with(".png") || l.ends_with(".jpg") || l.ends_with(".jpeg")
+            }).map(String::from);
             out.push(RemoteExt {
                 name,
                 namespace,
@@ -203,7 +215,7 @@ pub fn search(query: &str, size: usize) -> Vec<RemoteExt> {
                 download_url: files.get("download").and_then(|u| u.as_str()).map(String::from),
                 readme_url: files.get("readme").and_then(|u| u.as_str()).map(String::from),
                 changelog_url: files.get("changelog").and_then(|u| u.as_str()).map(String::from),
-                icon,
+                icon_url,
             });
         }
     }

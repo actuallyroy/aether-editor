@@ -383,7 +383,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 ),
             )
         } else {
-            ("Nova".to_string(), String::new())
+            ("Aether".to_string(), String::new())
         };
         // Diagnostic hover is shown as a floating card (see the overlay pass below),
         // not in the status bar — the status bar keeps showing the file path.
@@ -1161,8 +1161,14 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
 
     // Sidebar header + (Explorer tree | Extensions list)
     if app.sidebar_visible {
+        // Reserve the action-icon strip (Explorer only) so the title can't render under
+        // the icons when the sidebar is narrow.
+        let mut hdr = layout.sidebar_header_rect();
+        if app.sidebar_view == SidebarView::Explorer {
+            hdr.w = (hdr.w - (4.0 * theme::zpx(26.0) + theme::zpx(10.0))).max(0.0);
+        }
         ui.sidebar_header
-            .push(layout.sidebar.x + theme::zpx(12.0), layout.sidebar_header_rect(), theme::FG_DIM(), &mut areas);
+            .push(layout.sidebar.x + theme::zpx(12.0), hdr, theme::FG_DIM(), &mut areas);
         let tr = layout.tree_region();
         if app.sidebar_view == SidebarView::Explorer {
             let er = layout.explorer_action_rects();
@@ -1426,7 +1432,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     let capture = app.pending_capture.take();
     let cap_tex = capture.is_some().then(|| {
         gpu.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("nova-capture"),
+            label: Some("aether-capture"),
             size: wgpu::Extent3d {
                 width: gpu.config.width,
                 height: gpu.config.height,
@@ -1445,11 +1451,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         None => frame.texture.create_view(&TextureViewDescriptor::default()),
     };
     let mut encoder = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
-        label: Some("nova-encoder"),
+        label: Some("aether-encoder"),
     });
     {
         let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-            label: Some("nova-pass"),
+            label: Some("aether-pass"),
             color_attachments: &[Some(RenderPassColorAttachment {
                 view: &view,
                 resolve_target: None,
@@ -1517,11 +1523,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             gpu.media.prepare(&gpu.device, &gpu.queue, &detail_img_rects, (cfg_w, cfg_h), now_ms);
             gpu.quad_renderer.prepare(&gpu.device, &gpu.queue, &underlines, &[], (cfg_w, cfg_h));
             let mut enc = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("nova-media-pass"),
+                label: Some("aether-media-pass"),
             });
             {
                 let mut pass = enc.begin_render_pass(&RenderPassDescriptor {
-                    label: Some("nova-media"),
+                    label: Some("aether-media"),
                     color_attachments: &[Some(RenderPassColorAttachment {
                         view: &view,
                         resolve_target: None,
@@ -1590,11 +1596,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             )?;
 
             let mut enc = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("nova-image-pass"),
+                label: Some("aether-image-pass"),
             });
             {
                 let mut pass = enc.begin_render_pass(&RenderPassDescriptor {
-                    label: Some("nova-image"),
+                    label: Some("aether-image"),
                     color_attachments: &[Some(RenderPassColorAttachment {
                         view: &view,
                         resolve_target: None,
@@ -1652,11 +1658,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             &mut gpu.swash_cache,
         )?;
         let mut enc = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
-            label: Some("nova-ext-pass"),
+            label: Some("aether-ext-pass"),
         });
         {
             let mut pass = enc.begin_render_pass(&RenderPassDescriptor {
-                label: Some("nova-ext"),
+                label: Some("aether-ext"),
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -1702,11 +1708,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             &mut gpu.swash_cache,
         )?;
         let mut enc2 = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
-            label: Some("nova-menu-pass"),
+            label: Some("aether-menu-pass"),
         });
         {
             let mut pass = enc2.begin_render_pass(&RenderPassDescriptor {
-                label: Some("nova-menu"),
+                label: Some("aether-menu"),
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -1748,11 +1754,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 &mut gpu.swash_cache,
             )?;
             let mut encm = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("nova-menudd-pass"),
+                label: Some("aether-menudd-pass"),
             });
             {
                 let mut pass = encm.begin_render_pass(&RenderPassDescriptor {
-                    label: Some("nova-menudd"),
+                    label: Some("aether-menudd"),
                     color_attachments: &[Some(RenderPassColorAttachment {
                         view: &view,
                         resolve_target: None,
@@ -1792,11 +1798,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 &mut gpu.swash_cache,
             )?;
             let mut ench = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("nova-hovercard-pass"),
+                label: Some("aether-hovercard-pass"),
             });
             {
                 let mut pass = ench.begin_render_pass(&RenderPassDescriptor {
-                    label: Some("nova-hovercard"),
+                    label: Some("aether-hovercard"),
                     color_attachments: &[Some(RenderPassColorAttachment {
                         view: &view,
                         resolve_target: None,
@@ -1835,11 +1841,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             &mut gpu.swash_cache,
         )?;
         let mut enc3 = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
-            label: Some("nova-dialog-pass"),
+            label: Some("aether-dialog-pass"),
         });
         {
             let mut pass = enc3.begin_render_pass(&RenderPassDescriptor {
-                label: Some("nova-dialog"),
+                label: Some("aether-dialog"),
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -1878,11 +1884,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             &mut gpu.swash_cache,
         )?;
         let mut encf = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
-            label: Some("nova-feedback-pass"),
+            label: Some("aether-feedback-pass"),
         });
         {
             let mut pass = encf.begin_render_pass(&RenderPassDescriptor {
-                label: Some("nova-feedback"),
+                label: Some("aether-feedback"),
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -1922,14 +1928,14 @@ fn capture_texture_png(gpu: &crate::gpu::GpuState, tex: &wgpu::Texture) -> Optio
     let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
     let padded = unpadded.div_ceil(align) * align;
     let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("nova-capture-readback"),
+        label: Some("aether-capture-readback"),
         size: (padded * h) as u64,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
     let mut enc = gpu
         .device
-        .create_command_encoder(&CommandEncoderDescriptor { label: Some("nova-capture-copy") });
+        .create_command_encoder(&CommandEncoderDescriptor { label: Some("aether-capture-copy") });
     enc.copy_texture_to_buffer(
         wgpu::ImageCopyTexture {
             texture: tex,

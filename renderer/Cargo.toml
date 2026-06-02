@@ -1,12 +1,12 @@
 [package]
-name = "nova-renderer"
-version = "0.2.7"
+name = "aether-renderer"
+version = "0.2.8"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "nova"
+name = "aether"
 path = "src/main.rs"
 
 [dependencies]

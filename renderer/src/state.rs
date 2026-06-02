@@ -1,4 +1,4 @@
-// Machine-managed session state, persisted to `~/.nova/state.json`.
+// Machine-managed session state, persisted to `~/.aether/state.json`.
 //
 // This is deliberately separate from `settings.json`: settings are a
 // human-authored JSONC document (with comments + formatting we must not clobber),

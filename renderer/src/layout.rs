@@ -264,7 +264,7 @@ impl Layout {
 
     /// The file-tree list region: the sidebar below the header + root row.
     pub fn tree_region(&self) -> Rect {
-        // The Explorer reserves a row below the header for its root ("NOVA-EDITOR") row.
+        // The Explorer reserves a row below the header for its root ("AETHER-EDITOR") row.
         let top = self.sidebar.y + theme::SIDEBAR_HEADER_H() + theme::TREE_ROW_HEIGHT();
         Rect {
             x: self.sidebar.x,

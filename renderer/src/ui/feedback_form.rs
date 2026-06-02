@@ -89,7 +89,7 @@ impl FeedbackForm {
             l_type: mk(fs, "This is a"),
             l_title: mk(fs, "Title"),
             l_details: mk(fs, "Details"),
-            l_sysinfo: mk(fs, "Include system information (Nova version, OS)"),
+            l_sysinfo: mk(fs, "Include system information (Aether version, OS)"),
             l_screenshot: mk(fs, "Attach a screenshot of the editor"),
             l_submit: mk(fs, "Create on GitHub"),
             l_cancel: mk(fs, "Cancel"),
@@ -381,7 +381,7 @@ impl FeedbackForm {
         let mut body = self.details.text().trim().to_string();
         if self.include_sysinfo {
             body.push_str(&format!(
-                "\n\n---\nNova {} · {} ({})\n{}",
+                "\n\n---\nAether {} · {} ({})\n{}",
                 env!("CARGO_PKG_VERSION"),
                 std::env::consts::OS,
                 std::env::consts::ARCH,

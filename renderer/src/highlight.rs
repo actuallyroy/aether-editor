@@ -1,5 +1,5 @@
 // VS Code-style syntax highlighting (Layer 1): TextMate-family grammars run by
-// `syntect` (pure-Rust fancy-regex backend), with scopes mapped to Nova's theme
+// `syntect` (pure-Rust fancy-regex backend), with scopes mapped to Aether's theme
 // colors. This replaces the toy single-line TextMate interpreter + the
 // tree-sitter JSON/Rust path: syntect bundles JS/TS/JSON/CSS/HTML/Python/Rust/…
 // so common languages color out of the box.
@@ -37,7 +37,7 @@ pub fn supports(ext: &str) -> bool {
     syntax_for(ext).is_some()
 }
 
-/// Map a TextMate/Sublime scope string to a Nova theme color by its leading
+/// Map a TextMate/Sublime scope string to a Aether theme color by its leading
 /// standard segment (ported from the old textmate interpreter). The token's
 /// deepest scope wins.
 pub fn scope_color(s: &str) -> Color {

@@ -746,6 +746,26 @@ impl Document {
         true
     }
 
+    /// Assign a path to an (untitled) document — used by Save As. Re-derives the
+    /// language/extension/tab-name and rebuilds the syntect highlighter so the
+    /// buffer picks up syntax colors for the new file type, then reshapes.
+    pub fn set_path(&mut self, path: PathBuf, fs: &mut FontSystem) {
+        let ext = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        self.name = path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Untitled".into());
+        self.lang = Lang::from_ext(&ext);
+        self.hl = crate::highlight::LineCache::new(&ext);
+        self.ext = ext;
+        self.path = Some(path);
+        self.hl_dirty_from = 0;
+        self.reshape(fs);
+    }
+
     pub fn save(&mut self) -> std::io::Result<bool> {
         let Some(path) = self.path.clone() else {
             return Ok(false);
