@@ -45,7 +45,7 @@ pub struct ExtensionDetail {
     meta: TextLabel,
     desc: TextLabel,
     install: TextLabel,
-    installed_lbl: TextLabel,
+    uninstall: TextLabel,
     tabs: [TextLabel; 3],
     details: Markdown,
     features: Markdown,
@@ -78,8 +78,8 @@ impl ExtensionDetail {
         };
         let mut install = TextLabel::new(fs, 140.0, Self::btn_h());
         install.set(fs, "Install", theme::UI_FAMILY());
-        let mut installed_lbl = TextLabel::new(fs, 140.0, Self::btn_h());
-        installed_lbl.set(fs, "Installed", theme::UI_FAMILY());
+        let mut uninstall = TextLabel::new(fs, 140.0, Self::btn_h());
+        uninstall.set(fs, "Uninstall", theme::UI_FAMILY());
         let tabs = [
             { let mut l = TextLabel::new(fs, 140.0, Self::tabbar_h()); l.set(fs, "DETAILS", theme::UI_FAMILY()); l },
             { let mut l = TextLabel::new(fs, 140.0, Self::tabbar_h()); l.set(fs, "FEATURES", theme::UI_FAMILY()); l },
@@ -90,7 +90,7 @@ impl ExtensionDetail {
             meta: mk(fs, 1000.0, 24.0),
             desc: mk(fs, 1000.0, 48.0),
             install,
-            installed_lbl,
+            uninstall,
             tabs,
             details: Markdown::new(fs),
             features: Markdown::new(fs),
@@ -115,7 +115,7 @@ impl ExtensionDetail {
     /// name/meta/desc/sidebar/body re-shape on their own since `set` runs each frame.
     pub fn reshape(&mut self, fs: &mut FontSystem) {
         self.install.reshape(fs);
-        self.installed_lbl.reshape(fs);
+        self.uninstall.reshape(fs);
         for t in &mut self.tabs {
             t.reshape(fs);
         }
@@ -187,7 +187,14 @@ impl ExtensionDetail {
         section(&mut side, "VERSION", if version.is_empty() { "—".into() } else { version.to_string() });
         section(&mut side, "IDENTIFIER", format!("{publisher}.{name}"));
         section(&mut side, "CATEGORY", category.to_string());
-        section(&mut side, "STATUS", if supported { "Supported in Nova".into() } else { "Needs runtime".into() });
+        let status = if installed {
+            "Installed"
+        } else if supported {
+            "Supported in Nova"
+        } else {
+            "Needs runtime"
+        };
+        section(&mut side, "STATUS", status.into());
         let skey = format!("{publisher}{name}{version}{downloads}{supported}");
         self.sidebar.set_rich(fs, &skey, &side, ui(theme::FG_TEXT()));
 
@@ -277,6 +284,14 @@ impl ExtensionDetail {
     pub fn hit_install(&self, r: Rect, p: (f32, f32)) -> bool {
         self.supported && !self.installed && Self::install_rect(r).contains(p)
     }
+    /// The same button rect, when the extension is installed, is the Uninstall action.
+    pub fn hit_uninstall(&self, r: Rect, p: (f32, f32)) -> bool {
+        self.installed && Self::install_rect(r).contains(p)
+    }
+    /// True when the header button is interactive (Install or Uninstall) — drives hover.
+    pub fn hit_button(&self, r: Rect, p: (f32, f32)) -> bool {
+        self.hit_install(r, p) || self.hit_uninstall(r, p)
+    }
     pub fn hit_tab(&self, r: Rect, p: (f32, f32)) -> Option<DetailTab> {
         self.tab_rects(r)
             .iter()
@@ -308,8 +323,8 @@ impl ExtensionDetail {
                 quads.push(rr.quad(self.icon_color));
             }
         }
-        // Install button.
-        if self.supported && !self.installed {
+        // Header button: Install when installable, Uninstall once installed.
+        if self.installed || (self.supported && !self.installed) {
             let c = if hovered_install { theme::DIALOG_BTN_HOVER() } else { theme::DIALOG_BTN() };
             if let Some(rr) = clip(Self::install_rect(r)) {
                 quads.push(rr.quad(c));
@@ -385,14 +400,12 @@ impl ExtensionDetail {
             self.sidebar.push(sr.x, sr, theme::FG_TEXT(), areas);
         }
 
-        // Install / Installed label.
-        if self.supported {
-            if let Some(pill) = clip(Self::install_rect(r)) {
-                if self.installed {
-                    self.installed_lbl.draw_center(pill, theme::FG_DIM(), areas);
-                } else {
-                    self.install.draw_center(pill, theme::FG_ACTIVE(), areas);
-                }
+        // Header button label: Uninstall once installed, else Install (when supported).
+        if let Some(pill) = clip(Self::install_rect(r)) {
+            if self.installed {
+                self.uninstall.draw_center(pill, theme::FG_ACTIVE(), areas);
+            } else if self.supported {
+                self.install.draw_center(pill, theme::FG_ACTIVE(), areas);
             }
         }
     }

@@ -82,9 +82,8 @@ impl ExtensionsPanel {
             // Marketplace results (already filtered by the remote query).
             for (idx, e) in ext_remote.iter().enumerate() {
                 let name = if e.display.is_empty() { e.name.clone() } else { e.display.clone() };
-                // Mark results that are already installed (match by name — marketplace
-                // namespace can differ from the VS Code publisher).
-                let installed = extensions.iter().any(|x| x.name.eq_ignore_ascii_case(&e.name));
+                // Mark results already in Nova's store by stable marketplace id.
+                let installed = extensions.iter().any(|x| x.slug.eq_ignore_ascii_case(&e.id()));
                 let meta = format!("{} · {}", e.namespace, if installed { "Installed" } else { "Marketplace" });
                 let desc: String = e.description.chars().take(80).collect();
                 let uv = e

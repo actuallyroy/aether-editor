@@ -20,7 +20,7 @@ use crate::quad::QuadRenderer;
 use crate::theme;
 use crate::ext_detail::ExtensionDetail;
 use crate::widgets::{
-    make_ui_buffer, Dialog, Gutter, IconButton, ListView, Menu,
+    make_ui_buffer, Dialog, Gutter, HoverCard, IconButton, ListView, Menu,
     MenuBar, SearchField, TextInput, TextLabel,
 };
 
@@ -47,6 +47,7 @@ pub struct UiBuffers {
     pub find_input: TextInput,
     pub menu: Menu,
     pub dialog: Dialog,
+    pub diag_hover: HoverCard, // floating tooltip for the diagnostic under the pointer
     pub ext_detail: ExtensionDetail,
     pub terminal_panes: Vec<Buffer>, // one monospace grid buffer per visible split pane
     pub term_tablist: ListView,      // right-side terminal tab switcher (multi-tab only)
@@ -258,6 +259,7 @@ impl GpuState {
             },
             zoom_pct: TextLabel::new(&mut font_system, 52.0, theme::STATUS_BAR_HEIGHT()),
             dialog: Dialog::new(&mut font_system),
+            diag_hover: HoverCard::new(&mut font_system),
             ext_detail: ExtensionDetail::new(&mut font_system),
             terminal_panes: Vec::new(), // grown on demand as panes are split
             term_tablist: ListView::new(

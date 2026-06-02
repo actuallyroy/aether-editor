@@ -2080,6 +2080,164 @@ impl ExtensionList {
     }
 }
 
+/// A floating tooltip card (e.g. the diagnostic hover). Wraps its text to a max
+/// width, measures its own content size from the shaped runs, and draws a bordered
+/// box + text anchored near a point and clamped to stay on screen. Owns its buffer
+/// and reshapes only when the text changes — single source of truth for both sizing
+/// and drawing, so callers just hand it an anchor and a screen rect.
+/// VS Code-style link blue for the clickable rule id.
+const LINK_BLUE: glyphon::Color = glyphon::Color::rgb(0x3b, 0x8e, 0xea);
+
+pub struct HoverCard {
+    buffer: Buffer,
+    last: String, // change-detection key (message + source/code/href)
+    epoch: u64,
+    base_max_w: f32, // unzoomed max content width (wrap boundary)
+    href: Option<String>,
+    link_w: f32, // pixel width of the link (last) line, for hit-testing
+}
+
+impl HoverCard {
+    pub fn new(fs: &mut FontSystem) -> Self {
+        let max_w = 420.0;
+        Self {
+            buffer: make_ui_buffer(fs, max_w, 400.0),
+            last: String::new(),
+            epoch: theme::shape_epoch(),
+            base_max_w: max_w,
+            href: None,
+            link_w: 0.0,
+        }
+    }
+
+    /// Populate from a diagnostic hover: the message, then a `source(rule)` line —
+    /// the rule rendered as a blue link when the server provided a docs URL.
+    pub fn set(&mut self, fs: &mut FontSystem, hover: &crate::lsp::DiagHover) {
+        let key = format!("{}|{:?}|{:?}|{:?}", hover.message, hover.source, hover.code, hover.href);
+        if self.last == key && self.epoch == theme::shape_epoch() {
+            return;
+        }
+        self.epoch = theme::shape_epoch();
+        self.last = key;
+        self.href = hover.href.clone();
+
+        let base = Attrs::new().family(Family::Name(theme::UI_FAMILY()));
+        let mut spans: Vec<(String, Attrs)> = vec![(hover.message.clone(), base.color(theme::FG_TEXT()))];
+        // `source(rule)` footer line, e.g. "eslint(no-unused-vars)".
+        let src = hover.source.clone().unwrap_or_default();
+        let code = hover.code.clone().unwrap_or_default();
+        let footer = match (src.is_empty(), code.is_empty()) {
+            (false, false) => format!("{src}({code})"),
+            (false, true) => src,
+            (true, false) => code,
+            (true, true) => String::new(),
+        };
+        let has_link = self.href.is_some();
+        if !footer.is_empty() {
+            spans.push(("\n".to_string(), base.color(theme::FG_DIM())));
+            let color = if has_link { LINK_BLUE } else { theme::FG_DIM() };
+            spans.push((footer, base.color(color)));
+        }
+
+        let z = theme::ui_zoom();
+        self.buffer.set_metrics(fs, Metrics::new(theme::UI_FONT_SIZE(), theme::UI_LINE_HEIGHT()));
+        self.buffer.set_wrap(fs, Wrap::WordOrGlyph);
+        self.buffer.set_size(fs, Some(self.base_max_w * z), Some(4000.0));
+        self.buffer.set_rich_text(
+            fs,
+            spans.iter().map(|(s, a)| (s.as_str(), *a)),
+            base,
+            Shaping::Advanced,
+        );
+        self.buffer.shape_until_scroll(fs, false);
+        // Width of the last (link) line, for the underline + click hit-test.
+        self.link_w = if has_link {
+            self.buffer.layout_runs().last().map(|r| r.line_w).unwrap_or(0.0)
+        } else {
+            0.0
+        };
+    }
+
+    /// Measured content size (px) from the wrapped runs.
+    fn content_size(&self) -> (f32, f32) {
+        let mut w = 0.0f32;
+        let mut rows = 0;
+        for run in self.buffer.layout_runs() {
+            w = w.max(run.line_w);
+            rows += 1;
+        }
+        (w, rows.max(1) as f32 * theme::UI_LINE_HEIGHT())
+    }
+
+    fn pad() -> f32 {
+        theme::zpx(8.0)
+    }
+
+    /// The card's rect for a cursor `anchor`, clamped inside `screen`. Prefers to
+    /// sit just above the anchor (VS Code style); flips below if there's no room.
+    pub fn rect(&self, anchor: (f32, f32), screen: Rect) -> Rect {
+        let pad = Self::pad();
+        let (cw, ch) = self.content_size();
+        let w = cw + pad * 2.0;
+        let h = ch + pad * 2.0;
+        let gap = theme::zpx(6.0);
+        let mut x = anchor.0;
+        let mut y = anchor.1 - h - gap;
+        if y < screen.y {
+            y = anchor.1 + theme::zpx(18.0); // below the line if it won't fit above
+        }
+        let edge = theme::zpx(4.0);
+        if x + w > screen.x + screen.w {
+            x = screen.x + screen.w - w - edge;
+        }
+        x = x.max(screen.x + edge);
+        y = y.min(screen.y + screen.h - h - edge).max(screen.y + edge);
+        Rect { x, y, w, h }
+    }
+
+    /// Screen rect of the clickable link (the last line), if there's a docs URL.
+    pub fn link_rect(&self, card: Rect) -> Option<Rect> {
+        self.href.as_ref()?;
+        let lh = theme::UI_LINE_HEIGHT();
+        let pad = Self::pad();
+        let y = card.y + card.h - pad - lh;
+        Some(Rect { x: card.x + pad, y, w: self.link_w.max(1.0), h: lh })
+    }
+
+    /// The docs URL to open when the link is clicked.
+    pub fn href(&self) -> Option<&str> {
+        self.href.as_deref()
+    }
+
+    pub fn draw_quads(&self, r: Rect, quads: &mut Vec<Quad>) {
+        quads.push(Rect { x: r.x - 1.0, y: r.y - 1.0, w: r.w + 2.0, h: r.h + 2.0 }.quad(theme::PALETTE_BORDER()));
+        quads.push(r.quad(theme::PALETTE_BG()));
+        // Underline the link line.
+        if let Some(lr) = self.link_rect(r) {
+            let uy = lr.y + theme::UI_LINE_HEIGHT() - theme::zpx(2.0);
+            quads.push(Rect { x: lr.x, y: uy, w: lr.w, h: theme::zpx(1.0).max(1.0) }.quad([0.23, 0.56, 0.92, 1.0]));
+        }
+    }
+
+    pub fn draw_text<'a>(&'a self, r: Rect, areas: &mut Vec<TextArea<'a>>) {
+        let pad = Self::pad();
+        areas.push(TextArea {
+            buffer: &self.buffer,
+            left: r.x + pad,
+            top: r.y + pad,
+            scale: 1.0,
+            bounds: TextBounds {
+                left: r.x as i32,
+                top: r.y as i32,
+                right: (r.x + r.w) as i32,
+                bottom: (r.y + r.h) as i32,
+            },
+            default_color: theme::FG_TEXT(),
+            custom_glyphs: &[],
+        });
+    }
+}
+
 /// Apply a common editing/navigation key to a focused text input. Returns `None`
 /// if the key wasn't consumed, or `Some(text_changed)` if it was (so callers can
 /// re-filter only when content actually changed). Shared by every input so

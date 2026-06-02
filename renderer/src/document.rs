@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use glyphon::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Wrap};
 use ropey::Rope;
 
-use crate::syntax::{self, Lang};
+use crate::syntax::Lang;
 use crate::theme;
 use crate::widgets::{ScrollOpts, ScrollView};
 
@@ -75,7 +75,7 @@ pub struct Document {
     pub version: i32,                    // LSP document version (bumped on every edit)
     pub diagnostics: Vec<crate::lsp::Diagnostic>, // current LSP diagnostics for this doc
     pub lsp_dirty: bool,                 // text changed since the last didChange was sent
-    pub lsp_open: bool,                  // a didOpen has been sent to a server for this doc
+    pub lsp_servers: Vec<&'static str>,  // servers a didOpen has been sent to (open-state is per-server)
     hl: Option<crate::highlight::LineCache>, // syntect incremental highlighter (None = no grammar)
     hl_dirty_from: usize,                // lowest line changed since the last highlight (usize::MAX = none)
     semantic: Vec<(usize, usize, Color)>, // Layer-2 LSP semantic tokens (byte range → color)
@@ -266,7 +266,7 @@ impl Document {
             version: 0,
             diagnostics: Vec::new(),
             lsp_dirty: false,
-            lsp_open: false,
+            lsp_servers: Vec::new(),
             hl,
             hl_dirty_from: usize::MAX,
             semantic: Vec::new(),
@@ -318,7 +318,7 @@ impl Document {
             version: 0,
             diagnostics: Vec::new(),
             lsp_dirty: false,
-            lsp_open: false,
+            lsp_servers: Vec::new(),
             hl: None,
             hl_dirty_from: usize::MAX,
             semantic: Vec::new(),
@@ -389,7 +389,7 @@ impl Document {
             version: 0,
             diagnostics: Vec::new(),
             lsp_dirty: false,
-            lsp_open: false,
+            lsp_servers: Vec::new(),
             hl: None,
             hl_dirty_from: usize::MAX,
             semantic: Vec::new(),
@@ -594,7 +594,7 @@ impl Document {
     /// The diagnostic message under a buffer-relative point (for hover tooltips),
     /// if the point lands within a diagnostic's range. `buf_x/buf_y` are relative to
     /// the text's top-left (caller subtracts the editor pad + adds scroll).
-    pub fn diagnostic_at(&self, buf_x: f32, buf_y: f32) -> Option<String> {
+    pub fn diagnostic_at(&self, buf_x: f32, buf_y: f32) -> Option<crate::lsp::DiagHover> {
         if self.diagnostics.is_empty() {
             return None;
         }
@@ -604,14 +604,26 @@ impl Document {
             return None;
         }
         let byte = self.rope.line_to_byte(line) + hit.index.min(self.rope.line(line).len_bytes());
-        let mut msgs: Vec<&str> = Vec::new();
-        for d in &self.diagnostics {
-            let (lo, hi) = self.diag_byte_range(d);
-            if byte >= lo && byte < hi.max(lo + 1) {
-                msgs.push(d.message.trim());
-            }
+        let matched: Vec<&crate::lsp::Diagnostic> = self
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                let (lo, hi) = self.diag_byte_range(d);
+                byte >= lo && byte < hi.max(lo + 1)
+            })
+            .collect();
+        if matched.is_empty() {
+            return None;
         }
-        (!msgs.is_empty()).then(|| msgs.join("\n"))
+        let message = matched.iter().map(|d| d.message.trim()).collect::<Vec<_>>().join("\n");
+        // Prefer the diagnostic that carries a docs link for the source/code/href.
+        let primary = matched.iter().find(|d| d.code_href.is_some()).copied().unwrap_or(matched[0]);
+        Some(crate::lsp::DiagHover {
+            message,
+            source: primary.source.clone(),
+            code: primary.code.clone(),
+            href: primary.code_href.clone(),
+        })
     }
 
     /// Absolute byte (lo, hi) range of a diagnostic, for highlight rendering.

@@ -385,11 +385,8 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         } else {
             ("Nova".to_string(), String::new())
         };
-        // Hovering a diagnostic squiggle surfaces its message in place of the path.
-        let status_text = match &app.hover_tip {
-            Some((msg, ..)) => format!("  ⚠ {}", msg.replace('\n', "  •  ")),
-            None => status_text,
-        };
+        // Diagnostic hover is shown as a floating card (see the overlay pass below),
+        // not in the status bar — the status bar keeps showing the file path.
         gpu.ui.status.set(fs, &status_text, theme::UI_FAMILY());
         gpu.ui.status_right.set(fs, &status_right_text, theme::UI_FAMILY());
         gpu.ui.zoom_pct.set(fs, &format!("{}%", (theme::ui_zoom() * 100.0).round() as i32), theme::UI_FAMILY());
@@ -933,15 +930,39 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                         bg_quads.push(Quad::new(x, y, w, line_h, bg));
                     }
                 }
-                // Block cursor only in the focused pane, when the shell shows it
-                // (DECTCEM) and we're at the live bottom (not scrolled into history).
+                // Text selection highlight (normalized ends; full width for lines
+                // spanned in the middle of a multi-line selection).
+                if let Some((a, b)) = pane.sel {
+                    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                    let (cols, rows) = pane.term.dims();
+                    for r in 0..rows {
+                        let abs = top_line + r;
+                        if abs < lo.0 || abs > hi.0 {
+                            continue;
+                        }
+                        let c0 = if abs == lo.0 { lo.1 } else { 0 };
+                        let c1 = if abs == hi.0 { hi.1 } else { cols };
+                        if c1 <= c0 {
+                            continue;
+                        }
+                        let x = rect.x + theme::zpx(8.0) + c0 as f32 * char_w;
+                        let w = ((c1 - c0) as f32 * char_w).min((right - x).max(0.0));
+                        let y = rect.y + theme::zpx(4.0) + r as f32 * line_h;
+                        if w > 0.0 && y + line_h <= rect.y + rect.h {
+                            bg_quads.push(Quad::new(x, y, w, line_h, theme::SELECTION()));
+                        }
+                    }
+                }
+                // Thin blinking caret (editor-style) in the focused pane, when the
+                // shell shows the cursor (DECTCEM) and we're at the live bottom.
                 let focused = app.terminal.focused && i == g.focused;
-                if focused && pane.term.cursor_visible() && at_bottom {
+                if focused && pane.term.cursor_visible() && at_bottom && app.term_blink_on {
                     let (cc, cr) = pane.term.cursor();
                     let cx = rect.x + theme::zpx(8.0) + cc as f32 * char_w;
                     let cy = rect.y + theme::zpx(4.0) + cr as f32 * line_h;
+                    let caret_w = theme::zpx(2.0).max(1.0);
                     if cx < right && cy + line_h <= rect.y + rect.h {
-                        bg_quads.push(Quad::new(cx, cy, char_w.max(theme::zpx(2.0)), line_h, [0.6, 0.6, 0.6, 0.6]));
+                        bg_quads.push(Quad::new(cx, cy, caret_w, line_h, theme::CURSOR()));
                     }
                 }
                 // Auto-hiding scrollback scrollbar (overlay) for this pane.
@@ -1714,6 +1735,50 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 gpu.text_renderer.render(&gpu.atlas, &gpu.viewport, &mut pass)?;
             }
             gpu.queue.submit(Some(encm.finish()));
+        }
+    }
+
+    // ---- Diagnostic hover card overlay ----
+    // Floats above the editor, below any modal. Only when the pointer rests on a
+    // squiggle and no modal is open.
+    if app.dialog.is_none() && app.feedback_form.is_none() {
+        if let Some((info, hx, hy)) = app.hover_tip.clone() {
+            gpu.ui.diag_hover.set(&mut gpu.font_system, &info);
+            let screen = Rect { x: 0.0, y: 0.0, w: cfg_w as f32, h: cfg_h as f32 };
+            let card = gpu.ui.diag_hover.rect((hx, hy), screen);
+            let mut hq: Vec<Quad> = Vec::new();
+            gpu.ui.diag_hover.draw_quads(card, &mut hq);
+            gpu.quad_renderer.prepare(&gpu.device, &gpu.queue, &hq, &[], (cfg_w, cfg_h));
+            let mut hareas: Vec<TextArea> = Vec::new();
+            gpu.ui.diag_hover.draw_text(card, &mut hareas);
+            gpu.text_renderer.prepare(
+                &gpu.device,
+                &gpu.queue,
+                &mut gpu.font_system,
+                &mut gpu.atlas,
+                &gpu.viewport,
+                hareas,
+                &mut gpu.swash_cache,
+            )?;
+            let mut ench = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("nova-hovercard-pass"),
+            });
+            {
+                let mut pass = ench.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("nova-hovercard"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                gpu.quad_renderer.render_bg(&mut pass);
+                gpu.text_renderer.render(&gpu.atlas, &gpu.viewport, &mut pass)?;
+            }
+            gpu.queue.submit(Some(ench.finish()));
         }
     }
 

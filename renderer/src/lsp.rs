@@ -10,7 +10,7 @@
 // write without sharing the pipe. The reader thread parses server traffic and
 // either replies itself or forwards to the UI as `WorkerMsg::Lsp*`.
 
-use std::io::{BufRead, BufReader, Read as _, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
@@ -49,6 +49,17 @@ pub struct Diagnostic {
     pub severity: Severity,
     pub message: String,
     pub source: Option<String>,
+    pub code: Option<String>,      // rule id, e.g. "no-unused-vars"
+    pub code_href: Option<String>, // codeDescription.href — docs URL for the rule
+}
+
+/// Aggregated info for the diagnostic(s) under the pointer, used by the hover card.
+#[derive(Clone, PartialEq)]
+pub struct DiagHover {
+    pub message: String,          // joined messages of all diagnostics at the point
+    pub source: Option<String>,   // e.g. "eslint"
+    pub code: Option<String>,     // rule id, e.g. "no-unused-vars"
+    pub href: Option<String>,     // docs URL for the rule, if the server provided one
 }
 
 // ---- URI helpers ----
@@ -98,46 +109,140 @@ pub fn language_id(ext: &str) -> Option<&'static str> {
         "tsx" => "typescriptreact",
         "vue" => "vue",
         "json" | "jsonc" => "json",
+        "rs" => "rust",
         _ => return None,
     })
 }
 
-// ---- Server registry ----
+// ---- Server registry (data-driven) ----
+//
+// Everything below the registry is generic LSP. A server is fully described by this
+// struct — adding rust-analyzer / pyright / gopls / clangd is a new `ServerSpec`
+// entry, no new code paths. `resolve` finds the executable + args (None ⇒ skip),
+// `init_options`/`config_reply` carry any server-specific protocol bits, and the
+// `pull_*` flags say which features Nova requests (diagnostics / semantic tokens).
 
-/// A configured language server: how to launch it and what languages it serves.
 pub struct ServerSpec {
     pub name: &'static str,
     pub languages: &'static [&'static str],
+    /// (program, args) to launch, given the installed-extension roots. None ⇒ not available.
+    pub resolve: fn(ext_roots: &[PathBuf]) -> Option<(String, Vec<String>)>,
+    pub init_options: fn(root: &Path) -> Value,
+    pub config_reply: fn() -> Value,
+    /// Request diagnostics via `textDocument/diagnostic` (pull model, e.g. ESLint).
+    pub pull_diagnostics: bool,
+    /// Accept this server's `publishDiagnostics` (push model, e.g. rust-analyzer).
+    /// Servers without either flag have their diagnostics ignored — avoids the TS
+    /// server's (empty) push clobbering ESLint's pulled diagnostics on JS/TS.
+    pub push_diagnostics: bool,
+    pub pull_semantic: bool,
 }
 
-/// ESLint, the first supported server.
+/// Whether a server's pushed diagnostics should be applied (looked up by name).
+pub fn server_accepts_push(name: &str) -> bool {
+    registry().iter().any(|s| s.name == name && s.push_diagnostics)
+}
+
+fn resolve_eslint(ext_roots: &[PathBuf]) -> Option<(String, Vec<String>)> {
+    let node = resolve_node()?;
+    let server = eslint_server_path(ext_roots)?;
+    Some((node, vec![server.to_string_lossy().into_owned(), "--stdio".to_string()]))
+}
+
+fn resolve_typescript(_ext_roots: &[PathBuf]) -> Option<(String, Vec<String>)> {
+    let node = resolve_node()?;
+    let cli = typescript_ls_cli()?;
+    Some((node, vec![cli.to_string_lossy().into_owned(), "--stdio".to_string()]))
+}
+
+fn resolve_rust_analyzer(_ext_roots: &[PathBuf]) -> Option<(String, Vec<String>)> {
+    // A standalone binary that speaks LSP over stdio with no args.
+    rust_analyzer_bin().map(|p| (p, Vec::new()))
+}
+
 pub const ESLINT: ServerSpec = ServerSpec {
     name: "eslint",
     languages: &["javascript", "javascriptreact", "typescript", "typescriptreact", "vue"],
+    resolve: resolve_eslint,
+    init_options: eslint_init_options,
+    config_reply: eslint_config_reply,
+    pull_diagnostics: true,
+    push_diagnostics: false,
+    pull_semantic: false,
 };
 
-/// All registered servers (extend this to support more — the rest is generic).
-pub fn registry() -> &'static [ServerSpec] {
-    &[ESLINT]
+pub const TYPESCRIPT: ServerSpec = ServerSpec {
+    name: "typescript",
+    languages: &["javascript", "javascriptreact", "typescript", "typescriptreact"],
+    resolve: resolve_typescript,
+    init_options: ts_init_options,
+    config_reply: empty_config,
+    pull_diagnostics: false, // ESLint owns JS/TS diagnostics for now (avoid clobber)
+    push_diagnostics: false, // ignore TS push diagnostics so they don't clobber ESLint
+    pull_semantic: true,
+};
+
+pub const RUST_ANALYZER: ServerSpec = ServerSpec {
+    name: "rust-analyzer",
+    languages: &["rust"],
+    resolve: resolve_rust_analyzer,
+    init_options: empty_init,
+    config_reply: empty_config,
+    pull_diagnostics: false, // rust-analyzer pushes publishDiagnostics
+    push_diagnostics: true,
+    pull_semantic: true,
+};
+
+fn empty_init(_root: &Path) -> Value {
+    json!({})
+}
+fn empty_config() -> Value {
+    json!({})
 }
 
-/// The server (if any) that serves a given language id.
-pub fn server_for_language(lang: &str) -> Option<&'static ServerSpec> {
-    registry().iter().find(|s| s.languages.contains(&lang))
+/// All registered servers. Extend this list to support more — generic from here.
+pub fn registry() -> &'static [ServerSpec] {
+    &[ESLINT, TYPESCRIPT, RUST_ANALYZER]
+}
+
+/// True if any registered server serves this language id.
+pub fn server_for_language(lang: &str) -> bool {
+    registry().iter().any(|s| s.languages.contains(&lang))
 }
 
 // ---- Node + ESLint server resolution ----
 
-/// Resolve a `node` executable: PATH, then common install dirs (incl. a macOS
-/// login-shell lookup so GUI launches see nvm/homebrew node).
+/// Spawn a child process without flashing a console window on Windows
+/// (CREATE_NO_WINDOW). A no-op on other platforms. ALL process spawns in this module
+/// must go through this — otherwise a probe like `node --version`, run every sync,
+/// pops a console window each time ("dancing terminals").
+fn quiet_command(program: &str) -> Command {
+    let mut c = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    c
+}
+
+/// Resolve a `node` executable, cached for the session: PATH, then common install
+/// dirs (incl. a macOS login-shell lookup so GUI launches see nvm/homebrew node).
+/// Cached because `ensure()` calls it every sync while a JS/TS server isn't running,
+/// and re-spawning a probe each tick is both wasteful and (pre-fix) window-flashing.
 pub fn resolve_node() -> Option<String> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(resolve_node_uncached).clone()
+}
+
+fn resolve_node_uncached() -> Option<String> {
     #[cfg(windows)]
     let names = ["node.exe", "node"];
     #[cfg(not(windows))]
     let names = ["node"];
     // Direct PATH probe.
     for n in names {
-        if Command::new(n).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok() {
+        if quiet_command(n).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok() {
             return Some(n.to_string());
         }
     }
@@ -149,7 +254,7 @@ pub fn resolve_node() -> Option<String> {
             }
         }
         // Login shell (picks up nvm / fnm / asdf shims for GUI-launched apps).
-        if let Ok(out) = Command::new("/bin/sh").args(["-lc", "command -v node"]).output() {
+        if let Ok(out) = quiet_command("/bin/sh").args(["-lc", "command -v node"]).output() {
             let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if !path.is_empty() && Path::new(&path).exists() {
                 return Some(path);
@@ -187,8 +292,54 @@ pub fn typescript_ls_cli() -> Option<PathBuf> {
 
 /// `initializationOptions` for typescript-language-server (minimal; it auto-detects
 /// tsserver from the workspace or its bundled copy).
-pub fn ts_init_options() -> Value {
+pub fn ts_init_options(_root: &Path) -> Value {
     json!({ "hostInfo": "nova", "preferences": {} })
+}
+
+/// Resolve the `rust-analyzer` binary: PATH, ~/.cargo/bin, rustup, common dirs.
+pub fn rust_analyzer_bin() -> Option<String> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(rust_analyzer_bin_uncached).clone()
+}
+
+fn rust_analyzer_bin_uncached() -> Option<String> {
+    let probe = |p: &str| {
+        quiet_command(p)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    if probe("rust-analyzer") {
+        return Some("rust-analyzer".to_string());
+    }
+    if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+        let cargo = PathBuf::from(&home).join(".cargo").join("bin").join(if cfg!(windows) {
+            "rust-analyzer.exe"
+        } else {
+            "rust-analyzer"
+        });
+        if cargo.exists() {
+            return Some(cargo.to_string_lossy().into_owned());
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        for p in ["/opt/homebrew/bin/rust-analyzer", "/usr/local/bin/rust-analyzer"] {
+            if Path::new(p).exists() {
+                return Some(p.to_string());
+            }
+        }
+        if let Ok(out) = quiet_command("/bin/sh").args(["-lc", "command -v rust-analyzer"]).output() {
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !path.is_empty() && Path::new(&path).exists() {
+                return Some(path);
+            }
+        }
+    }
+    None
 }
 
 /// Locate the ESLint extension's bundled stdio server (`server/out/eslintServer.js`)
@@ -235,17 +386,12 @@ impl LspClient {
         cfg_reply: Value,
         tx: Sender<WorkerMsg>,
     ) -> Option<LspClient> {
-        let mut cmd = Command::new(program);
+        let mut cmd = quiet_command(program);
         cmd.args(args)
             .current_dir(&root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        }
         let mut child = cmd.spawn().ok()?;
         let mut stdin = child.stdin.take()?;
         let stdout = child.stdout.take()?;
@@ -285,7 +431,7 @@ impl LspClient {
             let mut reader = BufReader::new(stdout);
             loop {
                 match read_message(&mut reader) {
-                    Some(msg) => handle_server_message(&msg, &reply_tx, &cfg, &tx),
+                    Some(msg) => handle_server_message(server, &msg, &reply_tx, &cfg, &tx),
                     None => {
                         let _ = tx.send(WorkerMsg::LspExited { server });
                         break;
@@ -437,50 +583,29 @@ impl LspManager {
         self.clients.iter_mut().find(|c| c.server == server)
     }
 
-    /// Ensure the ESLint server is running for `root`; returns false if node or the
-    /// ESLint server can't be found (caller can surface a status). No-op if already up.
-    pub fn ensure_eslint(&mut self, root: &Path, ext_roots: &[PathBuf], tx: &Sender<WorkerMsg>) -> Result<(), String> {
-        if self.client_mut("eslint").is_some() {
-            return Ok(());
+    /// Ensure a registered server is running for `root` (generic, data-driven). No-op
+    /// if already up; returns false if the server can't be resolved/spawned.
+    fn ensure(&mut self, spec: &'static ServerSpec, root: &Path, ext_roots: &[PathBuf], tx: &Sender<WorkerMsg>) -> bool {
+        if self.clients.iter().any(|c| c.server == spec.name) {
+            return true;
         }
-        let node = resolve_node().ok_or("node not found on PATH")?;
-        let server = eslint_server_path(ext_roots).ok_or("ESLint extension not installed")?;
-        let args = vec![server.to_string_lossy().into_owned(), "--stdio".to_string()];
+        let Some((program, args)) = (spec.resolve)(ext_roots) else { return false };
         let client = LspClient::start(
-            "eslint",
-            &node,
+            spec.name,
+            &program,
             &args,
             root.to_path_buf(),
-            eslint_init_options(root),
-            eslint_config_reply(),
+            (spec.init_options)(root),
+            (spec.config_reply)(),
             tx.clone(),
-        )
-        .ok_or("failed to spawn ESLint server")?;
-        self.clients.push(client);
-        Ok(())
-    }
-
-    /// Ensure the TypeScript language server (semantic tokens for JS/TS) is running
-    /// for `root`. Returns Err with a reason if node or the server can't be found.
-    pub fn ensure_ts(&mut self, root: &Path, tx: &Sender<WorkerMsg>) -> Result<(), String> {
-        if self.client_mut("typescript").is_some() {
-            return Ok(());
+        );
+        match client {
+            Some(c) => {
+                self.clients.push(c);
+                true
+            }
+            None => false,
         }
-        let node = resolve_node().ok_or("node not found on PATH")?;
-        let cli = typescript_ls_cli().ok_or("typescript-language-server not installed (npm i -g typescript-language-server typescript)")?;
-        let args = vec![cli.to_string_lossy().into_owned(), "--stdio".to_string()];
-        let client = LspClient::start(
-            "typescript",
-            &node,
-            &args,
-            root.to_path_buf(),
-            ts_init_options(),
-            json!({}), // workspace/configuration reply (defaults)
-            tx.clone(),
-        )
-        .ok_or("failed to spawn typescript-language-server")?;
-        self.clients.push(client);
-        Ok(())
     }
 
     /// Request semantic tokens from a server; returns the request id.
@@ -497,6 +622,38 @@ impl LspManager {
 
     pub fn drop_server(&mut self, server: &str) {
         self.clients.retain(|c| c.server != server);
+    }
+
+    /// After an extension is uninstalled, stop any running server that can no longer
+    /// be resolved (its files were removed) and clear the diagnostics it produced, so
+    /// uninstalling takes effect immediately — no restart. Docs it served are marked
+    /// for re-sync so they reopen against whatever servers remain. Returns true if a
+    /// server was stopped (caller should redraw).
+    pub fn reconcile(&mut self, docs: &mut [crate::document::Document], ext_roots: &[PathBuf]) -> bool {
+        let stopped: Vec<&'static ServerSpec> = registry()
+            .iter()
+            .filter(|spec| self.clients.iter().any(|c| c.server == spec.name) && (spec.resolve)(ext_roots).is_none())
+            .collect();
+        if stopped.is_empty() {
+            return false;
+        }
+        for spec in &stopped {
+            if let Some(c) = self.client_mut(spec.name) {
+                c.shutdown();
+            }
+            self.clients.retain(|c| c.server != spec.name);
+        }
+        for d in docs.iter_mut() {
+            // Forget the stopped servers so the doc re-opens to them if reinstalled,
+            // and clear diagnostics from any server that just went away.
+            d.lsp_servers.retain(|s| !stopped.iter().any(|spec| spec.name == *s));
+            if let Some(lang) = d.language_id() {
+                if stopped.iter().any(|s| s.languages.contains(&lang)) {
+                    d.diagnostics.clear();
+                }
+            }
+        }
+        true
     }
 
     pub fn did_open(&mut self, server: &str, uri: &str, language_id: &str, version: i32, text: &str) {
@@ -534,9 +691,10 @@ impl LspManager {
 
     // ---- Orchestration (driven from App's idle tick / worker loop) ----
 
-    /// Open any served document not yet sent to the servers, send a debounced
-    /// full-text didChange for edited ones, and request diagnostics (ESLint) +
-    /// semantic tokens (TypeScript). Best-effort per server.
+    /// Open any served document not yet sent to its servers, send a debounced
+    /// full-text didChange for edited ones, and request the features each server
+    /// declares (diagnostics / semantic tokens). Fully driven by `registry()` — no
+    /// server is named here, so adding one is a `ServerSpec` entry.
     pub fn sync(
         &mut self,
         docs: &mut [crate::document::Document],
@@ -553,65 +711,67 @@ impl LspManager {
             lang: &'static str,
             version: i32,
             text: String,
-            open: bool,
         }
-        let mut work: Vec<Work> = Vec::new();
-        for d in docs.iter() {
+        // Candidate docs: any with a served language. Open-state is tracked per server
+        // (`d.lsp_servers`), so a doc already open to TypeScript still needs a didOpen
+        // when ESLint is installed later. We carry the doc index to mutate it afterwards.
+        let mut work: Vec<(usize, Work)> = Vec::new();
+        for (i, d) in docs.iter().enumerate() {
             let (Some(lang), Some(uri)) = (d.language_id(), d.uri()) else { continue };
-            if server_for_language(lang).is_none() {
+            if !server_for_language(lang) {
                 continue;
             }
-            let open = !d.lsp_open;
-            let change = d.lsp_dirty && debounce;
-            if open || change {
-                work.push(Work { uri, lang, version: d.version, text: d.text(), open });
-            }
+            work.push((i, Work { uri, lang, version: d.version, text: d.text() }));
         }
         if work.is_empty() {
             return;
         }
-        let eslint_ok = self.ensure_eslint(cwd, ext_roots, tx).is_ok();
-        let ts_ok = self.ensure_ts(cwd, tx).is_ok();
-        if !eslint_ok && !ts_ok {
-            for d in docs.iter_mut() {
-                d.lsp_open = true;
-                d.lsp_dirty = false;
+        // Start every registered server that serves at least one candidate's language.
+        let mut live: Vec<&'static ServerSpec> = Vec::new();
+        for spec in registry() {
+            let serves = work.iter().any(|(_, w)| spec.languages.contains(&w.lang));
+            if serves && self.ensure(spec, cwd, ext_roots, tx) {
+                live.push(spec);
             }
+        }
+        if live.is_empty() {
+            // No server available yet (nothing installed). Leave docs untouched so the
+            // next sync picks them up once a server appears.
+            self.last_sync = Some(now);
             return;
         }
-        for w in &work {
-            if w.open {
-                if eslint_ok {
-                    self.did_open("eslint", &w.uri, w.lang, w.version, &w.text);
+        for (i, w) in &work {
+            let change = docs[*i].lsp_dirty && debounce;
+            let mut serviced = false;
+            for spec in &live {
+                if !spec.languages.contains(&w.lang) {
+                    continue;
                 }
-                if ts_ok {
-                    self.did_open("typescript", &w.uri, w.lang, w.version, &w.text);
+                let first_open = !docs[*i].lsp_servers.contains(&spec.name);
+                if first_open {
+                    self.did_open(spec.name, &w.uri, w.lang, w.version, &w.text);
+                    docs[*i].lsp_servers.push(spec.name);
+                } else if change {
+                    self.did_change(spec.name, &w.uri, w.version, &w.text);
+                } else {
+                    continue; // already open + no change → nothing to send this server
                 }
-            } else {
-                if eslint_ok {
-                    self.did_change("eslint", &w.uri, w.version, &w.text);
+                if spec.pull_diagnostics {
+                    if let Some(id) = self.pull_diagnostics(spec.name, &w.uri) {
+                        self.diag_pending.insert(id, w.uri.clone());
+                    }
                 }
-                if ts_ok {
-                    self.did_change("typescript", &w.uri, w.version, &w.text);
+                if spec.pull_semantic {
+                    if let Some(id) = self.pull_semantic_tokens(spec.name, &w.uri) {
+                        self.sem_pending.insert(id, w.uri.clone());
+                    }
                 }
+                serviced = true;
             }
-            if eslint_ok {
-                if let Some(id) = self.pull_diagnostics("eslint", &w.uri) {
-                    self.diag_pending.insert(id, w.uri.clone());
-                }
-            }
-            if ts_ok {
-                if let Some(id) = self.pull_semantic_tokens("typescript", &w.uri) {
-                    self.sem_pending.insert(id, w.uri.clone());
-                }
-            }
-        }
-        for d in docs.iter_mut() {
-            if let Some(uri) = d.uri() {
-                if work.iter().any(|w| w.uri == uri) {
-                    d.lsp_open = true;
-                    d.lsp_dirty = false;
-                }
+            // Clear the dirty flag once we've pushed the change to the live servers
+            // (a server installed later re-opens with full text, so nothing is lost).
+            if change && serviced {
+                docs[*i].lsp_dirty = false;
             }
         }
         self.last_sync = Some(now);
@@ -697,7 +857,7 @@ fn read_message<R: BufRead>(reader: &mut R) -> Option<Value> {
 
 /// Dispatch a server→client message: reply to requests it blocks on, forward
 /// diagnostics/logs to the UI, ignore the rest.
-fn handle_server_message(msg: &Value, reply_tx: &Sender<Vec<u8>>, cfg_reply: &Value, tx: &Sender<WorkerMsg>) {
+fn handle_server_message(server: &'static str, msg: &Value, reply_tx: &Sender<Vec<u8>>, cfg_reply: &Value, tx: &Sender<WorkerMsg>) {
     let method = msg.get("method").and_then(|m| m.as_str());
     let id = msg.get("id");
     match (method, id) {
@@ -725,12 +885,12 @@ fn handle_server_message(msg: &Value, reply_tx: &Sender<Vec<u8>>, cfg_reply: &Va
         // ---- Notifications ----
         (Some("textDocument/publishDiagnostics"), None) => {
             if let Some((uri, diags)) = parse_diagnostics(msg.get("params")) {
-                let _ = tx.send(WorkerMsg::LspDiagnostics { uri, diags });
+                let _ = tx.send(WorkerMsg::LspDiagnostics { server, uri, diags });
             }
         }
         (Some("window/logMessage"), None) | (Some("window/showMessage"), None) => {
             if let Some(m) = msg.get("params").and_then(|p| p.get("message")).and_then(|m| m.as_str()) {
-                let _ = tx.send(WorkerMsg::LspLog { server: "lsp", message: m.to_string() });
+                let _ = tx.send(WorkerMsg::LspLog { server, message: m.to_string() });
             }
         }
         // ---- Responses to our requests ----
@@ -790,6 +950,15 @@ fn parse_diag_array(arr: Option<&Value>) -> Vec<Diagnostic> {
             severity: Severity::from_lsp(d.get("severity").and_then(|v| v.as_i64()).unwrap_or(1)),
             message: d.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string(),
             source: d.get("source").and_then(|m| m.as_str()).map(|s| s.to_string()),
+            // `code` may be a string (ESLint rule) or a number (tsc error code).
+            code: d.get("code").and_then(|c| {
+                c.as_str().map(|s| s.to_string()).or_else(|| c.as_i64().map(|n| n.to_string()))
+            }),
+            code_href: d
+                .get("codeDescription")
+                .and_then(|cd| cd.get("href"))
+                .and_then(|h| h.as_str())
+                .map(|s| s.to_string()),
         });
     }
     out

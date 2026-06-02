@@ -21,7 +21,15 @@ pub struct Pane {
     pub term: Terminal,
     pub scroll: ScrollView,
     pub dirty: bool,
+    /// Text selection as (anchor, head), each a `(line, col)` in combined-buffer
+    /// coordinates (`scrollback ++ live`). `None` when there's no selection.
+    pub sel: Option<(TermPos, TermPos)>,
+    pub sel_dragging: bool,
 }
+
+/// A `(line, col)` position in the terminal's combined buffer. `col` may equal the
+/// row width (end-exclusive). Ordered for normalizing a selection's two ends.
+pub type TermPos = (usize, usize);
 
 impl Pane {
     pub fn spawn(rows: usize, cols: usize, cwd: &std::path::Path) -> Option<Pane> {
@@ -33,7 +41,22 @@ impl Pane {
                 stick_to_end: true,
             }),
             dirty: true,
+            sel: None,
+            sel_dragging: false,
         })
+    }
+
+    /// The selected text, trimmed of trailing whitespace per line. None if empty.
+    pub fn selection_text(&self) -> Option<String> {
+        let (a, b) = self.sel?;
+        let s = self.term.selection_text(a, b);
+        (!s.is_empty()).then_some(s)
+    }
+
+    /// Clear any selection (e.g. on new keyboard input). Returns true if there was one.
+    pub fn clear_selection(&mut self) -> bool {
+        self.sel_dragging = false;
+        self.sel.take().is_some()
     }
 }
 
@@ -717,6 +740,39 @@ impl Terminal {
     /// (cols, rows) of the current grid.
     pub fn dims(&self) -> (usize, usize) {
         (self.grid.cols, self.grid.rows)
+    }
+
+    /// The characters of combined-buffer line `abs_line` (scrollback then live rows;
+    /// just the live screen on the alternate screen). Empty if out of range.
+    pub fn line_chars(&self, abs_line: usize) -> Vec<char> {
+        if self.grid.alt.is_some() {
+            return self.grid.cells.get(abs_line).map(|r| r.iter().map(|c| c.ch).collect()).unwrap_or_default();
+        }
+        let back = self.grid.scrollback.len();
+        let row = if abs_line < back {
+            self.grid.scrollback.get(abs_line)
+        } else {
+            self.grid.cells.get(abs_line - back)
+        };
+        row.map(|r| r.iter().map(|c| c.ch).collect()).unwrap_or_default()
+    }
+
+    /// Text between two selection ends (inclusive of full lines in between),
+    /// trimming trailing whitespace per line. Ends are normalized internally.
+    pub fn selection_text(&self, a: (usize, usize), b: (usize, usize)) -> String {
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        let mut out = String::new();
+        for line in lo.0..=hi.0 {
+            let chars = self.line_chars(line);
+            let c0 = if line == lo.0 { lo.1 } else { 0 }.min(chars.len());
+            let c1 = if line == hi.0 { hi.1 } else { chars.len() }.min(chars.len()).max(c0);
+            let seg: String = chars[c0..c1].iter().collect();
+            out.push_str(seg.trim_end());
+            if line != hi.0 {
+                out.push('\n');
+            }
+        }
+        out
     }
 
     /// Cursor cell position (col, row) within the visible grid.

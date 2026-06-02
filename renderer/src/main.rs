@@ -76,6 +76,10 @@ use workspace::Workspace;
 
 // ---------- App ----------
 
+/// How long the pointer must rest on a diagnostic before its hover card appears
+/// (matches VS Code's editor.hover.delay default; stops the card chasing the cursor).
+const HOVER_DELAY: Duration = Duration::from_millis(300);
+
 pub(crate) struct UiCache {
     pub(crate) tabs: String,
 }
@@ -197,9 +201,12 @@ pub(crate) struct App {
     pub(crate) hovered_tab: Option<usize>,
     pub(crate) hovered_tab_close: Option<usize>,
     pub(crate) hovered_tree: Option<usize>,
-    /// Diagnostic hover tooltip: (message, screen x, screen y) when the pointer rests
-    /// over a diagnostic range in the editor.
-    pub(crate) hover_tip: Option<(String, f32, f32)>,
+    /// Diagnostic hover tooltip: (info, screen x, screen y) when the pointer rests
+    /// over a diagnostic range in the editor (or over the card itself, for persistence).
+    pub(crate) hover_tip: Option<(crate::lsp::DiagHover, f32, f32)>,
+    /// A diagnostic the pointer is resting on, awaiting the hover delay before it's
+    /// promoted to a visible `hover_tip`. (info, x, y, when the rest started.)
+    pub(crate) hover_pending: Option<(crate::lsp::DiagHover, f32, f32, Instant)>,
     pub(crate) hovered_activity: Option<usize>,
     pub(crate) hovered_titlebtn: Option<usize>,
     pub(crate) hovered_search: bool,
@@ -221,6 +228,7 @@ pub(crate) struct App {
     pub(crate) skip_delete_confirm: bool,
     pub(crate) last_click: Instant,
     pub(crate) last_click_pos: (f32, f32),
+    pub(crate) click_streak: u32, // 1=single, 2=double, 3=triple… (consecutive clicks)
     pub(crate) sidebar_view: SidebarView,
     // Find-in-files (Search view): a self-contained panel (built once the GPU/font
     // system exists, in `resumed`). Owns all of its own state + buffers.
@@ -255,6 +263,8 @@ pub(crate) struct App {
     pub(crate) terminal_cell_w: f32,
     pub(crate) cursor_blink_on: bool,
     pub(crate) last_blink: Instant,
+    pub(crate) term_blink_on: bool,    // blink phase for the terminal block cursor
+    pub(crate) term_last_blink: Instant,
     pub(crate) last_edit: Instant,  // for files.autoSave (afterDelay)
     pub(crate) anim_start: Instant, // monotonic clock for GIF playback
     pub(crate) cursor_icon: CursorIcon,
@@ -287,6 +297,7 @@ impl App {
             hovered_tab_close: None,
             hovered_tree: None,
             hover_tip: None,
+            hover_pending: None,
             hovered_activity: None,
             hovered_titlebtn: None,
             hovered_search: false,
@@ -304,6 +315,7 @@ impl App {
             skip_delete_confirm: false,
             last_click: Instant::now(),
             last_click_pos: (0.0, 0.0),
+            click_streak: 1,
             sidebar_view: SidebarView::Explorer,
             search: None, // built in `resumed` once the font system exists
             source_control: None, // built in `resumed`
@@ -322,6 +334,8 @@ impl App {
             terminal_cell_w: theme::FONT_SIZE() * 0.6, // refined after first shape
             cursor_blink_on: true,
             last_blink: Instant::now(),
+            term_blink_on: true,
+            term_last_blink: Instant::now(),
             last_edit: Instant::now(),
             anim_start: Instant::now(),
             cursor_icon: CursorIcon::Default,
@@ -513,7 +527,7 @@ impl App {
 
         let new_page_install = if self.detail.open_extension.is_some() {
             let region = render::editor_region(&layout);
-            self.gpu.as_ref().map(|g| g.ui.ext_detail.hit_install(region, p)).unwrap_or(false)
+            self.gpu.as_ref().map(|g| g.ui.ext_detail.hit_button(region, p)).unwrap_or(false)
         } else {
             false
         };
@@ -564,20 +578,55 @@ impl App {
                 over_scroll_thumb = true;
             }
         }
-        // Diagnostic hover tooltip: the message under the pointer, if over a squiggle.
-        let new_tip = if ed_inside && !over_scroll_thumb {
+        // Diagnostic hover: the card only appears after the cursor *rests* on a
+        // squiggle (staged in `hover_pending`, promoted after a delay in about_to_wait).
+        // This stops it flickering in/out as the pointer sweeps across diagnostics.
+        let squiggle = if ed_inside && !over_scroll_thumb {
             self.workspace.active_doc().and_then(|d| {
                 let bx = p.0 - (layout.editor_text.x + theme::EDITOR_PAD()) + d.scroll_x();
                 let by = p.1 - (layout.editor_text.y + theme::EDITOR_PAD()) + d.scroll_y();
-                d.diagnostic_at(bx, by).map(|msg| (msg, p.0, p.1))
+                d.diagnostic_at(bx, by).map(|info| (info, p.0, p.1))
             })
         } else {
             None
         };
-        if new_tip.as_ref().map(|t| &t.0) != self.hover_tip.as_ref().map(|t| &t.0) {
-            changed = true;
+        // Keep a shown card visible while the pointer is over it — or in the small gap
+        // between the squiggle and the card (so moving toward it doesn't dismiss it).
+        // Also resolve whether the pointer is over the clickable docs link.
+        let (over_card, over_diag_link) = self
+            .hover_tip
+            .as_ref()
+            .zip(self.gpu.as_ref())
+            .map_or((false, false), |((_, ax, ay), g)| {
+                let screen = crate::widgets::Rect { x: 0.0, y: 0.0, w: g.config.width as f32, h: g.config.height as f32 };
+                let card = g.ui.diag_hover.rect((*ax, *ay), screen);
+                let m = theme::zpx(20.0); // margin bridges the anchor↔card gap
+                let bridge = crate::widgets::Rect { x: card.x - m, y: card.y - m, w: card.w + 2.0 * m, h: card.h + 2.0 * m };
+                let on_link = g.ui.diag_hover.link_rect(card).map_or(false, |lr| lr.contains(p));
+                (bridge.contains(p), on_link)
+            });
+        if over_card {
+            self.hover_pending = None; // leave hover_tip as-is
+        } else if let Some((info, cx, cy)) = squiggle {
+            let showing_same = self.hover_tip.as_ref().map_or(false, |(i, ..)| *i == info);
+            if showing_same {
+                self.hover_pending = None; // already visible; don't restart the timer
+            } else {
+                let same_pending = self.hover_pending.as_ref().map_or(false, |(i, ..)| *i == info);
+                if !same_pending {
+                    self.hover_pending = Some((info, cx, cy, Instant::now()));
+                }
+                if self.hover_tip.take().is_some() {
+                    changed = true; // hide a stale card from a previous squiggle
+                }
+            }
+        } else {
+            // Off any squiggle and not over the card → dismiss.
+            self.hover_pending = None;
+            if self.hover_tip.take().is_some() {
+                changed = true;
+            }
         }
-        self.hover_tip = new_tip;
         let (term_changed, term_thumb) = self.terminal.hover_panes(p, &layout);
         if term_changed {
             changed = true;
@@ -634,12 +683,25 @@ impl App {
                     || terminal_tablist_rect(terminal_content(panel), self.terminal.groups.len())
                         .map_or(false, |tl| tl.contains(p))
             });
+        // Over the terminal's text area → I-beam (selectable text), like VS Code.
+        let over_term_content = self.terminal.visible
+            && layout.palette.is_none()
+            && !over_term_btn
+            && !over_term_handle
+            && !over_scroll_thumb
+            && layout.terminal_panel.map_or(false, |panel| {
+                let content = terminal_content(panel);
+                content.contains(p)
+                    && terminal_tablist_rect(content, self.terminal.groups.len()).map_or(true, |tl| !tl.contains(p))
+            });
         let new_cursor = if self.sidebar_split.is_dragging() || over_handle {
             self.sidebar_split.cursor()
         } else if self.terminal.split.is_dragging() || over_term_handle {
             self.terminal.split.cursor()
         } else if over_term_btn {
             CursorIcon::Pointer
+        } else if over_term_content {
+            CursorIcon::Text
         } else if new_search {
             self.gpu
                 .as_ref()
@@ -680,7 +742,7 @@ impl App {
             c
         } else if self.focused_input_at(&layout, p).is_some() {
             CursorIcon::Text
-        } else if new_page_install || new_detail_tab.is_some() || over_detail_link {
+        } else if new_page_install || new_detail_tab.is_some() || over_detail_link || over_diag_link {
             CursorIcon::Pointer
         } else if self.detail.open_extension.is_some() && layout.editor_text.contains(p) {
             CursorIcon::Default
@@ -745,6 +807,9 @@ impl App {
         // the start and grammar extensions (rainbow-csv, …) activate on launch.
         self.extensions = extensions::scan();
         self.activate_installed_grammars();
+        // The panel was created with empty rows before this scan ran; push the
+        // installed list into it now so the Extensions view isn't blank on launch.
+        self.rebuild_ext_rows();
 
         let Some(gpu) = self.gpu.as_mut() else {
             return;
@@ -1248,7 +1313,7 @@ impl App {
         }
         let Some(ext) = self.ext_remote.get(idx).cloned() else { return };
         let Some(root) = extensions::dir() else {
-            self.show_info_dialog("Couldn't locate the extensions folder (~/.vscode/extensions).");
+            self.show_info_dialog("Couldn't locate the extensions folder (~/.nova/extensions).");
             return;
         };
         let label = if ext.display.is_empty() { ext.name.clone() } else { ext.display.clone() };
@@ -1273,6 +1338,39 @@ impl App {
             Some(OpenExt::Remote(i)) => self.install_remote(i),
             None => {}
         }
+    }
+
+    /// Uninstall whatever the detail page currently shows: delete it from Nova's
+    /// store, rescan, refresh the panel, and re-open the detail so it flips to
+    /// "Install". A running language server keeps going until the next launch.
+    fn uninstall_open(&mut self) {
+        let slug = match self.detail.open_extension {
+            Some(OpenExt::Local(i)) => self.extensions.get(i).map(|e| e.slug.clone()),
+            Some(OpenExt::Remote(i)) => self.ext_remote.get(i).map(|e| e.id().to_lowercase()),
+            None => None,
+        };
+        let Some(slug) = slug else { return };
+        if let Err(e) = extensions::uninstall(&slug) {
+            self.show_info_dialog(&format!("Couldn't uninstall: {e}"));
+            return;
+        }
+        self.extensions = extensions::scan();
+        // Stop any language server that came from the removed extension and clear its
+        // diagnostics, so uninstalling takes effect without a restart.
+        if let Some(ext_dir) = extensions::extensions_dir() {
+            self.lsp.reconcile(&mut self.workspace.documents, &[ext_dir]);
+        }
+        if let Some(g) = self.gpu.as_mut() {
+            for d in self.workspace.documents.iter_mut() {
+                d.reshape(&mut g.font_system);
+            }
+        }
+        // Close the detail page (the Local index it held may now be stale) and return
+        // to the refreshed list, where the extension is gone.
+        self.detail.open_extension = None;
+        self.rebuild_ext_rows();
+        self.show_info_dialog("Extension uninstalled.");
+        self.redraw();
     }
 
     /// The currently focused element (single source of truth for key routing).
@@ -1308,12 +1406,13 @@ impl App {
     /// Shares the editor's double-click state so the two can't both fire.
     fn register_click(&mut self, x: f32, y: f32) -> bool {
         let now = Instant::now();
-        let double = now.duration_since(self.last_click) < Duration::from_millis(400)
+        let same = now.duration_since(self.last_click) < Duration::from_millis(400)
             && (x - self.last_click_pos.0).abs() < 4.0
             && (y - self.last_click_pos.1).abs() < 4.0;
+        self.click_streak = if same { self.click_streak + 1 } else { 1 };
         self.last_click = now;
         self.last_click_pos = (x, y);
-        double
+        self.click_streak >= 2
     }
 
     /// (rect, left-pad) of a given input, if it's currently shown.
@@ -1700,6 +1799,8 @@ impl App {
     /// Drive language-server document sync from the idle tick (delegated to the
     /// manager, which owns the open/change/pull logic).
     fn sync_lsp(&mut self) {
+        // Language servers come only from Nova's own store (+ PATH for standalone
+        // binaries). We deliberately do NOT scan the user's VS Code extensions.
         let Some(ext_dir) = crate::extensions::extensions_dir() else { return };
         self.lsp.sync(&mut self.workspace.documents, &self.cwd, &[ext_dir], &self.worker_tx);
     }
@@ -1872,6 +1973,23 @@ impl App {
             return;
         }
 
+        // Clicking the docs link in the diagnostic hover card opens the rule's page.
+        if self.hover_tip.is_some() {
+            if let Some((url, hit)) = self.gpu.as_ref().and_then(|g| {
+                let (_, ax, ay) = self.hover_tip.as_ref().unwrap();
+                let screen = crate::widgets::Rect { x: 0.0, y: 0.0, w: g.config.width as f32, h: g.config.height as f32 };
+                let card = g.ui.diag_hover.rect((*ax, *ay), screen);
+                g.ui.diag_hover.link_rect(card).map(|lr| (g.ui.diag_hover.href().map(str::to_string), lr.contains((x, y))))
+            }) {
+                if hit {
+                    if let Some(url) = url {
+                        open_url(&url);
+                    }
+                    return;
+                }
+            }
+        }
+
         // A click while the context menu is open selects an item or dismisses it.
         if self.explorer.menu_open() {
             let item = self.gpu.as_ref().and_then(|g| self.explorer.menu_item_at((x, y), g));
@@ -1983,7 +2101,16 @@ impl App {
         // Terminal panel: header buttons, tab list, and pane-focus — the panel owns
         // its region's press handling. Clicking elsewhere while visible drops focus
         // (handled inside) without consuming the click.
-        if self.terminal.content_press((x, y), &layout, self.terminal_cell_w) {
+        // Count consecutive clicks for word/line selection, but only when the press
+        // lands in the terminal panel (so it consumes the click — no double-counting
+        // with the input/title handlers below).
+        let term_clicks = if layout.terminal_panel.map_or(false, |p| p.contains((x, y))) {
+            self.register_click(x, y);
+            self.click_streak
+        } else {
+            1
+        };
+        if self.terminal.content_press((x, y), &layout, self.terminal_cell_w, term_clicks) {
             self.redraw();
             return;
         }
@@ -2113,8 +2240,12 @@ impl App {
                 _ => None,
             };
             if let Some(v) = view {
-                if v == SidebarView::Extensions && self.extensions.is_empty() {
-                    self.extensions = extensions::scan();
+                if v == SidebarView::Extensions {
+                    if self.extensions.is_empty() {
+                        self.extensions = extensions::scan();
+                    }
+                    // Always rebuild: the list may have changed (install/uninstall)
+                    // since the panel last drew, and the guard above can leave stale rows.
                     self.rebuild_ext_rows();
                 }
                 if v == SidebarView::SourceControl {
@@ -2314,9 +2445,20 @@ impl App {
                     self.redraw();
                     return;
                 }
-                let hit = self.gpu.as_ref().map(|g| g.ui.ext_detail.hit_install(region, (x, y))).unwrap_or(false);
-                if hit {
+                let (hit_install, hit_uninstall) = self
+                    .gpu
+                    .as_ref()
+                    .map(|g| {
+                        (
+                            g.ui.ext_detail.hit_install(region, (x, y)),
+                            g.ui.ext_detail.hit_uninstall(region, (x, y)),
+                        )
+                    })
+                    .unwrap_or((false, false));
+                if hit_install {
                     self.install_open();
+                } else if hit_uninstall {
+                    self.uninstall_open();
                 }
                 return;
             }
@@ -2388,6 +2530,14 @@ impl App {
         if self.mouse_pressed && self.terminal.pane_scroll_drag((x, y)) {
             self.redraw();
             return;
+        }
+        // Terminal text-selection drag.
+        if self.mouse_pressed {
+            let layout = self.layout();
+            if self.terminal.selection_drag((x, y), &layout, self.terminal_cell_w) {
+                self.redraw();
+                return;
+            }
         }
         if self.mouse_pressed && self.sidebar_view == SidebarView::Extensions {
             let region = self.layout().tree_region();
@@ -2464,6 +2614,7 @@ impl App {
         self.sidebar_split.release();
         self.terminal.split.release();
         self.terminal.release_scrolls();
+        self.terminal.selection_release();
         self.detail.ext_detail_scroll.release();
         self.explorer.scroll.release();
         if let Some(ep) = self.extensions_panel.as_mut() {
@@ -2612,7 +2763,36 @@ impl App {
         // Editor arm falls through to the shortcut + editor-key handling below.
         match self.focus() {
             Focus::Terminal => {
+                // Copy: Ctrl+Shift+C always, or Ctrl+C when there's a selection
+                // (otherwise Ctrl+C falls through to send SIGINT, like VS Code).
+                let is_c = matches!(
+                    event.physical_key,
+                    winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyC)
+                );
+                // Ctrl+Shift+A selects everything (Ctrl+A alone still goes to the shell
+                // as beginning-of-line).
+                let is_a = matches!(
+                    event.physical_key,
+                    winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyA)
+                );
+                if ctrl && extend && is_a {
+                    if self.terminal.select_all() {
+                        self.redraw();
+                    }
+                    return;
+                }
+                if ctrl && is_c && (extend || self.terminal.selection_text().is_some()) {
+                    if let Some(text) = self.terminal.selection_text() {
+                        if let Some(cb) = self.clipboard.as_mut() {
+                            let _ = cb.set_text(text);
+                        }
+                    }
+                    self.terminal.clear_focused_selection();
+                    self.redraw();
+                    return;
+                }
                 if let Some(bytes) = translate_terminal_key(&event, ctrl, extend) {
+                    self.terminal.clear_focused_selection(); // input dismisses the selection
                     if let Some(g) = self.terminal.groups.get_mut(self.terminal.active) {
                         if let Some(p) = g.panes.get_mut(g.focused) {
                             p.term.write(&bytes);
@@ -3157,9 +3337,13 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
-                WorkerMsg::LspDiagnostics { uri, diags } => {
-                    self.lsp.apply_diagnostics_push(&mut self.workspace.documents, &uri, diags);
-                    self.redraw();
+                WorkerMsg::LspDiagnostics { server, uri, diags } => {
+                    // Only servers that own push diagnostics (e.g. rust-analyzer) get applied;
+                    // the TS server's empty push must not clobber ESLint's pulled squiggles.
+                    if crate::lsp::server_accepts_push(server) {
+                        self.lsp.apply_diagnostics_push(&mut self.workspace.documents, &uri, diags);
+                        self.redraw();
+                    }
                 }
                 WorkerMsg::LspDiagnosticReport { id, diags } => {
                     self.lsp.apply_diagnostic_report(&mut self.workspace.documents, id, diags);
@@ -3178,6 +3362,16 @@ impl ApplicationHandler for App {
         }
 
         let now = Instant::now();
+
+        // Promote a rested diagnostic hover into a visible card (VS Code-style delay).
+        if let Some((info, hx, hy, t0)) = self.hover_pending.clone() {
+            if now.duration_since(t0) >= HOVER_DELAY {
+                self.hover_pending = None;
+                self.hover_tip = Some((info, hx, hy));
+                self.redraw();
+            }
+        }
+        let hover_wake = self.hover_pending.as_ref().map(|(.., t0)| *t0 + HOVER_DELAY);
 
         // Language-server document sync (open + debounced didChange).
         self.sync_lsp();
@@ -3207,6 +3401,12 @@ impl ApplicationHandler for App {
                         changed = true;
                     }
                 }
+            }
+            // Blink the terminal block cursor on the standard cadence (PowerShell-style).
+            if now.duration_since(self.term_last_blink) >= Duration::from_millis(theme::BLINK_MS) {
+                self.term_blink_on = !self.term_blink_on;
+                self.term_last_blink = now;
+                changed = true;
             }
             if changed {
                 self.redraw();
@@ -3254,7 +3454,7 @@ impl ApplicationHandler for App {
                 && self.workspace.documents.iter().any(|d| d.dirty && d.path.is_some());
             let autosave_wake =
                 autosave_pending.then(|| self.last_edit + Duration::from_millis(1100));
-            el.set_control_flow(match min_instant(scroll_wake, autosave_wake) {
+            el.set_control_flow(match min_instant(min_instant(scroll_wake, autosave_wake), hover_wake) {
                 Some(w) => ControlFlow::WaitUntil(w),
                 None => ControlFlow::Wait,
             });
@@ -3268,7 +3468,10 @@ impl ApplicationHandler for App {
             self.redraw();
         }
         let blink_wake = self.last_blink + interval;
-        let wake = scroll_wake.map_or(blink_wake, |s| s.min(blink_wake));
+        let mut wake = scroll_wake.map_or(blink_wake, |s| s.min(blink_wake));
+        if let Some(hw) = hover_wake {
+            wake = wake.min(hw);
+        }
         el.set_control_flow(ControlFlow::WaitUntil(wake));
     }
 

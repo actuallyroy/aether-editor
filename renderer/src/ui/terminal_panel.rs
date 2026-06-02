@@ -212,7 +212,7 @@ impl TerminalPanel {
     /// Press in the terminal content/header: tab list (× kills / row switches), pane
     /// focus, or a header icon-button action. Returns true if consumed. Clicking
     /// outside the panel while visible just drops focus (not consumed).
-    pub fn content_press(&mut self, pt: (f32, f32), layout: &Layout, cell_w: f32) -> bool {
+    pub fn content_press(&mut self, pt: (f32, f32), layout: &Layout, cell_w: f32, clicks: u32) -> bool {
         if !self.visible {
             return false;
         }
@@ -233,12 +233,36 @@ impl TerminalPanel {
                     return true;
                 }
             }
-            // Otherwise focus whichever split pane was clicked.
+            // Otherwise focus whichever split pane was clicked, and begin a text
+            // selection at the clicked cell.
             let area = terminal_pane_area(content, self.groups.len());
             let rects = terminal_pane_rects(area, self.active_pane_count());
             if let Some(i) = rects.iter().position(|r| r.contains(pt)) {
                 if let Some(g) = self.groups.get_mut(self.active) {
                     g.focused = i;
+                    if let Some(pane) = g.panes.get_mut(i) {
+                        let (line, col) = Self::cell_at(rects[i], pt, cell_w, pane);
+                        match clicks {
+                            n if n >= 3 => {
+                                // Triple-click: select the whole line.
+                                let end = pane.term.line_chars(line).len();
+                                pane.sel = Some(((line, 0), (line, end)));
+                                pane.sel_dragging = false;
+                            }
+                            2 => {
+                                // Double-click: select the word (run of non-whitespace).
+                                let chars = pane.term.line_chars(line);
+                                let (s, e) = word_bounds(&chars, col);
+                                pane.sel = Some(((line, s), (line, e)));
+                                pane.sel_dragging = false;
+                            }
+                            _ => {
+                                pane.sel = Some(((line, col), (line, col)));
+                                pane.sel_dragging = true;
+                            }
+                        }
+                        pane.dirty = true;
+                    }
                 }
             }
             self.focused = true;
@@ -262,6 +286,116 @@ impl TerminalPanel {
             return true;
         }
         self.focused = false; // clicked elsewhere while visible
+        false
+    }
+
+    /// Map a point inside pane `rect` to a `(line, col)` in that pane's combined
+    /// buffer. Mirrors the cell geometry used by the renderer (8px/4px insets).
+    fn cell_at(rect: Rect, pt: (f32, f32), cell_w: f32, pane: &terminal::Pane) -> (usize, usize) {
+        let line_h = theme::LINE_HEIGHT();
+        let x0 = rect.x + theme::zpx(8.0);
+        let y0 = rect.y + theme::zpx(4.0);
+        let col = ((pt.0 - x0) / cell_w).floor().max(0.0) as usize;
+        let vis_row = ((pt.1 - y0) / line_h).floor().max(0.0) as usize;
+        let (cols, _) = pane.term.dims();
+        let top_line = (pane.scroll.offset().1 / line_h).round() as usize;
+        let total = pane.term.total_lines();
+        let line = (top_line + vis_row).min(total.saturating_sub(1));
+        (line, col.min(cols))
+    }
+
+    /// Continue a text selection drag in whichever pane is selecting. Returns true if
+    /// a selection drag was active (so the caller redraws).
+    pub fn selection_drag(&mut self, pt: (f32, f32), layout: &Layout, cell_w: f32) -> bool {
+        if !self.visible {
+            return false;
+        }
+        let Some(panel) = layout.terminal_panel else { return false };
+        let content = terminal_content(panel);
+        let area = terminal_pane_area(content, self.groups.len());
+        let rects = terminal_pane_rects(area, self.active_pane_count());
+        // Find the dragging pane and the rect it lives in.
+        let mut target: Option<usize> = None;
+        if let Some(g) = self.groups.get(self.active) {
+            target = g.panes.iter().position(|p| p.sel_dragging);
+        }
+        let Some(i) = target else { return false };
+        let rect = rects.get(i).copied().unwrap_or(content);
+        // Clamp the point into the pane so dragging past an edge selects to it.
+        let clamped = (
+            pt.0.clamp(rect.x, rect.x + rect.w - 1.0),
+            pt.1.clamp(rect.y, rect.y + rect.h - 1.0),
+        );
+        if let Some(g) = self.groups.get_mut(self.active) {
+            if let Some(p) = g.panes.get_mut(i) {
+                let head = Self::cell_at(rect, clamped, cell_w, p);
+                if let Some((_, h)) = p.sel.as_mut() {
+                    if *h != head {
+                        *h = head;
+                        p.dirty = true;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// End any in-progress selection drag; drop a zero-width selection (plain click).
+    pub fn selection_release(&mut self) {
+        for g in &mut self.groups {
+            for p in &mut g.panes {
+                if p.sel_dragging {
+                    p.sel_dragging = false;
+                    if let Some((a, b)) = p.sel {
+                        if a == b {
+                            p.sel = None;
+                        }
+                    }
+                    p.dirty = true;
+                }
+            }
+        }
+    }
+
+    /// Select the entire scrollback + screen of the focused pane. Returns true if a
+    /// selection was made (so the caller redraws).
+    pub fn select_all(&mut self) -> bool {
+        if let Some(g) = self.groups.get_mut(self.active) {
+            let f = g.focused;
+            if let Some(p) = g.panes.get_mut(f) {
+                let total = p.term.total_lines();
+                if total == 0 {
+                    return false;
+                }
+                let last = total - 1;
+                let last_len = p.term.line_chars(last).len();
+                p.sel = Some(((0, 0), (last, last_len)));
+                p.sel_dragging = false;
+                p.dirty = true;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The focused pane's selected text, if any.
+    pub fn selection_text(&self) -> Option<String> {
+        let g = self.groups.get(self.active)?;
+        g.panes.get(g.focused).and_then(|p| p.selection_text())
+    }
+
+    /// Clear the focused pane's selection (e.g. on keyboard input). Returns true if
+    /// there was one (so the caller redraws).
+    pub fn clear_focused_selection(&mut self) -> bool {
+        if let Some(g) = self.groups.get_mut(self.active) {
+            let f = g.focused;
+            if let Some(p) = g.panes.get_mut(f) {
+                if p.clear_selection() {
+                    p.dirty = true;
+                    return true;
+                }
+            }
+        }
         false
     }
 
@@ -342,4 +476,22 @@ impl TerminalPanel {
         }
         (changed, over_thumb)
     }
+}
+
+/// Word boundaries (start, end-exclusive) around `col` in `chars`: the run of
+/// non-whitespace under the cursor. On a space (or past the end) selects just that
+/// cell. Treating any non-space as a word keeps paths/URLs/flags selectable whole.
+fn word_bounds(chars: &[char], col: usize) -> (usize, usize) {
+    if col >= chars.len() || chars[col].is_whitespace() {
+        return (col, col + 1);
+    }
+    let mut s = col;
+    while s > 0 && !chars[s - 1].is_whitespace() {
+        s -= 1;
+    }
+    let mut e = col + 1;
+    while e < chars.len() && !chars[e].is_whitespace() {
+        e += 1;
+    }
+    (s, e)
 }

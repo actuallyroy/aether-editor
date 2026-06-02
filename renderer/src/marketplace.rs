@@ -32,7 +32,7 @@ pub enum WorkerMsg {
     FeedbackDone { result: Result<String, String> },
     // ---- Language server (see lsp.rs) ----
     LspInitialized { sem_token_types: Vec<String> },            // initialize response (+ semantic legend)
-    LspDiagnostics { uri: String, diags: Vec<crate::lsp::Diagnostic> }, // push publishDiagnostics
+    LspDiagnostics { server: &'static str, uri: String, diags: Vec<crate::lsp::Diagnostic> }, // push publishDiagnostics
     LspDiagnosticReport { id: i64, diags: Vec<crate::lsp::Diagnostic> }, // pull diagnostic response
     LspSemanticTokens { id: i64, data: Vec<u32> },              // semanticTokens/full response
     LspLog { server: &'static str, message: String },           // server log / stderr line

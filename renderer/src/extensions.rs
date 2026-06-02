@@ -60,10 +60,10 @@ pub fn open_ext_view(
         OpenExt::Remote(i) => {
             let e = remote.get(i)?;
             let name = if e.display.is_empty() { e.name.clone() } else { e.display.clone() };
-            // Already installed if a scanned extension matches by name. (We match on
-            // name, not publisher, because the marketplace namespace — e.g. Open VSX
-            // "prettier" — often differs from the VS Code publisher "esbenp".)
-            let installed = extensions.iter().any(|x| x.name.eq_ignore_ascii_case(&e.name));
+            // Installed iff Nova's own store has this exact marketplace id. Nova wrote
+            // the folder name as `namespace.name`, so the slug matches `e.id()` exactly —
+            // no fragile display-name comparison across two registries.
+            let installed = extensions.iter().any(|x| x.slug.eq_ignore_ascii_case(&e.id()));
             Some(OpenExtView {
                 name,
                 publisher: e.namespace.clone(),
@@ -91,6 +91,9 @@ pub enum ExtKind {
 
 pub struct Extension {
     pub name: String,
+    /// Marketplace id (`namespace.name`, lowercased) derived from the install
+    /// folder name Nova wrote — the stable key for matching against search results.
+    pub slug: String,
     pub publisher: String,
     pub description: String,
     pub version: String,
@@ -117,18 +120,43 @@ impl Extension {
     }
 }
 
+/// Nova's own extension store, `~/.nova/extensions`. Distinct from VS Code's so
+/// the Extensions view + Installed/Install state reflect only what Nova installed,
+/// not whatever the user's separate VS Code install happens to have on disk.
+/// `None` until something is installed (used by the sidebar scan).
 pub(crate) fn extensions_dir() -> Option<PathBuf> {
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
-    let dir = PathBuf::from(home).join(".vscode").join("extensions");
+    let dir = PathBuf::from(home).join(".nova").join("extensions");
     dir.is_dir().then_some(dir)
 }
 
-/// The extensions directory path, creating it if needed (for installs).
+/// The Nova extensions directory, creating it if needed (for installs).
 pub fn dir() -> Option<PathBuf> {
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
-    let dir = PathBuf::from(home).join(".vscode").join("extensions");
+    let dir = PathBuf::from(home).join(".nova").join("extensions");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
+}
+
+/// Remove an installed extension from Nova's store by its marketplace `slug`
+/// (`namespace.name`). Deletes every `<slug>-<version>/` folder for it. A running
+/// language server already loaded from the folder keeps going until the next launch.
+pub fn uninstall(slug: &str) -> std::io::Result<()> {
+    let Some(dir) = extensions_dir() else { return Ok(()) };
+    let slug = slug.to_lowercase();
+    for entry in std::fs::read_dir(&dir)?.flatten() {
+        let p = entry.path();
+        if !p.is_dir() {
+            continue;
+        }
+        if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+            let lower = name.to_lowercase();
+            if lower == slug || lower.starts_with(&format!("{slug}-")) {
+                std::fs::remove_dir_all(&p)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Scan installed VSCode extensions; supported ones sorted first, then by name.
@@ -205,6 +233,13 @@ fn parse(v: &Value, ext_dir: &std::path::Path) -> Option<Extension> {
         if d.starts_with('%') { String::new() } else { d.to_string() }
     };
     let version = v["version"].as_str().unwrap_or("").to_string();
+    // Nova installs to `<namespace>.<name>-<version>/`; recover the marketplace id
+    // (`namespace.name`) by stripping the trailing version from the folder name.
+    let slug = ext_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.trim_end_matches(&format!("-{version}")).to_lowercase())
+        .unwrap_or_else(|| format!("{publisher}.{raw_name}").to_lowercase());
     // README shipped alongside package.json (case-insensitive common names).
     let readme_path = ["README.md", "readme.md", "README.MD", "Readme.md"]
         .iter()
@@ -253,6 +288,7 @@ fn parse(v: &Value, ext_dir: &std::path::Path) -> Option<Extension> {
 
     Some(Extension {
         name,
+        slug,
         publisher,
         description,
         version,
