@@ -43,15 +43,29 @@ pub enum PickKind {
 /// One row in a quick-pick list (dynamic, unlike the fixed `COMMANDS`).
 #[derive(Clone)]
 pub struct PickItem {
-    pub label: String,  // committed value (e.g. the theme label) + primary text
-    pub detail: String, // dim right-hand hint (e.g. "dark" / source extension)
+    pub label: String,        // committed value / primary text
+    pub detail: String,       // dim right-hand hint
+    pub line: Option<usize>,  // 1-based target line (go-to-symbol)
 }
 
-/// The palette is either the fixed command list or a dynamic quick-pick (theme
-/// chooser, etc.) — the same widget, two data sources, so all list pickers reuse it.
+impl PickItem {
+    pub fn new(label: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self { label: label.into(), detail: detail.into(), line: None }
+    }
+    pub fn at_line(label: impl Into<String>, detail: impl Into<String>, line: usize) -> Self {
+        Self { label: label.into(), detail: detail.into(), line: Some(line) }
+    }
+}
+
+/// Quick-open modes, VSCode-style. Most are driven by the input's leading prefix
+/// (`>` commands, `@` symbols, `:` line, none = files); `QuickPick` is a one-off
+/// chooser (e.g. themes) opened programmatically.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PaletteMode {
-    Commands,
+    Commands,         // `>` — run a command
+    Files,            // (no prefix) — go to file
+    Symbols,          // `@` — go to symbol in the active file
+    GoToLine,         // `:` — go to line
     QuickPick(PickKind),
 }
 
@@ -61,6 +75,8 @@ pub struct PaletteState {
     pub filtered: Vec<usize>,
     pub mode: PaletteMode,
     pub items: Vec<PickItem>, // the quick-pick source (empty in Commands mode)
+    pub scroll: f32,          // list scroll offset in px (clamped/followed in render)
+    pub follow_selection: bool, // scroll to keep the selection visible next frame
 }
 
 impl PaletteState {
@@ -72,30 +88,35 @@ impl PaletteState {
             filtered,
             mode: PaletteMode::Commands,
             items: Vec::new(),
+            scroll: 0.0,
+            follow_selection: true,
         }
     }
-    /// Number of rows in the active source (commands or quick-pick items).
+    /// Number of rows in the active source (commands or item list).
     fn source_len(&self) -> usize {
         match self.mode {
             PaletteMode::Commands => COMMANDS.len(),
-            PaletteMode::QuickPick(_) => self.items.len(),
+            _ => self.items.len(),
         }
     }
     /// The display text of row `i` in the active source (for filtering).
     fn row_text(&self, i: usize) -> String {
         match self.mode {
             PaletteMode::Commands => COMMANDS[i].1.to_lowercase(),
-            PaletteMode::QuickPick(_) => self.items[i].label.to_lowercase(),
+            _ => self.items[i].label.to_lowercase(),
         }
     }
     pub fn refilter(&mut self, query: &str) {
         let q = query.to_lowercase();
         self.filtered = (0..self.source_len())
             .filter(|&i| q.is_empty() || self.row_text(i).contains(&q))
+            .take(500) // cap the rendered set (go-to-file can have thousands of matches)
             .collect();
         if self.selected >= self.filtered.len() {
             self.selected = self.filtered.len().saturating_sub(1);
         }
+        self.scroll = 0.0; // new results → back to the top
+        self.follow_selection = true;
     }
     pub fn open(&mut self) {
         self.mode = PaletteMode::Commands;
@@ -112,6 +133,18 @@ impl PaletteState {
         self.selected = 0;
         self.refilter("");
     }
+    /// Switch the source for a prefix-driven mode (Files/Symbols), keeping the
+    /// palette open. Resets the selection to the top.
+    pub fn set_source(&mut self, mode: PaletteMode, items: Vec<PickItem>) {
+        self.mode = mode;
+        self.items = items;
+        self.selected = 0;
+        self.refilter("");
+    }
+    /// The selected item in any item-based mode (Files/Symbols/QuickPick).
+    pub fn selected_item(&self) -> Option<&PickItem> {
+        self.filtered.get(self.selected).and_then(|&i| self.items.get(i))
+    }
     /// The selected quick-pick `(kind, label)`, if in quick-pick mode.
     pub fn selected_pick(&self) -> Option<(PickKind, String)> {
         match self.mode {
@@ -120,7 +153,7 @@ impl PaletteState {
                 .get(self.selected)
                 .and_then(|&i| self.items.get(i))
                 .map(|it| (kind, it.label.clone())),
-            PaletteMode::Commands => None,
+            _ => None,
         }
     }
     pub fn close(&mut self) {
@@ -130,6 +163,7 @@ impl PaletteState {
     pub fn select_next(&mut self) {
         if !self.filtered.is_empty() {
             self.selected = (self.selected + 1) % self.filtered.len();
+            self.follow_selection = true;
         }
     }
     /// Move the selection up one row (wraps to the bottom).
@@ -140,6 +174,7 @@ impl PaletteState {
             } else {
                 self.selected - 1
             };
+            self.follow_selection = true;
         }
     }
     /// The command under the current selection, if any (Commands mode only).

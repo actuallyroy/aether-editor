@@ -126,6 +126,8 @@ pub(crate) fn image_ctrl_cells(region: Rect) -> [Rect; 4] {
 }
 
 pub(crate) fn render(app: &mut App) -> Result<()> {
+    // Refresh the selection-occurrence highlight before borrowing gpu (needs &mut app).
+    app.recompute_selection_highlight();
     let Some(gpu) = app.gpu.as_mut() else {
         return Ok(());
     };
@@ -559,7 +561,8 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                         }
                     }
                 }
-                crate::commands::PaletteMode::QuickPick(_) => {
+                // All item-based modes (files / symbols / go-to-line / quick-pick).
+                _ => {
                     for &i in app.palette.filtered.iter() {
                         if let Some(it) = app.palette.items.get(i) {
                             if it.detail.is_empty() {
@@ -571,9 +574,12 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     }
                 }
             }
+            // Shape the FULL list height (not just the visible band) so scrolling
+            // reveals every row; draw_at clips to the visible region.
+            let content_h = app.palette.filtered.len() as f32 * theme::PALETTE_ROW_HEIGHT() + theme::zpx(40.0);
             gpu.ui
                 .palette_list
-                .set_text(fs, &list_text, pal.list.w, pal.list.h);
+                .set_text(fs, &list_text, pal.list.w, content_h.max(pal.list.h));
         }
 
         // Context menu items.
@@ -856,15 +862,17 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             }
         }
 
-        // Find-match highlights: a translucent box behind every match (the current
-        // one is shown by the selection drawn on top). Only visible matches are
-        // mapped to rects, so this stays cheap on large result sets.
-        if app.find.active && !app.find.matches.is_empty() && d.diff.is_none() {
+        // Match highlights: every find result (when the find widget is open) OR
+        // every occurrence of the current word-like selection (VSCode selection
+        // highlight). A translucent box behind each; the current one shows via the
+        // selection on top. Only visible matches are mapped to rects.
+        let hl_matches: &[(usize, usize)] = if app.find.active { &app.find.matches } else { &app.sel_matches };
+        if !hl_matches.is_empty() && d.diff.is_none() {
             let lh = theme::LINE_HEIGHT().max(1.0);
             let first = (d.scroll_y() / lh) as usize;
             let last = first + (layout.editor_text.h / lh) as usize + 2;
             let len = d.rope.len_bytes();
-            for &(s, e) in &app.find.matches {
+            for &(s, e) in hl_matches {
                 if e <= s {
                     continue;
                 }
@@ -1010,19 +1018,20 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         if !modal_open {
             d.scroll.draw(now, &mut fg_quads);
         }
-        // Find overview markers: a tick on the scrollbar track per match (VSCode's
-        // overview ruler), with the current match brighter. Always shown while the
-        // find widget is open so you can see where results sit in the whole file.
-        if app.find.active && !app.find.matches.is_empty() && !modal_open {
+        // Overview markers: a tick on the scrollbar track per match — find results
+        // (current one brighter) or selection occurrences — so you can see where
+        // they sit in the whole file (VSCode's overview ruler).
+        let ov_matches: &[(usize, usize)] = if app.find.active { &app.find.matches } else { &app.sel_matches };
+        if !ov_matches.is_empty() && !modal_open {
             let track = d.scroll.vtrack_rect();
             let total = d.rope.len_lines().max(1) as f32;
             let mh = theme::zpx(2.0).max(1.0);
             let inset = theme::zpx(1.0);
             let base = theme::FIND_MATCH();
-            for (i, &(s, _)) in app.find.matches.iter().enumerate() {
+            for (i, &(s, _)) in ov_matches.iter().enumerate() {
                 let line = d.rope.byte_to_line(s.min(d.rope.len_bytes())) as f32;
                 let y = track.y + (line / total) * track.h - mh * 0.5;
-                let current = app.find.index == Some(i);
+                let current = app.find.active && app.find.index == Some(i);
                 let color = if current { theme::ACCENT() } else { base };
                 let w = if current { track.w } else { track.w - inset * 2.0 };
                 let x = if current { track.x } else { track.x + inset };
@@ -1905,19 +1914,50 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         let ir = theme::zpx(7.0);
         pq.push(Rect { x: pal.input.x - 1.0, y: pal.input.y - 1.0, w: pal.input.w + 2.0, h: pal.input.h + 2.0 }.rounded_quad(theme::PALETTE_BORDER(), ir + 1.0));
         pq.push(pal.input.rounded_quad(theme::PALETTE_INPUT_BG(), ir));
+        // Scroll the list so the selection stays in view; clamp to content.
+        let row_h = theme::PALETTE_ROW_HEIGHT();
+        let n = app.palette.filtered.len();
+        let content_h = n as f32 * row_h;
+        let mut scroll = app.palette.scroll;
+        // Follow the selection into view only when it just moved (so the mouse wheel
+        // can scroll freely without snapping back to the selection).
+        if app.palette.follow_selection {
+            let sel_top = app.palette.selected as f32 * row_h;
+            if sel_top < scroll {
+                scroll = sel_top;
+            }
+            if sel_top + row_h > scroll + pal.list.h {
+                scroll = sel_top + row_h - pal.list.h;
+            }
+            app.palette.follow_selection = false;
+        }
+        scroll = scroll.clamp(0.0, (content_h - pal.list.h).max(0.0));
+        app.palette.scroll = scroll;
         if !app.palette.filtered.is_empty() {
             let r = gpu.ui.palette_list.row_rect(pal.list, app.palette.selected);
-            let pill = Rect { x: r.x + theme::zpx(4.0), y: r.y + theme::zpx(1.0), w: r.w - theme::zpx(8.0), h: (r.h - theme::zpx(2.0)).max(2.0) };
-            pq.push(pill.rounded_quad(theme::PALETTE_SELECTED(), theme::zpx(6.0)));
+            let py = r.y - scroll;
+            // Only draw the selection pill when it's within the visible list band.
+            if py + r.h > pal.list.y && py < pal.list.y + pal.list.h {
+                let pill = Rect { x: r.x + theme::zpx(4.0), y: py + theme::zpx(1.0), w: r.w - theme::zpx(8.0), h: (r.h - theme::zpx(2.0)).max(2.0) };
+                pq.push(pill.rounded_quad(theme::PALETTE_SELECTED(), theme::zpx(6.0)));
+            }
         }
         gpu.ui.palette_input.selection_quads(pal.input, theme::zpx(14.0), &mut pq);
         if app.cursor_blink_on {
             pfg.push(gpu.ui.palette_input.caret_quad(pal.input, theme::zpx(14.0)));
         }
+        // Scrollbar thumb for the list (when it overflows).
+        if content_h > pal.list.h {
+            let track_h = pal.list.h;
+            let thumb_h = (track_h * (track_h / content_h)).max(theme::zpx(20.0));
+            let thumb_y = pal.list.y + (scroll / (content_h - track_h)) * (track_h - thumb_h);
+            let tw = theme::zpx(4.0);
+            pq.push(Rect { x: pal.list.x + pal.list.w - tw - theme::zpx(2.0), y: thumb_y, w: tw, h: thumb_h }.rounded_quad([0.6, 0.64, 0.78, 0.5], tw * 0.5));
+        }
         gpu.quad_renderer.prepare(&gpu.device, &gpu.queue, &pq, &pfg, (cfg_w, cfg_h));
         let mut pareas: Vec<TextArea> = Vec::new();
         gpu.ui.palette_input.draw(pal.input, theme::zpx(14.0), theme::FG_TEXT(), &mut pareas);
-        gpu.ui.palette_list.draw(pal.list, theme::FG_TEXT(), &mut pareas);
+        gpu.ui.palette_list.draw_at(pal.list, pal.list.y - scroll, theme::FG_TEXT(), &mut pareas);
         gpu.text_renderer.prepare(&gpu.device, &gpu.queue, &mut gpu.font_system, &mut gpu.atlas, &gpu.viewport, pareas, &mut gpu.swash_cache)?;
         let mut encp = gpu.device.create_command_encoder(&CommandEncoderDescriptor { label: Some("aether-palette-pass") });
         {

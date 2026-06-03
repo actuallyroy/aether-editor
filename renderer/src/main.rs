@@ -240,6 +240,11 @@ pub(crate) struct App {
     pub(crate) extensions: Vec<Extension>,
     pub(crate) text_drag: Option<InputId>, // active mouse drag-selection in a text input
     pub(crate) find_drag: Option<bool>,    // find-widget drag-select (Some(true)=replace input)
+    // Selection-occurrence highlight (VSCode-style): all matches of the current
+    // word-like selection, recomputed when the selection text / doc version changes.
+    pub(crate) sel_matches: Vec<(usize, usize)>,
+    pub(crate) sel_hl_text: String,
+    pub(crate) sel_hl_version: i32,
     pub(crate) image_drag_last: Option<(f32, f32)>, // last cursor pos while panning an image
     pub(crate) ext_remote: Vec<marketplace::RemoteExt>, // current marketplace search results
     pub(crate) worker_tx: Sender<WorkerMsg>,
@@ -326,6 +331,9 @@ impl App {
             extensions: Vec::new(),
             text_drag: None,
             find_drag: None,
+            sel_matches: Vec::new(),
+            sel_hl_text: String::new(),
+            sel_hl_version: -1,
             image_drag_last: None,
             ext_remote: Vec::new(),
             worker_tx,
@@ -414,7 +422,7 @@ impl App {
                 .map(|(g, pal)| {
                     if pal.input.contains(p) {
                         CursorIcon::Text
-                    } else if g.ui.palette_list.row_at(pal.list, p, self.palette.filtered.len()).is_some() {
+                    } else if g.ui.palette_list.row_at_scrolled(pal.list, self.palette.scroll, p, self.palette.filtered.len()).is_some() {
                         CursorIcon::Pointer
                     } else {
                         CursorIcon::Default
@@ -423,7 +431,7 @@ impl App {
                 .unwrap_or(CursorIcon::Default);
             // Selecting the hovered row mirrors VSCode (mouse hover moves selection).
             if let Some((g, pal)) = self.gpu.as_ref().zip(layout.palette.as_ref()) {
-                if let Some(i) = g.ui.palette_list.row_at(pal.list, p, self.palette.filtered.len()) {
+                if let Some(i) = g.ui.palette_list.row_at_scrolled(pal.list, self.palette.scroll, p, self.palette.filtered.len()) {
                     if self.palette.selected != i {
                         self.palette.selected = i;
                         self.redraw();
@@ -1762,7 +1770,19 @@ impl App {
     }
 
     /// Open the command palette and focus its input.
+    /// Open the command palette (Ctrl+Shift+P) — prefilled with `>` so it starts in
+    /// command mode, VSCode-style.
     fn open_palette(&mut self) {
+        self.open_palette_with(">");
+    }
+
+    /// Open quick-open (Ctrl+P) — empty input, so it starts in go-to-file mode.
+    fn open_quick_open(&mut self) {
+        self.open_palette_with("");
+    }
+
+    /// Open the palette with `prefill` in the input; the prefix drives the mode.
+    fn open_palette_with(&mut self, prefill: &str) {
         self.palette.open();
         // Clear any chrome hover so nothing lingers (dimmed) behind the modal.
         self.hovered_tab = None;
@@ -1770,9 +1790,10 @@ impl App {
         self.hovered_activity = None;
         self.hovered_explorer = None;
         if let Some(g) = self.gpu.as_mut() {
-            g.ui.palette_input.clear(&mut g.font_system);
+            g.ui.palette_input.set_text(&mut g.font_system, prefill);
             g.ui.palette_input.focus(true);
         }
+        self.refilter_palette(); // derive the mode from the prefill + build its source
         self.redraw();
     }
 
@@ -1782,17 +1803,14 @@ impl App {
     fn theme_items(&self, only_ext: Option<usize>) -> Vec<commands::PickItem> {
         let mut items = Vec::new();
         if only_ext.is_none() {
-            items.push(commands::PickItem { label: "Aether Dark".into(), detail: "dark · built-in".into() });
+            items.push(commands::PickItem::new("Aether Dark", "dark · built-in"));
         }
         for (idx, e) in self.extensions.iter().enumerate() {
             if only_ext.map_or(false, |o| o != idx) {
                 continue;
             }
             for t in &e.themes {
-                items.push(commands::PickItem {
-                    label: t.label.clone(),
-                    detail: if t.dark { "dark" } else { "light" }.to_string(),
-                });
+                items.push(commands::PickItem::new(t.label.clone(), if t.dark { "dark" } else { "light" }));
             }
         }
         items
@@ -1831,14 +1849,150 @@ impl App {
         }
     }
 
-    /// Re-filter the palette from its input's current text.
+    /// All files under the workspace root (skipping VCS/build dirs), as Files-mode
+    /// items. `label` is the repo-relative path (filtered + opened on commit).
+    fn build_file_items(&self) -> Vec<commands::PickItem> {
+        const SKIP: &[&str] = &[".git", "target", "node_modules", ".aether", "dist", "build", "out", ".next", ".venv"];
+        let root = self.cwd.clone();
+        let mut out = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+            for ent in rd.flatten() {
+                let p = ent.path();
+                let name = ent.file_name().to_string_lossy().to_string();
+                if p.is_dir() {
+                    if !SKIP.contains(&name.as_str()) {
+                        stack.push(p);
+                    }
+                } else {
+                    let rel = p.strip_prefix(&root).unwrap_or(&p).to_string_lossy().replace('\\', "/");
+                    out.push(commands::PickItem::new(rel, ""));
+                    if out.len() >= 8000 {
+                        return out;
+                    }
+                }
+            }
+        }
+        out.sort_by(|a, b| a.label.cmp(&b.label));
+        out
+    }
+
+    /// Symbols of the active document, as Symbols-mode items (`@`).
+    fn build_symbol_items(&self) -> Vec<commands::PickItem> {
+        let Some(d) = self.workspace.active_doc() else { return Vec::new() };
+        let text = d.rope.to_string();
+        extract_symbols(&text, d.ext())
+            .into_iter()
+            .map(|(name, kind, line)| commands::PickItem::at_line(name, kind, line))
+            .collect()
+    }
+
+    /// Move the caret to a 1-based line in the active doc, reveal any fold over it,
+    /// and center it.
+    fn goto_line(&mut self, line: usize) {
+        let target = line.saturating_sub(1);
+        if let Some(d) = self.workspace.active_doc_mut() {
+            let l = target.min(d.rope.len_lines().saturating_sub(1));
+            if d.is_line_hidden(l) {
+                d.reveal_line(l);
+            }
+            let byte = d.rope.line_to_byte(l);
+            d.place(byte, false);
+        }
+        self.ensure_cursor_visible();
+        self.redraw();
+    }
+
+    /// Re-filter the palette from its input. The leading character selects the mode
+    /// (`>` commands, `@` symbols, `:` line, none = files) — VSCode quick-open.
     fn refilter_palette(&mut self) {
-        let q = self
-            .gpu
-            .as_ref()
-            .map(|g| g.ui.palette_input.text().to_string())
-            .unwrap_or_default();
-        self.palette.refilter(&q);
+        let raw = self.gpu.as_ref().map(|g| g.ui.palette_input.text().to_string()).unwrap_or_default();
+        // Resolve (target mode, residual query) from the prefix.
+        let (mode, sub): (commands::PaletteMode, String) = match raw.chars().next() {
+            // Keep an active programmatic quick-pick (e.g. theme chooser) regardless.
+            _ if matches!(self.palette.mode, commands::PaletteMode::QuickPick(_)) => (self.palette.mode, raw.clone()),
+            Some('>') => (commands::PaletteMode::Commands, raw[1..].to_string()),
+            Some('@') => (commands::PaletteMode::Symbols, raw.trim_start_matches(['@', ':']).to_string()),
+            Some(':') => (commands::PaletteMode::GoToLine, raw[1..].to_string()),
+            _ => (commands::PaletteMode::Files, raw.clone()),
+        };
+        // Go-to-line: show a single hint row reflecting the typed number.
+        if mode == commands::PaletteMode::GoToLine {
+            let total = self.workspace.active_doc().map_or(0, |d| d.rope.len_lines());
+            let label = if sub.trim().is_empty() {
+                format!("Go to line… (1–{total})")
+            } else {
+                format!("Go to line {}", sub.trim())
+            };
+            self.palette.set_source(mode, vec![commands::PickItem::new(label, "")]);
+            return;
+        }
+        // Rebuild the source only when the mode changes (file/symbol scans are not free).
+        if self.palette.mode != mode {
+            match mode {
+                commands::PaletteMode::Commands => self.palette.set_source(mode, Vec::new()),
+                commands::PaletteMode::Files => {
+                    let items = self.build_file_items();
+                    self.palette.set_source(mode, items);
+                }
+                commands::PaletteMode::Symbols => {
+                    let items = self.build_symbol_items();
+                    self.palette.set_source(mode, items);
+                }
+                commands::PaletteMode::GoToLine => self.palette.set_source(mode, Vec::new()),
+                commands::PaletteMode::QuickPick(_) => {}
+            }
+        }
+        self.palette.refilter(&sub);
+    }
+
+    /// Commit the current palette selection based on its mode. Returns true if the
+    /// palette should close afterward.
+    fn commit_palette(&mut self) -> bool {
+        match self.palette.mode {
+            commands::PaletteMode::Commands => {
+                if let Some(cmd) = self.palette.selected_command() {
+                    self.palette.close();
+                    self.exec_command(cmd);
+                }
+                true
+            }
+            commands::PaletteMode::QuickPick(_) => {
+                if let Some((kind, label)) = self.palette.selected_pick() {
+                    self.palette.close();
+                    self.exec_pick(kind, &label);
+                }
+                true
+            }
+            commands::PaletteMode::Files => {
+                if let Some(rel) = self.palette.selected_item().map(|it| it.label.clone()) {
+                    self.palette.close();
+                    let path = self.cwd.join(rel);
+                    self.open_file_at(path, 1, 0);
+                }
+                true
+            }
+            commands::PaletteMode::Symbols => {
+                if let Some(line) = self.palette.selected_item().and_then(|it| it.line) {
+                    self.palette.close();
+                    self.goto_line(line);
+                }
+                true
+            }
+            commands::PaletteMode::GoToLine => {
+                let n: usize = self
+                    .gpu
+                    .as_ref()
+                    .and_then(|g| g.ui.palette_input.text().trim_start_matches(':').trim().parse().ok())
+                    .unwrap_or(0);
+                self.palette.close();
+                if n > 0 {
+                    self.goto_line(n);
+                }
+                true
+            }
+        }
     }
 
     fn exec_command(&mut self, cmd: Command) {
@@ -2164,6 +2318,49 @@ impl App {
             }
         }
         self.ensure_cursor_visible();
+    }
+
+    /// VSCode-style selection highlight: find every occurrence of the current
+    /// word-like selection so the renderer can box them + mark the scrollbar.
+    /// Cached on (selection text, doc version); cleared while the find widget owns
+    /// the highlights.
+    pub(crate) fn recompute_selection_highlight(&mut self) {
+        if self.find.active {
+            self.sel_matches.clear();
+            self.sel_hl_text.clear();
+            self.sel_hl_version = -1;
+            return;
+        }
+        let (text, version) = match self.workspace.active_doc() {
+            Some(d) if !d.sel.is_empty() && d.diff.is_none() => {
+                let (lo, hi) = d.sel.range();
+                let s = d.rope.byte_slice(lo..hi).to_string();
+                let ok = !s.contains('\n') && !s.trim().is_empty() && s.trim() == s && s.chars().count() <= 200;
+                (if ok { s } else { String::new() }, d.version)
+            }
+            _ => (String::new(), -1),
+        };
+        if text == self.sel_hl_text && version == self.sel_hl_version {
+            return; // unchanged since last frame
+        }
+        self.sel_hl_text = text.clone();
+        self.sel_hl_version = version;
+        self.sel_matches.clear();
+        if text.is_empty() {
+            return;
+        }
+        if let Some(hay) = self.workspace.active_doc().map(|d| d.rope.to_string()) {
+            let mut start = 0;
+            while let Some(rel) = hay[start..].find(&text) {
+                let abs = start + rel;
+                self.sel_matches.push((abs, abs + text.len()));
+                start = abs + text.len();
+            }
+            // A lone occurrence (just the selection itself) isn't worth highlighting.
+            if self.sel_matches.len() < 2 {
+                self.sel_matches.clear();
+            }
+        }
     }
 
     /// Rebuild the match list for the current query + options against the active
@@ -2649,16 +2846,11 @@ impl App {
             let row = self
                 .gpu
                 .as_ref()
-                .and_then(|gpu| gpu.ui.palette_list.row_at(pal.list, (x, y), self.palette.filtered.len()));
+                .and_then(|gpu| gpu.ui.palette_list.row_at_scrolled(pal.list, self.palette.scroll, (x, y), self.palette.filtered.len()));
             if let Some(idx) = row {
                 self.palette.selected = idx;
-                if let Some((kind, label)) = self.palette.selected_pick() {
-                    self.palette.close();
-                    self.exec_pick(kind, &label);
-                } else if let Some(cmd) = self.palette.selected_command() {
-                    self.palette.close();
-                    self.exec_command(cmd);
-                }
+                self.commit_palette();
+                self.redraw();
             }
             return;
         }
@@ -3137,6 +3329,12 @@ impl App {
     fn on_scroll(&mut self, dy: f32) {
         let layout = self.layout();
         let p = (self.mouse_pos.x as f32, self.mouse_pos.y as f32);
+        // Command palette (modal) scrolls its result list.
+        if self.palette.active {
+            self.palette.scroll = (self.palette.scroll - dy).max(0.0);
+            self.redraw();
+            return;
+        }
         // Terminal scrollback: the panel owns its pane ScrollViews; consumes the
         // event (when over the content) so the editor doesn't scroll underneath.
         if self.terminal.on_scroll(p, &layout, dy) {
@@ -3297,6 +3495,27 @@ impl App {
                     self.redraw();
                     return;
                 }
+                // Paste: Ctrl/Cmd+V (and Ctrl+Shift+V) sends the clipboard to the shell
+                // as input — newlines become CR, like pressing Enter.
+                let is_v = matches!(
+                    event.physical_key,
+                    winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyV)
+                );
+                if ctrl && is_v {
+                    if let Some(text) = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok()) {
+                        let norm = text.replace("\r\n", "\n").replace('\n', "\r");
+                        self.terminal.clear_focused_selection();
+                        if let Some(g) = self.terminal.groups.get_mut(self.terminal.active) {
+                            if let Some(p) = g.panes.get_mut(g.focused) {
+                                p.term.write(norm.as_bytes());
+                                p.scroll.scroll_to_end();
+                                p.dirty = true;
+                            }
+                        }
+                        self.redraw();
+                    }
+                    return;
+                }
                 if let Some(bytes) = translate_terminal_key(&event, ctrl, extend) {
                     self.terminal.clear_focused_selection(); // input dismisses the selection
                     if let Some(g) = self.terminal.groups.get_mut(self.terminal.active) {
@@ -3358,13 +3577,8 @@ impl App {
                         return;
                     }
                     Key::Named(NamedKey::Enter) => {
-                        if let Some((kind, label)) = self.palette.selected_pick() {
-                            self.palette.close();
-                            self.exec_pick(kind, &label);
-                        } else if let Some(cmd) = self.palette.selected_command() {
-                            self.palette.close();
-                            self.exec_command(cmd);
-                        }
+                        self.commit_palette();
+                        self.redraw();
                         return;
                     }
                     _ => {}
@@ -3505,6 +3719,10 @@ impl App {
                 match code {
                     KeyCode::KeyP if shift => {
                         self.open_palette();
+                        return;
+                    }
+                    KeyCode::KeyP => {
+                        self.open_quick_open(); // Ctrl/Cmd+P → go to file
                         return;
                     }
                     KeyCode::KeyA => {
@@ -3705,6 +3923,64 @@ pub(crate) fn diagnostics_report() -> String {
     format!(
         "node: {node}\neslint server: {eslint}\ntypescript-language-server: {ts}\nextensions: {count} installed in {dir_str}"
     )
+}
+
+/// Lightweight, language-aware symbol extractor for go-to-symbol (`@`). Scans each
+/// line for a declaration keyword and takes the following identifier — no LSP needed,
+/// so it works offline and instantly. Returns (name, kind, 1-based line).
+pub(crate) fn extract_symbols(text: &str, ext: &str) -> Vec<(String, String, usize)> {
+    let kws: &[&str] = match ext {
+        "rs" => &["fn", "struct", "enum", "trait", "impl", "mod", "const", "static", "type", "macro_rules"],
+        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => &["function", "class", "interface", "enum", "type", "namespace", "const", "let", "var"],
+        "py" => &["def", "class"],
+        "go" => &["func", "type", "const", "var"],
+        "rb" => &["def", "class", "module"],
+        "cs" | "java" | "kt" | "swift" => &["class", "interface", "enum", "struct", "func", "void", "public", "private", "protected", "fn"],
+        "c" | "h" | "cpp" | "hpp" | "cc" | "cxx" => &["struct", "class", "enum", "namespace", "typedef"],
+        _ => &[],
+    };
+    if kws.is_empty() {
+        // Markdown / plain: use headings as the symbol outline.
+        if matches!(ext, "md" | "markdown") {
+            return text
+                .lines()
+                .enumerate()
+                .filter_map(|(i, l)| {
+                    let t = l.trim_start();
+                    t.starts_with('#').then(|| {
+                        let level = t.chars().take_while(|&c| c == '#').count();
+                        (t.trim_start_matches('#').trim().to_string(), format!("h{level}"), i + 1)
+                    })
+                })
+                .filter(|(n, _, _)| !n.is_empty())
+                .collect();
+        }
+        return Vec::new();
+    }
+    let ident = |s: &str| -> String {
+        s.trim_start_matches(['&', '*', '!'])
+            .chars()
+            .take_while(|&c| c.is_alphanumeric() || c == '_')
+            .collect()
+    };
+    let mut out = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('#') && ext != "py" {
+            continue;
+        }
+        let words: Vec<&str> = trimmed.split(|c: char| c.is_whitespace() || c == '(').filter(|w| !w.is_empty()).collect();
+        if let Some(pos) = words.iter().position(|w| kws.contains(&w.trim_end_matches('!'))) {
+            let kw = words[pos].trim_end_matches('!');
+            if let Some(next) = words.get(pos + 1) {
+                let name = ident(next);
+                if name.len() >= 2 && !kws.contains(&name.as_str()) {
+                    out.push((name, kw.to_string(), i + 1));
+                }
+            }
+        }
+    }
+    out
 }
 
 pub(crate) fn gh_program() -> String {

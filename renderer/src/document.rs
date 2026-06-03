@@ -452,6 +452,11 @@ impl Document {
         &self.eol
     }
 
+    /// The file's lowercased extension (e.g. "rs") — for go-to-symbol language rules.
+    pub fn ext(&self) -> &str {
+        &self.ext
+    }
+
     /// Toggle word-wrap: `Some(width)` wraps the buffer at that pixel width, `None`
     /// disables wrapping. Reshapes only when the value changes.
     pub fn set_wrap(&mut self, fs: &mut FontSystem, width: Option<f32>) {

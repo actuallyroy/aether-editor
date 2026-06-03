@@ -30,6 +30,8 @@ pub struct SearchPanel {
     opt_labels: [TextLabel; 3],
     chevrons: [IconButton; 2], // [expanded, collapsed]
     replace_all_label: TextLabel,
+    summary: TextLabel, // "N results in M files"
+    last_summary: String,
     scroll: ScrollView,
     opts: SearchOpts,
     results: Vec<FileMatches>,
@@ -69,6 +71,8 @@ impl SearchPanel {
                 IconButton::new(fs, theme::ICON_CHEVRON_RIGHT, ic, 16.0),
             ],
             replace_all_label,
+            summary: TextLabel::new(fs, theme::SIDEBAR_WIDTH(), 22.0),
+            last_summary: String::new(),
             scroll: ScrollView::new(ScrollOpts::vertical()),
             opts: SearchOpts::default(),
             results: Vec::new(),
@@ -101,9 +105,13 @@ impl SearchPanel {
         let rr = Self::replace_rect(r);
         Rect { x: rr.x, y: rr.y + rr.h + theme::zpx(6.0), w: rr.w, h: theme::zpx(24.0) }
     }
-    fn results_region(r: Rect) -> Rect {
+    fn summary_rect(r: Rect) -> Rect {
         let b = Self::replace_all_rect(r);
-        let top = b.y + b.h + theme::zpx(8.0);
+        Rect { x: r.x + theme::zpx(12.0), y: b.y + b.h + theme::zpx(8.0), w: r.w - theme::zpx(20.0), h: theme::zpx(20.0) }
+    }
+    fn results_region(r: Rect) -> Rect {
+        let b = Self::summary_rect(r);
+        let top = b.y + b.h + theme::zpx(2.0);
         Rect { x: r.x, y: top, w: r.w, h: (r.y + r.h - top).max(0.0) }
     }
 
@@ -185,6 +193,7 @@ impl SearchPanel {
             c.reshape(fs);
         }
         self.replace_all_label.reshape(fs);
+        self.summary.reshape(fs);
     }
 
     // ---- Shaping ----
@@ -192,6 +201,24 @@ impl SearchPanel {
         let rows = self.rows();
         let key: String = rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join("\n");
         self.list.set_text(fs, &key, 4000.0, 12000.0);
+        // Total-occurrence summary across all files (re-shaped only when it changes).
+        let total: usize = self
+            .results
+            .iter()
+            .map(|f| f.lines.iter().map(|l| l.ranges.len()).sum::<usize>())
+            .sum();
+        let files = self.results.len();
+        let summary = if total == 0 {
+            String::new()
+        } else {
+            let fw = if files == 1 { "file" } else { "files" };
+            let rw = if total == 1 { "result" } else { "results" };
+            format!("{} {} in {} {}", total, rw, files, fw)
+        };
+        if summary != self.last_summary {
+            self.summary.set(fs, &summary, theme::UI_FAMILY());
+            self.last_summary = summary;
+        }
         let region = Self::results_region(region);
         self.scroll
             .set_metrics(region, (region.w, rows.len() as f32 * theme::SEARCH_ROW_H()));
@@ -283,6 +310,12 @@ impl SearchPanel {
         let ba = Self::replace_all_rect(region);
         let bl = &self.replace_all_label;
         bl.push(ba.x + (ba.w - bl.width()) * 0.5, ba, theme::FG_TEXT(), areas);
+
+        // Total-occurrence summary line above the results.
+        if !self.last_summary.is_empty() {
+            let sr = Self::summary_rect(region);
+            self.summary.push(sr.x, sr, theme::FG_DIM(), areas);
+        }
 
         let region2 = Self::results_region(region);
         let scroll = self.scroll.offset().1;
