@@ -46,6 +46,11 @@ impl FileTree {
         for entry in entries.flatten() {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
+            // Hide only VCS/system noise — VSCode's default `files.exclude`. Ordinary
+            // dotfiles (.env, .vscode, .gitignore, .claude, …) stay visible.
+            if matches!(name.as_str(), ".git" | ".svn" | ".hg" | "CVS" | ".DS_Store" | "Thumbs.db") {
+                continue;
+            }
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
             children.push((path, name, is_dir));
         }

@@ -305,25 +305,17 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             let ui_attrs = Attrs::new()
                 .family(Family::Name(theme::UI_FAMILY()))
                 .color(theme::FG_TEXT());
-            let folder_attrs = Attrs::new()
-                .family(Family::Name(theme::ICON_FAMILY))
-                .color(theme::ICON_FOLDER_COLOR());
+            let icon_attrs = |color| Attrs::new().family(Family::Name(theme::ICON_FAMILY)).color(color);
             let mut spans: Vec<(String, Attrs)> = Vec::new();
             for node in app.workspace.tree.nodes.iter() {
                 spans.push(("  ".repeat(node.depth), ui_attrs));
-                if node.is_dir {
-                    let g = if node.expanded {
-                        theme::ICON_FOLDER_OPEN
-                    } else {
-                        theme::ICON_FOLDER_CLOSED
-                    };
-                    spans.push((format!("{}  ", g), folder_attrs));
+                // A type/name-specific glyph + color from the shared icon source.
+                let (glyph, color) = if node.is_dir {
+                    theme::folder_icon(&node.name, node.expanded)
                 } else {
-                    let fc = Attrs::new()
-                        .family(Family::Name(theme::ICON_FAMILY))
-                        .color(theme::file_icon_color(&node.name));
-                    spans.push((format!("{}  ", theme::ICON_FILE), fc));
-                }
+                    theme::file_icon(&node.name)
+                };
+                spans.push((format!("{}  ", glyph), icon_attrs(color)));
                 spans.push((format!("{}\n", node.name), ui_attrs));
             }
             // Lay the buffer out tall enough for every row (not just the visible
@@ -603,18 +595,22 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     gpu.search
         .draw_bg(layout.header_search_rect(), app.hovered_search, &mut bg_quads);
     // Menu-bar hover + layout-toggle hover. The open dropdown's title stays lit.
-    gpu.menubar
-        .draw_bg(layout.menu_bar_rect(), app.open_menu.or(app.hovered_menu), &mut bg_quads);
+    // On macOS the menu bar and window-control buttons are native (system menu bar +
+    // traffic lights), so we don't render our own.
+    if !cfg!(target_os = "macos") {
+        gpu.menubar
+            .draw_bg(layout.menu_bar_rect(), app.open_menu.or(app.hovered_menu), &mut bg_quads);
+        if let Some(b) = app.hovered_titlebtn {
+            let color = if b == 2 {
+                theme::TITLE_CLOSE_HOVER()
+            } else {
+                theme::TITLE_BTN_HOVER()
+            };
+            bg_quads.push(layout.title_btn_rects()[b].quad(color));
+        }
+    }
     if let Some(i) = app.hovered_layout {
         bg_quads.push(layout.layout_btn_rects()[i].quad(theme::TITLE_BTN_HOVER()));
-    }
-    if let Some(b) = app.hovered_titlebtn {
-        let color = if b == 2 {
-            theme::TITLE_CLOSE_HOVER()
-        } else {
-            theme::TITLE_BTN_HOVER()
-        };
-        bg_quads.push(layout.title_btn_rects()[b].quad(color));
     }
 
     // Activity bar bg + hover (hover rect == the button rect).
@@ -1183,23 +1179,27 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // can show the highlighted region), so the background always draws here.
     {
     // Title bar: menu bar (left) + centered search box + layout toggles and
-    // window controls (right).
-    gpu.menubar.draw(layout.menu_bar_rect(), &mut areas);
+    // window controls (right). On macOS the menu bar + window controls are native.
+    if !cfg!(target_os = "macos") {
+        gpu.menubar.draw(layout.menu_bar_rect(), &mut areas);
+    }
     gpu.search.draw(layout.header_search_rect(), &mut areas);
     let layout_rects = layout.layout_btn_rects();
     for (i, btn) in gpu.layout_btns.iter().enumerate() {
         btn.draw(layout_rects[i], theme::TITLE_FG(), &mut areas);
     }
     // Window controls — IconButton widgets at their layout rects (the same
-    // rects the hover bg used above; glyph is centered in each).
-    let tb_rects = layout.title_btn_rects();
-    for (b, btn) in gpu.titlebar_btns.iter().enumerate() {
-        let color = if app.hovered_titlebtn == Some(b) {
-            theme::FG_ACTIVE()
-        } else {
-            theme::TITLE_FG()
-        };
-        btn.draw(tb_rects[b], color, &mut areas);
+    // rects the hover bg used above; glyph is centered in each). Native on macOS.
+    if !cfg!(target_os = "macos") {
+        let tb_rects = layout.title_btn_rects();
+        for (b, btn) in gpu.titlebar_btns.iter().enumerate() {
+            let color = if app.hovered_titlebtn == Some(b) {
+                theme::FG_ACTIVE()
+            } else {
+                theme::TITLE_FG()
+            };
+            btn.draw(tb_rects[b], color, &mut areas);
+        }
     }
 
     // Activity-bar icons — IconButton widgets at their cell rects.
@@ -1434,23 +1434,31 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     .draw_clipped(Rect { x: g.x, y: cy0, w: g.w, h: cy1 - cy0 }, g_top, theme::FG_GUTTER(), &mut areas);
             }
             // Fold chevrons in the gutter: ▸ for folded headers, ▾ for foldable ones.
-            if !d.diff.is_some() {
-                let first = (d.scroll_y() / lh) as usize;
-                let last = first + (et.h / lh) as usize + 2;
-                for line in first..=last.min(total.saturating_sub(1)) {
-                    if d.is_line_hidden(line) || !d.is_foldable(line) {
-                        continue;
+            // Walk the SAME visible segments the text is drawn in — folded lines take
+            // no screen space but DO consume raw line numbers, so a fixed raw-line
+            // window stops short of the bottom and drops every chevron below a fold.
+            if d.diff.is_none() {
+                for (a, b) in fold_segments(d, total) {
+                    let off = lh * d.hidden_above(a) as f32;
+                    let seg_top = et.y + theme::EDITOR_PAD() + a as f32 * lh - d.scroll_y() - off;
+                    let seg_bot = seg_top + (b - a + 1) as f32 * lh;
+                    if seg_bot < etop || seg_top > ebot {
+                        continue; // segment fully off-screen
                     }
-                    let off = lh * d.hidden_above(line) as f32;
-                    let y = et.y + theme::EDITOR_PAD() + line as f32 * lh - d.scroll_y() - off;
-                    if y < etop - lh || y > ebot {
-                        continue;
+                    // Scan only the lines whose row is actually visible.
+                    let lo = if seg_top < etop { a + ((etop - seg_top) / lh) as usize } else { a };
+                    let hi = if seg_bot > ebot { a + ((ebot - seg_top) / lh) as usize } else { b };
+                    for line in lo..=hi.min(b) {
+                        if !d.is_foldable(line) {
+                            continue;
+                        }
+                        let y = et.y + theme::EDITOR_PAD() + line as f32 * lh - d.scroll_y() - off;
+                        let folded = d.is_folded(line);
+                        let chev = if folded { &ui.diff_chev_right } else { &ui.diff_chev_down };
+                        let color = if folded { theme::FG_TEXT() } else { theme::FG_DIM() };
+                        let cr = Rect { x: g.x + g.w - theme::zpx(16.0), y, w: theme::zpx(14.0), h: lh };
+                        chev.push(cr.x, cr, color, &mut areas);
                     }
-                    let folded = d.is_folded(line);
-                    let chev = if folded { &ui.diff_chev_right } else { &ui.diff_chev_down };
-                    let color = if folded { theme::FG_TEXT() } else { theme::FG_DIM() };
-                    let cr = Rect { x: g.x + g.w - theme::zpx(16.0), y, w: theme::zpx(14.0), h: lh };
-                    chev.push(cr.x, cr, color, &mut areas);
                 }
             }
         }

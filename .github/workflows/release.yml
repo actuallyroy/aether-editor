@@ -65,11 +65,58 @@ jobs:
           mkdir -p dist
           cp "target/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
 
-      - name: Upload build artifact
+      # Package an installable Aether.app inside a .dmg (with an Applications drop
+      # target). The bare binary above is kept too — the in-app auto-updater
+      # downloads `aether-macos-arm64` to self-replace. The .app is unsigned, so
+      # first launch needs right-click → Open (or `xattr -cr /Applications/Aether.app`).
+      - name: Bundle macOS .app + DMG
+        if: matrix.os == 'macos-latest'
+        run: |
+          set -e
+          VERSION="${GITHUB_REF_NAME#v}"
+          APP="Aether.app"
+          rm -rf "$APP" dmgroot
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp target/release/aether "$APP/Contents/MacOS/aether"
+          chmod +x "$APP/Contents/MacOS/aether"
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+          <key>CFBundleName</key><string>Aether</string>
+          <key>CFBundleDisplayName</key><string>Aether</string>
+          <key>CFBundleExecutable</key><string>aether</string>
+          <key>CFBundleIdentifier</key><string>com.actuallyroy.aether</string>
+          <key>CFBundleVersion</key><string>${VERSION}</string>
+          <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+          <key>CFBundlePackageType</key><string>APPL</string>
+          <key>CFBundleIconFile</key><string>icon</string>
+          <key>LSMinimumSystemVersion</key><string>11.0</string>
+          <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          # App icon from the bundled SVG logo (best-effort — default icon if it fails).
+          if brew install librsvg >/dev/null 2>&1; then
+            mkdir -p icon.iconset
+            for s in 16 32 128 256 512; do
+              rsvg-convert -w "$s" -h "$s" renderer/assets/logo.svg -o "icon.iconset/icon_${s}x${s}.png" || true
+              rsvg-convert -w "$((s*2))" -h "$((s*2))" renderer/assets/logo.svg -o "icon.iconset/icon_${s}x${s}@2x.png" || true
+            done
+            iconutil -c icns icon.iconset -o "$APP/Contents/Resources/icon.icns" || true
+          fi
+          # DMG with an Applications symlink for drag-to-install.
+          mkdir -p dmgroot
+          cp -R "$APP" dmgroot/
+          ln -s /Applications dmgroot/Applications
+          hdiutil create -volname "Aether" -srcfolder dmgroot -ov -format UDZO "dist/Aether-macos-arm64.dmg"
+
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset }}
-          path: dist/${{ matrix.asset }}
+          name: ${{ matrix.os }}
+          path: dist/*
           if-no-files-found: error
 
   release:

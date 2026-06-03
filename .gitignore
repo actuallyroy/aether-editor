@@ -8,4 +8,5 @@ Cargo.lock.bak
 windows-mcp-issues.txt
 Cargo.lock
 nova-perf.log
+aether-perf.log
 PRD.md

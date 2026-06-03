@@ -556,7 +556,6 @@ pub fn DIALOG_BTN_HOVER() -> [f32; 4] { current().read().unwrap().dialog_btn_hov
 pub fn DIALOG_OVERLAY() -> [f32; 4] { current().read().unwrap().dialog_overlay }
 pub fn ACTIVITY_ICON_FG() -> Color { current().read().unwrap().activity_icon_fg }
 pub fn ACTIVITY_ICON_ACTIVE() -> Color { current().read().unwrap().activity_icon_active }
-pub fn ICON_FOLDER_COLOR() -> Color { current().read().unwrap().icon_folder_color }
 pub fn ICON_FILE_COLOR() -> Color { current().read().unwrap().icon_file_color }
 // Diff view line backgrounds + hunk header (fixed; VSCode-like, not yet themeable).
 pub fn DIFF_ADD_BG() -> [f32; 4] { [0.18, 0.43, 0.24, 0.30] }
@@ -580,18 +579,76 @@ pub fn CONTEXT_BORDER() -> [f32; 4] { current().read().unwrap().context_border }
 pub fn CONTEXT_SEL() -> [f32; 4] { current().read().unwrap().context_sel }
 
 // File-type icon colours (Seti-ish), keyed by extension. (Not themed yet.)
-pub fn file_icon_color(name: &str) -> Color {
-    let ext = name.rsplit('.').next().unwrap_or("");
-    match ext {
-        "rs" => Color::rgb(0xDE, 0xA5, 0x84),
-        "md" => Color::rgb(0x51, 0x9A, 0xBA),
-        "toml" | "lock" => Color::rgb(0x9C, 0x9C, 0x9C),
-        "json" | "mcp" => Color::rgb(0xCB, 0xCB, 0x41),
-        "wgsl" => Color::rgb(0x8F, 0xBC, 0x8F),
-        "txt" => Color::rgb(0xB0, 0xB4, 0xBA),
-        "png" | "jpg" | "ico" => Color::rgb(0xA0, 0x74, 0xC4),
-        _ => Color::rgb(0xC5, 0xC5, 0xC5),
+/// Icon glyph + color for a file row, by well-known filename then extension. The
+/// single source of truth for file icons everywhere (explorer, SCM, tabs). The
+/// glyph is a Codicon category icon; the color carries the language/type signal.
+pub fn file_icon(name: &str) -> (char, Color) {
+    let lower = name.to_ascii_lowercase();
+    let c = |r, g, b| Color::rgb(r, g, b);
+    // Well-known whole filenames take priority over the extension.
+    match lower.as_str() {
+        "dockerfile" | ".dockerignore" => return (ICON_FILE_CODE, c(0x4F, 0x9E, 0xE0)),
+        ".gitignore" | ".gitattributes" | ".gitmodules" | ".git" => return (ICON_GEAR_FILE, c(0xE0, 0x6C, 0x4E)),
+        "makefile" | "cmakelists.txt" | ".editorconfig" => return (ICON_GEAR_FILE, c(0x9C, 0x9C, 0x9C)),
+        "license" | "license.md" | "license.txt" | "copying" => return (ICON_KEY, c(0xD4, 0xB8, 0x6A)),
+        _ => {}
     }
+    let ext = lower.rsplit('.').next().unwrap_or("");
+    match ext {
+        "rs" => (ICON_FILE_CODE, c(0xDE, 0xA5, 0x84)),
+        "ts" | "tsx" => (ICON_FILE_CODE, c(0x3F, 0x8E, 0xD0)),
+        "js" | "jsx" | "mjs" | "cjs" => (ICON_FILE_CODE, c(0xE8, 0xD4, 0x4D)),
+        "py" | "pyw" | "pyi" => (ICON_FILE_CODE, c(0x5A, 0x9F, 0xD4)),
+        "go" => (ICON_FILE_CODE, c(0x4F, 0xC3, 0xE0)),
+        "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hxx" => (ICON_FILE_CODE, c(0x6F, 0x9F, 0xD8)),
+        "cs" => (ICON_FILE_CODE, c(0x6E, 0xC4, 0x8F)),
+        "java" | "kt" | "kts" => (ICON_FILE_CODE, c(0xC9, 0x7B, 0x4E)),
+        "rb" => (ICON_RUBY, c(0xCC, 0x42, 0x3A)),
+        "php" => (ICON_FILE_CODE, c(0x8A, 0x8F, 0xD0)),
+        "swift" => (ICON_FILE_CODE, c(0xE0, 0x6C, 0x4E)),
+        "sh" | "bash" | "zsh" | "fish" | "bat" | "cmd" | "ps1" => (ICON_TERMINAL_FILE, c(0x89, 0xD1, 0x85)),
+        "html" | "htm" | "xhtml" => (ICON_FILE_CODE, c(0xE3, 0x6C, 0x4E)),
+        "css" | "scss" | "sass" | "less" => (ICON_FILE_CODE, c(0x42, 0xA5, 0xF5)),
+        "vue" | "svelte" => (ICON_FILE_CODE, c(0x6B, 0xC4, 0x8F)),
+        "wgsl" | "glsl" | "hlsl" | "shader" | "metal" => (ICON_FILE_CODE, c(0x8F, 0xBC, 0x8F)),
+        "json" | "jsonc" | "json5" | "mcp" => (ICON_JSON, c(0xCB, 0xCB, 0x41)),
+        "md" | "markdown" | "mdx" | "rst" => (ICON_MARKDOWN, c(0x51, 0x9A, 0xBA)),
+        "toml" | "yaml" | "yml" | "ini" | "cfg" | "conf" | "env" | "properties" | "xml" => {
+            (ICON_GEAR_FILE, c(0x9C, 0x9C, 0x9C))
+        }
+        "lock" => (ICON_LOCK_FILE, c(0x9C, 0x9C, 0x9C)),
+        "png" | "jpg" | "jpeg" | "gif" | "ico" | "bmp" | "webp" | "svg" | "avif" => {
+            (ICON_FILE_MEDIA, c(0xA0, 0x74, 0xC4))
+        }
+        "zip" | "tar" | "gz" | "tgz" | "rar" | "7z" | "xz" | "bz2" => (ICON_FILE_ZIP, c(0xB0, 0x90, 0x4A)),
+        "pdf" => (ICON_FILE_PDF, c(0xD0, 0x65, 0x4E)),
+        "db" | "sqlite" | "sqlite3" | "sql" => (ICON_DATABASE, c(0x6B, 0xA5, 0xC4)),
+        "exe" | "dll" | "so" | "dylib" | "o" | "a" | "bin" | "wasm" | "class" => {
+            (ICON_FILE_BINARY, c(0x9C, 0x9C, 0x9C))
+        }
+        "csv" | "tsv" => (ICON_FILE_TEXT, c(0x89, 0xD1, 0x85)),
+        "txt" | "log" | "text" => (ICON_FILE_TEXT, c(0xB0, 0xB4, 0xBA)),
+        _ => (ICON_FILE, c(0xC5, 0xC5, 0xC5)),
+    }
+}
+
+/// Folder glyph (open/closed) + a color tinted by well-known folder names. We have
+/// only generic folder glyphs in codicon, so the name signal is carried by color.
+pub fn folder_icon(name: &str, open: bool) -> (char, Color) {
+    let g = if open { ICON_FOLDER_OPEN } else { ICON_FOLDER_CLOSED };
+    let base = current().read().unwrap().icon_folder_color;
+    let c = |r, gg, b| Color::rgb(r, gg, b);
+    let col = match name.to_ascii_lowercase().as_str() {
+        ".git" => c(0xE0, 0x6C, 0x4E),
+        "node_modules" | "vendor" | "target" | "dist" | "build" | "out" | ".next" | "bin" | "obj" => {
+            c(0x7A, 0x7E, 0x86)
+        }
+        ".github" | ".vscode" | ".idea" | ".cargo" => c(0x6B, 0x8A, 0xB0),
+        "assets" | "images" | "img" | "media" | "public" | "static" => c(0xA0, 0x74, 0xC4),
+        "test" | "tests" | "__tests__" | "spec" | "specs" => c(0x89, 0xD1, 0x85),
+        _ => base,
+    };
+    (g, col)
 }
 
 // ---- Dimensions / fonts / glyphs ----
@@ -707,6 +764,23 @@ pub const ICON_LAYOUT_SIDEBAR_RIGHT: char = '\u{ebf4}';
 pub const ICON_FOLDER_CLOSED: char = '\u{ea83}';
 pub const ICON_FOLDER_OPEN: char = '\u{eaf7}';
 pub const ICON_FILE: char = '\u{ea7b}';
+// File-type category glyphs (verified against the bundled codicon.ttf cmap). We
+// don't ship per-language logos, so the glyph marks the broad category and the
+// color carries the language signal (VSCode "Minimal" icon theme style).
+pub const ICON_FILE_CODE: char = '\u{eae9}';
+pub const ICON_FILE_MEDIA: char = '\u{eaea}';
+pub const ICON_FILE_ZIP: char = '\u{eaef}';
+pub const ICON_FILE_PDF: char = '\u{eaeb}';
+pub const ICON_FILE_BINARY: char = '\u{eae8}';
+pub const ICON_FILE_TEXT: char = '\u{ec5e}';
+pub const ICON_JSON: char = '\u{eb0f}';
+pub const ICON_MARKDOWN: char = '\u{eb1d}';
+pub const ICON_GEAR_FILE: char = '\u{eaf8}';
+pub const ICON_LOCK_FILE: char = '\u{ea75}';
+pub const ICON_TERMINAL_FILE: char = '\u{ea85}';
+pub const ICON_DATABASE: char = '\u{eace}';
+pub const ICON_RUBY: char = '\u{eb48}';
+pub const ICON_KEY: char = '\u{eb11}';
 
 pub const BLINK_MS: u64 = 530;
 

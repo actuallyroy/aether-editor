@@ -23,6 +23,8 @@ mod lsp;
 mod markdown;
 mod marketplace;
 mod menus;
+#[cfg(target_os = "macos")]
+mod macos_menu;
 mod perf;
 mod update;
 mod media;
@@ -245,6 +247,9 @@ pub(crate) struct App {
     pub(crate) sel_matches: Vec<(usize, usize)>,
     pub(crate) sel_hl_text: String,
     pub(crate) sel_hl_version: i32,
+    // Native macOS menu bar — kept alive here; map resolves a click to a MenuCmd.
+    #[cfg(target_os = "macos")]
+    pub(crate) macos_menu: Option<(muda::Menu, std::collections::HashMap<String, menus::MenuCmd>)>,
     pub(crate) image_drag_last: Option<(f32, f32)>, // last cursor pos while panning an image
     pub(crate) ext_remote: Vec<marketplace::RemoteExt>, // current marketplace search results
     pub(crate) worker_tx: Sender<WorkerMsg>,
@@ -334,6 +339,8 @@ impl App {
             sel_matches: Vec::new(),
             sel_hl_text: String::new(),
             sel_hl_version: -1,
+            #[cfg(target_os = "macos")]
+            macos_menu: None,
             image_drag_last: None,
             ext_remote: Vec::new(),
             worker_tx,
@@ -516,7 +523,7 @@ impl App {
             changed = true;
         }
 
-        let new_menu = if layout.palette.is_none() {
+        let new_menu = if layout.palette.is_none() && !cfg!(target_os = "macos") {
             self.gpu
                 .as_ref()
                 .and_then(|g| g.menubar.item_at(layout.menu_bar_rect(), p))
@@ -2581,6 +2588,9 @@ impl App {
     // ---- Input dispatch ----
 
     fn title_btn_at(&self, x: f32, y: f32, layout: &Layout) -> Option<usize> {
+        if cfg!(target_os = "macos") {
+            return None; // native traffic lights handle window controls on macOS
+        }
         layout.title_btn_rects().iter().position(|r| r.contains((x, y)))
     }
 
@@ -2828,14 +2838,16 @@ impl App {
                 }
                 return;
             }
-            // Menu titles open their dropdown.
-            if let Some(idx) = self
-                .gpu
-                .as_ref()
-                .and_then(|g| g.menubar.item_at(layout.menu_bar_rect(), (x, y)))
-            {
-                self.open_app_menu(idx);
-                return;
+            // Menu titles open their dropdown (custom menu bar is non-macOS only).
+            if !cfg!(target_os = "macos") {
+                if let Some(idx) = self
+                    .gpu
+                    .as_ref()
+                    .and_then(|g| g.menubar.item_at(layout.menu_bar_rect(), (x, y)))
+                {
+                    self.open_app_menu(idx);
+                    return;
+                }
             }
             match self.title_btn_at(x, y, &layout) {
                 Some(0) => {
@@ -4081,6 +4093,14 @@ fn min_instant(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
 
 impl ApplicationHandler for App {
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        // Native macOS menu clicks → commands.
+        #[cfg(target_os = "macos")]
+        {
+            let cmds = self.macos_menu.as_ref().map(|(_, map)| macos_menu::poll(map)).unwrap_or_default();
+            for c in cmds {
+                self.exec_menu_cmd(c);
+            }
+        }
         // Drain background worker results (marketplace search/install).
         while let Ok(msg) = self.worker_rx.try_recv() {
             match msg {
@@ -4343,12 +4363,32 @@ impl ApplicationHandler for App {
         if self.gpu.is_some() {
             return;
         }
-        let attrs = Window::default_attributes()
+        let mut attrs = Window::default_attributes()
             .with_title("Aether")
-            .with_decorations(false)
             .with_window_icon(app_icon())
             .with_inner_size(LogicalSize::new(1400.0, 900.0));
+        // macOS: keep the native traffic lights (top-left) but let our content fill
+        // the window behind a transparent titlebar — so we render our own header but
+        // the OS draws min/zoom/close. Other platforms: fully borderless (we draw the
+        // window controls ourselves).
+        #[cfg(target_os = "macos")]
+        {
+            use winit::platform::macos::WindowAttributesExtMacOS;
+            attrs = attrs
+                .with_titlebar_transparent(true)
+                .with_fullsize_content_view(true)
+                .with_title_hidden(true);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            attrs = attrs.with_decorations(false);
+        }
         let window = Arc::new(el.create_window(attrs).expect("create window"));
+        // Install the native macOS menu bar (system menu). Kept alive on `self`.
+        #[cfg(target_os = "macos")]
+        {
+            self.macos_menu = Some(macos_menu::install());
+        }
         match pollster::block_on(GpuState::new(window)) {
             Ok(gpu) => {
                 self.gpu = Some(gpu);

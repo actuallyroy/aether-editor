@@ -1,6 +1,6 @@
 [package]
 name = "aether-renderer"
-version = "0.2.12"
+version = "0.2.13"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -38,3 +38,8 @@ ureq = { version = "2", features = ["tls"] }
 wgpu = "22"
 winit = "0.30"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# Native macOS menu bar (system menu, top of the screen). Other platforms draw the
+# custom in-window menu instead.
+[target.'cfg(target_os = "macos")'.dependencies]
+muda = "0.16"

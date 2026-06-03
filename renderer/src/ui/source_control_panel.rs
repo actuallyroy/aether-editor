@@ -39,6 +39,7 @@ struct Row {
     fname_len: usize, // byte length of the bright file-name prefix in the current display
     badge: usize,     // index into BADGE_*
     untracked: bool,  // for Discard (delete vs revert)
+    new_file: bool,   // untracked or staged-added: no prior version, so no diff
 }
 
 /// One visible line in a group: either a folder (tree mode only) or a file row.
@@ -256,6 +257,10 @@ impl SourceControlPanel {
     }
 
     fn row(path: &str, code: char) -> Row {
+        // `git status --porcelain` reports a fully-untracked directory as a single
+        // "dir/" entry (trailing slash). Without trimming it, rsplit('/') returns an
+        // empty final segment, so the row renders nameless — the "ghost row" bug.
+        let path = path.trim_end_matches(['/', '\\']);
         let fname = path.rsplit(['/', '\\']).next().unwrap_or(path);
         let dir = path[..path.len().saturating_sub(fname.len())].trim_end_matches(['/', '\\']);
         Row {
@@ -265,6 +270,7 @@ impl SourceControlPanel {
             fname_len: fname.len(),
             badge: badge_for(code),
             untracked: code == '?',
+            new_file: code == '?' || code == 'A',
         }
     }
 
@@ -832,8 +838,15 @@ impl SourceControlPanel {
                             }
                         }
                         if !acted {
-                            // Row body opens the diff (VSCode opens the diff on row click).
-                            out.push(Intent::OpenDiff { path: r.path.clone(), staged, untracked: r.untracked });
+                            // Row body opens the diff (VSCode opens the diff on row click) —
+                            // except a newly created file (untracked or staged-added) has no
+                            // prior version, so a diff is pointless: open the file itself. The
+                            // per-row "Open Changes" icon still forces a diff if wanted.
+                            if r.new_file {
+                                out.push(Intent::OpenFile { path: self.root.join(&r.path), line: 1, col: 0 });
+                            } else {
+                                out.push(Intent::OpenDiff { path: r.path.clone(), staged, untracked: r.untracked });
+                            }
                         }
                     }
                 }
@@ -887,5 +900,161 @@ impl SourceControlPanel {
             Some(_) => true,
             None => !ctrl,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn panel() -> (SourceControlPanel, FontSystem) {
+        let mut fs = FontSystem::new();
+        let p = SourceControlPanel::new(&mut fs, PathBuf::from("/tmp/repo"));
+        (p, fs)
+    }
+
+    // Clicking the per-row Stage (+) icon on an unstaged file must emit GitStage for
+    // THAT file — not fall through to the row-body OpenDiff.
+    #[test]
+    fn unstaged_stage_icon_emits_git_stage() {
+        let (mut p, mut fs) = panel();
+        p.unstaged_rows = vec![make_row("src/main.rs", 'M')];
+        let region = Rect { x: 0.0, y: 0.0, w: 300.0, h: 1000.0 };
+        p.update(&mut fs, region); // builds vis + shapes rows for this width
+
+        let lr = p.unstaged_list(region);
+        let y = lr.y; // first (only) row
+        let stage = SourceControlPanel::action_rects(lr, y, false)
+            .into_iter()
+            .find(|(a, _)| matches!(a, Act::Stage))
+            .expect("stage action present")
+            .1;
+        let pt = (stage.x + stage.w * 0.5, stage.y + stage.h * 0.5);
+
+        let mut out = Vec::new();
+        let consumed = p.on_press(pt, region, &mut out);
+        assert!(consumed, "press should be consumed");
+        assert!(
+            matches!(out.as_slice(), [Intent::GitStage(path)] if path == "src/main.rs"),
+            "expected GitStage(src/main.rs), got {} intents",
+            out.len()
+        );
+    }
+
+    // Clicking the per-row Unstage (−) icon on a staged file must emit GitUnstage.
+    #[test]
+    fn staged_unstage_icon_emits_git_unstage() {
+        let (mut p, mut fs) = panel();
+        p.staged_rows = vec![make_row("src/main.rs", 'M')];
+        let region = Rect { x: 0.0, y: 0.0, w: 300.0, h: 1000.0 };
+        p.update(&mut fs, region);
+
+        let lr = p.staged_list(region);
+        let y = lr.y;
+        let unstage = SourceControlPanel::action_rects(lr, y, true)
+            .into_iter()
+            .find(|(a, _)| matches!(a, Act::Unstage))
+            .expect("unstage action present")
+            .1;
+        let pt = (unstage.x + unstage.w * 0.5, unstage.y + unstage.h * 0.5);
+
+        let mut out = Vec::new();
+        let consumed = p.on_press(pt, region, &mut out);
+        assert!(consumed, "press should be consumed");
+        assert!(
+            matches!(out.as_slice(), [Intent::GitUnstage(path)] if path == "src/main.rs"),
+            "expected GitUnstage(src/main.rs), got {} intents",
+            out.len()
+        );
+    }
+
+    // Same as the flat-mode test, but in tree mode with a nested path so a folder
+    // row sits above the file — the file's vis index is offset by the folder rows.
+    #[test]
+    fn tree_mode_stage_icon_emits_git_stage() {
+        let (mut p, mut fs) = panel();
+        p.tree_mode = true;
+        p.unstaged_rows = vec![make_row("src/ui/main.rs", 'M')];
+        let region = Rect { x: 0.0, y: 0.0, w: 300.0, h: 1000.0 };
+        p.update(&mut fs, region);
+
+        // Find the file's vis index (folders are emitted before it).
+        let file_i = p
+            .unstaged_vis
+            .iter()
+            .position(|v| matches!(v, Vis::File { .. }))
+            .expect("file row present");
+        let lr = p.unstaged_list(region);
+        let y = lr.y + file_i as f32 * row_h();
+        let stage = SourceControlPanel::action_rects(lr, y, false)
+            .into_iter()
+            .find(|(a, _)| matches!(a, Act::Stage))
+            .expect("stage action present")
+            .1;
+        let pt = (stage.x + stage.w * 0.5, stage.y + stage.h * 0.5);
+
+        let mut out = Vec::new();
+        let consumed = p.on_press(pt, region, &mut out);
+        assert!(consumed, "press should be consumed");
+        assert!(
+            matches!(out.as_slice(), [Intent::GitStage(path)] if path == "src/ui/main.rs"),
+            "expected GitStage(src/ui/main.rs), got {} intents",
+            out.len()
+        );
+    }
+
+    // The user runs at a scaled UI zoom. Verify the per-row action hit-test still
+    // lands on the right row + icon at zoom 2.0, including a NON-first row (where any
+    // drift between ListView::row_at and action_rects would surface). Resets zoom so
+    // it doesn't leak into the other tests.
+    #[test]
+    fn stage_icon_hits_at_zoom_2x() {
+        theme::set_ui_zoom(2.0);
+        let mut fs = FontSystem::new();
+        let mut p = SourceControlPanel::new(&mut fs, PathBuf::from("/tmp/repo"));
+        p.unstaged_rows = vec![make_row("a.rs", 'M'), make_row("b.rs", 'M'), make_row("c.rs", 'M')];
+        let region = Rect { x: 0.0, y: 0.0, w: 320.0, h: 1200.0 };
+        p.update(&mut fs, region);
+
+        // Target the SECOND file (vis index 1 in flat mode).
+        let lr = p.unstaged_list(region);
+        let y = lr.y + 1.0 * row_h();
+        let stage = SourceControlPanel::action_rects(lr, y, false)
+            .into_iter()
+            .find(|(a, _)| matches!(a, Act::Stage))
+            .unwrap()
+            .1;
+        let pt = (stage.x + stage.w * 0.5, stage.y + stage.h * 0.5);
+
+        let mut out = Vec::new();
+        let consumed = p.on_press(pt, region, &mut out);
+        theme::set_ui_zoom(1.0); // restore before asserting (so a panic still resets)
+
+        assert!(consumed, "press should be consumed at zoom 2x");
+        assert!(
+            matches!(out.as_slice(), [Intent::GitStage(path)] if path == "b.rs"),
+            "expected GitStage(b.rs) at zoom 2x, got {} intents",
+            out.len()
+        );
+    }
+
+    // A fully-untracked directory arrives as "dir/" — the row must show the directory
+    // name, not a blank "ghost row".
+    #[test]
+    fn untracked_directory_has_a_name() {
+        let r = make_row("scripts/", '?');
+        assert_eq!(r.fname, "scripts");
+        assert!(r.fname_len > 0, "ghost row: empty file name for an untracked dir");
+        assert_eq!(r.path, "scripts", "path keeps the dir name (no trailing slash)");
+        assert!(r.untracked);
+
+        // Nested untracked dir keeps its parent path for the tree, name = leaf.
+        let r2 = make_row("a/b/", '?');
+        assert_eq!(r2.fname, "b");
+        assert_eq!(r2.dir, "a");
+    }
+
+    fn make_row(path: &str, code: char) -> Row {
+        SourceControlPanel::row(path, code)
     }
 }

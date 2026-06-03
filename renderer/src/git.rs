@@ -41,8 +41,18 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let out = cmd.output().ok()?;
+    let out = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => {
+            // `git` missing from PATH, or `root` unreadable — the usual cause of
+            // "staging silently does nothing". Surface it instead of swallowing.
+            eprintln!("[git] {args:?} failed to spawn in {root:?}: {e}");
+            return None;
+        }
+    };
     if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        eprintln!("[git] {args:?} in {root:?} exited {}: {}", out.status, err.trim());
         return None;
     }
     String::from_utf8(out.stdout).ok()
@@ -73,7 +83,10 @@ pub fn unstage(root: &Path, path: &str) {
 /// to the index/HEAD (`git restore`).
 pub fn discard(root: &Path, path: &str, untracked: bool) {
     if untracked {
-        let _ = std::fs::remove_file(root.join(path));
+        // An untracked entry can be a file or a whole directory (git reports the
+        // latter as "dir/"); try file removal first, then recursive dir removal.
+        let target = root.join(path);
+        let _ = std::fs::remove_file(&target).or_else(|_| std::fs::remove_dir_all(&target));
     } else {
         let _ = git(root, &["restore", "--", path]);
     }
@@ -119,8 +132,13 @@ pub fn commit(root: &Path, msg: &str, stage_all: bool) -> bool {
 }
 
 /// Changed paths in the working tree (staged, modified, and untracked).
+///
+/// `-uall` lists untracked files individually instead of collapsing a fully-
+/// untracked directory into one "dir/" entry (like VSCode). That way every row is a
+/// real file: it nests correctly in the tree and its diff shows actual content,
+/// rather than a nameless directory row that can't be diffed.
 pub fn status(root: &Path) -> Vec<Change> {
-    let Some(out) = git(root, &["status", "--porcelain"]) else {
+    let Some(out) = git(root, &["status", "--porcelain", "-uall"]) else {
         return Vec::new();
     };
     out.lines()
@@ -180,4 +198,53 @@ fn unquote(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    fn run(root: &Path, args: &[&str]) {
+        let ok = Command::new("git").arg("-C").arg(root).args(args).status().map(|s| s.success()).unwrap_or(false);
+        assert!(ok, "git {args:?} failed");
+    }
+
+    // End-to-end: a modified tracked file, once staged, must leave the worktree
+    // (unstaged) side and appear on the index (staged) side of `git status`.
+    #[test]
+    fn stage_moves_file_to_index() {
+        let dir = std::env::temp_dir().join(format!("aether-git-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        run(&dir, &["init", "-q"]);
+        run(&dir, &["config", "user.email", "t@t"]);
+        run(&dir, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+        run(&dir, &["add", "-A"]);
+        run(&dir, &["commit", "-qm", "init"]);
+
+        // Modify, confirm it shows as worktree-modified and NOT staged.
+        std::fs::write(dir.join("src/main.rs"), "fn main() { /* edit */ }\n").unwrap();
+        let before = status(&dir);
+        let c = before.iter().find(|c| c.path == "src/main.rs").expect("file in status");
+        assert_eq!(c.worktree, 'M', "should be worktree-modified before staging");
+        assert!(!c.is_staged(), "should not be staged before staging");
+
+        // Stage it via the real code path, then re-read.
+        stage(&dir, "src/main.rs");
+        let after = status(&dir);
+        let c = after.iter().find(|c| c.path == "src/main.rs").expect("file still in status");
+        assert!(c.is_staged(), "expected staged after stage(), got staged={:?} worktree={:?}", c.staged, c.worktree);
+        assert_eq!(c.worktree, ' ', "worktree side should be clean after staging a fully-staged edit");
+
+        // And unstage round-trips it back.
+        unstage(&dir, "src/main.rs");
+        let back = status(&dir);
+        let c = back.iter().find(|c| c.path == "src/main.rs").expect("file in status");
+        assert!(!c.is_staged(), "expected not staged after unstage()");
+        assert_eq!(c.worktree, 'M', "worktree-modified again after unstaging");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
