@@ -1033,6 +1033,31 @@ impl App {
 
     fn on_right_press(&mut self, x: f32, y: f32) {
         let layout = self.layout();
+        // Windows-style terminal right-click: copy the selection if there is one,
+        // otherwise paste the clipboard into the shell.
+        if self.terminal.visible {
+            if let Some(panel) = layout.terminal_panel {
+                if crate::terminal_content(panel).contains((x, y)) {
+                    if let Some(text) = self.terminal.selection_text() {
+                        if let Some(cb) = self.clipboard.as_mut() {
+                            let _ = cb.set_text(text);
+                        }
+                        self.terminal.clear_focused_selection();
+                    } else if let Some(text) = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok()) {
+                        let norm = text.replace("\r\n", "\n").replace('\n', "\r");
+                        if let Some(g) = self.terminal.groups.get_mut(self.terminal.active) {
+                            if let Some(p) = g.panes.get_mut(g.focused) {
+                                p.term.write(norm.as_bytes());
+                                p.scroll.scroll_to_end();
+                                p.dirty = true;
+                            }
+                        }
+                    }
+                    self.redraw();
+                    return;
+                }
+            }
+        }
         if !self.sidebar_visible || !layout.sidebar.contains((x, y)) {
             return;
         }
