@@ -2124,6 +2124,16 @@ impl App {
                 if let Some(d) = self.workspace.active_doc_mut() {
                     let _ = d.save();
                 }
+                // Tell the language servers (didSave triggers e.g. rust-analyzer's
+                // cargo check — without it, full diagnostics never refresh).
+                if let Some(d) = self.workspace.active_doc() {
+                    if let Some(uri) = d.uri() {
+                        let text = d.text();
+                        for server in d.lsp_servers.clone() {
+                            self.lsp.did_save(server, &uri, &text);
+                        }
+                    }
+                }
                 // Saving settings.json applies the new values immediately.
                 if let Some(p) = saved_path {
                     if settings::is_user_settings(&p) {
@@ -2417,7 +2427,10 @@ impl App {
         let t1 = std::time::Instant::now();
         if let Some(gpu) = self.gpu.as_mut() {
             if let Some(d) = self.workspace.active_doc_mut() {
+                // Paste is its own undo step (stops before and after, like VSCode).
+                d.break_undo_group();
                 d.insert_str(&text, &mut gpu.font_system);
+                d.break_undo_group();
             }
         }
         perf::log(&format!("paste: clipboard get_text {:?}, insert+reshape({n}B) {:?}", t_clip, t1.elapsed()));
@@ -2678,6 +2691,13 @@ impl App {
 
     fn on_mouse_press(&mut self, x: f32, y: f32) {
         let layout = self.layout();
+
+        // Any click dismisses the completion popup (VSCode behavior) — the click
+        // itself still lands wherever it was aimed.
+        if self.completion.active {
+            self.completion.close();
+            self.redraw();
+        }
 
         // The feedback form is modal: it swallows all clicks while open.
         if self.feedback_form.is_some() {
@@ -4069,11 +4089,10 @@ impl App {
             return; // not opened to the server yet; the sync tick will, next keystroke works
         }
         // Flush the just-typed text so the server completes against current contents
-        // (the debounced didChange would otherwise lag a keystroke behind).
+        // (the debounced didChange would otherwise lag a keystroke behind). The doc
+        // stays lsp_dirty so the sync tick still runs its semantic/diagnostic pulls —
+        // its duplicate same-version didChange is benign.
         self.lsp.did_change(server, &uri, version, &text);
-        if let Some(d) = self.workspace.active_doc_mut() {
-            d.lsp_dirty = false; // synced now — don't let the debounced sync resend this version
-        }
         if let Some(id) = self.lsp.request_completion(lang, &uri, line as u32, col as u32) {
             self.completion_req = Some((id, prefix_start));
         }
@@ -4380,6 +4399,9 @@ impl ApplicationHandler for App {
                 WorkerMsg::LspDiagnosticReport { id, diags } => {
                     self.lsp.apply_diagnostic_report(&mut self.workspace.documents, id, diags);
                     self.redraw();
+                }
+                WorkerMsg::LspSemanticRefresh { server } => {
+                    self.lsp.refresh_semantic(&self.workspace.documents, server);
                 }
                 WorkerMsg::LspCompletion { id, items } => {
                     // Apply only the newest request's results, and only if the popup is

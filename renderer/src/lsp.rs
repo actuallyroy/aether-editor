@@ -190,9 +190,14 @@ pub const RUST_ANALYZER: ServerSpec = ServerSpec {
     name: "rust-analyzer",
     languages: &["rust"],
     resolve: resolve_rust_analyzer,
-    init_options: empty_init,
+    init_options: rust_init,
     config_reply: empty_config,
-    pull_diagnostics: false, // rust-analyzer pushes publishDiagnostics
+    // Both models, deliberately: we declare the LSP 3.17 diagnostic-pull capability,
+    // so rust-analyzer serves its NATIVE diagnostics (live, in-memory — unresolved
+    // names, type errors) via pull only and stops pushing them. Pulling on every
+    // debounced change keeps those live while typing; flycheck (`cargo check`, the
+    // full compiler) still arrives via push after each save.
+    pull_diagnostics: true,
     push_diagnostics: true,
     pull_semantic: true,
     completion: true,
@@ -200,6 +205,13 @@ pub const RUST_ANALYZER: ServerSpec = ServerSpec {
 
 fn empty_init(_root: &Path) -> Value {
     json!({})
+}
+
+fn rust_init(_root: &Path) -> Value {
+    // Dedicated check dir (`target/rust-analyzer`): the server's `cargo check`
+    // otherwise shares the target lock with the user's own builds and can sit
+    // blocked for minutes before the first diagnostics appear.
+    json!({ "cargo": { "targetDir": true } })
 }
 fn empty_config() -> Value {
     json!({})
@@ -376,6 +388,11 @@ pub struct LspClient {
     initialized: bool,
     /// didOpen/didChange queued until the initialize handshake completes.
     pending: Vec<Value>,
+    /// Last didChange version sent per URI. Both the completion flush and the
+    /// debounced sync can try to send the same version — servers may treat a
+    /// repeated version as a protocol error and stop tracking the document, so
+    /// duplicates are dropped here.
+    sent_versions: std::collections::HashMap<String, i32>,
 }
 
 impl LspClient {
@@ -452,6 +469,7 @@ impl LspClient {
             next_id: 1,
             initialized: false,
             pending: Vec::new(),
+            sent_versions: std::collections::HashMap::new(),
         };
         // Kick off the initialize handshake.
         let id = client.next_id;
@@ -507,6 +525,11 @@ impl LspClient {
     }
 
     pub fn did_change(&mut self, uri: &str, version: i32, text: &str) {
+        // Drop duplicates: a repeated version can make a server stop tracking the doc.
+        if self.sent_versions.get(uri) == Some(&version) {
+            return;
+        }
+        self.sent_versions.insert(uri.to_string(), version);
         self.notify(
             "textDocument/didChange",
             json!({ "textDocument": { "uri": uri, "version": version }, "contentChanges": [{ "text": text }] }),
@@ -658,6 +681,21 @@ impl LspManager {
     pub fn completion_server(&self, lang: &str) -> Option<&'static str> {
         let name = registry().iter().find(|s| s.completion && s.languages.contains(&lang))?.name;
         self.clients.iter().find(|c| c.server == name).map(|c| c.server)
+    }
+
+    /// Re-pull semantic tokens for every doc open to `server` (the server signalled
+    /// via `workspace/semanticTokens/refresh` that its analysis is ready/changed).
+    pub fn refresh_semantic(&mut self, docs: &[crate::document::Document], server: &str) {
+        let uris: Vec<String> = docs
+            .iter()
+            .filter(|d| d.lsp_servers.iter().any(|s| *s == server))
+            .filter_map(|d| d.uri())
+            .collect();
+        for uri in uris {
+            if let Some(id) = self.pull_semantic_tokens(server, &uri) {
+                self.sem_pending.insert(id, uri);
+            }
+        }
     }
 
     /// Finish the handshake on whichever client just got its initialize response.
@@ -962,6 +1000,17 @@ fn handle_server_message(server: &'static str, msg: &Value, reply_tx: &Sender<Ve
         (Some("client/registerCapability"), Some(id))
         | (Some("client/unregisterCapability"), Some(id))
         | (Some("window/workDoneProgress/create"), Some(id)) => {
+            let _ = reply_tx.send(frame(&json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null })));
+        }
+        // The server's analysis became ready/changed: it asks us to re-pull semantic
+        // tokens (the initial pull at didOpen usually lands before indexing finishes
+        // and comes back empty — without honoring this, files stay base-colored until
+        // the next edit).
+        (Some("workspace/semanticTokens/refresh"), Some(id)) => {
+            let _ = reply_tx.send(frame(&json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null })));
+            let _ = tx.send(WorkerMsg::LspSemanticRefresh { server });
+        }
+        (Some("workspace/diagnostic/refresh"), Some(id)) => {
             let _ = reply_tx.send(frame(&json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null })));
         }
         (Some("workspace/applyEdit"), Some(id)) => {

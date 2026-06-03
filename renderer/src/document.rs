@@ -49,6 +49,10 @@ pub struct Edit {
     pub op: EditOp,
     pub sel_before: (usize, usize),
     pub sel_after: (usize, usize),
+    /// Undo group (Monaco-style "stack element"): consecutive edits share a group
+    /// until an undo stop — Enter, a space after a word, paste, a cursor move, or
+    /// undo/redo — starts a new one. Undo/redo applies a whole group at once.
+    pub group: u64,
 }
 
 pub struct Document {
@@ -60,6 +64,9 @@ pub struct Document {
     pub dirty: bool,
     history: Vec<Edit>,
     future: Vec<Edit>,
+    next_group: u64,    // id for the next undo group (see `Edit::group`)
+    pending_stop: bool, // force the next edit into a fresh undo group
+    force_join: bool,   // glue the next edit to the current group (replace-selection typing)
     pub buffer: Buffer,
     lang: Lang,
     ext: String,
@@ -253,6 +260,9 @@ impl Document {
             scroll: ScrollView::new(ScrollOpts::both()),
             dirty: false,
             history: Vec::new(),
+            next_group: 0,
+            pending_stop: true,
+            force_join: false,
             future: Vec::new(),
             buffer,
             lang,
@@ -308,6 +318,9 @@ impl Document {
             scroll: ScrollView::new(ScrollOpts::both()),
             dirty: false,
             history: Vec::new(),
+            next_group: 0,
+            pending_stop: true,
+            force_join: false,
             future: Vec::new(),
             buffer,
             lang: Lang::PlainText,
@@ -389,6 +402,9 @@ impl Document {
             scroll: ScrollView::new(ScrollOpts::both()),
             dirty: false,
             history: Vec::new(),
+            next_group: 0,
+            pending_stop: true,
+            force_join: false,
             future: Vec::new(),
             buffer,
             lang: Lang::PlainText,
@@ -716,6 +732,11 @@ impl Document {
     }
 
     fn apply_op(&mut self, op: &EditOp, at_byte: usize) {
+        // Keep diagnostic squiggles anchored to their text while the server's
+        // re-publish is pending (it can lag to the next save). Positions are shifted
+        // against the PRE-edit rope. Undo/redo also pass through here with inverse
+        // ops, so the shifts cancel correctly.
+        self.shift_diagnostics(op, at_byte);
         let at_char = self.rope.byte_to_char(at_byte);
         match op {
             EditOp::Insert(s) => {
@@ -728,15 +749,126 @@ impl Document {
         }
     }
 
+    /// Shift stored diagnostic positions for an edit at `at_byte` (VSCode keeps
+    /// squiggles glued to their text between server publishes; without this they sit
+    /// at stale coordinates, underlining whatever scrolls into them). LSP positions
+    /// are (line, UTF-16 col); cols are computed in UTF-16 to match.
+    fn shift_diagnostics(&mut self, op: &EditOp, at_byte: usize) {
+        if self.diagnostics.is_empty() {
+            return;
+        }
+        let at = at_byte.min(self.rope.len_bytes());
+        let line = self.rope.byte_to_line(at);
+        let line_start = self.rope.line_to_byte(line);
+        let utf16 = |s: &str| s.encode_utf16().count() as i64;
+        let col = utf16(&self.rope.byte_slice(line_start..at).to_string());
+        let (l, c) = (line as i64, col);
+        let (s, deleting) = match op {
+            EditOp::Insert(s) => (s, false),
+            EditOp::Delete(s) => (s, true),
+        };
+        let k = s.matches('\n').count() as i64; // newlines in the edited text
+        let t = utf16(s.rsplit('\n').next().unwrap_or("")); // utf16 len after the last newline
+        // End of the affected span (deletes only).
+        let (l2, c2) = if k == 0 { (l, c + t) } else { (l + k, t) };
+        for d in &mut self.diagnostics {
+            for (is_end, pl, pc) in [
+                (false, &mut d.start_line, &mut d.start_char),
+                (true, &mut d.end_line, &mut d.end_char),
+            ] {
+                let (mut a, mut b) = (*pl as i64, *pc as i64);
+                if !deleting {
+                    // Insert at (l, c): positions after it slide right/down. Ties differ:
+                    // inserting AT a range's start pushes the range right, but inserting
+                    // AT its (exclusive) end does not extend it.
+                    let hit = if is_end { b > c } else { b >= c };
+                    if a == l && hit {
+                        if k == 0 {
+                            b += t;
+                        } else {
+                            a += k;
+                            b = b - c + t;
+                        }
+                    } else if a > l {
+                        a += k;
+                    }
+                } else {
+                    // Delete [ (l,c) .. (l2,c2) ): positions after the span slide back;
+                    // positions inside it clamp to the span start.
+                    if a > l2 || (a == l2 && b >= c2) {
+                        if a == l2 {
+                            a = l;
+                            b = c + (b - c2);
+                        } else {
+                            a -= k;
+                        }
+                    } else if a > l || (a == l && b > c) {
+                        a = l;
+                        b = c;
+                    }
+                }
+                *pl = a.max(0) as u32;
+                *pc = b.max(0) as u32;
+            }
+        }
+    }
+
+    /// True when `op` should extend the current undo group (Monaco's rules): same
+    /// kind, the caret never moved in between (the new edit starts exactly where the
+    /// last one ended), single keystrokes only, Enter starts its own group, and a
+    /// space typed after a word starts the next group ("hello world" undoes word-wise).
+    fn joins_undo_group(&self, op: &EditOp, sel_before: (usize, usize)) -> bool {
+        if self.force_join {
+            return true;
+        }
+        if self.pending_stop || !self.future.is_empty() {
+            return false;
+        }
+        let Some(prev) = self.history.last() else {
+            return false;
+        };
+        if sel_before != prev.sel_after {
+            return false; // cursor moved (click/arrows) between the edits
+        }
+        match (&prev.op, op) {
+            (EditOp::Insert(p), EditOp::Insert(s)) => {
+                if s.len() > 4 || p.len() > 200 || s.contains('\n') || p.ends_with('\n') {
+                    return false;
+                }
+                let s_ws = s.chars().all(char::is_whitespace);
+                let p_ends_word = p.chars().last().map_or(false, |c| !c.is_whitespace());
+                !(s_ws && p_ends_word) // space after a word → new group
+            }
+            (EditOp::Delete(p), EditOp::Delete(s)) => {
+                s.len() <= 4 && p.len() <= 200 && !s.contains('\n') && !p.contains('\n')
+            }
+            _ => false,
+        }
+    }
+
+    /// Force the next edit into a fresh undo group (called around paste, etc.).
+    pub fn break_undo_group(&mut self) {
+        self.pending_stop = true;
+    }
+
     fn push_and_apply(&mut self, op: EditOp, at_byte: usize, sel_after: Selection) {
         let sel_before = (self.sel.anchor, self.sel.head);
         let sel_after_t = (sel_after.anchor, sel_after.head);
+        let group = if self.joins_undo_group(&op, sel_before) {
+            self.history.last().map(|e| e.group).unwrap_or(0)
+        } else {
+            self.next_group += 1;
+            self.next_group
+        };
+        self.pending_stop = false;
+        self.force_join = false;
         self.apply_op(&op, at_byte);
         self.history.push(Edit {
             at_byte,
             op,
             sel_before,
             sel_after: sel_after_t,
+            group,
         });
         self.future.clear();
         self.sel = sel_after;
@@ -833,6 +965,9 @@ impl Document {
         }
         if !self.sel.is_empty() {
             self.delete_selection_no_reshape();
+            // The delete + insert came from one keystroke (typing over a selection):
+            // keep them in one undo group so a single undo restores both.
+            self.force_join = true;
         }
         let head = self.sel.head;
         let new_head = head + s.len();
@@ -904,20 +1039,25 @@ impl Document {
         if self.read_only {
             return false;
         }
-        let Some(edit) = self.history.pop() else {
+        // Undo the entire top group (a typing run is one step, like VSCode).
+        let Some(group) = self.history.last().map(|e| e.group) else {
             return false;
         };
-        let inverse_op = match &edit.op {
-            EditOp::Insert(s) => EditOp::Delete(s.clone()),
-            EditOp::Delete(s) => EditOp::Insert(s.clone()),
-        };
-        self.apply_op(&inverse_op, edit.at_byte);
-        self.sel = Selection {
-            anchor: edit.sel_before.0,
-            head: edit.sel_before.1,
-            desired_col: None,
-        };
-        self.future.push(edit);
+        while self.history.last().map_or(false, |e| e.group == group) {
+            let edit = self.history.pop().expect("checked above");
+            let inverse_op = match &edit.op {
+                EditOp::Insert(s) => EditOp::Delete(s.clone()),
+                EditOp::Delete(s) => EditOp::Insert(s.clone()),
+            };
+            self.apply_op(&inverse_op, edit.at_byte);
+            self.sel = Selection {
+                anchor: edit.sel_before.0,
+                head: edit.sel_before.1,
+                desired_col: None,
+            };
+            self.future.push(edit);
+        }
+        self.pending_stop = true; // typing after an undo starts a fresh group
         self.dirty = true;
         self.reshape(fs);
         true
@@ -927,16 +1067,21 @@ impl Document {
         if self.read_only {
             return false;
         }
-        let Some(edit) = self.future.pop() else {
+        // Redo the entire top group, mirroring undo.
+        let Some(group) = self.future.last().map(|e| e.group) else {
             return false;
         };
-        self.apply_op(&edit.op, edit.at_byte);
-        self.sel = Selection {
-            anchor: edit.sel_after.0,
-            head: edit.sel_after.1,
-            desired_col: None,
-        };
-        self.history.push(edit);
+        while self.future.last().map_or(false, |e| e.group == group) {
+            let edit = self.future.pop().expect("checked above");
+            self.apply_op(&edit.op, edit.at_byte);
+            self.sel = Selection {
+                anchor: edit.sel_after.0,
+                head: edit.sel_after.1,
+                desired_col: None,
+            };
+            self.history.push(edit);
+        }
+        self.pending_stop = true;
         self.dirty = true;
         self.reshape(fs);
         true
@@ -1237,4 +1382,91 @@ impl Document {
         Some(self.rope.slice(lo_char..hi_char).to_string())
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lsp::{Diagnostic, Severity};
+
+    fn diag(sl: u32, sc: u32, el: u32, ec: u32) -> Diagnostic {
+        Diagnostic {
+            start_line: sl,
+            start_char: sc,
+            end_line: el,
+            end_char: ec,
+            severity: Severity::Warning,
+            message: String::new(),
+            source: None,
+            code: None,
+            code_href: None,
+        }
+    }
+
+    // Squiggles must stay glued to their text between server publishes: inserting
+    // lines above shifts them down, same-line inserts shift columns, deletes shift
+    // back, and undo round-trips exactly.
+    #[test]
+    fn diagnostics_follow_edits() {
+        let mut fs = glyphon::FontSystem::new();
+        let mut d = Document::new(None, "line0\nline1\nline2\n".into(), &mut fs);
+        d.diagnostics = vec![diag(2, 0, 2, 5)]; // underlines "line2"
+
+        // Newline inserted at the top → range moves down a line.
+        d.place(0, false);
+        d.insert_str("\n", &mut fs);
+        assert_eq!((d.diagnostics[0].start_line, d.diagnostics[0].end_line), (3, 3));
+
+        // Undo (inverse delete) → back where it was.
+        d.undo(&mut fs);
+        assert_eq!((d.diagnostics[0].start_line, d.diagnostics[0].end_line), (2, 2));
+
+        // Same-line insert BEFORE the range → columns shift right.
+        let b = d.rope.line_to_byte(2);
+        d.place(b, false);
+        d.insert_str("xx", &mut fs);
+        assert_eq!((d.diagnostics[0].start_char, d.diagnostics[0].end_char), (2, 7));
+        assert_eq!(d.diagnostics[0].start_line, 2);
+
+        // Insert AFTER the range on the same line → untouched.
+        let after = d.rope.line_to_byte(2) + 7;
+        d.place(after, false);
+        d.insert_str("yy", &mut fs);
+        assert_eq!((d.diagnostics[0].start_char, d.diagnostics[0].end_char), (2, 7));
+    }
+
+    // Monaco-style undo grouping: a typed run is ONE undo step; spaces start the
+    // next word's group; Enter stands alone; cursor moves break the run; redo
+    // replays a whole group.
+    #[test]
+    fn undo_groups_typed_runs() {
+        let mut fs = glyphon::FontSystem::new();
+        let mut d = Document::new(None, String::new(), &mut fs);
+        for ch in ["d", "a", "f", "d", "s", "f"] {
+            d.insert_str(ch, &mut fs);
+        }
+        assert_eq!(d.text(), "dafdsf");
+        d.undo(&mut fs);
+        assert_eq!(d.text(), "", "quickly typed run undoes as one step");
+        d.redo(&mut fs);
+        assert_eq!(d.text(), "dafdsf", "redo replays the whole group");
+
+        // "hello world": space starts the next group → undo peels "( world)" then "hello".
+        let mut d = Document::new(None, String::new(), &mut fs);
+        for ch in "hello world".chars() {
+            d.insert_str(&ch.to_string(), &mut fs);
+        }
+        d.undo(&mut fs);
+        assert_eq!(d.text(), "hello", "undo removes the second word group");
+        d.undo(&mut fs);
+        assert_eq!(d.text(), "");
+
+        // A cursor move breaks the run.
+        let mut d = Document::new(None, String::new(), &mut fs);
+        d.insert_str("ab", &mut fs);
+        d.place(1, false); // move between 'a' and 'b'
+        d.insert_str("x", &mut fs);
+        d.undo(&mut fs);
+        assert_eq!(d.text(), "ab", "edit after a cursor move undoes alone");
+    }
 }

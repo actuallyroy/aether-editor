@@ -15,7 +15,7 @@ pub enum Command {
     ToggleTerminal,
     OpenFolder,
     ColorTheme,
-}
+}   
 
 pub const COMMANDS: &[(Command, &str, &str)] = &[
     (Command::Save, "File: Save", "Ctrl+S"),
