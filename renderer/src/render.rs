@@ -49,6 +49,36 @@ pub(crate) fn editor_region(layout: &Layout) -> Rect {
     }
 }
 
+/// Visible (non-collapsed) line ranges `[a, b]` inclusive, in order — the gaps are
+/// the folded regions. Used to render the editor text/gutter as fold-aware segments.
+pub(crate) fn fold_segments(d: &crate::document::Document, total: usize) -> Vec<(usize, usize)> {
+    if total == 0 {
+        return Vec::new();
+    }
+    if d.folds.is_empty() {
+        return vec![(0, total - 1)];
+    }
+    // Maximal runs of non-hidden lines (robust to overlapping/nested fold ranges).
+    let mut segs = Vec::new();
+    let mut start: Option<usize> = None;
+    for line in 0..total {
+        if d.is_line_hidden(line) {
+            if let Some(s) = start.take() {
+                segs.push((s, line - 1));
+            }
+        } else if start.is_none() {
+            start = Some(line);
+        }
+    }
+    if let Some(s) = start {
+        segs.push((s, total - 1));
+    }
+    if segs.is_empty() {
+        segs.push((0, total - 1));
+    }
+    segs
+}
+
 /// Scale that fits a `iw`x`ih` image inside `region` (16px padding), never upscaling.
 pub(crate) fn image_fit_scale(iw: f32, ih: f32, region: Rect) -> f32 {
     let pad = 16.0;
@@ -181,7 +211,9 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     } else if let Some(d) = app.workspace.active_doc_mut() {
         // Editor: size the document's scroll viewport (offset clamps here, thumbs
         // position from these metrics). Content height uses logical lines + padding.
-        let content_h = d.rope.len_lines() as f32 * theme::LINE_HEIGHT() + theme::EDITOR_PAD() * 2.0;
+        // Collapsed fold regions remove their hidden lines from the scrollable height.
+        let hidden = d.hidden_above(d.rope.len_lines());
+        let content_h = (d.rope.len_lines().saturating_sub(hidden)) as f32 * theme::LINE_HEIGHT() + theme::EDITOR_PAD() * 2.0;
         let content_w = d.max_line_width() + theme::EDITOR_PAD() * 2.0;
         // In a side-by-side diff each pane is ~half the editor width, so the
         // horizontal scroll range must be measured against the pane width (else a
@@ -764,6 +796,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             let bot = (y + h).min(ebot);
             (bot > top).then_some((top, bot - top))
         };
+        // Code folding shifts every line up by the height of collapsed regions above
+        // it; `foff(line)` is that pixel offset (0 when nothing is folded). Hidden
+        // lines (`d.is_line_hidden`) are skipped entirely by the per-line loops below.
+        let fold_lh = theme::LINE_HEIGHT();
+        let foff = |line: usize| -> f32 { fold_lh * d.hidden_above(line) as f32 };
 
         let (cur_line, _) = d.head_line_col();
         // Current line highlight across full editor width (editor.renderLineHighlight).
@@ -771,7 +808,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         // Skipped in diff views (the per-line add/del backgrounds carry the meaning).
         if crate::settings::render_line_highlight() && d.diff.is_none() {
             let (ltop, lh) = d.line_visual_bounds(cur_line);
-            let line_y = layout.editor_text.y + theme::EDITOR_PAD() + ltop - d.scroll_y();
+            let line_y = layout.editor_text.y + theme::EDITOR_PAD() + ltop - d.scroll_y() - foff(cur_line);
             if let Some((qy, qh)) = clip_v(line_y, lh) {
                 bg_quads.push(Quad::new(editor_full.x, qy, editor_full.w, qh, theme::LINE_HIGHLIGHT()));
             }
@@ -800,6 +837,8 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                         bg_quads.push(Quad::new(lt_x, qy, lt_w, qh, theme::DIFF_FILLER_BG()));
                         bg_quads.push(Quad::new(rt_x, qy, rt_w, qh, theme::DIFF_ADD_BG()));
                     }
+                    // Combined-view file header: a full-width band (clickable to collapse).
+                    RowKind::File => bg_quads.push(Quad::new(editor_full.x, qy, editor_full.w, qh, theme::TAB_BAR_BG())),
                     RowKind::Context => {}
                 }
             }
@@ -817,6 +856,56 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             }
         }
 
+        // Find-match highlights: a translucent box behind every match (the current
+        // one is shown by the selection drawn on top). Only visible matches are
+        // mapped to rects, so this stays cheap on large result sets.
+        if app.find.active && !app.find.matches.is_empty() && d.diff.is_none() {
+            let lh = theme::LINE_HEIGHT().max(1.0);
+            let first = (d.scroll_y() / lh) as usize;
+            let last = first + (layout.editor_text.h / lh) as usize + 2;
+            let len = d.rope.len_bytes();
+            for &(s, e) in &app.find.matches {
+                if e <= s {
+                    continue;
+                }
+                let lo_line = d.rope.byte_to_line(s.min(len));
+                if lo_line + 1 < first || lo_line > last {
+                    continue; // off-screen
+                }
+                let hi = e.min(len);
+                let hi_line = d.rope.byte_to_line(hi);
+                let lo_col = s - d.rope.line_to_byte(lo_line);
+                let hi_col = hi - d.rope.line_to_byte(hi_line);
+                for run in d.buffer.layout_runs() {
+                    let line = run.line_i;
+                    if line < lo_line || line > hi_line || d.is_line_hidden(line) {
+                        continue;
+                    }
+                    let (cs, ce) = if lo_line == hi_line {
+                        (lo_col, hi_col)
+                    } else if line == lo_line {
+                        (lo_col, usize::MAX)
+                    } else if line == hi_line {
+                        (0, hi_col)
+                    } else {
+                        (0, usize::MAX)
+                    };
+                    let (xs, xe) = x_range_in_run(&run, cs, ce);
+                    let w = (xe - xs).max(2.0);
+                    let my = layout.editor_text.y + theme::EDITOR_PAD() + run.line_top - d.scroll_y() - foff(line);
+                    if let Some((qy, qh)) = clip_v(my, run.line_height) {
+                        bg_quads.push(Quad::new(
+                            layout.editor_text.x + theme::EDITOR_PAD() + xs - d.scroll_x(),
+                            qy,
+                            w,
+                            qh,
+                            theme::FIND_MATCH(),
+                        ));
+                    }
+                }
+            }
+        }
+
         // Selection quads.
         if !d.sel.is_empty() {
             let (lo, hi) = d.sel.range();
@@ -826,7 +915,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             let hi_col = hi - d.rope.line_to_byte(hi_line);
             for run in d.buffer.layout_runs() {
                 let line = run.line_i;
-                if line < lo_line || line > hi_line {
+                if line < lo_line || line > hi_line || d.is_line_hidden(line) {
                     continue;
                 }
                 let (col_start, col_end) = if lo_line == hi_line {
@@ -840,7 +929,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 };
                 let (xs, xe) = x_range_in_run(&run, col_start, col_end);
                 let w = (xe - xs).max(2.0);
-                let sel_y = layout.editor_text.y + theme::EDITOR_PAD() + run.line_top - d.scroll_y();
+                let sel_y = layout.editor_text.y + theme::EDITOR_PAD() + run.line_top - d.scroll_y() - foff(line);
                 if let Some((qy, qh)) = clip_v(sel_y, run.line_height) {
                     bg_quads.push(Quad::new(
                         layout.editor_text.x + theme::EDITOR_PAD() + xs - d.scroll_x(),
@@ -870,7 +959,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 };
                 for run in d.buffer.layout_runs() {
                     let line = run.line_i;
-                    if line < lo_line || line > hi_line {
+                    if line < lo_line || line > hi_line || d.is_line_hidden(line) {
                         continue;
                     }
                     let (col_start, col_end) = if lo_line == hi_line {
@@ -884,7 +973,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     };
                     let (xs, xe) = x_range_in_run(&run, col_start, col_end);
                     let w = (xe - xs).max(3.0 * uz);
-                    let line_y = layout.editor_text.y + theme::EDITOR_PAD() + run.line_top - d.scroll_y();
+                    let line_y = layout.editor_text.y + theme::EDITOR_PAD() + run.line_top - d.scroll_y() - foff(line);
                     let under_y = line_y + run.line_height - 2.0 * uz;
                     if let Some((qy, qh)) = clip_v(under_y, 2.0 * uz) {
                         fg_quads.push(Quad::new(
@@ -900,10 +989,12 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         }
 
         // Cursor (foreground so it sits over glyphs) — gated by blink. Read-only
-        // tabs (images, diffs) have nothing to edit, so they show no caret.
-        if app.cursor_blink_on && !d.read_only {
+        // tabs (images, diffs) have nothing to edit, so they show no caret. Also
+        // suppressed when a modal (palette/dialog) owns the screen or the find
+        // widget has focus, so the editor caret never bleeds over them.
+        if app.cursor_blink_on && !d.read_only && !modal_open && !app.find.focused {
             let (cx, cy, ch) = d.caret_visual();
-            let cursor_y = layout.editor_text.y + theme::EDITOR_PAD() + cy - d.scroll_y();
+            let cursor_y = layout.editor_text.y + theme::EDITOR_PAD() + cy - d.scroll_y() - foff(cur_line);
             if let Some((qy, qh)) = clip_v(cursor_y, ch) {
                 fg_quads.push(Quad::new(
                     layout.editor_text.x + theme::EDITOR_PAD() + cx - d.scroll_x(),
@@ -918,6 +1009,25 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         // Editor scrollbars (auto-hide overlay; vertical + horizontal).
         if !modal_open {
             d.scroll.draw(now, &mut fg_quads);
+        }
+        // Find overview markers: a tick on the scrollbar track per match (VSCode's
+        // overview ruler), with the current match brighter. Always shown while the
+        // find widget is open so you can see where results sit in the whole file.
+        if app.find.active && !app.find.matches.is_empty() && !modal_open {
+            let track = d.scroll.vtrack_rect();
+            let total = d.rope.len_lines().max(1) as f32;
+            let mh = theme::zpx(2.0).max(1.0);
+            let inset = theme::zpx(1.0);
+            let base = theme::FIND_MATCH();
+            for (i, &(s, _)) in app.find.matches.iter().enumerate() {
+                let line = d.rope.byte_to_line(s.min(d.rope.len_bytes())) as f32;
+                let y = track.y + (line / total) * track.h - mh * 0.5;
+                let current = app.find.index == Some(i);
+                let color = if current { [1.0, 0.6, 0.0, 1.0] } else { base };
+                let w = if current { track.w } else { track.w - inset * 2.0 };
+                let x = if current { track.x } else { track.x + inset };
+                fg_quads.push(Quad::new(x, y, w, mh, color));
+            }
         }
     }
 
@@ -1014,53 +1124,52 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // Status bar
     bg_quads.push(layout.status_bar.quad(theme::STATUS_BAR_BG()));
 
-    // Find bar
-    if let Some(fb) = layout.find_bar.as_ref() {
-        bg_quads.push(fb.quad(theme::TAB_BAR_BG()));
-        bg_quads.push(Quad::new(
-            fb.x,
-            fb.y + fb.h - 1.0,
-            fb.w,
-            1.0,
-            theme::BORDER(),
-        ));
-    }
+    // (The find/replace widget draws in its own late pass — see below.)
 
     // Palette dim overlay + box
     if let Some(pal) = layout.palette.as_ref() {
-        bg_quads.push(Quad::new(
-            0.0,
-            0.0,
-            gpu.config.width as f32,
-            gpu.config.height as f32,
-            [0.0, 0.0, 0.0, 0.6],
-        ));
-        bg_quads.push(pal.box_.quad(theme::PALETTE_BG()));
-        bg_quads.push(Quad::new(
-            pal.box_.x - 1.0,
-            pal.box_.y - 1.0,
-            pal.box_.w + 2.0,
-            pal.box_.h + 2.0,
-            theme::PALETTE_BORDER(),
-        ));
-        bg_quads.push(pal.input.quad(theme::PALETTE_INPUT_BG()));
-        // Selected row highlight — row rect from the ListView.
-        if !app.palette.filtered.is_empty() {
+        // Dim the rest of the window behind the modal.
+        bg_quads.push(Quad::new(0.0, 0.0, gpu.config.width as f32, gpu.config.height as f32, [0.0, 0.0, 0.0, 0.45]));
+        let radius = theme::zpx(12.0);
+        // Soft drop shadow: a few expanding, fading rounded quads behind the card.
+        for i in 1..=6 {
+            let s = i as f32 * theme::zpx(2.0);
+            let a = 0.16 * (1.0 - (i as f32 - 1.0) / 6.0);
             bg_quads.push(
-                gpu.ui
-                    .palette_list
-                    .row_rect(pal.list, app.palette.selected)
-                    .quad(theme::PALETTE_SELECTED()),
+                Rect { x: pal.box_.x - s, y: pal.box_.y - s + theme::zpx(3.0), w: pal.box_.w + s * 2.0, h: pal.box_.h + s * 2.0 }
+                    .rounded_quad([0.0, 0.0, 0.0, a], radius + s),
             );
+        }
+        // Card: 1px border ring (slightly larger rounded quad) + body.
+        bg_quads.push(
+            Rect { x: pal.box_.x - 1.0, y: pal.box_.y - 1.0, w: pal.box_.w + 2.0, h: pal.box_.h + 2.0 }
+                .rounded_quad(theme::PALETTE_BORDER(), radius + 1.0),
+        );
+        bg_quads.push(pal.box_.rounded_quad(theme::PALETTE_BG(), radius));
+        // Search input: rounded, subtly bordered.
+        let ir = theme::zpx(7.0);
+        bg_quads.push(
+            Rect { x: pal.input.x - 1.0, y: pal.input.y - 1.0, w: pal.input.w + 2.0, h: pal.input.h + 2.0 }
+                .rounded_quad(theme::PALETTE_BORDER(), ir + 1.0),
+        );
+        bg_quads.push(pal.input.rounded_quad(theme::PALETTE_INPUT_BG(), ir));
+        // Selected row: an inset rounded "pill" (not a full-bleed bar).
+        if !app.palette.filtered.is_empty() {
+            let r = gpu.ui.palette_list.row_rect(pal.list, app.palette.selected);
+            let pill = Rect {
+                x: r.x + theme::zpx(4.0),
+                y: r.y + theme::zpx(1.0),
+                w: r.w - theme::zpx(8.0),
+                h: (r.h - theme::zpx(2.0)).max(2.0),
+            };
+            bg_quads.push(pill.rounded_quad(theme::PALETTE_SELECTED(), theme::zpx(6.0)));
         }
     }
 
     // Text-input carets (blink-gated, drawn on top via fg_quads).
     if app.cursor_blink_on {
         if let Some(pal) = layout.palette.as_ref() {
-            fg_quads.push(gpu.ui.palette_input.caret_quad(pal.input, theme::zpx(6.0)));
-        } else if let Some(fb) = layout.find_bar.as_ref() {
-            fg_quads.push(gpu.ui.find_input.caret_quad(*fb, theme::zpx(8.0)));
+            fg_quads.push(gpu.ui.palette_input.caret_quad(pal.input, theme::zpx(14.0)));
         }
         if let Some(pc) = app.explorer.creating.as_ref() {
             let (_, _, field) = create_row_geometry(layout.tree_region(), pc.row, pc.depth);
@@ -1072,10 +1181,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // Text-input selection highlights — drawn into bg_quads (under glyphs, over
     // the input box). Not blink-gated.
     if let Some(pal) = layout.palette.as_ref() {
-        gpu.ui.palette_input.selection_quads(pal.input, theme::zpx(6.0), &mut bg_quads);
-    }
-    if let Some(fb) = layout.find_bar.as_ref() {
-        gpu.ui.find_input.selection_quads(*fb, theme::zpx(8.0), &mut bg_quads);
+        gpu.ui.palette_input.selection_quads(pal.input, theme::zpx(14.0), &mut bg_quads);
     }
     // (The Extensions and Search panels draw their selection highlights in their own draw_quads.)
 
@@ -1304,27 +1410,86 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     custom_glyphs: &[],
                 });
             }
+            // Combined view: overlay the codicon twistie on each visible file header
+            // (same chevron as the sidebar tree), flipped to match collapse state.
+            if let Some(diff) = d.diff.as_ref() {
+                if diff.combined {
+                    for run in d.buffer.layout_runs() {
+                        let Some(row) = diff.rows.get(run.line_i) else { continue };
+                        if row.kind != crate::diff::RowKind::File {
+                            continue;
+                        }
+                        let y = lt.y + theme::EDITOR_PAD() + run.line_top - d.scroll_y();
+                        if y + run.line_height < lt.y || y > lt.y + lt.h {
+                            continue;
+                        }
+                        let chev = if d.diff_collapsed.contains(&row.file) {
+                            &ui.diff_chev_right
+                        } else {
+                            &ui.diff_chev_down
+                        };
+                        let cr = Rect { x: lt.x + theme::EDITOR_PAD(), y, w: theme::zpx(18.0), h: run.line_height };
+                        chev.push(cr.x, cr, theme::FG_TEXT(), &mut areas);
+                    }
+                }
+            }
         } else {
-            // Line numbers — clipped to the gutter region so they never bleed over
-            // the tab strip when scrolled.
-            ui.line_numbers
-                .draw(layout.gutter, d.scroll_y(), theme::FG_GUTTER(), &mut areas);
-
-            // Document text
-            areas.push(TextArea {
-                buffer: &d.buffer,
-                left: layout.editor_text.x + theme::EDITOR_PAD() - d.scroll_x(),
-                top: layout.editor_text.y + theme::EDITOR_PAD() - d.scroll_y(),
-                scale: 1.0,
-                bounds: TextBounds {
-                    left: layout.editor_text.x as i32,
-                    top: layout.editor_text.y as i32,
-                    right: (layout.editor_text.x + layout.editor_text.w) as i32,
-                    bottom: (layout.editor_text.y + layout.editor_text.h) as i32,
-                },
-                default_color: theme::FG_TEXT(),
-                custom_glyphs: &[],
-            });
+            // Fold-aware rendering: draw the text + gutter as visible line segments
+            // (collapsed regions are simply not drawn, and everything below shifts up).
+            let et = layout.editor_text;
+            let g = layout.gutter;
+            let lh = theme::LINE_HEIGHT();
+            let total = d.rope.len_lines();
+            let (etop, ebot) = (et.y, et.y + et.h);
+            for (a, b) in fold_segments(d, total) {
+                let off = lh * d.hidden_above(a) as f32;
+                let seg_top = et.y + theme::EDITOR_PAD() + a as f32 * lh - d.scroll_y() - off;
+                let seg_bot = seg_top + (b - a + 1) as f32 * lh;
+                let cy0 = seg_top.max(etop);
+                let cy1 = seg_bot.min(ebot);
+                if cy1 <= cy0 {
+                    continue; // segment fully scrolled off
+                }
+                let text_top = et.y + theme::EDITOR_PAD() - d.scroll_y() - off;
+                let clip = Rect { x: et.x, y: cy0, w: et.w, h: cy1 - cy0 };
+                areas.push(TextArea {
+                    buffer: &d.buffer,
+                    left: et.x + theme::EDITOR_PAD() - d.scroll_x(),
+                    top: text_top,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: clip.x as i32,
+                        top: clip.y as i32,
+                        right: (clip.x + clip.w) as i32,
+                        bottom: (clip.y + clip.h) as i32,
+                    },
+                    default_color: theme::FG_TEXT(),
+                    custom_glyphs: &[],
+                });
+                let g_top = g.y + theme::EDITOR_PAD() - d.scroll_y() - off;
+                ui.line_numbers
+                    .draw_clipped(Rect { x: g.x, y: cy0, w: g.w, h: cy1 - cy0 }, g_top, theme::FG_GUTTER(), &mut areas);
+            }
+            // Fold chevrons in the gutter: ▸ for folded headers, ▾ for foldable ones.
+            if !d.diff.is_some() {
+                let first = (d.scroll_y() / lh) as usize;
+                let last = first + (et.h / lh) as usize + 2;
+                for line in first..=last.min(total.saturating_sub(1)) {
+                    if d.is_line_hidden(line) || !d.is_foldable(line) {
+                        continue;
+                    }
+                    let off = lh * d.hidden_above(line) as f32;
+                    let y = et.y + theme::EDITOR_PAD() + line as f32 * lh - d.scroll_y() - off;
+                    if y < etop - lh || y > ebot {
+                        continue;
+                    }
+                    let folded = d.is_folded(line);
+                    let chev = if folded { &ui.diff_chev_right } else { &ui.diff_chev_down };
+                    let color = if folded { theme::FG_TEXT() } else { theme::FG_DIM() };
+                    let cr = Rect { x: g.x + g.w - theme::zpx(16.0), y, w: theme::zpx(14.0), h: lh };
+                    chev.push(cr.x, cr, color, &mut areas);
+                }
+            }
         }
     }
 
@@ -1345,10 +1510,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         lbl.push(c.x + (c.w - lbl.width()) * 0.5, c, sfg, &mut areas);
     }
 
-    // Find bar
-    if let Some(fb) = layout.find_bar.as_ref() {
-        ui.find_input.draw(*fb, theme::zpx(8.0), theme::FG_TEXT(), &mut areas);
-    }
+    // (The find/replace widget draws in its own late pass — see below.)
 
     // Panel header (VSCode-style tabs + stub icon buttons) and terminal grid text.
     if app.terminal.visible {
@@ -1409,7 +1571,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // Palette text
     if let Some(pal) = layout.palette.as_ref() {
         ui.palette_input
-            .draw(pal.input, theme::zpx(6.0), theme::FG_TEXT(), &mut areas);
+            .draw(pal.input, theme::zpx(14.0), theme::FG_TEXT(), &mut areas);
         ui.palette_list
             .draw(pal.list, theme::FG_TEXT(), &mut areas);
     }
@@ -1773,6 +1935,50 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             }
             gpu.queue.submit(Some(encm.finish()));
         }
+    }
+
+    // ---- Find/replace widget overlay ----
+    // Floats over the editor's top-right; its own pass so editor text never bleeds
+    // over the card. Suppressed while a centered modal owns the screen.
+    if app.find.active && layout.palette.is_none() && app.dialog.is_none() && app.feedback_form.is_none() {
+        let er = editor_region(&layout);
+        let fl = crate::ui::find_widget::FindWidget::layout(er, app.find.replace_open);
+        let opts = [app.find.opts.case_sensitive, app.find.opts.whole_word, app.find.opts.regex];
+        let mut fq: Vec<Quad> = Vec::new();
+        let mut ffg: Vec<Quad> = Vec::new();
+        gpu.ui.find.draw_quads(&fl, app.find.focused, app.find.on_replace, opts, app.cursor_blink_on, &mut fq, &mut ffg);
+        gpu.quad_renderer.prepare(&gpu.device, &gpu.queue, &fq, &ffg, (cfg_w, cfg_h));
+        let mut fareas: Vec<TextArea> = Vec::new();
+        gpu.ui.find.draw_text(&fl, app.find.replace_open, opts, &mut fareas);
+        gpu.text_renderer.prepare(
+            &gpu.device,
+            &gpu.queue,
+            &mut gpu.font_system,
+            &mut gpu.atlas,
+            &gpu.viewport,
+            fareas,
+            &mut gpu.swash_cache,
+        )?;
+        let mut encf = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("aether-find-pass"),
+        });
+        {
+            let mut pass = encf.begin_render_pass(&RenderPassDescriptor {
+                label: Some("aether-find"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            gpu.quad_renderer.render_bg(&mut pass);
+            gpu.text_renderer.render(&gpu.atlas, &gpu.viewport, &mut pass)?;
+            gpu.quad_renderer.render_fg(&mut pass);
+        }
+        gpu.queue.submit(Some(encf.finish()));
     }
 
     // ---- Diagnostic hover card overlay ----

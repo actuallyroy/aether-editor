@@ -95,6 +95,12 @@ pub fn discard_all(root: &Path) {
     let _ = git(root, &["restore", "."]);
 }
 
+/// Stash all working-tree changes, including untracked files
+/// (`git stash push --include-untracked`). Returns true on success.
+pub fn stash(root: &Path) -> bool {
+    git(root, &["stash", "push", "--include-untracked"]).is_some()
+}
+
 /// Push the current branch (`git push`). Returns true on success.
 pub fn push(root: &Path) -> bool {
     git(root, &["push"]).is_some()

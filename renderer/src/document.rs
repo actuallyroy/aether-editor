@@ -66,8 +66,11 @@ pub struct Document {
     wrap_width: Option<f32>, // Some(w) when word-wrap is on (wraps at w px)
     eol: String,             // this file's actual line ending ("\n" or "\r\n")
     pub read_only: bool,     // diff views (and future previews) reject edits
-    pub diff: Option<crate::diff::Diff>, // Some => this tab is a git diff view
+    pub diff: Option<crate::diff::Diff>, // Some => this tab is a git diff view (visible projection)
     pub diff_right: Option<Buffer>,      // side-by-side: `buffer` = old/left, this = new/right
+    pub diff_full: Option<crate::diff::Diff>, // combined view: the complete diff (pre-collapse)
+    pub diff_collapsed: std::collections::HashSet<usize>, // collapsed file indices (combined view)
+    pub folds: std::collections::BTreeMap<usize, usize>, // folded regions: header line → last hidden line
     pub image: Option<String>,           // Some(media key) => this tab renders an image
     pub image_scale: Option<f32>,        // None = fit-to-window; Some(s) = absolute scale
     pub image_pan: (f32, f32),           // pan offset (px) from centered position
@@ -259,6 +262,9 @@ impl Document {
             read_only: false,
             diff: None,
             diff_right: None,
+            diff_full: None,
+            diff_collapsed: std::collections::HashSet::new(),
+            folds: std::collections::BTreeMap::new(),
             image: None,
             image_scale: None,
             image_pan: (0.0, 0.0),
@@ -311,6 +317,9 @@ impl Document {
             read_only: true,
             diff: None,
             diff_right: None,
+            diff_full: None,
+            diff_collapsed: std::collections::HashSet::new(),
+            folds: std::collections::BTreeMap::new(),
             image: Some(key),
             image_scale: None,
             image_pan: (0.0, 0.0),
@@ -363,12 +372,19 @@ impl Document {
             apply_buffer_text(&mut b, fs, &display, display.matches('\n').count(), Lang::PlainText, "", None, None, &[]);
             b
         };
-        let buffer = mk(fs, &diff.left_text);
-        let diff_right = Some(mk(fs, &diff.right_text));
+        // Combined views keep the full diff so collapse can re-project; the buffers
+        // and `diff` start from the fully-expanded projection.
+        let (visible, full) = if diff.combined {
+            (crate::diff::project(&diff, &std::collections::HashSet::new()), Some(diff))
+        } else {
+            (diff, None)
+        };
+        let buffer = mk(fs, &visible.left_text);
+        let diff_right = Some(mk(fs, &visible.right_text));
         Self {
             path: None,
-            name: diff.title.clone(),
-            rope: Rope::from_str(&diff.left_text),
+            name: visible.title.clone(),
+            rope: Rope::from_str(&visible.left_text),
             sel: Selection::caret(0),
             scroll: ScrollView::new(ScrollOpts::both()),
             dirty: false,
@@ -380,8 +396,11 @@ impl Document {
             wrap_width: None,
             eol: "\n".to_string(),
             read_only: true,
-            diff: Some(diff),
+            diff: Some(visible),
             diff_right,
+            diff_full: full,
+            diff_collapsed: std::collections::HashSet::new(),
+            folds: std::collections::BTreeMap::new(),
             image: None,
             image_scale: None,
             image_pan: (0.0, 0.0),
@@ -394,6 +413,38 @@ impl Document {
             hl_dirty_from: usize::MAX,
             semantic: Vec::new(),
         }
+    }
+
+    /// If visible `line` is a combined-diff file header, the file index it toggles.
+    pub fn diff_file_at_line(&self, line: usize) -> Option<usize> {
+        let d = self.diff.as_ref()?;
+        if !d.combined {
+            return None;
+        }
+        let row = d.rows.get(line)?;
+        (row.kind == crate::diff::RowKind::File).then_some(row.file)
+    }
+
+    /// Collapse/expand one file in a combined diff and rebuild the side-by-side
+    /// panes from the new projection.
+    pub fn toggle_diff_file(&mut self, file_idx: usize, fs: &mut FontSystem) {
+        let Some(full) = self.diff_full.as_ref() else {
+            return;
+        };
+        if !self.diff_collapsed.insert(file_idx) {
+            self.diff_collapsed.remove(&file_idx);
+        }
+        let vis = crate::diff::project(full, &self.diff_collapsed);
+        let mk = |fs: &mut FontSystem, text: &str| {
+            let mut b = Buffer::new(fs, Metrics::new(theme::FONT_SIZE(), theme::LINE_HEIGHT()));
+            let display = text.replace('\r', "");
+            apply_buffer_text(&mut b, fs, &display, display.matches('\n').count(), Lang::PlainText, "", None, None, &[]);
+            b
+        };
+        self.buffer = mk(fs, &vis.left_text);
+        self.diff_right = Some(mk(fs, &vis.right_text));
+        self.rope = Rope::from_str(&vis.left_text);
+        self.diff = Some(vis);
     }
 
     /// This file's line ending: "\n" or "\r\n".
@@ -483,6 +534,141 @@ impl Document {
         }
     }
 
+    // ---- Code folding (indentation-based) ----
+
+    /// Leading-whitespace width of a line, or None for a blank line.
+    fn line_indent(&self, line: usize) -> Option<usize> {
+        if line >= self.rope.len_lines() {
+            return None;
+        }
+        let s = self.rope.line(line).to_string();
+        if s.trim().is_empty() {
+            return None;
+        }
+        Some(s.chars().take_while(|c| *c == ' ' || *c == '\t').count())
+    }
+
+    /// The last line of the indentation-based fold starting at `header`, if any.
+    pub fn fold_range(&self, header: usize) -> Option<usize> {
+        let total = self.rope.len_lines();
+        let base = self.line_indent(header)?;
+        let mut end = header;
+        let mut i = header + 1;
+        while i < total {
+            match self.line_indent(i) {
+                None => {}                          // blank line: keep scanning
+                Some(ind) if ind > base => end = i, // deeper: part of the region
+                Some(_) => break,                   // same/less indent: region ends
+            }
+            i += 1;
+        }
+        (end > header).then_some(end)
+    }
+
+    pub fn is_foldable(&self, line: usize) -> bool {
+        self.fold_range(line).is_some()
+    }
+    pub fn is_folded(&self, header: usize) -> bool {
+        self.folds.contains_key(&header)
+    }
+    /// True if `line` sits inside a collapsed region (not the header itself).
+    pub fn is_line_hidden(&self, line: usize) -> bool {
+        self.folds.iter().any(|(&h, &e)| line > h && line <= e)
+    }
+    /// Count of hidden lines strictly above `line` (drives vertical placement).
+    /// Counts unique hidden lines (robust to overlapping/nested fold ranges).
+    pub fn hidden_above(&self, line: usize) -> usize {
+        if self.folds.is_empty() {
+            return 0;
+        }
+        let cap = line.min(self.rope.len_lines());
+        (0..cap).filter(|&l| self.is_line_hidden(l)).count()
+    }
+
+    /// Expand any folds that hide `line` (e.g. when navigating to a search match
+    /// inside a collapsed region) so it becomes visible.
+    pub fn reveal_line(&mut self, line: usize) {
+        let headers: Vec<usize> = self
+            .folds
+            .iter()
+            .filter(|(&h, &e)| line > h && line <= e)
+            .map(|(&h, _)| h)
+            .collect();
+        for h in headers {
+            self.folds.remove(&h);
+        }
+    }
+
+    /// Fold or unfold the region whose header is `header`.
+    pub fn toggle_fold(&mut self, header: usize) {
+        if self.folds.remove(&header).is_some() {
+            return;
+        }
+        if let Some(end) = self.fold_range(header) {
+            // Keep nested child folds intact — the union-based fold logic renders
+            // overlapping ranges correctly, so unfolding this parent restores the
+            // children's collapsed state (like VSCode).
+            self.folds.insert(header, end);
+            // Pull the caret out of a region that just collapsed.
+            let (cl, _) = self.head_line_col();
+            if cl > header && cl <= end {
+                let byte = self.rope.line_to_byte(header);
+                self.place(byte, false);
+            }
+        }
+    }
+
+    /// Map a visible-row index (counting only non-hidden lines, top to bottom) to
+    /// its rope line. Robust to overlapping/nested folds.
+    pub fn visible_index_to_line(&self, vidx: usize) -> usize {
+        let total = self.rope.len_lines();
+        if self.folds.is_empty() {
+            return vidx.min(total.saturating_sub(1));
+        }
+        let mut seen = 0usize;
+        for l in 0..total {
+            if self.is_line_hidden(l) {
+                continue;
+            }
+            if seen == vidx {
+                return l;
+            }
+            seen += 1;
+        }
+        total.saturating_sub(1)
+    }
+
+    /// Convert a click's compressed y (px, fold-collapsed space) to the real buffer
+    /// y, so hit-testing lands on the right line when folds are present.
+    pub fn expand_visual_y(&self, vy: f32) -> f32 {
+        if self.folds.is_empty() || vy <= 0.0 {
+            return vy;
+        }
+        let lh = theme::LINE_HEIGHT();
+        let vidx = (vy / lh).floor() as usize;
+        let frac = vy - vidx as f32 * lh;
+        self.visible_index_to_line(vidx) as f32 * lh + frac
+    }
+
+    /// First visible line at or after `line` (skips collapsed regions, moving down).
+    pub fn first_visible_from(&self, line: usize, down: bool) -> usize {
+        let total = self.rope.len_lines();
+        let mut l = line.min(total.saturating_sub(1));
+        while self.is_line_hidden(l) {
+            if down {
+                if l + 1 >= total {
+                    break;
+                }
+                l += 1;
+            } else if l == 0 {
+                break;
+            } else {
+                l -= 1;
+            }
+        }
+        l
+    }
+
     pub fn reshape(&mut self, fs: &mut FontSystem) {
         let t0 = std::time::Instant::now();
         let text = self.rope.to_string().replace('\r', "");
@@ -550,6 +736,11 @@ impl Document {
         self.future.clear();
         self.sel = sel_after;
         self.dirty = true;
+        // Folds are keyed by line number; an edit can shift lines, so drop them
+        // rather than hide the wrong range. (Cheap to re-fold.)
+        if !self.folds.is_empty() {
+            self.folds.clear();
+        }
         // LSP: the text changed — bump the version and flag a pending didChange
         // (App sends it debounced from the idle tick).
         self.version += 1;
@@ -847,12 +1038,15 @@ impl Document {
         if line == 0 {
             return;
         }
-        self.move_to_line(line - 1, extend);
+        // Skip over any collapsed region above.
+        let target = self.first_visible_from(line - 1, false);
+        self.move_to_line(target, extend);
     }
 
     pub fn move_down(&mut self, extend: bool) {
         let (line, _) = self.head_line_col();
-        self.move_to_line(line + 1, extend);
+        let target = self.first_visible_from(line + 1, true);
+        self.move_to_line(target, extend);
     }
 
     pub fn move_home(&mut self, extend: bool) {
@@ -1018,27 +1212,4 @@ impl Document {
         Some(self.rope.slice(lo_char..hi_char).to_string())
     }
 
-    pub fn find_next(&mut self, needle: &str, from_byte: usize) -> Option<usize> {
-        if needle.is_empty() {
-            return None;
-        }
-        let text = self.rope.to_string();
-        let start = from_byte.min(text.len());
-        if let Some(rel) = text[start..].find(needle) {
-            return Some(start + rel);
-        }
-        text[..start].find(needle)
-    }
-
-    pub fn find_prev(&mut self, needle: &str, from_byte: usize) -> Option<usize> {
-        if needle.is_empty() {
-            return None;
-        }
-        let text = self.rope.to_string();
-        let end = from_byte.min(text.len());
-        if let Some(pos) = text[..end].rfind(needle) {
-            return Some(pos);
-        }
-        text.rfind(needle)
-    }
 }

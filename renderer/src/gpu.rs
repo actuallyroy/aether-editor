@@ -33,6 +33,8 @@ pub struct UiBuffers {
     pub status_right: TextLabel,
     pub line_numbers: Gutter,
     pub line_numbers2: Gutter, // right pane's gutter in a side-by-side diff
+    pub diff_chev_down: TextLabel, // combined-diff file-header twistie (expanded)
+    pub diff_chev_right: TextLabel, // combined-diff file-header twistie (collapsed)
     pub menu_dropdown: Menu,   // top menu-bar dropdown (File/Edit/…)
     pub scm_badge: TextLabel,  // change-count badge on the Source Control icon
     pub img_minus: TextLabel,  // image zoom-out control
@@ -44,7 +46,7 @@ pub struct UiBuffers {
     pub zoom_pct: TextLabel,
     pub palette_input: TextInput,
     pub palette_list: ListView,
-    pub find_input: TextInput,
+    pub find: crate::ui::find_widget::FindWidget,
     pub menu: Menu,
     pub dialog: Dialog,
     pub diag_hover: HoverCard, // floating tooltip for the diagnostic under the pointer
@@ -219,6 +221,16 @@ impl GpuState {
             status_right: TextLabel::new(&mut font_system, 4000.0, theme::STATUS_BAR_HEIGHT()),
             line_numbers: Gutter::new(&mut font_system, theme::GUTTER_WIDTH()),
             line_numbers2: Gutter::new(&mut font_system, theme::GUTTER_WIDTH()),
+            diff_chev_down: {
+                let mut l = TextLabel::new(&mut font_system, 32.0, theme::LINE_HEIGHT());
+                l.set(&mut font_system, &theme::ICON_CHEVRON_DOWN.to_string(), theme::ICON_FAMILY);
+                l
+            },
+            diff_chev_right: {
+                let mut l = TextLabel::new(&mut font_system, 32.0, theme::LINE_HEIGHT());
+                l.set(&mut font_system, &theme::ICON_CHEVRON_RIGHT.to_string(), theme::ICON_FAMILY);
+                l
+            },
             palette_input: TextInput::new(&mut font_system, 600.0, theme::PALETTE_INPUT_HEIGHT()),
             palette_list: ListView::new(
                 &mut font_system,
@@ -227,7 +239,7 @@ impl GpuState {
                 theme::PALETTE_ROW_HEIGHT(),
                 6.0,
             ),
-            find_input: TextInput::new(&mut font_system, 800.0, theme::FIND_BAR_HEIGHT()),
+            find: crate::ui::find_widget::FindWidget::new(&mut font_system),
             menu: Menu::new(&mut font_system, 200.0),
             menu_dropdown: Menu::new(&mut font_system, 220.0),
             scm_badge: TextLabel::new(&mut font_system, 40.0, theme::ACTIVITY_ICON_SIZE()),

@@ -2,13 +2,17 @@
 // blue Commit button, then "Staged Changes" / "Changes" groups (each with a count
 // badge). Rows show filename (bright) + dimmed dir, ellipsized to fit, a colored
 // status letter on the right, and per-row hover actions:
-//   • Changes:        Open file · Discard · Stage (+)
-//   • Staged Changes: Open file · Unstage (−)
-// Owns its workspace root + commit message. Deferred: per-file-type icons + GRAPH.
+//   • Changes:        Open Changes (diff) · Open File · Discard · Stage (+)
+//   • Staged Changes: Open Changes (diff) · Open File · Unstage (−)
+// A header toolbar offers Stash · View as Tree/List · Refresh · More. The changed
+// files render either as a flat list or a collapsible folder tree (with single-
+// child folder chains compacted, like VSCode). Owns its workspace root + commit
+// message. Deferred: per-file-type icons + GRAPH.
 
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
-use glyphon::{Color, FontSystem, TextArea};
+use glyphon::{Attrs, Color, Family, FontSystem, TextArea};
 
 use crate::git;
 use crate::quad::Quad;
@@ -37,9 +41,25 @@ struct Row {
     untracked: bool,  // for Discard (delete vs revert)
 }
 
+/// One visible line in a group: either a folder (tree mode only) or a file row.
+/// In list mode every item is a `File` at depth 0; in tree mode files nest under
+/// `Folder`s whose collapse state is keyed in `collapsed`.
+enum Vis {
+    Folder { key: String, label: String, depth: usize, collapsed: bool },
+    File { row: usize, depth: usize },
+}
+
+/// Temporary tree built from the flat change paths to produce the `Vis` list.
+#[derive(Default)]
+struct TNode {
+    children: BTreeMap<String, TNode>,
+    files: Vec<usize>, // row indices whose file lives directly in this folder
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Act {
-    Open,
+    Diff, // Open Changes (diff)
+    Open, // Open File
     Discard,
     Stage,
     Unstage,
@@ -70,8 +90,12 @@ pub struct SourceControlPanel {
     unstaged: ListView,
     staged_rows: Vec<Row>,
     unstaged_rows: Vec<Row>,
+    staged_vis: Vec<Vis>,
+    unstaged_vis: Vec<Vis>,
+    tree_mode: bool,
+    collapsed: HashSet<String>, // keyed folders (per group, see `walk`)
     last_w: f32, // sidebar width the rows were last ellipsized for (-1 = stale)
-    hovered: Option<(bool, usize)>, // (is_staged_group, row index)
+    hovered: Option<(bool, usize)>, // (is_staged_group, visible-item index)
     branch: Option<String>,
     l_changes: TextLabel,
     l_staged: TextLabel,
@@ -80,12 +104,16 @@ pub struct SourceControlPanel {
     count_staged: TextLabel,
     count_unstaged: TextLabel,
     badges: [TextLabel; 5],
+    ic_diff: TextLabel,
     ic_open: TextLabel,
     ic_discard: TextLabel,
     ic_stage: TextLabel,
     ic_unstage: TextLabel,
     ic_refresh: TextLabel,
     ic_more: TextLabel,
+    ic_stash: TextLabel,
+    ic_tree: TextLabel,
+    ic_flat: TextLabel,
     ic_chevron: TextLabel,
     hovered_header: Option<bool>, // Some(true)=Staged header, Some(false)=Changes header
     root: PathBuf,
@@ -118,6 +146,10 @@ impl SourceControlPanel {
             unstaged: ListView::new(fs, theme::SIDEBAR_WIDTH(), 4000.0, row_h(), pad_x()),
             staged_rows: Vec::new(),
             unstaged_rows: Vec::new(),
+            staged_vis: Vec::new(),
+            unstaged_vis: Vec::new(),
+            tree_mode: false,
+            collapsed: HashSet::new(),
             last_w: -1.0,
             hovered: None,
             branch: None,
@@ -128,12 +160,16 @@ impl SourceControlPanel {
             count_staged: mk(fs, "0"),
             count_unstaged: mk(fs, "0"),
             badges,
+            ic_diff: icon(fs, theme::ICON_OPEN_CHANGES),
             ic_open: icon(fs, theme::ICON_FILE),
             ic_discard: icon(fs, theme::ICON_DISCARD),
             ic_stage: icon(fs, theme::ICON_ADD),
             ic_unstage: icon(fs, theme::ICON_REMOVE),
             ic_refresh: icon(fs, theme::ICON_REFRESH),
             ic_more: icon(fs, theme::ICON_ELLIPSIS),
+            ic_stash: icon(fs, theme::ICON_STASH),
+            ic_tree: icon(fs, theme::ICON_LIST_TREE),
+            ic_flat: icon(fs, theme::ICON_LIST_FLAT),
             ic_chevron: icon(fs, theme::ICON_CHEVRON_DOWN),
             hovered_header: None,
             root,
@@ -156,12 +192,16 @@ impl SourceControlPanel {
             &mut self.l_commit,
             &mut self.count_staged,
             &mut self.count_unstaged,
+            &mut self.ic_diff,
             &mut self.ic_open,
             &mut self.ic_discard,
             &mut self.ic_stage,
             &mut self.ic_unstage,
             &mut self.ic_refresh,
             &mut self.ic_more,
+            &mut self.ic_stash,
+            &mut self.ic_tree,
+            &mut self.ic_flat,
             &mut self.ic_chevron,
         ] {
             l.reshape(fs);
@@ -246,15 +286,113 @@ impl SourceControlPanel {
                 r.fname_len = Self::display(&r.fname, &r.dir, avail).1;
             }
         }
-        let key = |rows: &[Row]| {
-            rows.iter()
-                .map(|r| Self::display(&r.fname, &r.dir, avail).0)
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let (sk, uk) = (key(&self.staged_rows), key(&self.unstaged_rows));
-        self.staged.set_text(fs, &sk, theme::SIDEBAR_WIDTH(), 4000.0);
-        self.unstaged.set_text(fs, &uk, theme::SIDEBAR_WIDTH(), 4000.0);
+        // Rebuild the visible-item lists (flat or tree) for the current collapse state.
+        self.staged_vis = self.build_vis(&self.staged_rows, true);
+        self.unstaged_vis = self.build_vis(&self.unstaged_rows, false);
+        let sw = theme::SIDEBAR_WIDTH();
+        if self.tree_mode {
+            let (sk, ss) = Self::tree_spans(&self.staged_vis, &self.staged_rows);
+            let (uk, us) = Self::tree_spans(&self.unstaged_vis, &self.unstaged_rows);
+            self.staged.set_rich(fs, &sk, &ss, sw, 4000.0);
+            self.unstaged.set_rich(fs, &uk, &us, sw, 4000.0);
+        } else {
+            let key = |rows: &[Row]| {
+                rows.iter()
+                    .map(|r| Self::display(&r.fname, &r.dir, avail).0)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            // `set_text` uses the key AS the buffer text, so no prefix here. The
+            // tree-mode key is prefixed ("T\n") and so never collides with these,
+            // meaning a mode toggle always re-shapes.
+            let (sk, uk) = (key(&self.staged_rows), key(&self.unstaged_rows));
+            self.staged.set_text(fs, &sk, sw, 4000.0);
+            self.unstaged.set_text(fs, &uk, sw, 4000.0);
+        }
+    }
+
+    /// Build the visible-item list for one group. Flat in list mode; a compacted
+    /// folder tree (honoring `collapsed`) in tree mode.
+    fn build_vis(&self, rows: &[Row], staged: bool) -> Vec<Vis> {
+        if !self.tree_mode {
+            return (0..rows.len()).map(|row| Vis::File { row, depth: 0 }).collect();
+        }
+        let mut root = TNode::default();
+        for (i, r) in rows.iter().enumerate() {
+            let parts: Vec<&str> = r.path.split('/').filter(|s| !s.is_empty()).collect();
+            let n = parts.len();
+            let mut node = &mut root;
+            for seg in parts.iter().take(n.saturating_sub(1)) {
+                node = node.children.entry((*seg).to_string()).or_default();
+            }
+            node.files.push(i);
+        }
+        let mut out = Vec::new();
+        self.walk(&root, String::new(), 0, staged, rows, &mut out);
+        out
+    }
+
+    /// DFS the build tree, emitting folder items (single-child chains compacted)
+    /// then file items, skipping subtrees under collapsed folders.
+    fn walk(&self, node: &TNode, prefix: String, depth: usize, staged: bool, rows: &[Row], out: &mut Vec<Vis>) {
+        for (seg, child) in &node.children {
+            // Compact a chain of single-child folders ("a" → "a/b/c") like VSCode.
+            let mut label = seg.clone();
+            let mut cur = child;
+            loop {
+                if !(cur.files.is_empty() && cur.children.len() == 1) {
+                    break;
+                }
+                let (cseg, cchild) = cur.children.iter().next().unwrap();
+                label = format!("{}/{}", label, cseg);
+                cur = cchild;
+            }
+            let full = if prefix.is_empty() { label.clone() } else { format!("{}/{}", prefix, label) };
+            // Key is per-group (staged flag) + full folder path so collapse state is stable.
+            let key = format!("{}\u{0}{}", staged as u8, full);
+            let collapsed = self.collapsed.contains(&key);
+            out.push(Vis::Folder { key, label, depth, collapsed });
+            if !collapsed {
+                self.walk(cur, full, depth + 1, staged, rows, out);
+            }
+        }
+        let mut files = node.files.clone();
+        files.sort_by(|&a, &b| rows[a].fname.cmp(&rows[b].fname));
+        for row in files {
+            out.push(Vis::File { row, depth });
+        }
+    }
+
+    /// Rich-text spans for the tree: indent + chevron glyph (folders) + name. The
+    /// returned key encodes the structure so a collapse/expand re-shapes the buffer.
+    fn tree_spans(vis: &[Vis], rows: &[Row]) -> (String, Vec<(String, Attrs<'static>)>) {
+        let ui = Attrs::new().family(Family::Name(theme::UI_FAMILY())).color(theme::FG_TEXT());
+        let chev = Attrs::new().family(Family::Name(theme::ICON_FAMILY)).color(theme::FG_TEXT());
+        // A transparent chevron: occupies the exact same width as a real one so file
+        // names align one indent level right of their parent folder (not slightly left).
+        let blank = Attrs::new().family(Family::Name(theme::ICON_FAMILY)).color(Color::rgba(0, 0, 0, 0));
+        let mut key = String::from("T\n");
+        let mut spans: Vec<(String, Attrs<'static>)> = Vec::new();
+        for v in vis {
+            match v {
+                Vis::Folder { label, depth, collapsed, .. } => {
+                    spans.push(("  ".repeat(*depth), ui));
+                    let g = if *collapsed { theme::ICON_CHEVRON_RIGHT } else { theme::ICON_CHEVRON_DOWN };
+                    spans.push((format!("{} ", g), chev));
+                    spans.push((format!("{}\n", label), ui));
+                    key.push_str(&format!("d{}{}{}\n", depth, *collapsed as u8, label));
+                }
+                Vis::File { row, depth } => {
+                    // Same structure as a folder (indent + twistie-slot + name), but the
+                    // twistie is an invisible chevron so the column widths match exactly.
+                    spans.push(("  ".repeat(*depth), ui));
+                    spans.push((format!("{} ", theme::ICON_CHEVRON_DOWN), blank));
+                    spans.push((format!("{}\n", rows[*row].fname), ui));
+                    key.push_str(&format!("f{}{}\n", depth, rows[*row].fname));
+                }
+            }
+        }
+        (key, spans)
     }
 
     /// "filename  dir" truncated with an ellipsis to fit `avail` px (leaving room
@@ -298,7 +436,7 @@ impl SourceControlPanel {
     }
     fn staged_list(&self, r: Rect) -> Rect {
         let h = Self::staged_hdr(r);
-        Rect { x: r.x, y: h.y + row_h(), w: r.w, h: self.staged_rows.len() as f32 * row_h() }
+        Rect { x: r.x, y: h.y + row_h(), w: r.w, h: self.staged_vis.len() as f32 * row_h() }
     }
     fn unstaged_hdr(&self, r: Rect) -> Rect {
         let sl = self.staged_list(r);
@@ -306,7 +444,7 @@ impl SourceControlPanel {
     }
     fn unstaged_list(&self, r: Rect) -> Rect {
         let h = self.unstaged_hdr(r);
-        Rect { x: r.x, y: h.y + row_h(), w: r.w, h: self.unstaged_rows.len() as f32 * row_h() }
+        Rect { x: r.x, y: h.y + row_h(), w: r.w, h: self.unstaged_vis.len() as f32 * row_h() }
     }
 
     /// Hover-action icon rects for a row, right-to-left ending before the status.
@@ -324,13 +462,16 @@ impl SourceControlPanel {
             .collect()
     }
 
-    /// [refresh, more] toolbar rects, right-aligned in the CHANGES header row.
-    fn toolbar_rects(r: Rect) -> [Rect; 2] {
+    /// [stash, tree-toggle, refresh, more] toolbar rects, right-aligned in the
+    /// CHANGES header row.
+    fn toolbar_rects(r: Rect) -> [Rect; 4] {
         let bw = 22.0 * theme::ui_zoom();
         let ch = Self::changes_hdr(r);
         let more = Rect { x: ch.x + ch.w - bw, y: ch.y, w: bw, h: row_h() };
-        let refresh = Rect { x: more.x - bw, y: ch.y, w: bw, h: row_h() };
-        [refresh, more]
+        let refresh = Rect { x: more.x - bw, ..more };
+        let tree = Rect { x: refresh.x - bw, ..more };
+        let stash = Rect { x: tree.x - bw, ..more };
+        [stash, tree, refresh, more]
     }
     fn commit_main(r: Rect) -> Rect {
         let c = Self::commit_rect(r);
@@ -342,14 +483,15 @@ impl SourceControlPanel {
         Rect { x: c.x + c.w - cw, w: cw, ..c }
     }
     /// Group-header composite actions (left of the count pill, on hover):
-    /// Staged → Unstage All; Changes → Discard All + Stage All.
+    /// Open Changes (all files) first, then Staged → Unstage All; Changes → Discard
+    /// All + Stage All.
     fn header_actions(&self, r: Rect, staged: bool) -> Vec<(Act, Rect)> {
         let (hdr, count) = if staged {
             (Self::staged_hdr(r), &self.count_staged)
         } else {
             (self.unstaged_hdr(r), &self.count_unstaged)
         };
-        let acts: &[Act] = if staged { &[Act::Unstage] } else { &[Act::Discard, Act::Stage] };
+        let acts: &[Act] = if staged { &[Act::Diff, Act::Unstage] } else { &[Act::Diff, Act::Discard, Act::Stage] };
         let end = hdr.x + hdr.w - (count.width() + theme::zpx(12.0)) - theme::zpx(6.0);
         let start = end - acts.len() as f32 * action_w();
         acts.iter()
@@ -388,13 +530,77 @@ impl SourceControlPanel {
             let y = lr.y + idx as f32 * row_h();
             bg.push(Quad::new(region.x, y, region.w, row_h(), theme::TREE_HOVER()));
         }
+        // Tree-mode indent guides: a faint vertical line per ancestor level, drawn
+        // per row so consecutive rows form continuous lines (like VSCode).
+        if self.tree_mode {
+            self.indent_guides(&self.staged, &self.staged_vis, self.staged_list(region), bg);
+            self.indent_guides(&self.unstaged, &self.unstaged_vis, self.unstaged_list(region), bg);
+        }
+    }
+
+    fn vis_depth(v: &Vis) -> usize {
+        match v {
+            Vis::Folder { depth, .. } | Vis::File { depth, .. } => *depth,
+        }
+    }
+
+    /// The chevron (twistie) center x per depth, measured from the shaped buffer so
+    /// guides land exactly on each level's twistie at any zoom. Index = depth; the
+    /// chevron occupies the 3 bytes right after the `2*depth` indent spaces.
+    fn depth_centers(list: &ListView, vis: &[Vis]) -> Vec<f32> {
+        let mut centers: Vec<f32> = Vec::new();
+        for (i, v) in vis.iter().enumerate() {
+            let d = Self::vis_depth(v);
+            if centers.len() > d && centers[d] >= 0.0 {
+                continue; // already measured this depth
+            }
+            let start = 2 * d; // leading indent is 2 spaces per depth
+            if let Some((x0, x1)) = list.line_x_range(i, start, start + 3) {
+                while centers.len() <= d {
+                    centers.push(-1.0);
+                }
+                centers[d] = (x0 + x1) * 0.5;
+            }
+        }
+        centers
+    }
+
+    fn indent_guides(&self, list: &ListView, vis: &[Vis], lr: Rect, bg: &mut Vec<Quad>) {
+        if vis.is_empty() {
+            return;
+        }
+        // Anchor to the first level's measured twistie center, then step by one
+        // consistent indent unit — so guides are evenly spaced by construction (no
+        // per-depth measurement jitter or gaps).
+        let centers = Self::depth_centers(list, vis);
+        let base = centers.iter().copied().find(|&c| c >= 0.0).unwrap_or(7.0 * theme::ui_zoom());
+        let unit = match (centers.first(), centers.get(1)) {
+            (Some(&a), Some(&b)) if a >= 0.0 && b >= 0.0 => b - a,
+            _ => 13.0 * theme::ui_zoom(),
+        };
+        let origin = lr.x + list.pad_x();
+        let w = theme::zpx(1.0).max(1.0);
+        let color = [0.50, 0.50, 0.58, 0.7];
+        for (i, v) in vis.iter().enumerate() {
+            let depth = Self::vis_depth(v);
+            let y = lr.y + i as f32 * row_h();
+            // One guide per ancestor level, evenly spaced from the anchor. Snap x to a
+            // whole pixel so the 1px line stays crisp (no anti-aliased smear).
+            for k in 0..depth {
+                let x = (origin + base + k as f32 * unit).round();
+                bg.push(Quad::new(x, y, w, row_h(), color));
+            }
+        }
     }
 
     pub fn draw_text<'b>(&'b self, region: Rect, areas: &mut Vec<TextArea<'b>>) {
         let ch = Self::changes_hdr(region);
         self.l_changes.push(ch.x, ch, theme::FG_DIM(), areas);
-        // Top toolbar: refresh + more.
-        let [refresh, more] = Self::toolbar_rects(region);
+        // Top toolbar: stash · tree/list toggle · refresh · more.
+        let [stash, tree, refresh, more] = Self::toolbar_rects(region);
+        self.push_icon(&self.ic_stash, stash, theme::FG_DIM(), areas);
+        let toggle = if self.tree_mode { &self.ic_flat } else { &self.ic_tree };
+        self.push_icon(toggle, tree, theme::FG_DIM(), areas);
         self.push_icon(&self.ic_refresh, refresh, theme::FG_DIM(), areas);
         self.push_icon(&self.ic_more, more, theme::FG_DIM(), areas);
 
@@ -416,7 +622,7 @@ impl SourceControlPanel {
             Some((true, i)) => Some(i),
             _ => None,
         };
-        self.draw_rows(&self.staged, &self.staged_rows, self.staged_list(region), true, sh_idx, areas);
+        self.draw_rows(&self.staged, &self.staged_vis, &self.staged_rows, self.staged_list(region), true, sh_idx, areas);
 
         let uh = self.unstaged_hdr(region);
         self.l_unstaged.push(uh.x, uh, theme::FG_TEXT(), areas);
@@ -428,7 +634,7 @@ impl SourceControlPanel {
             Some((false, i)) => Some(i),
             _ => None,
         };
-        self.draw_rows(&self.unstaged, &self.unstaged_rows, self.unstaged_list(region), false, uh_idx, areas);
+        self.draw_rows(&self.unstaged, &self.unstaged_vis, &self.unstaged_rows, self.unstaged_list(region), false, uh_idx, areas);
     }
 
     fn push_icon<'b>(&self, label: &'b TextLabel, r: Rect, color: glyphon::Color, areas: &mut Vec<TextArea<'b>>) {
@@ -450,6 +656,7 @@ impl SourceControlPanel {
 
     fn icon_for(&self, act: Act) -> &TextLabel {
         match act {
+            Act::Diff => &self.ic_diff,
             Act::Open => &self.ic_open,
             Act::Discard => &self.ic_discard,
             Act::Stage => &self.ic_stage,
@@ -460,30 +667,37 @@ impl SourceControlPanel {
     fn draw_rows<'b>(
         &'b self,
         list: &'b ListView,
+        vis: &[Vis],
         rows: &[Row],
         region: Rect,
         staged: bool,
         hovered_idx: Option<usize>,
         areas: &mut Vec<TextArea<'b>>,
     ) {
-        if rows.is_empty() {
+        if vis.is_empty() {
             return;
         }
         // Clip the row text to leave the status/action column clear.
         let text_clip = Rect { w: (region.w - status_w() - theme::zpx(4.0)).max(0.0), ..region };
-        list.draw_at(text_clip, region.y, theme::FG_DIM(), areas);
+        // Tree mode embeds its colors in the rich spans; list mode draws dim then a
+        // bright band over each file-name prefix.
+        let base = if self.tree_mode { theme::FG_TEXT() } else { theme::FG_DIM() };
+        list.draw_at(text_clip, region.y, base, areas);
         let pad = list.pad_x();
-        for (i, r) in rows.iter().enumerate() {
+        for (i, v) in vis.iter().enumerate() {
             let y = region.y + i as f32 * row_h();
-            // Bright file-name prefix (same origin, clipped to its width).
-            if let Some((_x0, x1)) = list.line_x_range(i, 0, r.fname_len) {
-                let w = (pad + x1).min(text_clip.w);
-                let band = Rect { x: region.x, y, w, h: row_h() };
-                list.draw_at(band, region.y, theme::FG_TEXT(), areas);
+            let Vis::File { row, .. } = v else { continue };
+            let r = &rows[*row];
+            if !self.tree_mode {
+                // Bright file-name prefix (same origin, clipped to its width).
+                if let Some((_x0, x1)) = list.line_x_range(i, 0, r.fname_len) {
+                    let w = (pad + x1).min(text_clip.w);
+                    let band = Rect { x: region.x, y, w, h: row_h() };
+                    list.draw_at(band, region.y, theme::FG_TEXT(), areas);
+                }
             }
             // Status letter at the far right.
             let (rr, gg, bb) = BADGE_RGB[r.badge];
-            // Full status-column width (was a fixed 18px → the letter clipped at zoom).
             let st = Rect { x: region.x + region.w - status_w(), y, w: status_w(), h: row_h() };
             self.badges[r.badge].push(st.x, st, Color::rgb(rr, gg, bb), areas);
             // Hover actions for this row.
@@ -501,9 +715,9 @@ impl SourceControlPanel {
         let sl = self.staged_list(region);
         let ul = self.unstaged_list(region);
         let new = if sl.contains(pt) {
-            self.staged.row_at(sl, pt, self.staged_rows.len()).map(|i| (true, i))
+            self.staged.row_at(sl, pt, self.staged_vis.len()).map(|i| (true, i))
         } else if ul.contains(pt) {
-            self.unstaged.row_at(ul, pt, self.unstaged_rows.len()).map(|i| (false, i))
+            self.unstaged.row_at(ul, pt, self.unstaged_vis.len()).map(|i| (false, i))
         } else {
             None
         };
@@ -528,7 +742,16 @@ impl SourceControlPanel {
             return true;
         }
         // Top toolbar.
-        let [refresh, more] = Self::toolbar_rects(region);
+        let [stash, tree, refresh, more] = Self::toolbar_rects(region);
+        if stash.contains(pt) {
+            out.push(Intent::GitStash);
+            return true;
+        }
+        if tree.contains(pt) {
+            self.tree_mode = !self.tree_mode;
+            self.last_w = -1.0; // force a reflow into the new mode on the next frame
+            return true;
+        }
         if refresh.contains(pt) {
             out.push(Intent::GitRefresh);
             return true;
@@ -557,6 +780,7 @@ impl SourceControlPanel {
             for (act, ar) in self.header_actions(region, staged) {
                 if ar.contains(pt) {
                     out.push(match act {
+                        Act::Diff => Intent::OpenAllDiffs { staged },
                         Act::Stage => Intent::GitStageAll,
                         Act::Unstage => Intent::GitUnstageAll,
                         _ => Intent::GitDiscardAll,
@@ -565,36 +789,59 @@ impl SourceControlPanel {
                 }
             }
         }
+        // Row hit: resolve into either a folder toggle (deferred so we don't mutate
+        // `self` while a `&self` borrow of the vis/rows is live) or file actions.
+        let mut toggle: Option<String> = None;
+        let mut handled = false;
         for staged in [true, false] {
-            let (lr, rows): (Rect, &[Row]) = if staged {
-                (self.staged_list(region), &self.staged_rows)
+            let (lr, vis, rows, list): (Rect, &[Vis], &[Row], &ListView) = if staged {
+                (self.staged_list(region), &self.staged_vis, &self.staged_rows, &self.staged)
             } else {
-                (self.unstaged_list(region), &self.unstaged_rows)
+                (self.unstaged_list(region), &self.unstaged_vis, &self.unstaged_rows, &self.unstaged)
             };
             if !lr.contains(pt) {
                 continue;
             }
-            let list = if staged { &self.staged } else { &self.unstaged };
-            if let Some(i) = list.row_at(lr, pt, rows.len()) {
-                let row = &rows[i];
-                let y = lr.y + i as f32 * row_h();
-                // Action icon hit?
-                for (act, ar) in Self::action_rects(lr, y, staged) {
-                    if ar.contains(pt) {
-                        let p = row.path.clone();
-                        match act {
-                            Act::Open => out.push(Intent::OpenFile { path: self.root.join(&p), line: 1, col: 0 }),
-                            Act::Stage => out.push(Intent::GitStage(p)),
-                            Act::Unstage => out.push(Intent::GitUnstage(p)),
-                            Act::Discard => out.push(Intent::GitDiscard { path: p, untracked: row.untracked }),
+            if let Some(i) = list.row_at(lr, pt, vis.len()) {
+                match &vis[i] {
+                    Vis::Folder { key, .. } => toggle = Some(key.clone()),
+                    Vis::File { row, .. } => {
+                        let r = &rows[*row];
+                        let y = lr.y + i as f32 * row_h();
+                        let mut acted = false;
+                        for (act, ar) in Self::action_rects(lr, y, staged) {
+                            if ar.contains(pt) {
+                                let p = r.path.clone();
+                                match act {
+                                    Act::Diff => out.push(Intent::OpenDiff { path: p, staged, untracked: r.untracked }),
+                                    Act::Open => out.push(Intent::OpenFile { path: self.root.join(&p), line: 1, col: 0 }),
+                                    Act::Stage => out.push(Intent::GitStage(p)),
+                                    Act::Unstage => out.push(Intent::GitUnstage(p)),
+                                    Act::Discard => out.push(Intent::GitDiscard { path: p, untracked: r.untracked }),
+                                }
+                                acted = true;
+                                break;
+                            }
                         }
-                        return true;
+                        if !acted {
+                            // Row body opens the diff (VSCode opens the diff on row click).
+                            out.push(Intent::OpenDiff { path: r.path.clone(), staged, untracked: r.untracked });
+                        }
                     }
                 }
-                // Otherwise the row body opens the diff (VSCode opens the diff on
-                // row click; the Open-file icon opens the actual file).
-                out.push(Intent::OpenDiff { path: row.path.clone(), staged, untracked: row.untracked });
             }
+            handled = true;
+            break;
+        }
+        if let Some(k) = toggle {
+            // Toggle this folder's collapse state, then force a reflow next frame.
+            if !self.collapsed.remove(&k) {
+                self.collapsed.insert(k);
+            }
+            self.last_w = -1.0;
+            return true;
+        }
+        if handled {
             return true;
         }
         self.set_unfocused();

@@ -170,6 +170,8 @@ pub(crate) enum SidebarView {
 pub(crate) enum DialogAction {
     DeleteNode(usize),
     CloseDoc(usize),
+    GitDiscard { path: String, untracked: bool },
+    GitDiscardAll,
     InstallUpdate,
     Dismiss, // info-only dialog; any button just closes it
 }
@@ -237,6 +239,7 @@ pub(crate) struct App {
     pub(crate) extensions_panel: Option<ui::extensions_panel::ExtensionsPanel>,
     pub(crate) extensions: Vec<Extension>,
     pub(crate) text_drag: Option<InputId>, // active mouse drag-selection in a text input
+    pub(crate) find_drag: Option<bool>,    // find-widget drag-select (Some(true)=replace input)
     pub(crate) image_drag_last: Option<(f32, f32)>, // last cursor pos while panning an image
     pub(crate) ext_remote: Vec<marketplace::RemoteExt>, // current marketplace search results
     pub(crate) worker_tx: Sender<WorkerMsg>,
@@ -322,6 +325,7 @@ impl App {
             extensions_panel: None, // built in `resumed`
             extensions: Vec::new(),
             text_drag: None,
+            find_drag: None,
             image_drag_last: None,
             ext_remote: Vec::new(),
             worker_tx,
@@ -700,8 +704,52 @@ impl App {
                 content.contains(p)
                     && terminal_tablist_rect(content, self.terminal.groups.len()).map_or(true, |tl| !tl.contains(p))
             });
+        // Find/replace widget: update button-hover highlight + resolve its cursor.
+        let find_cursor = if self.find.active {
+            let er = render::editor_region(&layout);
+            let fl = ui::find_widget::FindWidget::layout(er, self.find.replace_open);
+            if let Some(g) = self.gpu.as_mut() {
+                let h = g.ui.find.button_at(&fl, p);
+                if h != g.ui.find.hover {
+                    g.ui.find.hover = h;
+                    changed = true;
+                }
+                g.ui.find.cursor(&fl, p)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Gutter fold chevron (foldable line) is clickable → pointer.
+        let over_fold_chevron = layout.gutter.contains(p)
+            && p.0 >= layout.gutter.x + layout.gutter.w - theme::zpx(18.0)
+            && self.workspace.active_doc().map_or(false, |d| {
+                if d.diff.is_some() {
+                    return false;
+                }
+                let lh = theme::LINE_HEIGHT();
+                let vy = p.1 - (layout.editor_text.y + theme::EDITOR_PAD()) + d.scroll_y();
+                if vy < 0.0 {
+                    return false;
+                }
+                let line = d.visible_index_to_line((vy / lh) as usize);
+                d.is_foldable(line)
+            });
+
+        // Combined-diff file headers are clickable (collapse/expand) → pointer.
+        let over_diff_header = layout.editor_text.contains(p)
+            && self.workspace.active_doc().map_or(false, |d| {
+                d.diff_full.is_some()
+                    && ui::editor_view::EditorView::line_at(d, &layout, p.0, p.1)
+                        .and_then(|line| d.diff_file_at_line(line))
+                        .is_some()
+            });
         let new_cursor = if self.sidebar_split.is_dragging() || over_handle {
             self.sidebar_split.cursor()
+        } else if let Some(c) = find_cursor {
+            c
         } else if self.terminal.split.is_dragging() || over_term_handle {
             self.terminal.split.cursor()
         } else if over_term_btn {
@@ -777,6 +825,9 @@ impl App {
                 g.ui.sidebar.cursor()
             } else if over_scroll_thumb {
                 CursorIcon::Default
+            } else if over_diff_header || over_fold_chevron {
+                // Combined-diff file header / gutter fold chevron: clickable.
+                CursorIcon::Pointer
             } else if layout.editor_text.contains(p) {
                 // Editor text area: I-beam (not a component).
                 CursorIcon::Text
@@ -1143,6 +1194,25 @@ impl App {
                 self.ensure_cursor_visible();
                 self.redraw();
             }
+            ui::Intent::OpenAllDiffs { staged } => {
+                // Collect this group's changed files, then open one combined diff tab.
+                let entries: Vec<(String, bool)> = git::status(&self.cwd)
+                    .into_iter()
+                    .filter_map(|c| {
+                        let included = if staged { c.staged != ' ' && c.staged != '?' } else { c.worktree != ' ' };
+                        included.then(|| (c.path, !staged && c.worktree == '?'))
+                    })
+                    .collect();
+                if !entries.is_empty() {
+                    if let Some(g) = self.gpu.as_mut() {
+                        let d = diff::compute_all(&self.cwd, &entries, staged);
+                        self.workspace.open_diff(d, &mut g.font_system);
+                        self.detail.open_extension = None;
+                    }
+                    self.ensure_cursor_visible();
+                    self.redraw();
+                }
+            }
             ui::Intent::OpenExtDetail(which) => self.open_ext_detail(which),
             ui::Intent::GitCommit { msg, stage_all } => {
                 if git::commit(&self.cwd, &msg, stage_all) {
@@ -1162,8 +1232,7 @@ impl App {
                 self.refresh_source_control();
             }
             ui::Intent::GitDiscard { path, untracked } => {
-                git::discard(&self.cwd, &path, untracked);
-                self.refresh_source_control();
+                self.confirm_discard(path, untracked);
             }
             ui::Intent::GitStageAll => {
                 git::stage_all(&self.cwd);
@@ -1174,7 +1243,10 @@ impl App {
                 self.refresh_source_control();
             }
             ui::Intent::GitDiscardAll => {
-                git::discard_all(&self.cwd);
+                self.confirm_discard_all();
+            }
+            ui::Intent::GitStash => {
+                git::stash(&self.cwd);
                 self.refresh_source_control();
             }
             ui::Intent::GitRefresh => self.refresh_source_control(),
@@ -1385,7 +1457,7 @@ impl App {
             Focus::Rename
         } else if self.palette.active {
             Focus::Palette
-        } else if self.find.active {
+        } else if self.find.active && self.find.focused {
             Focus::Find
         } else if self.terminal.visible && self.terminal.focused && !self.terminal.groups.is_empty() {
             Focus::Terminal
@@ -1422,14 +1494,13 @@ impl App {
     /// (rect, left-pad) of a given input, if it's currently shown.
     fn input_rect_for(&self, id: InputId, layout: &Layout) -> Option<(Rect, f32)> {
         match id {
-            InputId::Palette => layout.palette.as_ref().map(|p| (p.input, 6.0)),
-            InputId::Find => layout.find_bar.as_ref().map(|fb| (*fb, 8.0)),
+            InputId::Palette => layout.palette.as_ref().map(|p| (p.input, theme::zpx(14.0))),
         }
     }
 
     /// The focused input under point `p` (for click-to-position / drag-select).
     fn focused_input_at(&self, layout: &Layout, p: (f32, f32)) -> Option<(InputId, Rect, f32)> {
-        for id in [InputId::Palette, InputId::Find] {
+        for id in [InputId::Palette] {
             if let Some((rect, pad)) = self.input_rect_for(id, layout) {
                 if rect.contains(p) {
                     return Some((id, rect, pad));
@@ -1484,6 +1555,52 @@ impl App {
                 self.workspace.tree.refresh();
             }
         }
+        self.redraw();
+    }
+
+    /// Confirm before discarding a single file's working-tree changes — this is
+    /// irreversible (git checkout / delete of an untracked file), so always ask.
+    fn confirm_discard(&mut self, path: String, untracked: bool) {
+        let name = std::path::Path::new(&path)
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.clone());
+        let msg = if untracked {
+            format!("Are you sure you want to DELETE '{}'? This is irreversible.", name)
+        } else {
+            format!(
+                "Are you sure you want to discard changes in '{}'? This is irreversible.",
+                name
+            )
+        };
+        if let Some(g) = self.gpu.as_mut() {
+            g.ui
+                .dialog
+                .set(&mut g.font_system, &msg, &["Discard Changes", "Cancel"], None);
+        }
+        self.dialog = Some(DialogState {
+            action: DialogAction::GitDiscard { path, untracked },
+            has_check: false,
+            checked: false,
+            hovered: None,
+        });
+        self.redraw();
+    }
+
+    /// Confirm before discarding ALL working-tree changes — irreversible.
+    fn confirm_discard_all(&mut self) {
+        let msg = "Are you sure you want to discard ALL changes? This is irreversible and cannot be undone.";
+        if let Some(g) = self.gpu.as_mut() {
+            g.ui
+                .dialog
+                .set(&mut g.font_system, msg, &["Discard All Changes", "Cancel"], None);
+        }
+        self.dialog = Some(DialogState {
+            action: DialogAction::GitDiscardAll,
+            has_check: false,
+            checked: false,
+            hovered: None,
+        });
         self.redraw();
     }
 
@@ -1550,6 +1667,20 @@ impl App {
                     }
                     1 => self.workspace.close_idx(idx),
                     _ => {}
+                }
+            }
+            DialogAction::GitDiscard { path, untracked } => {
+                // 0 = Discard Changes, 1 = Cancel
+                if i == 0 {
+                    git::discard(&self.cwd, &path, untracked);
+                    self.refresh_source_control();
+                }
+            }
+            DialogAction::GitDiscardAll => {
+                // 0 = Discard All Changes, 1 = Cancel
+                if i == 0 {
+                    git::discard_all(&self.cwd);
+                    self.refresh_source_control();
                 }
             }
             DialogAction::InstallUpdate => {
@@ -1705,11 +1836,27 @@ impl App {
             }
             Command::Find => {
                 self.find.active = true;
+                self.find.focused = true;
+                self.find.on_replace = false;
+                // Seed the query from the editor's current selection, if any.
+                let seed = self
+                    .workspace
+                    .active_doc()
+                    .filter(|d| !d.sel.is_empty())
+                    .map(|d| {
+                        let (lo, hi) = d.sel.range();
+                        d.rope.byte_slice(lo..hi).to_string()
+                    })
+                    .filter(|s| !s.contains('\n') && !s.is_empty());
                 if let Some(g) = self.gpu.as_mut() {
-                    g.ui.find_input.clear(&mut g.font_system);
-                    g.ui.find_input.set_placeholder(&mut g.font_system, " Find...");
-                    g.ui.find_input.focus(true);
+                    if let Some(s) = seed.as_ref() {
+                        g.ui.find.query.set_text(&mut g.font_system, s);
+                    }
+                    g.ui.find.query.select_all();
+                    g.ui.find.query.focus(true);
+                    g.ui.find.replace.focus(false);
                 }
+                self.recompute_find();
             }
             Command::Undo => {
                 if let Some(gpu) = self.gpu.as_mut() {
@@ -1845,7 +1992,9 @@ impl App {
             g.ui.zoom_minus.reshape(&mut g.font_system);
             g.ui.zoom_plus.reshape(&mut g.font_system);
             g.ui.palette_input.rezoom(&mut g.font_system);
-            g.ui.find_input.rezoom(&mut g.font_system);
+            g.ui.find.reshape(&mut g.font_system);
+            g.ui.diff_chev_down.reshape(&mut g.font_system); // fold + combined-diff chevrons
+            g.ui.diff_chev_right.reshape(&mut g.font_system);
             g.create_input.rezoom(&mut g.font_system);
             for b in g.create_icons.iter_mut() {
                 b.reshape(&mut g.font_system); // inline new-file/folder row icons
@@ -1976,40 +2125,194 @@ impl App {
         self.ensure_cursor_visible();
     }
 
-    fn find_step(&mut self, forward: bool) {
-        let needle = self
-            .gpu
-            .as_ref()
-            .map(|g| g.ui.find_input.text().to_string())
-            .unwrap_or_default();
-        if needle.is_empty() {
-            return;
+    /// Rebuild the match list for the current query + options against the active
+    /// doc, refresh the count, and select the match at/after the caret.
+    fn recompute_find(&mut self) {
+        let query = self.gpu.as_ref().map(|g| g.ui.find.query.text().to_string()).unwrap_or_default();
+        self.find.matches.clear();
+        self.find.index = None;
+        let (text, caret) = match self.workspace.active_doc() {
+            Some(d) => (d.rope.to_string(), d.sel.head),
+            None => {
+                self.update_find_count();
+                return;
+            }
+        };
+        if !query.is_empty() {
+            if let Some(re) = crate::search::build_regex(&query, self.find.opts) {
+                let mut start = 0usize;
+                while start <= text.len() {
+                    match re.find_from_pos(&text, start) {
+                        Ok(Some(m)) => {
+                            self.find.matches.push((m.start(), m.end()));
+                            start = if m.end() > m.start() { m.end() } else { m.end() + 1 };
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            if !self.find.matches.is_empty() {
+                let idx = self.find.matches.iter().position(|&(s, _)| s >= caret).unwrap_or(0);
+                self.find.index = Some(idx);
+                self.select_find_match(idx);
+            }
         }
-        let Some(gpu) = self.gpu.as_mut() else {
-            return;
-        };
-        let Some(d) = self.workspace.active_doc_mut() else {
-            return;
-        };
-        let from = if forward {
-            d.sel.head
+        self.update_find_count();
+    }
+
+    fn update_find_count(&mut self) {
+        let empty_query = self.gpu.as_ref().map(|g| g.ui.find.query.text().is_empty()).unwrap_or(true);
+        let text = if !self.find.matches.is_empty() {
+            let i = self.find.index.map(|i| i + 1).unwrap_or(0);
+            format!("{} of {}", i, self.find.matches.len())
+        } else if empty_query {
+            String::new()
         } else {
-            let (lo, _) = d.sel.range();
-            lo
+            "No results".to_string()
         };
-        let result = if forward {
-            d.find_next(&needle, from + if d.sel.is_empty() { 0 } else { needle.len() })
-        } else {
-            d.find_prev(&needle, from)
-        };
-        if let Some(pos) = result {
-            d.sel.anchor = pos;
-            d.sel.head = pos + needle.len();
+        if let Some(g) = self.gpu.as_mut() {
+            g.ui.find.set_count(&mut g.font_system, &text);
+        }
+    }
+
+    fn select_find_match(&mut self, i: usize) {
+        let Some(&(s, e)) = self.find.matches.get(i) else { return };
+        if let Some(d) = self.workspace.active_doc_mut() {
+            d.sel.anchor = s;
+            d.sel.head = e;
             d.sel.desired_col = None;
-            self.find.last_match = Some(pos);
-            let _ = gpu;
+            // If the match sits inside a collapsed fold, expand it so it's visible.
+            let line = d.rope.byte_to_line(s.min(d.rope.len_bytes()));
+            if d.is_line_hidden(line) {
+                d.reveal_line(line);
+            }
         }
         self.ensure_cursor_visible();
+    }
+
+    fn find_step(&mut self, forward: bool) {
+        if self.find.matches.is_empty() {
+            self.recompute_find();
+        }
+        let n = self.find.matches.len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.find.index.unwrap_or(0);
+        let next = if forward { (cur + 1) % n } else { (cur + n - 1) % n };
+        self.find.index = Some(next);
+        self.select_find_match(next);
+        self.update_find_count();
+        self.redraw();
+    }
+
+    /// Replace the current match with the replace field's text, then advance.
+    fn replace_current(&mut self) {
+        let Some(i) = self.find.index else { return };
+        let Some(&(s, e)) = self.find.matches.get(i) else { return };
+        let repl = self.gpu.as_ref().map(|g| g.ui.find.replace.text().to_string()).unwrap_or_default();
+        if let (Some(g), Some(d)) = (self.gpu.as_mut(), self.workspace.active_doc_mut()) {
+            d.sel.anchor = s;
+            d.sel.head = e;
+            d.sel.desired_col = None;
+            d.insert_str(&repl, &mut g.font_system);
+        }
+        self.recompute_find();
+        self.refresh_source_control();
+        self.redraw();
+    }
+
+    /// Replace every match (back-to-front so earlier byte offsets stay valid).
+    fn replace_all(&mut self) {
+        let repl = self.gpu.as_ref().map(|g| g.ui.find.replace.text().to_string()).unwrap_or_default();
+        let matches = self.find.matches.clone();
+        if matches.is_empty() {
+            return;
+        }
+        if let (Some(g), Some(d)) = (self.gpu.as_mut(), self.workspace.active_doc_mut()) {
+            for &(s, e) in matches.iter().rev() {
+                d.sel.anchor = s;
+                d.sel.head = e;
+                d.sel.desired_col = None;
+                d.insert_str(&repl, &mut g.font_system);
+            }
+        }
+        self.recompute_find();
+        self.refresh_source_control();
+        self.redraw();
+    }
+
+    /// Close the find/replace widget and return focus to the editor.
+    fn close_find(&mut self) {
+        self.find.active = false;
+        self.find.focused = false;
+        if let Some(g) = self.gpu.as_mut() {
+            g.ui.find.query.focus(false);
+            g.ui.find.replace.focus(false);
+        }
+        self.redraw();
+    }
+
+    /// Handle a mouse press inside the find/replace widget panel.
+    fn on_find_press(&mut self, p: (f32, f32), fl: &ui::find_widget::FindLayout, double: bool) {
+        use ui::find_widget::FindBtn;
+        if let Some(btn) = self.gpu.as_ref().and_then(|g| g.ui.find.button_at(fl, p)) {
+            match btn {
+                FindBtn::Expand => {
+                    self.find.replace_open = !self.find.replace_open;
+                    if self.find.replace_open {
+                        self.find.focused = true;
+                        self.find.on_replace = true;
+                        if let Some(g) = self.gpu.as_mut() {
+                            g.ui.find.replace.focus(true);
+                            g.ui.find.query.focus(false);
+                        }
+                    }
+                }
+                FindBtn::Case => {
+                    self.find.opts.case_sensitive = !self.find.opts.case_sensitive;
+                    self.recompute_find();
+                }
+                FindBtn::Word => {
+                    self.find.opts.whole_word = !self.find.opts.whole_word;
+                    self.recompute_find();
+                }
+                FindBtn::Regex => {
+                    self.find.opts.regex = !self.find.opts.regex;
+                    self.recompute_find();
+                }
+                FindBtn::Prev => self.find_step(false),
+                FindBtn::Next => self.find_step(true),
+                FindBtn::Close => self.close_find(),
+                FindBtn::Replace => self.replace_current(),
+                FindBtn::ReplaceAll => self.replace_all(),
+            }
+            return;
+        }
+        // Click in one of the inputs: focus it + place caret + start drag-select.
+        let (rect, on_replace) = if fl.replace_input.map_or(false, |r| r.contains(p)) {
+            (fl.replace_input.unwrap(), true)
+        } else if fl.find_text.contains(p) {
+            (fl.find_text, false)
+        } else {
+            return; // panel chrome — keep current focus
+        };
+        self.find.active = true;
+        self.find.focused = true;
+        self.find.on_replace = on_replace;
+        let pad = theme::zpx(6.0);
+        if let Some(g) = self.gpu.as_mut() {
+            let inp = if on_replace { &mut g.ui.find.replace } else { &mut g.ui.find.query };
+            if double {
+                inp.select_word_at(rect, pad, p.0);
+            } else {
+                inp.set_caret_from_x(rect, pad, p.0);
+            }
+            inp.focus(true);
+            let other = if on_replace { &mut g.ui.find.query } else { &mut g.ui.find.replace };
+            other.focus(false);
+        }
+        self.find_drag = Some(on_replace);
     }
 
     // ---- Input dispatch ----
@@ -2209,17 +2512,29 @@ impl App {
             if let Some(g) = self.gpu.as_mut() {
                 let inp = match id {
                     InputId::Palette => &mut g.ui.palette_input,
-                    InputId::Find => &mut g.ui.find_input,
                 };
                 if double {
                     inp.select_word_at(rect, pad, x);
                 } else {
                     inp.set_caret_from_x(rect, pad, x);
                 }
+                inp.focus(true);
             }
             self.text_drag = Some(id);
             self.redraw();
             return;
+        }
+
+        // Find/replace widget: buttons, input focus + caret, drag-select.
+        if self.find.active {
+            let er = crate::render::editor_region(&layout);
+            let fl = ui::find_widget::FindWidget::layout(er, self.find.replace_open);
+            if fl.panel.contains((x, y)) {
+                let double = self.register_click(x, y);
+                self.on_find_press((x, y), &fl, double);
+                self.redraw();
+                return;
+            }
         }
 
         // Sidebar resize handle — let the Splitter claim the press.
@@ -2560,14 +2875,36 @@ impl App {
             }
         }
 
-        if let Some(fb) = layout.find_bar.as_ref() {
-            if fb.contains((x, y)) {
-                return;
+        // Gutter fold chevron: clicking the right edge of the gutter on a foldable
+        // line collapses/expands it.
+        if layout.gutter.contains((x, y))
+            && x >= layout.gutter.x + layout.gutter.w - theme::zpx(18.0)
+            && self.workspace.active_doc().map_or(false, |d| d.diff.is_none())
+        {
+            let lh = theme::LINE_HEIGHT();
+            if let Some(d) = self.workspace.active_doc_mut() {
+                let vy = y - (layout.editor_text.y + theme::EDITOR_PAD()) + d.scroll_y();
+                let vidx = (vy / lh).max(0.0) as usize;
+                let line = d.visible_index_to_line(vidx);
+                if d.is_foldable(line) {
+                    d.toggle_fold(line);
+                    self.redraw();
+                    return;
+                }
             }
         }
 
         if layout.editor_text.contains((x, y)) {
             self.set_ext_filter_focus(false); // editor takes keyboard focus
+            // Clicking the editor moves focus off the find widget (it stays open, but
+            // typing now goes to the editor — like VSCode).
+            if self.find.focused {
+                self.find.focused = false;
+                if let Some(g) = self.gpu.as_mut() {
+                    g.ui.find.query.focus(false);
+                    g.ui.find.replace.focus(false);
+                }
+            }
             if let Some(sp) = self.search.as_mut() {
                 sp.set_unfocused();
             }
@@ -2576,6 +2913,19 @@ impl App {
             }
             let consecutive = self.register_click(x, y);
             let extend = self.mods.shift_key();
+            // Combined diff: a click on a file header collapses/expands that file.
+            let toggle = self.workspace.active_doc().and_then(|d| {
+                d.diff_full.as_ref()?;
+                let line = ui::editor_view::EditorView::line_at(d, &layout, x, y)?;
+                d.diff_file_at_line(line)
+            });
+            if let Some(fidx) = toggle {
+                if let (Some(d), Some(g)) = (self.workspace.active_doc_mut(), self.gpu.as_mut()) {
+                    d.toggle_diff_file(fidx, &mut g.font_system);
+                }
+                self.redraw();
+                return;
+            }
             if let Some(d) = self.workspace.active_doc_mut() {
                 self.editor.on_press(d, &layout, x, y, extend, consecutive);
             }
@@ -2613,12 +2963,30 @@ impl App {
                     if let Some(g) = self.gpu.as_mut() {
                         let inp = match id {
                             InputId::Palette => &mut g.ui.palette_input,
-                            InputId::Find => &mut g.ui.find_input,
                         };
                         inp.extend_to_x(rect, pad, x);
                     }
                     self.redraw();
                 }
+                return;
+            }
+        }
+        // Find/replace widget drag-select.
+        if let Some(on_replace) = self.find_drag {
+            if self.mouse_pressed {
+                let layout = self.layout();
+                let er = crate::render::editor_region(&layout);
+                let fl = ui::find_widget::FindWidget::layout(er, self.find.replace_open);
+                let (rect, pad) = if on_replace {
+                    (fl.replace_input.unwrap_or(fl.find_text), theme::zpx(6.0))
+                } else {
+                    (fl.find_text, theme::zpx(6.0))
+                };
+                if let Some(g) = self.gpu.as_mut() {
+                    let inp = if on_replace { &mut g.ui.find.replace } else { &mut g.ui.find.query };
+                    inp.extend_to_x(rect, pad, x);
+                }
+                self.redraw();
                 return;
             }
         }
@@ -2703,6 +3071,7 @@ impl App {
     fn on_mouse_release(&mut self) {
         self.editor.on_release();
         self.text_drag = None;
+        self.find_drag = None;
         self.image_drag_last = None;
         if let Some(f) = self.feedback_form.as_mut() {
             f.end_drag();
@@ -2971,26 +3340,44 @@ impl App {
                 return;
             }
             Focus::Find => {
+                let on_replace = self.find.on_replace;
                 match event.logical_key.as_ref() {
                     Key::Named(NamedKey::Escape) => {
-                        self.find.active = false;
-                        if let Some(g) = self.gpu.as_mut() {
-                            g.ui.find_input.focus(false);
-                        }
-                        self.redraw();
+                        self.close_find();
                         return;
                     }
                     Key::Named(NamedKey::Enter) => {
-                        self.find_step(!extend);
+                        // Enter in the replace field replaces the current match; in the
+                        // find field it steps to the next (Shift+Enter = previous).
+                        if on_replace {
+                            self.replace_current();
+                        } else {
+                            self.find_step(!extend);
+                        }
+                        return;
+                    }
+                    // Tab / Ctrl+H jump to (and open) the replace field.
+                    Key::Named(NamedKey::Tab) => {
+                        self.find.replace_open = true;
+                        self.find.on_replace = !on_replace;
+                        if let Some(g) = self.gpu.as_mut() {
+                            g.ui.find.query.focus(self.find.on_replace == false);
+                            g.ui.find.replace.focus(self.find.on_replace);
+                        }
                         self.redraw();
                         return;
                     }
                     _ => {}
                 }
                 let consumed = self.gpu.as_mut().and_then(|g| {
-                    edit_input(&mut g.ui.find_input, &mut g.font_system, self.clipboard.as_mut(), &event, ctrl, extend)
+                    let inp = if on_replace { &mut g.ui.find.replace } else { &mut g.ui.find.query };
+                    edit_input(inp, &mut g.font_system, self.clipboard.as_mut(), &event, ctrl, extend)
                 });
-                if consumed.is_some() {
+                if let Some(changed) = consumed {
+                    // Editing the find query re-runs the search incrementally.
+                    if changed && !on_replace {
+                        self.recompute_find();
+                    }
                     self.redraw();
                 }
                 return;
@@ -3057,7 +3444,13 @@ impl App {
                     return;
                 }
             }
-            Focus::Editor => {}
+            Focus::Editor => {
+                // Escape closes the find widget when the editor has focus (VSCode parity).
+                if self.find.active && matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape)) {
+                    self.close_find();
+                    return;
+                }
+            }
         }
 
         // Ctrl shortcuts — matched on the PHYSICAL key, not the logical character.
@@ -3330,7 +3723,6 @@ fn open_url(url: &str) {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InputId {
     Palette,
-    Find,
 }
 
 /// The earlier of two optional wake times (whichever is present).

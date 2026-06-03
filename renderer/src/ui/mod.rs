@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 pub mod editor_view;
 pub mod explorer_panel;
+pub mod find_widget;
 pub mod ext_detail_view;
 pub mod extensions_panel;
 pub mod search_panel;
@@ -31,6 +32,9 @@ pub enum Intent {
     /// Open a read-only git diff for a repo-relative `path` in an editor tab.
     /// `staged` diffs the index vs HEAD; otherwise the working tree vs HEAD.
     OpenDiff { path: String, staged: bool, untracked: bool },
+    /// Open a combined diff of every file in a group (staged or unstaged) — one
+    /// collapsible section per file — in a single editor tab.
+    OpenAllDiffs { staged: bool },
     /// Open an extension's detail page.
     OpenExtDetail(OpenExt),
     /// Reload every open document from disk (after a Replace All rewrote files).
@@ -45,6 +49,8 @@ pub enum Intent {
     GitStageAll,
     GitUnstageAll,
     GitDiscardAll,
+    /// Stash all working-tree changes (including untracked).
+    GitStash,
     GitRefresh,
     /// Commit then push (the Commit button's split-dropdown action).
     GitCommitPush { msg: String, stage_all: bool },

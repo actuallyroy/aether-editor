@@ -14,7 +14,6 @@ pub struct Layout {
     pub gutter: Rect,
     pub editor_text: Rect,
     pub status_bar: Rect,
-    pub find_bar: Option<Rect>,
     pub terminal_panel: Option<Rect>,
     pub palette: Option<PaletteLayout>,
 }
@@ -64,17 +63,10 @@ impl Layout {
             w: (w - editor_left).max(0.0),
             h: theme::TAB_HEIGHT(),
         };
-        let find_bar = if find_active {
-            Some(Rect {
-                x: editor_left,
-                y: tb + tab_strip.h,
-                w: tab_strip.w,
-                h: theme::FIND_BAR_HEIGHT(),
-            })
-        } else {
-            None
-        };
-        let editor_y = tb + tab_strip.h + if find_active { theme::FIND_BAR_HEIGHT() } else { 0.0 };
+        // The find/replace widget floats over the editor's top-right (it doesn't
+        // push the editor down), so no vertical reservation here.
+        let _ = find_active;
+        let editor_y = tb + tab_strip.h;
         // Terminal panel sits above the status bar; the editor shrinks to fit. A
         // maximize request (huge height) is clamped here to fill the whole content
         // area (editor_h → 0); normal drag is bounded by the splitter's own max.
@@ -121,28 +113,27 @@ impl Layout {
         };
         let palette = if palette_active {
             let pw = theme::PALETTE_WIDTH().min(w - theme::zpx(40.0));
-            let visible = 8usize;
-            let ph = theme::PALETTE_INPUT_HEIGHT()
+            let visible = 9usize;
+            let pad = theme::zpx(10.0); // inner card padding
+            let gap = theme::zpx(8.0); // input ↔ list gap
+            let ph = pad
+                + theme::PALETTE_INPUT_HEIGHT()
+                + gap
                 + theme::PALETTE_ROW_HEIGHT() * visible as f32
-                + theme::zpx(8.0);
+                + pad;
             let bx = (w - pw) * 0.5;
-            let by = theme::zpx(80.0);
-            let box_ = Rect {
-                x: bx,
-                y: by,
-                w: pw,
-                h: ph,
-            };
+            let by = theme::zpx(72.0);
+            let box_ = Rect { x: bx, y: by, w: pw, h: ph };
             let input = Rect {
-                x: box_.x + theme::zpx(4.0),
-                y: box_.y + theme::zpx(4.0),
-                w: box_.w - theme::zpx(8.0),
+                x: box_.x + pad,
+                y: box_.y + pad,
+                w: box_.w - pad * 2.0,
                 h: theme::PALETTE_INPUT_HEIGHT(),
             };
             let list = Rect {
-                x: box_.x + theme::zpx(4.0),
-                y: input.y + input.h + theme::zpx(4.0),
-                w: box_.w - theme::zpx(8.0),
+                x: box_.x + pad,
+                y: input.y + input.h + gap,
+                w: box_.w - pad * 2.0,
                 h: theme::PALETTE_ROW_HEIGHT() * visible as f32,
             };
             Some(PaletteLayout { box_, input, list })
@@ -157,7 +148,6 @@ impl Layout {
             gutter,
             editor_text,
             status_bar,
-            find_bar,
             terminal_panel,
             palette,
         }

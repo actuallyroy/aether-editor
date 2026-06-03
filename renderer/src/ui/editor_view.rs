@@ -24,7 +24,7 @@ impl EditorView {
     /// there, extending the selection when `extend`.
     fn place_caret(doc: &mut Document, layout: &Layout, x: f32, y: f32, extend: bool) {
         let buf_x = x - (layout.editor_text.x + theme::EDITOR_PAD()) + doc.scroll_x();
-        let buf_y = y - (layout.editor_text.y + theme::EDITOR_PAD()) + doc.scroll_y();
+        let buf_y = doc.expand_visual_y(y - (layout.editor_text.y + theme::EDITOR_PAD()) + doc.scroll_y());
         if let Some(hit) = doc.buffer.hit(buf_x, buf_y) {
             let line = hit.line;
             if line < doc.rope.len_lines() {
@@ -34,6 +34,14 @@ impl EditorView {
                 doc.place(line_start + col, extend);
             }
         }
+    }
+
+    /// The buffer line under `(x, y)`, if any — used to hit-test diff file headers.
+    /// Line is driven by `y`, so a click anywhere across the row resolves correctly.
+    pub fn line_at(doc: &Document, layout: &Layout, x: f32, y: f32) -> Option<usize> {
+        let buf_x = x - (layout.editor_text.x + theme::EDITOR_PAD()) + doc.scroll_x();
+        let buf_y = y - (layout.editor_text.y + theme::EDITOR_PAD()) + doc.scroll_y();
+        doc.buffer.hit(buf_x, buf_y).map(|h| h.line)
     }
 
     /// Editor mouse-press: place the caret, then word/line/document-select on

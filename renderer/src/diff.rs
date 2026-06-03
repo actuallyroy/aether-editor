@@ -19,20 +19,30 @@ pub enum RowKind {
     Add,     // added: right side only (left is filler)
     Del,     // removed: left side only (right is filler)
     Hunk,    // an "@@ ... @@" separator spanning both sides
+    File,    // combined view: a per-file header row (collapsible)
 }
 
+#[derive(Clone)]
 pub struct DiffRow {
     pub kind: RowKind,
     pub left: Option<u32>,  // old line number (None = filler / hunk)
     pub right: Option<u32>, // new line number (None = filler / hunk)
+    pub file: usize,        // index into Diff.files (which file this row belongs to)
 }
 
+#[derive(Clone)]
 pub struct Diff {
     pub title: String,
     pub left_text: String,  // old side, one line per row (blank for filler/add)
     pub right_text: String, // new side, one line per row (blank for filler/del)
     pub rows: Vec<DiffRow>,
+    pub combined: bool,     // true = multi-file view (has RowKind::File headers)
+    pub files: Vec<String>, // display names per file index (combined view)
 }
+
+/// Leading pad on a combined-view file-header line, leaving room for the codicon
+/// twistie that the renderer overlays at the row's left.
+const FILE_HEADER_PAD: &str = "   ";
 
 fn git(root: &Path, args: &[&str]) -> Option<String> {
     let mut cmd = Command::new("git");
@@ -67,7 +77,84 @@ pub fn compute(root: &Path, path: &str, staged: bool, untracked: bool) -> Diff {
         vec!["diff", "--no-color", "HEAD", "--", path]
     };
     let raw = git(root, &args).unwrap_or_default();
-    Builder::new(title).parse(&raw).finish()
+    let mut b = Builder::new(title);
+    b.parse_into(&raw);
+    b.finish()
+}
+
+/// Combined "Open Changes" view: every entry's diff stacked under a per-file header
+/// row (`RowKind::File`). `entries` is `(repo-relative path, untracked)`; `staged`
+/// selects the index-vs-HEAD diff. The header text carries an expanded chevron;
+/// `project` rewrites it per collapse state.
+pub fn compute_all(root: &Path, entries: &[(String, bool)], staged: bool) -> Diff {
+    let title = if staged { "Staged Changes".to_string() } else { "Changes".to_string() };
+    let mut b = Builder::new(title);
+    b.combined = true;
+    for (path, untracked) in entries {
+        let name = file_name(path).to_string();
+        let fidx = b.files.len();
+        b.files.push(name.clone());
+        b.cur_file = fidx;
+        b.row(RowKind::File, None, None, &format!("{}{}", FILE_HEADER_PAD, name), "");
+        if *untracked {
+            let content = std::fs::read_to_string(root.join(path)).unwrap_or_default();
+            let mut n = 1u32;
+            for line in content.replace('\r', "").lines() {
+                b.row(RowKind::Add, None, Some(n), "", line);
+                n += 1;
+            }
+        } else {
+            let args: Vec<&str> = if staged {
+                vec!["diff", "--no-color", "--cached", "--", path]
+            } else {
+                vec!["diff", "--no-color", "HEAD", "--", path]
+            };
+            let raw = git(root, &args).unwrap_or_default();
+            b.parse_into(&raw);
+        }
+        b.flush();
+    }
+    if b.files.is_empty() {
+        b.row(RowKind::Context, None, None, "No changes.", "No changes.");
+    }
+    b.into_diff()
+}
+
+/// Re-derive the visible side of a combined diff for the given collapsed file set:
+/// every file's header row stays (its chevron flipped to match), but a collapsed
+/// file's body rows are dropped. Returns a fresh `Diff` to install as the view.
+pub fn project(full: &Diff, collapsed: &std::collections::HashSet<usize>) -> Diff {
+    let lefts: Vec<&str> = full.left_text.split('\n').collect();
+    let rights: Vec<&str> = full.right_text.split('\n').collect();
+    let mut left_text = String::new();
+    let mut right_text = String::new();
+    let mut rows = Vec::new();
+    for (i, r) in full.rows.iter().enumerate() {
+        if r.kind == RowKind::File {
+            // The collapse chevron is overlaid by the renderer; keep just the padded name.
+            let name = full.files.get(r.file).map(String::as_str).unwrap_or("");
+            left_text.push_str(&format!("{}{}\n", FILE_HEADER_PAD, name));
+            right_text.push('\n');
+            rows.push(r.clone());
+            continue;
+        }
+        if collapsed.contains(&r.file) {
+            continue; // body of a collapsed file
+        }
+        left_text.push_str(lefts.get(i).copied().unwrap_or(""));
+        left_text.push('\n');
+        right_text.push_str(rights.get(i).copied().unwrap_or(""));
+        right_text.push('\n');
+        rows.push(r.clone());
+    }
+    Diff {
+        title: full.title.clone(),
+        left_text,
+        right_text,
+        rows,
+        combined: true,
+        files: full.files.clone(),
+    }
 }
 
 /// Untracked file: every line is an addition (right side only).
@@ -89,6 +176,9 @@ struct Builder {
     left_text: String,
     right_text: String,
     rows: Vec<DiffRow>,
+    combined: bool,
+    files: Vec<String>,
+    cur_file: usize,
     // Pending deletions/additions within the current change block, paired on flush.
     dels: Vec<(u32, String)>,
     adds: Vec<(u32, String)>,
@@ -101,6 +191,9 @@ impl Builder {
             left_text: String::new(),
             right_text: String::new(),
             rows: Vec::new(),
+            combined: false,
+            files: Vec::new(),
+            cur_file: 0,
             dels: Vec::new(),
             adds: Vec::new(),
         }
@@ -112,7 +205,7 @@ impl Builder {
         self.left_text.push('\n');
         self.right_text.push_str(r);
         self.right_text.push('\n');
-        self.rows.push(DiffRow { kind, left, right });
+        self.rows.push(DiffRow { kind, left, right, file: self.cur_file });
     }
 
     /// Emit the pending change block: deletions first (left side, right is filler),
@@ -129,7 +222,7 @@ impl Builder {
         }
     }
 
-    fn parse(mut self, raw: &str) -> Self {
+    fn parse_into(&mut self, raw: &str) {
         let mut old = 0u32;
         let mut new = 0u32;
         let mut in_hunk = false;
@@ -167,18 +260,23 @@ impl Builder {
             }
         }
         self.flush();
-        self
     }
 
     fn finish(mut self) -> Diff {
         if self.rows.is_empty() {
             self.row(RowKind::Context, None, None, "No changes.", "No changes.");
         }
+        self.into_diff()
+    }
+
+    fn into_diff(self) -> Diff {
         Diff {
             title: self.title,
             left_text: self.left_text,
             right_text: self.right_text,
             rows: self.rows,
+            combined: self.combined,
+            files: self.files,
         }
     }
 }

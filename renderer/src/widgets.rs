@@ -1054,6 +1054,25 @@ impl Gutter {
             custom_glyphs: &[],
         });
     }
+
+    /// Draw the gutter with line 0 placed at `top`, clipped to `clip` — used to
+    /// render fold-aware segments (each visible run of lines at its shifted y).
+    pub fn draw_clipped<'a>(&'a self, clip: Rect, top: f32, color: glyphon::Color, areas: &mut Vec<TextArea<'a>>) {
+        areas.push(TextArea {
+            buffer: &self.buffer,
+            left: clip.x,
+            top,
+            scale: 1.0,
+            bounds: TextBounds {
+                left: clip.x as i32,
+                top: clip.y as i32,
+                right: (clip.x + clip.w) as i32,
+                bottom: (clip.y + clip.h) as i32,
+            },
+            default_color: color,
+            custom_glyphs: &[],
+        });
+    }
 }
 
 /// Reusable vertical list of fixed-height rows backed by one shared multi-line
@@ -1742,6 +1761,11 @@ impl ScrollView {
             w: theme::SCROLLBAR_WIDTH(),
             h: self.viewport.h,
         }
+    }
+
+    /// The vertical scrollbar track rect (for overview markers like find matches).
+    pub fn vtrack_rect(&self) -> Rect {
+        self.vtrack()
     }
     fn htrack(&self) -> Rect {
         Rect {

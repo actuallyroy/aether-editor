@@ -108,7 +108,7 @@ impl Theme {
             md_list: Color::rgb(0x64, 0x9B, 0xD6),
             fg_dim: Color::rgb(0x85, 0x85, 0x85),
             fg_active: Color::rgb(0xFF, 0xFF, 0xFF),
-            fg_gutter: Color::rgb(0x6E, 0x73, 0x81),
+            fg_gutter: Color::rgb(0x90, 0x96, 0xA6),
             fg_gutter_active: Color::rgb(0xC6, 0xC6, 0xC6),
             cursor: [0.82, 0.82, 0.82, 1.0],
             scrollbar_thumb: [1.0, 1.0, 1.0, 0.16],
@@ -138,10 +138,10 @@ impl Theme {
             tree_hover: [1.0, 1.0, 1.0, 0.04],
             tree_active_file: [1.0, 1.0, 1.0, 0.09],
             tree_selected: [0.15, 0.30, 0.45, 0.6],
-            palette_bg: [0.176, 0.176, 0.176, 1.0],
-            palette_border: [0.30, 0.30, 0.30, 1.0],
-            palette_input_bg: [0.20, 0.20, 0.20, 1.0],
-            palette_selected: [0.07, 0.36, 0.61, 0.85],
+            palette_bg: [0.145, 0.155, 0.165, 1.0],
+            palette_border: [0.32, 0.34, 0.38, 1.0],
+            palette_input_bg: [0.10, 0.11, 0.12, 1.0],
+            palette_selected: [0.20, 0.42, 0.70, 0.95],
             dialog_btn: [0.24, 0.24, 0.26, 1.0],
             dialog_btn_hover: [0.20, 0.42, 0.66, 1.0],
             dialog_overlay: [0.0, 0.0, 0.0, 0.5],
@@ -207,7 +207,7 @@ fn ensure_legible(t: &mut Theme) {
     // technically passing but reading as "dim". Higher floor = comfortably legible.
     t.fg_dim = legible(t.fg_dim, darkest, t.fg_text, 7.0);
     t.fg_active = legible(t.fg_active, eb, t.fg_text, 7.0);
-    t.fg_gutter = legible(t.fg_gutter, darkest, t.fg_text, 4.5);
+    t.fg_gutter = legible(t.fg_gutter, darkest, t.fg_text, 6.0);
     t.close_fg = legible(t.close_fg, darkest, t.fg_text, 6.0);
     t.tab_fg_inactive = legible(t.tab_fg_inactive, quad_tuple(t.tab_bar_bg), t.tab_fg_active, 6.0);
     t.tab_fg_active = legible(t.tab_fg_active, quad_tuple(t.tab_active), t.fg_text, 7.0);
@@ -671,6 +671,18 @@ pub const ICON_NEW_FILE: char = '\u{ea7f}';
 pub const ICON_NEW_FOLDER: char = '\u{ea80}';
 pub const ICON_REFRESH: char = '\u{eb37}';
 pub const ICON_COLLAPSE_ALL: char = '\u{eac5}';
+pub const ICON_LIST_TREE: char = '\u{eb86}'; // codicon "list-tree" — view-as-tree toggle
+pub const ICON_LIST_FLAT: char = '\u{eb84}'; // codicon "list-flat" — view-as-list toggle
+pub const ICON_STASH: char = '\u{ec26}'; // codicon "git-stash"
+pub const ICON_OPEN_CHANGES: char = '\u{eafd}'; // codicon "git-compare" — open diff
+// Find/replace widget glyphs.
+pub const ICON_ARROW_UP: char = '\u{eaa1}'; // previous match
+pub const ICON_ARROW_DOWN: char = '\u{ea9a}'; // next match
+pub const ICON_REPLACE: char = '\u{eb3d}'; // replace current
+pub const ICON_REPLACE_ALL: char = '\u{eb3c}'; // replace all
+pub const ICON_CASE: char = '\u{eab1}'; // match case (Aa)
+pub const ICON_WORD: char = '\u{eb7e}'; // whole word (ab)
+pub const ICON_REGEX: char = '\u{eb38}'; // use regex (.*)
 pub const ICON_LAYOUT_SIDEBAR_LEFT: char = '\u{ebf3}';
 pub const ICON_LAYOUT_PANEL: char = '\u{ebf2}';
 pub const ICON_LAYOUT_SIDEBAR_RIGHT: char = '\u{ebf4}';
@@ -706,7 +718,6 @@ pub fn TREE_ROW_HEIGHT() -> f32 { 22.0 * ui_zoom() }
 pub fn SIDEBAR_HEADER_H() -> f32 { 30.0 * ui_zoom() }
 pub fn TAB_MIN_WIDTH() -> f32 { 120.0 * ui_zoom() }
 pub fn TAB_MAX_WIDTH() -> f32 { 220.0 * ui_zoom() }
-pub fn FIND_BAR_HEIGHT() -> f32 { 36.0 * ui_zoom() }
 pub fn TERMINAL_HEIGHT() -> f32 { 240.0 * ui_zoom() } // initial/default panel height
 pub fn TERMINAL_MIN_HEIGHT() -> f32 { 80.0 * ui_zoom() }
 pub fn TERMINAL_MAX_HEIGHT() -> f32 { 700.0 * ui_zoom() }
@@ -715,6 +726,7 @@ pub fn TERMINAL_HEADER_H() -> f32 { 32.0 * ui_zoom() } // panel header (tabs + b
 /// Bottom-panel tabs (VSCode layout). Index 3 (TERMINAL) is the active stub.
 pub const PANEL_TABS: &[&str] = &["PROBLEMS", "OUTPUT", "DEBUG CONSOLE", "TERMINAL", "PORTS"];
 pub const PANEL_ACTIVE_TAB: usize = 3;
-pub fn PALETTE_WIDTH() -> f32 { 560.0 * ui_zoom() }
-pub fn PALETTE_ROW_HEIGHT() -> f32 { 24.0 * ui_zoom() }
-pub fn PALETTE_INPUT_HEIGHT() -> f32 { 30.0 * ui_zoom() }
+pub fn PALETTE_WIDTH() -> f32 { 620.0 * ui_zoom() }
+// Row height matches the UI line height so the selection pill aligns with the text.
+pub fn PALETTE_ROW_HEIGHT() -> f32 { UI_LINE_HEIGHT() }
+pub fn PALETTE_INPUT_HEIGHT() -> f32 { 40.0 * ui_zoom() }

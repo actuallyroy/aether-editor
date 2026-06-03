@@ -152,15 +152,25 @@ impl PaletteState {
 }
 
 pub struct FindBarState {
-    pub active: bool,
-    pub last_match: Option<usize>,
+    pub active: bool,                       // the widget is open/visible
+    pub focused: bool,                      // a find/replace input has keyboard focus
+    pub on_replace: bool,                   // focus is on the replace input (vs find)
+    pub replace_open: bool,                 // the replace row is expanded
+    pub opts: crate::search::SearchOpts,    // case / whole-word / regex
+    pub matches: Vec<(usize, usize)>,       // byte ranges of matches in the active doc
+    pub index: Option<usize>,               // current match within `matches`
 }
 
 impl FindBarState {
     pub fn new() -> Self {
         Self {
             active: false,
-            last_match: None,
+            focused: false,
+            on_replace: false,
+            replace_open: false,
+            opts: crate::search::SearchOpts::default(),
+            matches: Vec::new(),
+            index: None,
         }
     }
 }
