@@ -832,11 +832,10 @@ impl SearchField {
         } else {
             theme::SEARCH_BG()
         };
-        bg_quads.push(rect.quad(fill));
-        bg_quads.push(Quad::new(rect.x, rect.y, rect.w, 1.0, theme::SEARCH_BORDER()));
-        bg_quads.push(Quad::new(rect.x, rect.y + rect.h - 1.0, rect.w, 1.0, theme::SEARCH_BORDER()));
-        bg_quads.push(Quad::new(rect.x, rect.y, 1.0, rect.h, theme::SEARCH_BORDER()));
-        bg_quads.push(Quad::new(rect.x + rect.w - 1.0, rect.y, 1.0, rect.h, theme::SEARCH_BORDER()));
+        // Rounded pill with a 1px border ring (zoom-scaled radius).
+        let r = (rect.h * 0.5).min(theme::zpx(8.0));
+        bg_quads.push(Rect { x: rect.x - 1.0, y: rect.y - 1.0, w: rect.w + 2.0, h: rect.h + 2.0 }.rounded_quad(theme::SEARCH_BORDER(), r + 1.0));
+        bg_quads.push(rect.rounded_quad(fill, r));
     }
 
     pub fn draw<'a>(&'a self, rect: Rect, areas: &mut Vec<TextArea<'a>>) {
@@ -1279,13 +1278,25 @@ impl Menu {
     }
 
     pub fn draw_bg(&self, menu: Rect, hovered: Option<usize>, quads: &mut Vec<Quad>) {
+        let r = theme::zpx(8.0);
+        // Soft drop shadow so the menu floats above the content.
+        for i in 1..=5 {
+            let s = i as f32 * theme::zpx(2.0);
+            let a = 0.14 * (1.0 - (i as f32 - 1.0) / 5.0);
+            quads.push(
+                Rect { x: menu.x - s, y: menu.y - s + theme::zpx(2.0), w: menu.w + s * 2.0, h: menu.h + s * 2.0 }
+                    .rounded_quad([0.0, 0.0, 0.0, a], r + s),
+            );
+        }
         quads.push(
             Rect { x: menu.x - 1.0, y: menu.y - 1.0, w: menu.w + 2.0, h: menu.h + 2.0 }
-                .quad(theme::CONTEXT_BORDER()),
+                .rounded_quad(theme::CONTEXT_BORDER(), r + 1.0),
         );
-        quads.push(menu.quad(theme::CONTEXT_BG()));
+        quads.push(menu.rounded_quad(theme::CONTEXT_BG(), r));
         if let Some(i) = hovered {
-            quads.push(self.list.row_rect(self.inner(menu), i).quad(theme::CONTEXT_SEL()));
+            let row = self.list.row_rect(self.inner(menu), i);
+            let pill = Rect { x: row.x + theme::zpx(4.0), y: row.y + theme::zpx(1.0), w: row.w - theme::zpx(8.0), h: (row.h - theme::zpx(2.0)).max(2.0) };
+            quads.push(pill.rounded_quad(theme::CONTEXT_SEL(), theme::zpx(5.0)));
         }
     }
 
@@ -1381,16 +1392,26 @@ impl Dialog {
         quads: &mut Vec<Quad>,
     ) {
         quads.push(Rect { x: 0.0, y: 0.0, w: win.0, h: win.1 }.quad(theme::DIALOG_OVERLAY()));
-        quads.push(Rect { x: b.x - 1.0, y: b.y - 1.0, w: b.w + 2.0, h: b.h + 2.0 }.quad(theme::PALETTE_BORDER()));
-        quads.push(b.quad(theme::PALETTE_BG()));
+        let radius = theme::zpx(12.0);
+        // Soft drop shadow behind the card.
+        for i in 1..=6 {
+            let s = i as f32 * theme::zpx(2.5);
+            let a = 0.18 * (1.0 - (i as f32 - 1.0) / 6.0);
+            quads.push(
+                Rect { x: b.x - s, y: b.y - s + theme::zpx(4.0), w: b.w + s * 2.0, h: b.h + s * 2.0 }
+                    .rounded_quad([0.0, 0.0, 0.0, a], radius + s),
+            );
+        }
+        quads.push(Rect { x: b.x - 1.0, y: b.y - 1.0, w: b.w + 2.0, h: b.h + 2.0 }.rounded_quad(theme::PALETTE_BORDER(), radius + 1.0));
+        quads.push(b.rounded_quad(theme::PALETTE_BG(), radius));
         for (i, r) in self.button_rects(b).iter().enumerate() {
             let c = if hovered == Some(i) { theme::DIALOG_BTN_HOVER() } else { theme::DIALOG_BTN() };
-            quads.push(r.quad(c));
+            quads.push(r.rounded_quad(c, theme::zpx(6.0)));
         }
         if has_check {
             let cb = self.check_box(b);
-            quads.push(Rect { x: cb.x - 1.0, y: cb.y - 1.0, w: cb.w + 2.0, h: cb.h + 2.0 }.quad(theme::PALETTE_BORDER()));
-            quads.push(cb.quad(if checked { theme::DIALOG_BTN_HOVER() } else { theme::PALETTE_INPUT_BG() }));
+            quads.push(Rect { x: cb.x - 1.0, y: cb.y - 1.0, w: cb.w + 2.0, h: cb.h + 2.0 }.rounded_quad(theme::PALETTE_BORDER(), theme::zpx(4.0)));
+            quads.push(cb.rounded_quad(if checked { theme::DIALOG_BTN_HOVER() } else { theme::PALETTE_INPUT_BG() }, theme::zpx(3.0)));
         }
     }
 

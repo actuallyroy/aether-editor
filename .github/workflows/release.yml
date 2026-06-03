@@ -38,8 +38,9 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
+      # No build cache here: the cache-save post-step is flaky on Windows and a
+      # failure there marks the job failed, which skips the release-publish job.
+      # Releases are infrequent, so a clean build is worth the reliability.
 
       # Linux build deps: rfd (GTK file dialogs), winit/glyphon (xkbcommon,
       # wayland, fontconfig), and a C/C++ toolchain for the bundled C deps

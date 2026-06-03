@@ -209,21 +209,22 @@ impl SearchPanel {
         bg: &mut Vec<Quad>,
         fg: &mut Vec<Quad>,
     ) {
+        let ir = theme::zpx(7.0); // input corner radius (zoom-scaled so it stays round)
         let q = Self::query_rect(region);
         let border = Rect { x: q.x - 1.0, y: q.y - 1.0, w: q.w + 2.0, h: q.h + 2.0 };
-        bg.push(border.rounded_quad(theme::SEARCH_BORDER(), 3.0));
-        bg.push(q.rounded_quad(theme::SEARCH_BG(), 2.0));
+        bg.push(border.rounded_quad(theme::SEARCH_BORDER(), ir + 1.0));
+        bg.push(q.rounded_quad(theme::SEARCH_BG(), ir));
         let on = [self.opts.case_sensitive, self.opts.whole_word, self.opts.regex];
         for (i, r) in Self::opt_rects(region).iter().enumerate() {
             if on[i] {
-                bg.push(r.rounded_quad(theme::TREE_SELECTED(), 3.0));
+                bg.push(r.rounded_quad(theme::ACCENT(), theme::zpx(4.0)));
             }
         }
         let rr = Self::replace_rect(region);
         let rb = Rect { x: rr.x - 1.0, y: rr.y - 1.0, w: rr.w + 2.0, h: rr.h + 2.0 };
-        bg.push(rb.rounded_quad(theme::SEARCH_BORDER(), 3.0));
-        bg.push(rr.rounded_quad(theme::SEARCH_BG(), 2.0));
-        bg.push(Self::replace_all_rect(region).rounded_quad(theme::DIALOG_BTN(), 3.0));
+        bg.push(rb.rounded_quad(theme::SEARCH_BORDER(), ir + 1.0));
+        bg.push(rr.rounded_quad(theme::SEARCH_BG(), ir));
+        bg.push(Self::replace_all_rect(region).rounded_quad(theme::DIALOG_BTN(), theme::zpx(6.0)));
 
         if self.query_active {
             self.query.selection_quads(q, theme::zpx(6.0), bg);

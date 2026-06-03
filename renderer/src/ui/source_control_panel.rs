@@ -503,26 +503,30 @@ impl SourceControlPanel {
     // ---- Drawing ----
     pub fn draw_quads(&self, region: Rect, blink: bool, bg: &mut Vec<Quad>, fg: &mut Vec<Quad>) {
         let m = Self::msg_rect(region);
+        let ir = theme::zpx(7.0);
         let border = Rect { x: m.x - 1.0, y: m.y - 1.0, w: m.w + 2.0, h: m.h + 2.0 };
-        bg.push(border.rounded_quad(theme::SEARCH_BORDER(), 3.0));
-        bg.push(m.rounded_quad(theme::SEARCH_BG(), 2.0));
+        bg.push(border.rounded_quad(theme::SEARCH_BORDER(), ir + 1.0));
+        bg.push(m.rounded_quad(theme::SEARCH_BG(), ir));
         if self.msg_active {
             self.msg.selection_quads(m, theme::zpx(6.0), bg);
             if blink {
                 fg.push(self.msg.caret_quad(m, theme::zpx(6.0)));
             }
         }
-        bg.push(Self::commit_rect(region).rounded_quad([0.06, 0.40, 0.62, 1.0], 3.0));
+        bg.push(Self::commit_rect(region).rounded_quad(theme::ACCENT_DIM(), theme::zpx(5.0)));
         // Split divider between the Commit label and its dropdown chevron.
         let cc = Self::commit_chevron(region);
-        bg.push(Quad::new(cc.x, cc.y + theme::zpx(5.0), 1.0, cc.h - theme::zpx(10.0), [0.03, 0.28, 0.46, 1.0]));
-        for (hdr, label) in [
-            (Self::staged_hdr(region), &self.count_staged),
-            (self.unstaged_hdr(region), &self.count_unstaged),
+        bg.push(Quad::new(cc.x, cc.y + theme::zpx(5.0), 1.0, cc.h - theme::zpx(10.0), [0.0, 0.0, 0.0, 0.25]));
+        for (hdr, label, empty) in [
+            (Self::staged_hdr(region), &self.count_staged, self.staged_vis.is_empty()),
+            (self.unstaged_hdr(region), &self.count_unstaged, self.unstaged_vis.is_empty()),
         ] {
+            if empty {
+                continue; // no count badge for an empty group (VSCode-style)
+            }
             let w = label.width() + theme::zpx(12.0);
             let pill = Rect { x: hdr.x + hdr.w - w, y: hdr.y + theme::zpx(3.0), w, h: row_h() - theme::zpx(6.0) };
-            bg.push(pill.rounded_quad([0.20, 0.30, 0.42, 1.0], pill.h * 0.5));
+            bg.push(pill.rounded_quad(theme::ACCENT_DIM(), pill.h * 0.5));
         }
         // Hovered-row highlight (so the action icons read as part of an active row).
         if let Some((staged, idx)) = self.hovered {
@@ -614,7 +618,9 @@ impl SourceControlPanel {
 
         let sh = Self::staged_hdr(region);
         self.l_staged.push(sh.x, sh, theme::FG_TEXT(), areas);
-        self.push_count(&self.count_staged, sh, areas);
+        if !self.staged_vis.is_empty() {
+            self.push_count(&self.count_staged, sh, areas);
+        }
         if self.hovered_header == Some(true) {
             self.draw_header_actions(region, true, areas);
         }
@@ -626,7 +632,9 @@ impl SourceControlPanel {
 
         let uh = self.unstaged_hdr(region);
         self.l_unstaged.push(uh.x, uh, theme::FG_TEXT(), areas);
-        self.push_count(&self.count_unstaged, uh, areas);
+        if !self.unstaged_vis.is_empty() {
+            self.push_count(&self.count_unstaged, uh, areas);
+        }
         if self.hovered_header == Some(false) {
             self.draw_header_actions(region, false, areas);
         }

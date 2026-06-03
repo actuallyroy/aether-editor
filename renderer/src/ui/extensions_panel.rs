@@ -188,9 +188,10 @@ impl ExtensionsPanel {
     // rows render in their own clipped pass via `list_*`. ----
     pub fn draw_quads(&self, region: Rect, blink: bool, bg: &mut Vec<Quad>, fg: &mut Vec<Quad>) {
         let fr = ext_filter_rect(region);
+        let ir = theme::zpx(7.0);
         let border = Rect { x: fr.x - 1.0, y: fr.y - 1.0, w: fr.w + 2.0, h: fr.h + 2.0 };
-        bg.push(border.rounded_quad(theme::SEARCH_BORDER(), 3.0));
-        bg.push(fr.rounded_quad(theme::SEARCH_BG(), 2.0));
+        bg.push(border.rounded_quad(theme::SEARCH_BORDER(), ir + 1.0));
+        bg.push(fr.rounded_quad(theme::SEARCH_BG(), ir));
         if self.filter_active {
             self.filter.selection_quads(fr, theme::zpx(6.0), bg);
             if blink {

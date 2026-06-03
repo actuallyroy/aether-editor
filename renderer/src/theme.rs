@@ -89,8 +89,8 @@ impl Theme {
     /// The built-in VSCode Dark Modern / Dark+ palette (default).
     pub fn dark() -> Self {
         Self {
-            bg_editor: wgpu::Color { r: 0.076, g: 0.078, b: 0.078, a: 1.0 },
-            fg_text: Color::rgb(0xD4, 0xD4, 0xD4),
+            bg_editor: wgpu::Color { r: 0.063, g: 0.071, b: 0.090, a: 1.0 },
+            fg_text: Color::rgb(0xCD, 0xD3, 0xE0),
             syn_comment: Color::rgb(0x6A, 0x99, 0x55),
             syn_string: Color::rgb(0xCE, 0x91, 0x78),
             syn_keyword: Color::rgb(0x56, 0x9C, 0xD6),
@@ -106,60 +106,63 @@ impl Theme {
             md_code: Color::rgb(0xCE, 0x91, 0x78),
             md_rule: Color::rgb(0x80, 0x80, 0x80),
             md_list: Color::rgb(0x64, 0x9B, 0xD6),
-            fg_dim: Color::rgb(0x85, 0x85, 0x85),
+            // ---- Aether dark: cool blue-gray surfaces with an indigo accent. ----
+            // Surface elevation: editor (0.063) < panels/tabs < sidebar/title <
+            // floating cards. Accent ≈ #6E8CFF used for selection/active states.
+            fg_dim: Color::rgb(0x79, 0x82, 0x96),
             fg_active: Color::rgb(0xFF, 0xFF, 0xFF),
-            fg_gutter: Color::rgb(0x90, 0x96, 0xA6),
-            fg_gutter_active: Color::rgb(0xC6, 0xC6, 0xC6),
-            cursor: [0.82, 0.82, 0.82, 1.0],
-            scrollbar_thumb: [1.0, 1.0, 1.0, 0.16],
-            scrollbar_thumb_hover: [1.0, 1.0, 1.0, 0.34],
-            selection: [0.16, 0.32, 0.55, 0.45],
-            line_highlight: [1.0, 1.0, 1.0, 0.04],
-            find_match: [0.6, 0.5, 0.0, 0.45],
-            activity_bar_bg: [0.129, 0.137, 0.141, 1.0],
-            activity_bar_active: [1.0, 1.0, 1.0, 0.08],
-            activity_active_border: [1.0, 1.0, 1.0, 0.85],
-            sidebar_bg: [0.102, 0.110, 0.114, 1.0],
-            // Slightly raised vs the editor (0.076) so the terminal reads as its
-            // own surface, and a soft translucent-white divider on top.
-            panel_bg: [0.094, 0.098, 0.102, 1.0],
-            panel_border: [1.0, 1.0, 1.0, 0.10],
-            tab_bar_bg: [0.098, 0.102, 0.106, 1.0],
-            tab_inactive: [0.098, 0.102, 0.106, 1.0],
-            tab_active: [0.076, 0.078, 0.078, 1.0],
-            tab_hover: [0.21, 0.21, 0.21, 1.0],
+            fg_gutter: Color::rgb(0x6B, 0x74, 0x8C),
+            fg_gutter_active: Color::rgb(0xC6, 0xCC, 0xDA),
+            cursor: [0.55, 0.66, 1.0, 1.0],
+            scrollbar_thumb: [0.62, 0.68, 0.85, 0.18],
+            scrollbar_thumb_hover: [0.62, 0.68, 0.85, 0.38],
+            selection: [0.43, 0.55, 1.0, 0.22],
+            line_highlight: [1.0, 1.0, 1.0, 0.035],
+            find_match: [0.85, 0.62, 0.20, 0.40],
+            activity_bar_bg: [0.075, 0.082, 0.106, 1.0],
+            activity_bar_active: [1.0, 1.0, 1.0, 0.07],
+            activity_active_border: [0.43, 0.55, 1.0, 1.0],
+            sidebar_bg: [0.086, 0.094, 0.118, 1.0],
+            // Raised vs the editor so the terminal reads as its own surface, with a
+            // soft translucent divider on top.
+            panel_bg: [0.075, 0.082, 0.106, 1.0],
+            panel_border: [1.0, 1.0, 1.0, 0.08],
+            tab_bar_bg: [0.071, 0.078, 0.100, 1.0],
+            tab_inactive: [0.071, 0.078, 0.100, 1.0],
+            tab_active: [0.063, 0.071, 0.090, 1.0],
+            tab_hover: [1.0, 1.0, 1.0, 0.05],
             tab_fg_active: Color::rgb(0xFF, 0xFF, 0xFF),
-            tab_fg_inactive: Color::rgb(0xB0, 0xB0, 0xB0),
-            close_fg: Color::rgb(0x9A, 0x9A, 0x9A),
+            tab_fg_inactive: Color::rgb(0x9A, 0xA2, 0xB4),
+            close_fg: Color::rgb(0x9A, 0xA2, 0xB4),
             close_fg_hover: Color::rgb(0xFF, 0xFF, 0xFF),
-            status_bar_bg: [0.129, 0.129, 0.125, 1.0],
-            status_bar_fg: Color::rgb(0xFF, 0xFF, 0xFF),
-            border: [0.0, 0.0, 0.0, 1.0],
-            tree_hover: [1.0, 1.0, 1.0, 0.04],
-            tree_active_file: [1.0, 1.0, 1.0, 0.09],
-            tree_selected: [0.15, 0.30, 0.45, 0.6],
-            palette_bg: [0.145, 0.155, 0.165, 1.0],
-            palette_border: [0.32, 0.34, 0.38, 1.0],
-            palette_input_bg: [0.10, 0.11, 0.12, 1.0],
-            palette_selected: [0.20, 0.42, 0.70, 0.95],
-            dialog_btn: [0.24, 0.24, 0.26, 1.0],
-            dialog_btn_hover: [0.20, 0.42, 0.66, 1.0],
+            status_bar_bg: [0.086, 0.094, 0.118, 1.0],
+            status_bar_fg: Color::rgb(0xC6, 0xCC, 0xDA),
+            border: [1.0, 1.0, 1.0, 0.07],
+            tree_hover: [1.0, 1.0, 1.0, 0.045],
+            tree_active_file: [0.43, 0.55, 1.0, 0.12],
+            tree_selected: [0.43, 0.55, 1.0, 0.20],
+            palette_bg: [0.110, 0.122, 0.153, 1.0],
+            palette_border: [0.30, 0.33, 0.42, 1.0],
+            palette_input_bg: [0.063, 0.071, 0.094, 1.0],
+            palette_selected: [0.43, 0.55, 1.0, 0.30],
+            dialog_btn: [0.18, 0.20, 0.26, 1.0],
+            dialog_btn_hover: [0.30, 0.42, 0.85, 1.0],
             dialog_overlay: [0.0, 0.0, 0.0, 0.5],
-            activity_icon_fg: Color::rgb(0xC8, 0xC8, 0xC8),
+            activity_icon_fg: Color::rgb(0x9A, 0xA2, 0xB4),
             activity_icon_active: Color::rgb(0xFF, 0xFF, 0xFF),
-            icon_folder_color: Color::rgb(0x8A, 0xB4, 0xE8),
-            icon_file_color: Color::rgb(0xC5, 0xC5, 0xC5),
-            title_bar_bg: [0.145, 0.149, 0.152, 1.0],
-            title_fg: Color::rgb(0xCC, 0xCC, 0xCC),
-            search_bg: [0.118, 0.118, 0.125, 1.0],
-            search_bg_hover: [0.22, 0.22, 0.23, 1.0],
-            search_border: [0.27, 0.27, 0.28, 1.0],
-            title_close_hover: [0.78, 0.16, 0.16, 1.0],
+            icon_folder_color: Color::rgb(0x7E, 0x9C, 0xF0),
+            icon_file_color: Color::rgb(0xB8, 0xC0, 0xD2),
+            title_bar_bg: [0.071, 0.078, 0.100, 1.0],
+            title_fg: Color::rgb(0xC6, 0xCC, 0xDA),
+            search_bg: [0.063, 0.071, 0.094, 1.0],
+            search_bg_hover: [1.0, 1.0, 1.0, 0.06],
+            search_border: [0.27, 0.30, 0.40, 1.0],
+            title_close_hover: [0.78, 0.20, 0.24, 1.0],
             title_btn_hover: [1.0, 1.0, 1.0, 0.08],
-            menu_hover: [1.0, 1.0, 1.0, 0.08],
-            context_bg: [0.18, 0.18, 0.19, 1.0],
-            context_border: [0.30, 0.30, 0.30, 1.0],
-            context_sel: [0.07, 0.36, 0.61, 0.85],
+            menu_hover: [0.43, 0.55, 1.0, 0.16],
+            context_bg: [0.110, 0.122, 0.153, 1.0],
+            context_border: [0.30, 0.33, 0.42, 1.0],
+            context_sel: [0.43, 0.55, 1.0, 0.28],
         }
     }
 }
@@ -528,6 +531,19 @@ pub fn CLOSE_FG_HOVER() -> Color { current().read().unwrap().close_fg_hover }
 pub fn STATUS_BAR_BG() -> [f32; 4] { current().read().unwrap().status_bar_bg }
 pub fn STATUS_BAR_FG() -> Color { current().read().unwrap().status_bar_fg }
 pub fn BORDER() -> [f32; 4] { current().read().unwrap().border }
+/// The signature accent (opaque) — derived from the selection color so loaded
+/// VSCode themes track their own accent. Used for primary buttons, focus borders,
+/// badges, and the current-match marker.
+pub fn ACCENT() -> [f32; 4] {
+    let c = current().read().unwrap().palette_selected;
+    [c[0], c[1], c[2], 1.0]
+}
+/// A dimmer accent for large filled surfaces (e.g. the Commit button) so white
+/// text on top stays comfortable.
+pub fn ACCENT_DIM() -> [f32; 4] {
+    let c = current().read().unwrap().palette_selected;
+    [c[0] * 0.72, c[1] * 0.72, c[2] * 0.86, 1.0]
+}
 pub fn TREE_HOVER() -> [f32; 4] { current().read().unwrap().tree_hover }
 pub fn TREE_ACTIVE_FILE() -> [f32; 4] { current().read().unwrap().tree_active_file }
 pub fn TREE_SELECTED() -> [f32; 4] { current().read().unwrap().tree_selected }

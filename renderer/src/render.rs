@@ -671,7 +671,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     }
                 }
             }
-            // Tree row hover (below the header) — row rect from the ListView.
+            // Tree row hover (below the header).
             if let Some(idx) = app.hovered_tree {
                 if let Some(rr) = clip_row(gpu.ui.sidebar.row_rect(tr, idx)) {
                     bg_quads.push(rr.quad(theme::TREE_HOVER()));
@@ -736,18 +736,18 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             theme::TAB_INACTIVE()
         };
         bg_quads.push(tab.quad(fill));
-        // Top accent stripe for active tab.
+        // Top accent stripe for active tab (indigo identity).
         if active {
-            bg_quads.push(Quad::new(tab.x, tab.y, tab.w, 2.0, [0.0, 0.475, 0.78, 1.0]));
+            bg_quads.push(Quad::new(tab.x, tab.y, tab.w, theme::zpx(2.0), theme::ACCENT()));
         }
         // Subtle vertical divider between tabs.
         if i + 1 < n_tabs {
             bg_quads.push(Quad::new(
                 tab.x + tab.w - 1.0,
-                tab.y + 4.0,
+                tab.y + theme::zpx(6.0),
                 1.0,
-                tab.h - 8.0,
-                [0.30, 0.30, 0.30, 0.6],
+                tab.h - theme::zpx(12.0),
+                [1.0, 1.0, 1.0, 0.06],
             ));
         }
         // Close button hover background — same rect the × glyph uses.
@@ -1023,7 +1023,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 let line = d.rope.byte_to_line(s.min(d.rope.len_bytes())) as f32;
                 let y = track.y + (line / total) * track.h - mh * 0.5;
                 let current = app.find.index == Some(i);
-                let color = if current { [1.0, 0.6, 0.0, 1.0] } else { base };
+                let color = if current { theme::ACCENT() } else { base };
                 let w = if current { track.w } else { track.w - inset * 2.0 };
                 let x = if current { track.x } else { track.x + inset };
                 fg_quads.push(Quad::new(x, y, w, mh, color));
@@ -1041,7 +1041,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         // Active panel tab underline (text + buttons are drawn in the areas phase).
         let header = Rect { x: panel.x, y: panel.y, w: panel.w, h: theme::TERMINAL_HEADER_H() };
         if let Some(r) = panel_tab_rects(header, &gpu.terminal_tabs).get(theme::PANEL_ACTIVE_TAB) {
-            bg_quads.push(Quad::new(r.x, header.y + header.h - 2.0, r.w, 2.0, [0.9, 0.9, 0.9, 1.0]));
+            bg_quads.push(Quad::new(r.x, header.y + header.h - theme::zpx(2.0), r.w, theme::zpx(2.0), theme::ACCENT()));
         }
         let char_w = app.terminal_cell_w;
         let line_h = theme::LINE_HEIGHT();
@@ -1127,61 +1127,15 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // (The find/replace widget draws in its own late pass — see below.)
 
     // Palette dim overlay + box
-    if let Some(pal) = layout.palette.as_ref() {
-        // Dim the rest of the window behind the modal.
-        bg_quads.push(Quad::new(0.0, 0.0, gpu.config.width as f32, gpu.config.height as f32, [0.0, 0.0, 0.0, 0.45]));
-        let radius = theme::zpx(12.0);
-        // Soft drop shadow: a few expanding, fading rounded quads behind the card.
-        for i in 1..=6 {
-            let s = i as f32 * theme::zpx(2.0);
-            let a = 0.16 * (1.0 - (i as f32 - 1.0) / 6.0);
-            bg_quads.push(
-                Rect { x: pal.box_.x - s, y: pal.box_.y - s + theme::zpx(3.0), w: pal.box_.w + s * 2.0, h: pal.box_.h + s * 2.0 }
-                    .rounded_quad([0.0, 0.0, 0.0, a], radius + s),
-            );
-        }
-        // Card: 1px border ring (slightly larger rounded quad) + body.
-        bg_quads.push(
-            Rect { x: pal.box_.x - 1.0, y: pal.box_.y - 1.0, w: pal.box_.w + 2.0, h: pal.box_.h + 2.0 }
-                .rounded_quad(theme::PALETTE_BORDER(), radius + 1.0),
-        );
-        bg_quads.push(pal.box_.rounded_quad(theme::PALETTE_BG(), radius));
-        // Search input: rounded, subtly bordered.
-        let ir = theme::zpx(7.0);
-        bg_quads.push(
-            Rect { x: pal.input.x - 1.0, y: pal.input.y - 1.0, w: pal.input.w + 2.0, h: pal.input.h + 2.0 }
-                .rounded_quad(theme::PALETTE_BORDER(), ir + 1.0),
-        );
-        bg_quads.push(pal.input.rounded_quad(theme::PALETTE_INPUT_BG(), ir));
-        // Selected row: an inset rounded "pill" (not a full-bleed bar).
-        if !app.palette.filtered.is_empty() {
-            let r = gpu.ui.palette_list.row_rect(pal.list, app.palette.selected);
-            let pill = Rect {
-                x: r.x + theme::zpx(4.0),
-                y: r.y + theme::zpx(1.0),
-                w: r.w - theme::zpx(8.0),
-                h: (r.h - theme::zpx(2.0)).max(2.0),
-            };
-            bg_quads.push(pill.rounded_quad(theme::PALETTE_SELECTED(), theme::zpx(6.0)));
-        }
-    }
+    // (The command palette card/text draws in its own late pass — see below.)
 
     // Text-input carets (blink-gated, drawn on top via fg_quads).
     if app.cursor_blink_on {
-        if let Some(pal) = layout.palette.as_ref() {
-            fg_quads.push(gpu.ui.palette_input.caret_quad(pal.input, theme::zpx(14.0)));
-        }
         if let Some(pc) = app.explorer.creating.as_ref() {
             let (_, _, field) = create_row_geometry(layout.tree_region(), pc.row, pc.depth);
             fg_quads.push(gpu.create_input.caret_quad(field, 0.0));
         }
         // (The Extensions and Search panels draw their carets in their own draw_quads.)
-    }
-
-    // Text-input selection highlights — drawn into bg_quads (under glyphs, over
-    // the input box). Not blink-gated.
-    if let Some(pal) = layout.palette.as_ref() {
-        gpu.ui.palette_input.selection_quads(pal.input, theme::zpx(14.0), &mut bg_quads);
     }
     // (The Extensions and Search panels draw their selection highlights in their own draw_quads.)
 
@@ -1215,10 +1169,10 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // a clipped media pass after the main pass).
     let mut detail_img_rects: Vec<(String, Rect)> = Vec::new();
 
-    // When the palette (modal) is open, suppress all underlying text so it can't
-    // bleed through — text renders in one pass after the bg quads, so the dim
-    // overlay alone can't occlude it. Only the palette text is drawn below.
-    if layout.palette.is_none() {
+    // The command palette renders in its own late pass on top of the live
+    // background (VSCode-style — the file stays visible so symbol/line navigation
+    // can show the highlighted region), so the background always draws here.
+    {
     // Title bar: menu bar (left) + centered search box + layout toggles and
     // window controls (right).
     gpu.menubar.draw(layout.menu_bar_rect(), &mut areas);
@@ -1566,15 +1520,9 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             }
         }
     }
-    } // end: palette closed
+    } // end: background text
 
-    // Palette text
-    if let Some(pal) = layout.palette.as_ref() {
-        ui.palette_input
-            .draw(pal.input, theme::zpx(14.0), theme::FG_TEXT(), &mut areas);
-        ui.palette_list
-            .draw(pal.list, theme::FG_TEXT(), &mut areas);
-    }
+    // (The command palette draws in its own late pass — see below.)
 
     gpu.text_renderer.prepare(
         &gpu.device,
@@ -1935,6 +1883,60 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             }
             gpu.queue.submit(Some(encm.finish()));
         }
+    }
+
+    // ---- Command palette overlay ----
+    // Its own pass over the live background (no dim) so the file stays visible for
+    // symbol/line navigation; the card's shadow + border keep it legible on top.
+    if let Some(pal) = layout.palette.as_ref() {
+        let mut pq: Vec<Quad> = Vec::new();
+        let mut pfg: Vec<Quad> = Vec::new();
+        let radius = theme::zpx(12.0);
+        for i in 1..=7 {
+            let s = i as f32 * theme::zpx(2.5);
+            let a = 0.22 * (1.0 - (i as f32 - 1.0) / 7.0);
+            pq.push(
+                Rect { x: pal.box_.x - s, y: pal.box_.y - s + theme::zpx(4.0), w: pal.box_.w + s * 2.0, h: pal.box_.h + s * 2.0 }
+                    .rounded_quad([0.0, 0.0, 0.0, a], radius + s),
+            );
+        }
+        pq.push(Rect { x: pal.box_.x - 1.0, y: pal.box_.y - 1.0, w: pal.box_.w + 2.0, h: pal.box_.h + 2.0 }.rounded_quad(theme::PALETTE_BORDER(), radius + 1.0));
+        pq.push(pal.box_.rounded_quad(theme::PALETTE_BG(), radius));
+        let ir = theme::zpx(7.0);
+        pq.push(Rect { x: pal.input.x - 1.0, y: pal.input.y - 1.0, w: pal.input.w + 2.0, h: pal.input.h + 2.0 }.rounded_quad(theme::PALETTE_BORDER(), ir + 1.0));
+        pq.push(pal.input.rounded_quad(theme::PALETTE_INPUT_BG(), ir));
+        if !app.palette.filtered.is_empty() {
+            let r = gpu.ui.palette_list.row_rect(pal.list, app.palette.selected);
+            let pill = Rect { x: r.x + theme::zpx(4.0), y: r.y + theme::zpx(1.0), w: r.w - theme::zpx(8.0), h: (r.h - theme::zpx(2.0)).max(2.0) };
+            pq.push(pill.rounded_quad(theme::PALETTE_SELECTED(), theme::zpx(6.0)));
+        }
+        gpu.ui.palette_input.selection_quads(pal.input, theme::zpx(14.0), &mut pq);
+        if app.cursor_blink_on {
+            pfg.push(gpu.ui.palette_input.caret_quad(pal.input, theme::zpx(14.0)));
+        }
+        gpu.quad_renderer.prepare(&gpu.device, &gpu.queue, &pq, &pfg, (cfg_w, cfg_h));
+        let mut pareas: Vec<TextArea> = Vec::new();
+        gpu.ui.palette_input.draw(pal.input, theme::zpx(14.0), theme::FG_TEXT(), &mut pareas);
+        gpu.ui.palette_list.draw(pal.list, theme::FG_TEXT(), &mut pareas);
+        gpu.text_renderer.prepare(&gpu.device, &gpu.queue, &mut gpu.font_system, &mut gpu.atlas, &gpu.viewport, pareas, &mut gpu.swash_cache)?;
+        let mut encp = gpu.device.create_command_encoder(&CommandEncoderDescriptor { label: Some("aether-palette-pass") });
+        {
+            let mut pass = encp.begin_render_pass(&RenderPassDescriptor {
+                label: Some("aether-palette"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            gpu.quad_renderer.render_bg(&mut pass);
+            gpu.text_renderer.render(&gpu.atlas, &gpu.viewport, &mut pass)?;
+            gpu.quad_renderer.render_fg(&mut pass);
+        }
+        gpu.queue.submit(Some(encp.finish()));
     }
 
     // ---- Find/replace widget overlay ----

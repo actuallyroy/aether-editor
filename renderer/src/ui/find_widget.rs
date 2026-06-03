@@ -172,13 +172,15 @@ impl FindWidget {
         fg: &mut Vec<Quad>,
     ) {
         // Panel background + border (a floating card over the editor).
-        bg.push(Rect { x: l.panel.x - 1.0, y: l.panel.y - 1.0, w: l.panel.w + 2.0, h: l.panel.h + 2.0 }.rounded_quad(theme::PALETTE_BORDER(), 4.0));
-        bg.push(l.panel.rounded_quad(theme::PALETTE_BG(), 4.0));
+        let pr = theme::zpx(10.0);
+        let ir = theme::zpx(6.0);
+        bg.push(Rect { x: l.panel.x - 1.0, y: l.panel.y - 1.0, w: l.panel.w + 2.0, h: l.panel.h + 2.0 }.rounded_quad(theme::PALETTE_BORDER(), pr + 1.0));
+        bg.push(l.panel.rounded_quad(theme::PALETTE_BG(), pr));
 
         let mut input_box = |r: Rect, active: bool, bg: &mut Vec<Quad>| {
-            let border = if active { [0.28, 0.55, 0.86, 1.0] } else { theme::SEARCH_BORDER() };
-            bg.push(Rect { x: r.x - 1.0, y: r.y - 1.0, w: r.w + 2.0, h: r.h + 2.0 }.rounded_quad(border, 3.0));
-            bg.push(r.rounded_quad(theme::SEARCH_BG(), 2.0));
+            let border = if active { theme::ACCENT() } else { theme::SEARCH_BORDER() };
+            bg.push(Rect { x: r.x - 1.0, y: r.y - 1.0, w: r.w + 2.0, h: r.h + 2.0 }.rounded_quad(border, ir + 1.0));
+            bg.push(r.rounded_quad(theme::SEARCH_BG(), ir));
         };
         input_box(l.find_input, focused && !on_replace, bg);
         if let Some(ri) = l.replace_input {
@@ -188,13 +190,13 @@ impl FindWidget {
         // Active option-toggle backgrounds.
         for (on, r) in [(opts[0], l.case), (opts[1], l.word), (opts[2], l.regex)] {
             if on {
-                bg.push(r.rounded_quad(theme::DIALOG_BTN_HOVER(), 3.0));
+                bg.push(r.rounded_quad(theme::DIALOG_BTN_HOVER(), theme::zpx(4.0)));
             }
         }
         // Hover highlight on whichever button the pointer is over.
         if let Some(h) = self.hover {
             if let Some(r) = self.btn_rect(l, h) {
-                bg.push(r.rounded_quad(theme::MENU_HOVER(), 3.0));
+                bg.push(r.rounded_quad(theme::MENU_HOVER(), theme::zpx(4.0)));
             }
         }
         // Carets + selection for the focused input.

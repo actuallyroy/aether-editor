@@ -403,6 +403,42 @@ impl App {
             return;
         }
 
+        // Command palette (modal) captures hover: pointer over a row, text over the
+        // input, arrow elsewhere. No chrome hover behind it (it would show through
+        // the dim and flicker as the pointer moves).
+        if self.palette.active {
+            let cursor = self
+                .gpu
+                .as_ref()
+                .zip(layout.palette.as_ref())
+                .map(|(g, pal)| {
+                    if pal.input.contains(p) {
+                        CursorIcon::Text
+                    } else if g.ui.palette_list.row_at(pal.list, p, self.palette.filtered.len()).is_some() {
+                        CursorIcon::Pointer
+                    } else {
+                        CursorIcon::Default
+                    }
+                })
+                .unwrap_or(CursorIcon::Default);
+            // Selecting the hovered row mirrors VSCode (mouse hover moves selection).
+            if let Some((g, pal)) = self.gpu.as_ref().zip(layout.palette.as_ref()) {
+                if let Some(i) = g.ui.palette_list.row_at(pal.list, p, self.palette.filtered.len()) {
+                    if self.palette.selected != i {
+                        self.palette.selected = i;
+                        self.redraw();
+                    }
+                }
+            }
+            if cursor != self.cursor_icon {
+                self.cursor_icon = cursor;
+                if let Some(g) = self.gpu.as_ref() {
+                    g.window.set_cursor(cursor);
+                }
+            }
+            return;
+        }
+
         // Context menu (modal) captures hover when open.
         if self.explorer.menu_open() {
             let new_item = self.gpu.as_ref().and_then(|g| self.explorer.menu_item_at(p, g));
@@ -1728,6 +1764,11 @@ impl App {
     /// Open the command palette and focus its input.
     fn open_palette(&mut self) {
         self.palette.open();
+        // Clear any chrome hover so nothing lingers (dimmed) behind the modal.
+        self.hovered_tab = None;
+        self.hovered_tree = None;
+        self.hovered_activity = None;
+        self.hovered_explorer = None;
         if let Some(g) = self.gpu.as_mut() {
             g.ui.palette_input.clear(&mut g.font_system);
             g.ui.palette_input.focus(true);

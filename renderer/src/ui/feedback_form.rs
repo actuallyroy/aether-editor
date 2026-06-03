@@ -144,12 +144,12 @@ impl FeedbackForm {
     pub fn draw_quads(&self, win: (f32, f32), blink: bool, bg: &mut Vec<Quad>, fg: &mut Vec<Quad>) {
         let r = self.rects(win);
         bg.push(Quad::new(0.0, 0.0, win.0, win.1, theme::DIALOG_OVERLAY()));
-        bg.push(r.box_.rounded_quad(theme::CONTEXT_BG(), 8.0));
+        bg.push(r.box_.rounded_quad(theme::CONTEXT_BG(), theme::zpx(10.0)));
         bg.push(Quad::new(r.box_.x, r.box_.y, r.box_.w, 1.0, theme::CONTEXT_BORDER()));
         // Type chips: selected = accent fill.
         for (i, c) in r.chips.iter().enumerate() {
             let sel = TYPES[i].0 == self.ftype;
-            bg.push(c.rounded_quad(if sel { theme::PALETTE_SELECTED() } else { theme::SEARCH_BG() }, 4.0));
+            bg.push(c.rounded_quad(if sel { theme::PALETTE_SELECTED() } else { theme::SEARCH_BG() }, theme::zpx(5.0)));
         }
         // Field boxes: a darker fill (clearly distinct from the modal surface) with
         // a full 1px border, so each input reads as an input and the placeholder
@@ -157,7 +157,7 @@ impl FeedbackForm {
         let field_fill = [0.10, 0.10, 0.12, 1.0];
         let border = theme::SEARCH_BORDER();
         for f in [r.title, r.details] {
-            bg.push(f.rounded_quad(field_fill, 4.0));
+            bg.push(f.rounded_quad(field_fill, theme::zpx(6.0)));
             bg.push(Quad::new(f.x, f.y, f.w, 1.0, border));
             bg.push(Quad::new(f.x, f.y + f.h - 1.0, f.w, 1.0, border));
             bg.push(Quad::new(f.x, f.y, 1.0, f.h, border));
@@ -167,7 +167,7 @@ impl FeedbackForm {
         let sz = 16.0 * theme::ui_zoom();
         for (row, checked) in [(r.sysinfo, self.include_sysinfo), (r.screenshot, self.include_screenshot)] {
             let cb = Rect { x: row.x, y: row.y + theme::zpx(2.0), w: sz, h: sz };
-            bg.push(cb.rounded_quad(if checked { theme::BADGE_BG() } else { [0.10, 0.10, 0.12, 1.0] }, 3.0));
+            bg.push(cb.rounded_quad(if checked { theme::BADGE_BG() } else { [0.10, 0.10, 0.12, 1.0] }, theme::zpx(3.0)));
             if !checked {
                 let bd = theme::FG_DIM();
                 let bdc = [bd.r() as f32 / 255.0, bd.g() as f32 / 255.0, bd.b() as f32 / 255.0, 1.0];
@@ -178,8 +178,8 @@ impl FeedbackForm {
             }
         }
         // Buttons.
-        bg.push(r.submit.rounded_quad(theme::DIALOG_BTN_HOVER(), 4.0));
-        bg.push(r.cancel.rounded_quad(theme::DIALOG_BTN(), 4.0));
+        bg.push(r.submit.rounded_quad(theme::DIALOG_BTN_HOVER(), theme::zpx(6.0)));
+        bg.push(r.cancel.rounded_quad(theme::DIALOG_BTN(), theme::zpx(6.0)));
         // Selection highlight (under text) + caret (over text) of the focused field.
         let pad = 8.0 * theme::ui_zoom();
         let (fld, frect) = if self.focus == Field::Title { (&self.title, r.title) } else { (&self.details, r.details) };
