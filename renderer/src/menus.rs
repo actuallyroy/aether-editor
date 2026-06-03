@@ -12,6 +12,7 @@ pub enum MenuCmd {
     Feedback,    // open the feedback / report-issue tab
     CheckUpdate, // check GitHub for a newer release
     About,       // show version info
+    NewWindow,   // open a new app window on the current workspace
     Exit,        // quit the app
 }
 
@@ -25,10 +26,11 @@ const fn e(label: &'static str, cmd: MenuCmd) -> Entry {
 }
 
 use Command::*;
-use MenuCmd::{About, CheckUpdate, Cmd, Exit, Feedback, Palette};
+use MenuCmd::{About, CheckUpdate, Cmd, Exit, Feedback, NewWindow, Palette};
 
 const FILE: &[Entry] = &[
     e("New File", Cmd(NewFile)),
+    e("New Window", NewWindow),
     e("Open Folder…", Cmd(OpenFolder)),
     e("Save", Cmd(Save)),
     e("Close Editor", Cmd(Close)),

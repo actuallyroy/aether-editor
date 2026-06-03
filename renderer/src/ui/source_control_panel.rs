@@ -906,6 +906,14 @@ impl SourceControlPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // These tests read/mutate the global UI zoom; serialize them so the 2x-zoom test
+    // can't change zoom out from under another running in parallel.
+    static ZOOM_LOCK: Mutex<()> = Mutex::new(());
+    fn zoom_guard() -> std::sync::MutexGuard<'static, ()> {
+        ZOOM_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn panel() -> (SourceControlPanel, FontSystem) {
         let mut fs = FontSystem::new();
@@ -917,6 +925,7 @@ mod tests {
     // THAT file — not fall through to the row-body OpenDiff.
     #[test]
     fn unstaged_stage_icon_emits_git_stage() {
+        let _z = zoom_guard();
         let (mut p, mut fs) = panel();
         p.unstaged_rows = vec![make_row("src/main.rs", 'M')];
         let region = Rect { x: 0.0, y: 0.0, w: 300.0, h: 1000.0 };
@@ -944,6 +953,7 @@ mod tests {
     // Clicking the per-row Unstage (−) icon on a staged file must emit GitUnstage.
     #[test]
     fn staged_unstage_icon_emits_git_unstage() {
+        let _z = zoom_guard();
         let (mut p, mut fs) = panel();
         p.staged_rows = vec![make_row("src/main.rs", 'M')];
         let region = Rect { x: 0.0, y: 0.0, w: 300.0, h: 1000.0 };
@@ -972,6 +982,7 @@ mod tests {
     // row sits above the file — the file's vis index is offset by the folder rows.
     #[test]
     fn tree_mode_stage_icon_emits_git_stage() {
+        let _z = zoom_guard();
         let (mut p, mut fs) = panel();
         p.tree_mode = true;
         p.unstaged_rows = vec![make_row("src/ui/main.rs", 'M')];
@@ -1009,6 +1020,7 @@ mod tests {
     // it doesn't leak into the other tests.
     #[test]
     fn stage_icon_hits_at_zoom_2x() {
+        let _z = zoom_guard();
         theme::set_ui_zoom(2.0);
         let mut fs = FontSystem::new();
         let mut p = SourceControlPanel::new(&mut fs, PathBuf::from("/tmp/repo"));

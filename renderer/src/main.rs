@@ -8,6 +8,7 @@
 // status bar, command palette (Ctrl+Shift+P), find bar (Ctrl+F).
 
 mod commands;
+mod completion;
 mod diff;
 mod document;
 mod ext_detail;
@@ -176,6 +177,9 @@ pub(crate) enum DialogAction {
     GitDiscard { path: String, untracked: bool },
     GitDiscardAll,
     InstallUpdate,
+    /// Closing the window while terminals have running processes: kill them, keep
+    /// them running in the background (daemon), or cancel the close.
+    CloseWindowBusy,
     Dismiss, // info-only dialog; any button just closes it
 }
 
@@ -248,6 +252,11 @@ pub(crate) struct App {
     pub(crate) sel_matches: Vec<(usize, usize)>,
     pub(crate) sel_hl_text: String,
     pub(crate) sel_hl_version: i32,
+    // Code-completion popup. Word-based fills it instantly; an async LSP request
+    // (rust-analyzer/tsserver/…) upgrades it. `completion_req` is the in-flight LSP
+    // request (id, prefix_start) so a stale response can't apply to a moved cursor.
+    pub(crate) completion: completion::Completion,
+    pub(crate) completion_req: Option<(i64, usize)>,
     // Native macOS menu bar — kept alive here; map resolves a click to a MenuCmd.
     #[cfg(target_os = "macos")]
     pub(crate) macos_menu: Option<(muda::Menu, std::collections::HashMap<String, menus::MenuCmd>)>,
@@ -337,6 +346,8 @@ impl App {
             extensions: Vec::new(),
             text_drag: None,
             find_drag: None,
+            completion: completion::Completion::default(),
+            completion_req: None,
             sel_matches: Vec::new(),
             sel_hl_text: String::new(),
             sel_hl_version: -1,
@@ -1151,7 +1162,28 @@ impl App {
                     std::env::consts::ARCH
                 ));
             }
-            menus::MenuCmd::Exit => self.pending_close = true,
+            menus::MenuCmd::NewWindow => self.open_new_window(),
+            menus::MenuCmd::Exit => {
+                if self.confirm_close_window() {
+                    self.pending_close = true;
+                }
+            }
+        }
+    }
+
+    /// Launch another app window: a fresh, folder-less `aether` instance (like
+    /// VSCode's File → New Window). The user opens a folder from there; if they pick
+    /// one that's already open in a live window, that window is focused instead.
+    fn open_new_window(&mut self) {
+        if let Ok(exe) = std::env::current_exe() {
+            let mut cmd = std::process::Command::new(exe);
+            cmd.arg("--new-window");
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                cmd.process_group(0); // detach so it doesn't die with this process
+            }
+            let _ = cmd.spawn();
         }
     }
 
@@ -1719,6 +1751,34 @@ impl App {
         self.redraw();
     }
 
+    /// Gate window close on busy terminals: true ⇒ nothing running, close freely.
+    /// Otherwise shows the Close Processes / Keep Running / Cancel dialog and the
+    /// close is deferred to the user's choice.
+    fn confirm_close_window(&mut self) -> bool {
+        let busy = self.terminal.busy_terminal_count();
+        if busy == 0 {
+            return true;
+        }
+        let msg = if busy == 1 {
+            "A terminal has a running process. Close it, or keep it running in the background?".to_string()
+        } else {
+            format!("{busy} terminals have running processes. Close them, or keep them running in the background?")
+        };
+        if let Some(g) = self.gpu.as_mut() {
+            g.ui
+                .dialog
+                .set(&mut g.font_system, &msg, &["Close Processes", "Keep Running", "Cancel"], None);
+        }
+        self.dialog = Some(DialogState {
+            action: DialogAction::CloseWindowBusy,
+            has_check: false,
+            checked: false,
+            hovered: None,
+        });
+        self.redraw();
+        false
+    }
+
     fn dialog_click(&mut self, i: usize) {
         let Some(ds) = self.dialog.take() else {
             return;
@@ -1765,6 +1825,19 @@ impl App {
                 if i == 0 {
                     update::install_async(self.worker_tx.clone());
                     self.show_info_dialog("Downloading update… the app will restart when it's ready.");
+                }
+            }
+            DialogAction::CloseWindowBusy => {
+                // 0 = Close Processes, 1 = Keep Running, 2 = Cancel
+                match i {
+                    0 => {
+                        self.terminal.close_all_terminals(); // kill the shells
+                        self.pending_close = true;
+                    }
+                    // Just disconnect: the daemon orphans them, still running, and
+                    // reopening this folder reclaims them.
+                    1 => self.pending_close = true,
+                    _ => {}
                 }
             }
             DialogAction::Dismiss => {}
@@ -2134,6 +2207,11 @@ impl App {
     /// root), update the explorer header, and clear stale search state. Open editors
     /// are kept, like VSCode.
     fn open_folder(&mut self, folder: PathBuf) {
+        // Single-window-per-folder (like VSCode): if another live window already has
+        // this folder open, it raises itself instead of us opening a duplicate.
+        if self.terminal.focus_other_window(&folder.to_string_lossy()) {
+            return;
+        }
         self.cwd = folder.clone();
         self.terminal.set_cwd(folder.clone()); // new shells start in the new root
         if let Some(scp) = self.source_control.as_mut() {
@@ -2153,11 +2231,14 @@ impl App {
     /// Persist machine-managed session state (zoom + last workspace) to
     /// `~/.aether/state.json` so the next launch restores it.
     fn persist_state(&self) {
-        state::State {
-            zoom: Some(theme::ui_zoom()),
-            last_workspace: Some(self.cwd.clone()),
-        }
-        .save();
+        // A folder-less window (File → New Window) must not clobber the remembered
+        // workspace — keep whatever the last real folder was.
+        let last_workspace = if self.cwd.as_os_str().is_empty() {
+            state::State::load().last_workspace
+        } else {
+            Some(self.cwd.clone())
+        };
+        state::State { zoom: Some(theme::ui_zoom()), last_workspace }.save();
     }
 
     // Integrated-terminal actions live on `ui::terminal_panel::TerminalPanel`; these
@@ -2863,7 +2944,11 @@ impl App {
                     }
                 }
                 Some(2) => {
-                    self.pending_close = true;
+                    // Custom close button (non-macOS chrome): same busy-terminal gate
+                    // as the native close.
+                    if self.confirm_close_window() {
+                        self.pending_close = true;
+                    }
                 }
                 _ => {
                     if let Some(g) = self.gpu.as_ref() {
@@ -3836,6 +3921,41 @@ impl App {
             return;
         };
 
+        // Code-completion popup intercepts navigation/accept/dismiss before the editor
+        // sees the key (so ↑/↓/Enter/Tab/Esc drive the popup, not the document).
+        if self.completion.active {
+            match event.logical_key.as_ref() {
+                Key::Named(NamedKey::Escape) => {
+                    self.completion.close();
+                    self.redraw();
+                    return;
+                }
+                Key::Named(NamedKey::ArrowDown) => {
+                    self.completion.move_sel(1);
+                    self.redraw();
+                    return;
+                }
+                Key::Named(NamedKey::ArrowUp) => {
+                    self.completion.move_sel(-1);
+                    self.redraw();
+                    return;
+                }
+                Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Tab) => {
+                    if let Some(item) = self.completion.selected_item() {
+                        let insert = item.insert.clone();
+                        let start = self.completion.prefix_start;
+                        d.replace_prefix(start, &insert, &mut gpu.font_system);
+                        self.completion.close();
+                        self.last_edit = Instant::now();
+                        self.ensure_cursor_visible();
+                        self.redraw();
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+
         match event.logical_key.as_ref() {
             Key::Named(NamedKey::ArrowLeft) => {
                 if ctrl {
@@ -3907,9 +4027,56 @@ impl App {
             }
         }
         let _ = (d, gpu);
+        // Update the completion popup: typing/deleting recomputes suggestions; any
+        // other navigation key dismisses it (VSCode behavior).
+        match event.logical_key.as_ref() {
+            Key::Character(_) | Key::Named(NamedKey::Backspace) | Key::Named(NamedKey::Delete) => {
+                self.recompute_completion();
+            }
+            Key::Named(_) => self.completion.close(),
+            _ => {}
+        }
         self.last_edit = Instant::now(); // for files.autoSave idle timer
         self.ensure_cursor_visible();
         self.redraw();
+    }
+
+    /// Recompute the completion popup: fill it instantly from words in the document,
+    /// and fire an async LSP request (if a server serves this language) whose richer
+    /// results replace the word-based ones when they arrive.
+    fn recompute_completion(&mut self) {
+        let Some(d) = self.workspace.active_doc() else {
+            self.completion.close();
+            self.completion_req = None;
+            return;
+        };
+        let text = d.text();
+        let caret = d.caret_byte();
+        let (line, col) = d.head_line_col();
+        let lang = d.language_id();
+        let uri = d.uri();
+        let version = d.version;
+        // Fill instantly from words in the document.
+        self.completion.update_words(&text, caret);
+        // Fire a language-server request alongside (scoped to the doc's language) when
+        // there's an identifier prefix; its richer results replace the word-based ones.
+        self.completion_req = None;
+        let Some(prefix_start) = completion::word_prefix(&text, caret) else { return };
+        let (Some(lang), Some(uri)) = (lang, uri) else { return };
+        // Only worth a request once a completion server is running with this doc open.
+        let Some(server) = self.lsp.completion_server(lang) else { return };
+        if !d.lsp_servers.contains(&server) {
+            return; // not opened to the server yet; the sync tick will, next keystroke works
+        }
+        // Flush the just-typed text so the server completes against current contents
+        // (the debounced didChange would otherwise lag a keystroke behind).
+        self.lsp.did_change(server, &uri, version, &text);
+        if let Some(d) = self.workspace.active_doc_mut() {
+            d.lsp_dirty = false; // synced now — don't let the debounced sync resend this version
+        }
+        if let Some(id) = self.lsp.request_completion(lang, &uri, line as u32, col as u32) {
+            self.completion_req = Some((id, prefix_start));
+        }
     }
 }
 
@@ -4214,6 +4381,18 @@ impl ApplicationHandler for App {
                     self.lsp.apply_diagnostic_report(&mut self.workspace.documents, id, diags);
                     self.redraw();
                 }
+                WorkerMsg::LspCompletion { id, items } => {
+                    // Apply only the newest request's results, and only if the popup is
+                    // still open at the prefix we requested for (the user may have moved).
+                    if self.lsp.is_current_completion(id) && !items.is_empty() {
+                        if let Some((req_id, prefix_start)) = self.completion_req {
+                            if req_id == id {
+                                self.completion.set_items(completion::from_lsp(items), prefix_start);
+                                self.redraw();
+                            }
+                        }
+                    }
+                }
                 WorkerMsg::LspExited { server } => self.lsp.drop_server(server),
                 WorkerMsg::LspLog { server, message } => eprintln!("[lsp:{server}] {message}"),
                 WorkerMsg::FeedbackDone { result } => match result {
@@ -4271,11 +4450,26 @@ impl ApplicationHandler for App {
             }
         }
 
-        // Integrated terminal: drain every pane's shell output, and keep ticking
-        // while open so new output appears promptly.
+        // Drain the pty-host link even with the panel hidden: the daemon may ask this
+        // window to raise itself (another instance opened our workspace).
+        let polled = self.terminal.poll();
+        if self.terminal.focus_requested {
+            self.terminal.focus_requested = false;
+            if let Some(g) = self.gpu.as_ref() {
+                g.window.focus_window();
+            }
+        }
+        // A workspace switch swapped the panel's contents out — rebuild it now with
+        // the new folder's restored shells (or a fresh one) so it changes in place.
+        if self.terminal.needs_initial() {
+            let panel = self.layout().terminal_panel;
+            self.terminal.spawn_initial(panel, self.terminal_cell_w);
+            self.redraw();
+        }
+
+        // Integrated terminal: keep ticking while open so new output appears promptly.
         if self.terminal.visible {
-            // Drain the daemon connection once; the panel routes output to its panes.
-            let mut changed = self.terminal.poll();
+            let mut changed = polled;
             // Blink the terminal block cursor on the standard cadence (PowerShell-style).
             if now.duration_since(self.term_last_blink) >= Duration::from_millis(theme::BLINK_MS) {
                 self.term_blink_on = !self.term_blink_on;
@@ -4328,7 +4522,13 @@ impl ApplicationHandler for App {
                 && self.workspace.documents.iter().any(|d| d.dirty && d.path.is_some());
             let autosave_wake =
                 autosave_pending.then(|| self.last_edit + Duration::from_millis(1100));
-            let wake = min_instant(min_instant(min_instant(scroll_wake, autosave_wake), hover_wake), search_wake);
+            // While connected to the pty-host, keep a slow heartbeat so cross-window
+            // focus requests are drained even when this window is otherwise idle.
+            let daemon_wake = self.terminal.connected().then(|| now + Duration::from_millis(500));
+            let wake = min_instant(
+                min_instant(min_instant(min_instant(scroll_wake, autosave_wake), hover_wake), search_wake),
+                daemon_wake,
+            );
             el.set_control_flow(match wake {
                 Some(w) => ControlFlow::WaitUntil(w),
                 None => ControlFlow::Wait,
@@ -4400,6 +4600,12 @@ impl ApplicationHandler for App {
                 self.refresh_source_control();
                 // Check GitHub for a newer release in the background.
                 update::check_async(self.worker_tx.clone(), false);
+                // Register this window with the pty-host (single-window-per-folder):
+                // if another live window already has this workspace open, it raises
+                // itself and this duplicate instance closes.
+                if self.terminal.register_window() {
+                    el.exit();
+                }
             }
             Err(e) => {
                 eprintln!("init failed: {e:?}");
@@ -4410,7 +4616,13 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => el.exit(),
+            // Warn first when terminals have running processes; the dialog's choice
+            // then closes via `pending_close`.
+            WindowEvent::CloseRequested => {
+                if self.confirm_close_window() {
+                    el.exit();
+                }
+            }
             WindowEvent::ModifiersChanged(m) => {
                 self.mods = m.state();
             }
@@ -4498,8 +4710,12 @@ fn main() -> Result<()> {
     settings::migrate_legacy_config_dir();
     // Optional path arg: a directory becomes the workspace root; a file is opened
     // (and its parent becomes the root). Falls back to the current directory.
-    let arg = std::env::args().nth(1).map(PathBuf::from);
+    // `--new-window` opens a folder-less window (File → New Window, like VSCode) —
+    // no last-workspace restore; the user picks a folder via Open Folder.
+    let new_window = std::env::args().any(|a| a == "--new-window");
+    let arg = std::env::args().nth(1).filter(|a| a != "--new-window").map(PathBuf::from);
     let (root, initial_file) = match arg {
+        _ if new_window => (PathBuf::new(), None),
         Some(p) if p.is_dir() => (p, None),
         Some(p) if p.is_file() => {
             let parent = p

@@ -987,6 +987,26 @@ impl Document {
         (line, self.sel.head - line_start)
     }
 
+    /// Caret byte offset (selection head). Used by code completion to find the
+    /// identifier prefix ending at the cursor.
+    pub fn caret_byte(&self) -> usize {
+        self.sel.head
+    }
+
+    /// Replace the bytes from `start` to the caret with `text` — used to accept a
+    /// completion that replaces the typed prefix. No-op if `start` is past the caret.
+    pub fn replace_prefix(&mut self, start: usize, text: &str, fs: &mut FontSystem) {
+        if self.read_only {
+            return;
+        }
+        let head = self.sel.head;
+        if start > head {
+            return;
+        }
+        self.sel = Selection { anchor: start, head, desired_col: None };
+        self.insert_str(text, fs);
+    }
+
     pub fn place(&mut self, byte: usize, extend: bool) {
         self.sel.head = byte;
         if !extend {

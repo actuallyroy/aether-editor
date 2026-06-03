@@ -40,6 +40,12 @@ pub struct TerminalPanel {
     /// daemon replies in request order on one connection).
     pending: VecDeque<u64>,
     next_tag: u64,
+    /// Set when the daemon asks this window to raise itself (another instance tried
+    /// to open our workspace). `App` consumes it after `poll`.
+    pub focus_requested: bool,
+    /// Orphaned terminals offered at connect time (this workspace's shells from a
+    /// closed window), re-attached when the terminal panel first opens.
+    reattach: Vec<crate::ptyhost::TermInfo>,
 }
 
 impl TerminalPanel {
@@ -60,21 +66,42 @@ impl TerminalPanel {
             client: None,
             pending: VecDeque::new(),
             next_tag: 1,
+            focus_requested: false,
+            reattach: Vec::new(),
         }
     }
 
-    /// Ensure we're connected to the daemon. Returns the daemon's existing terminals
-    /// the first time it connects (to re-attach), else an empty list.
-    fn ensure_connected(&mut self) -> Vec<crate::ptyhost::TermInfo> {
-        if self.client.is_some() {
-            return Vec::new();
+    /// Connect to the pty-host at startup (registering this window's workspace for
+    /// single-window-per-folder focus), and ask whether that workspace is already
+    /// open in another live window. Returns true if so (caller should defer to it).
+    pub fn register_window(&mut self) -> bool {
+        self.ensure_connected();
+        let ws = self.cwd.to_string_lossy().to_string();
+        if ws.is_empty() {
+            return false; // folder-less window: registered, but never a duplicate
         }
-        match Client::connect_or_spawn() {
-            Some((client, terminals)) => {
-                self.client = Some(client);
-                terminals
-            }
-            None => Vec::new(),
+        self.client.as_mut().map_or(false, |c| c.focus_existing(&ws))
+    }
+
+    /// Single-window-per-folder check before switching to `folder`: true when
+    /// another live window already has it open (and was asked to raise itself).
+    pub fn focus_other_window(&mut self, folder: &str) -> bool {
+        self.ensure_connected();
+        if folder.is_empty() {
+            return false;
+        }
+        self.client.as_mut().map_or(false, |c| c.focus_existing(folder))
+    }
+
+    /// Ensure we're connected to the daemon; on first connect, stash the orphaned
+    /// terminals offered for this workspace (consumed by `spawn_initial`).
+    fn ensure_connected(&mut self) {
+        if self.client.is_some() {
+            return;
+        }
+        if let Some((client, terminals)) = Client::connect_or_spawn(&self.cwd.to_string_lossy()) {
+            self.client = Some(client);
+            self.reattach = terminals;
         }
     }
 
@@ -89,7 +116,7 @@ impl TerminalPanel {
     /// Drain daemon frames: bind newly-created shells, feed output into grids, and
     /// drop panes whose shell exited. Returns true if anything changed (needs redraw).
     pub fn poll(&mut self) -> bool {
-        let Some(client) = self.client.as_ref() else {
+        let Some(client) = self.client.as_mut() else {
             return false;
         };
         let incoming = client.poll();
@@ -100,9 +127,17 @@ impl TerminalPanel {
         for inc in incoming {
             match inc {
                 Incoming::Created { id, title } => {
-                    if let Some(tag) = self.pending.pop_front() {
-                        if let Some(p) = self.term_by_tag(tag) {
-                            p.term.bind(id, title);
+                    let bound = self
+                        .pending
+                        .pop_front()
+                        .and_then(|tag| self.term_by_tag(tag))
+                        .map(|p| p.term.bind(id, title))
+                        .is_some();
+                    if !bound {
+                        // Its pane is gone (e.g. folder switched mid-create) — release
+                        // the shell instead of leaking an owned, invisible terminal.
+                        if let Some(c) = self.client.as_ref() {
+                            c.detach(id);
                         }
                     }
                 }
@@ -113,6 +148,26 @@ impl TerminalPanel {
                     }
                 }
                 Incoming::Exited { id } => exited.push(id),
+                Incoming::Focus => self.focus_requested = true,
+                // Workspace switched (Open Folder): release the old folder's shells
+                // back to the daemon (kept running for when that folder reopens) and
+                // swap in the new folder's offer. `App` respawns the panel right after
+                // this poll if it's visible, so the terminal switches with the folder.
+                Incoming::Offered(terminals) => {
+                    if let Some(c) = self.client.as_ref() {
+                        for g in &self.groups {
+                            for p in &g.panes {
+                                if p.term.id != 0 {
+                                    c.detach(p.term.id);
+                                }
+                            }
+                        }
+                    }
+                    self.groups.clear();
+                    self.pending.clear();
+                    self.reattach = terminals;
+                    self.active = 0;
+                }
             }
         }
         for id in exited {
@@ -144,9 +199,13 @@ impl TerminalPanel {
         self.mark_dirty();
     }
 
-    /// Update the directory new shells will start in (called on Open Folder).
+    /// Update the directory new shells will start in (called on Open Folder), and
+    /// re-register this window's workspace with the pty-host.
     pub fn set_cwd(&mut self, cwd: PathBuf) {
         self.cwd = cwd;
+        if let Some(c) = self.client.as_ref() {
+            c.set_workspace(&self.cwd.to_string_lossy());
+        }
     }
 
     /// Requested panel height: huge when maximized (the layout clamps it to leave a
@@ -156,6 +215,43 @@ impl TerminalPanel {
             return None;
         }
         Some(if self.maximized { 100_000.0 } else { self.split.size() })
+    }
+
+    /// Whether this window holds a live pty-host connection (it then needs periodic
+    /// polling even when idle, e.g. for cross-window focus requests).
+    pub fn connected(&self) -> bool {
+        self.client.is_some()
+    }
+
+    /// True when the panel is visible but has no tabs — only happens right after a
+    /// workspace switch swapped its contents out. `App` then respawns it (restoring
+    /// the new folder's shells, or a fresh one).
+    pub fn needs_initial(&self) -> bool {
+        self.visible && self.groups.is_empty()
+    }
+
+    /// How many of this window's shells have a foreground process running (asks the
+    /// daemon — it owns the processes). 0 with no client or no terminals.
+    pub fn busy_terminal_count(&mut self) -> usize {
+        if self.groups.is_empty() {
+            return 0;
+        }
+        self.client.as_mut().map_or(0, |c| c.busy_count())
+    }
+
+    /// Kill every shell in this window (the "Close Processes" choice on quit).
+    pub fn close_all_terminals(&mut self) {
+        if let Some(c) = self.client.as_ref() {
+            for g in &self.groups {
+                for p in &g.panes {
+                    if p.term.id != 0 {
+                        c.close(p.term.id);
+                    }
+                }
+            }
+        }
+        self.groups.clear();
+        self.pending.clear();
     }
 
     /// Number of split panes in the active tab (0 when there's no terminal).
@@ -297,7 +393,8 @@ impl TerminalPanel {
     /// On first open: re-attach to any shells the daemon kept alive from a previous
     /// session (one tab each), else spawn a fresh first tab.
     pub fn spawn_initial(&mut self, panel: Option<Rect>, cell_w: f32) {
-        let existing = self.ensure_connected();
+        self.ensure_connected();
+        let existing = std::mem::take(&mut self.reattach);
         if !existing.is_empty() {
             let Some(panel) = panel else { return };
             if let Some(client) = self.client.as_ref() {

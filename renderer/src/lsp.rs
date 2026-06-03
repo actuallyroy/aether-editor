@@ -136,6 +136,8 @@ pub struct ServerSpec {
     /// server's (empty) push clobbering ESLint's pulled diagnostics on JS/TS.
     pub push_diagnostics: bool,
     pub pull_semantic: bool,
+    /// Serve `textDocument/completion` from this server (rust-analyzer, tsserver, …).
+    pub completion: bool,
 }
 
 /// Whether a server's pushed diagnostics should be applied (looked up by name).
@@ -169,6 +171,7 @@ pub const ESLINT: ServerSpec = ServerSpec {
     pull_diagnostics: true,
     push_diagnostics: false,
     pull_semantic: false,
+    completion: false, // ESLint is a linter — no completion
 };
 
 pub const TYPESCRIPT: ServerSpec = ServerSpec {
@@ -180,6 +183,7 @@ pub const TYPESCRIPT: ServerSpec = ServerSpec {
     pull_diagnostics: false, // ESLint owns JS/TS diagnostics for now (avoid clobber)
     push_diagnostics: false, // ignore TS push diagnostics so they don't clobber ESLint
     pull_semantic: true,
+    completion: true,
 };
 
 pub const RUST_ANALYZER: ServerSpec = ServerSpec {
@@ -191,6 +195,7 @@ pub const RUST_ANALYZER: ServerSpec = ServerSpec {
     pull_diagnostics: false, // rust-analyzer pushes publishDiagnostics
     push_diagnostics: true,
     pull_semantic: true,
+    completion: true,
 };
 
 fn empty_init(_root: &Path) -> Value {
@@ -554,6 +559,27 @@ impl LspClient {
         id
     }
 
+    /// Request completions at a position. Returns the request id (map the response).
+    pub fn request_completion(&mut self, uri: &str, line: u32, character: u32) -> i64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "textDocument/completion",
+            "params": {
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character }
+            }
+        });
+        if self.initialized {
+            self.send_raw(msg);
+        } else {
+            self.pending.push(msg);
+        }
+        id
+    }
+
     pub fn shutdown(&mut self) {
         let id = self.next_id;
         self.next_id += 1;
@@ -572,6 +598,7 @@ pub struct LspManager {
     diag_pending: std::collections::HashMap<i64, String>, // diagnostic request id → uri
     sem_pending: std::collections::HashMap<i64, String>,  // semantic-tokens request id → uri
     sem_legend: Vec<String>,                              // semantic token-type names
+    comp_pending: Option<i64>,                            // latest completion request id
 }
 
 impl LspManager {
@@ -611,6 +638,26 @@ impl LspManager {
     /// Request semantic tokens from a server; returns the request id.
     pub fn pull_semantic_tokens(&mut self, server: &str, uri: &str) -> Option<i64> {
         self.client_mut(server).map(|c| c.pull_semantic_tokens(uri))
+    }
+
+    /// Request completions from whatever running server serves `lang` with completion
+    /// (generic — rust-analyzer, tsserver, …). Records the id so stale responses drop.
+    pub fn request_completion(&mut self, lang: &str, uri: &str, line: u32, character: u32) -> Option<i64> {
+        let server = registry().iter().find(|s| s.completion && s.languages.contains(&lang))?.name;
+        let id = self.client_mut(server)?.request_completion(uri, line, character);
+        self.comp_pending = Some(id);
+        Some(id)
+    }
+
+    /// True if `id` is the newest completion request (drop superseded responses).
+    pub fn is_current_completion(&self, id: i64) -> bool {
+        self.comp_pending == Some(id)
+    }
+
+    /// The running server name that serves `lang` with completion, if any.
+    pub fn completion_server(&self, lang: &str) -> Option<&'static str> {
+        let name = registry().iter().find(|s| s.completion && s.languages.contains(&lang))?.name;
+        self.clients.iter().find(|c| c.server == name).map(|c| c.server)
     }
 
     /// Finish the handshake on whichever client just got its initialize response.
@@ -826,6 +873,45 @@ impl LspManager {
     }
 }
 
+/// A parsed `textDocument/completion` item — the subset we render + insert. Generic
+/// across servers (rust-analyzer, tsserver, …); `kind` is the LSP CompletionItemKind.
+#[derive(Clone)]
+pub struct CompletionItem {
+    pub label: String,
+    pub insert: String, // insertText / textEdit.newText, else label
+    pub detail: String, // type/signature hint
+    pub kind: u8,       // LSP CompletionItemKind (1..=25); 0 = unknown
+}
+
+/// Parse a completion response (`CompletionList{items}` or a bare `CompletionItem[]`).
+fn parse_completion(result: &Value) -> Vec<CompletionItem> {
+    let items = if let Some(arr) = result.as_array() {
+        arr.clone()
+    } else if let Some(arr) = result.get("items").and_then(|i| i.as_array()) {
+        arr.clone()
+    } else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|it| {
+            let label = it.get("label")?.as_str()?.trim().to_string();
+            // Snippet items (insertTextFormat==2) carry `$1`/`${..}` placeholders — fall
+            // back to the label so we never insert raw snippet syntax.
+            let snippet = it.get("insertTextFormat").and_then(|v| v.as_u64()) == Some(2);
+            let raw = it
+                .get("insertText")
+                .and_then(|v| v.as_str())
+                .or_else(|| it.get("textEdit").and_then(|t| t.get("newText")).and_then(|v| v.as_str()))
+                .unwrap_or(&label);
+            let insert = if snippet || raw.contains('$') { label.clone() } else { raw.to_string() };
+            let detail = it.get("detail").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let kind = it.get("kind").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+            Some(CompletionItem { label, insert, detail, kind })
+        })
+        .collect()
+}
+
 /// Frame a JSON value as a Content-Length delimited LSP message.
 fn frame(msg: &Value) -> Vec<u8> {
     let body = serde_json::to_vec(msg).unwrap_or_default();
@@ -916,7 +1002,12 @@ fn handle_server_message(server: &'static str, msg: &Value, reply_tx: &Sender<Ve
                         .map(|a| a.iter().filter_map(|n| n.as_u64().map(|x| x as u32)).collect())
                         .unwrap_or_default();
                     let _ = tx.send(WorkerMsg::LspSemanticTokens { id: id.as_i64().unwrap_or(0), data });
-                } else if r.get("items").is_some() || r.get("kind").is_some() {
+                } else if r.is_array() || r.get("isIncomplete").is_some() {
+                    // Completion: a bare CompletionItem[] or a CompletionList. Checked
+                    // before the diagnostic branch since both carry an `items` array.
+                    let items = parse_completion(r);
+                    let _ = tx.send(WorkerMsg::LspCompletion { id: id.as_i64().unwrap_or(0), items });
+                } else if r.get("kind").is_some() {
                     // Pull-diagnostics report: { kind: "full"|"unchanged", items: [...] }.
                     let diags = parse_diag_array(r.get("items"));
                     let _ = tx.send(WorkerMsg::LspDiagnosticReport { id: id.as_i64().unwrap_or(0), diags });

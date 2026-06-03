@@ -17,7 +17,12 @@ const BACKLOG_CAP: usize = 1 << 20; // keep ~1 MiB of recent VT bytes per termin
 
 struct Term {
     title: String,
-    cwd: String,
+    workspace: String,
+    /// The connection that currently holds this terminal; `None` = orphaned (its
+    /// window closed). Output is routed to the owner; an orphan can be re-claimed by a
+    /// new connection in the same workspace. This is what isolates windows from each
+    /// other while still letting a restart reclaim its own shells.
+    owner: Option<u64>,
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     child: Box<dyn Child + Send + Sync>,
@@ -26,17 +31,15 @@ struct Term {
 
 enum Event {
     NewClient(TcpStream),
-    // `gen` tags the connection: a relaunched GUI replaces the client, and the old
-    // dead socket's reader fires a late `ClientGone` — without the tag it would clear
-    // the *new* connection, so Welcome never goes out and the GUI spawns a duplicate
-    // daemon. Stale-gen events are ignored.
-    Client(u64, Frame),
+    Client(u64, Frame), // (connection id, frame)
     ClientGone(u64),
     TermOut { id: TermId, data: Vec<u8> },
     TermExit { id: TermId },
 }
 
-/// Run the daemon event loop. Blocks until the last terminal exits with no client.
+/// Run the daemon event loop. One daemon per machine serves every window; clients
+/// are isolated by terminal ownership + workspace. Exits when no terminals and no
+/// connections remain.
 pub fn run() -> io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
@@ -61,119 +64,184 @@ pub fn run() -> io::Result<()> {
 
     let mut terms: HashMap<TermId, Term> = HashMap::new();
     let mut next_id: TermId = 1;
-    let mut client: Option<TcpStream> = None; // write half of the current connection
-    let mut attached: HashSet<TermId> = HashSet::new();
-    let mut authed = false;
-    let mut ever_had_term = false;
-    let mut gen: u64 = 0; // current connection generation
+    let mut next_conn: u64 = 1;
+    let mut conns: HashMap<u64, TcpStream> = HashMap::new(); // conn id → write half
+    let mut authed: HashSet<u64> = HashSet::new();
+    let mut workspaces: HashMap<u64, String> = HashMap::new(); // conn id → workspace root
+    let mut ever_connected = false;
 
     for ev in rx {
         match ev {
             Event::NewClient(stream) => {
-                // One client at a time: a relaunched GUI replaces the old connection.
-                gen += 1;
-                let g = gen;
-                client = stream.try_clone().ok();
-                authed = false;
-                attached.clear();
+                let cid = next_conn;
+                next_conn += 1;
+                ever_connected = true;
+                if let Ok(w) = stream.try_clone() {
+                    conns.insert(cid, w);
+                }
                 if let Ok(mut rd) = stream.try_clone() {
                     let tx = tx.clone();
                     std::thread::spawn(move || loop {
                         match Frame::read_from(&mut rd) {
                             Ok(f) => {
-                                if tx.send(Event::Client(g, f)).is_err() {
+                                if tx.send(Event::Client(cid, f)).is_err() {
                                     break;
                                 }
                             }
                             Err(_) => {
-                                let _ = tx.send(Event::ClientGone(g));
+                                let _ = tx.send(Event::ClientGone(cid));
                                 break;
                             }
                         }
                     });
                 }
             }
-            Event::ClientGone(g) => {
-                if g != gen {
-                    continue; // a previous connection's late disconnect — ignore
+            Event::ClientGone(cid) => {
+                conns.remove(&cid);
+                authed.remove(&cid);
+                workspaces.remove(&cid);
+                // Orphan this window's terminals (keep them running for re-claim).
+                for t in terms.values_mut() {
+                    if t.owner == Some(cid) {
+                        t.owner = None;
+                    }
                 }
-                client = None;
-                attached.clear();
-                if ever_had_term && terms.is_empty() {
-                    break; // nothing left to keep alive
+                if ever_connected && terms.is_empty() && conns.is_empty() {
+                    break; // nothing left to serve
                 }
             }
             Event::TermOut { id, data } => {
-                if let Some(t) = terms.get_mut(&id) {
+                let owner = if let Some(t) = terms.get_mut(&id) {
                     t.backlog.extend(data.iter().copied());
                     let over = t.backlog.len().saturating_sub(BACKLOG_CAP);
                     if over > 0 {
                         t.backlog.drain(0..over);
                     }
-                }
-                if attached.contains(&id) {
-                    send(&mut client, Frame::Output { id, data });
+                    t.owner
+                } else {
+                    None
+                };
+                if let Some(cid) = owner {
+                    send(&mut conns, cid, Frame::Output { id, data });
                 }
             }
             Event::TermExit { id } => {
-                terms.remove(&id);
-                attached.remove(&id);
-                send(&mut client, Frame::Control(Msg::Exited { id }));
-                if terms.is_empty() && client.is_none() {
+                let owner = terms.remove(&id).and_then(|t| t.owner);
+                if let Some(cid) = owner {
+                    send(&mut conns, cid, Frame::Control(Msg::Exited { id }));
+                }
+                if terms.is_empty() && conns.is_empty() {
                     break;
                 }
             }
-            Event::Client(g, _) if g != gen => {} // frame from a replaced connection
-            Event::Client(_, frame) => match frame {
-                Frame::Control(Msg::Hello { token: t }) => {
-                    if t == token {
-                        authed = true;
+            Event::Client(cid, frame) => {
+                // Handshake first; everything else requires an authed connection.
+                if let Frame::Control(Msg::Hello { token: t, workspace }) = &frame {
+                    if *t == token {
+                        authed.insert(cid);
+                        workspaces.insert(cid, workspace.clone());
+                        // Offer only orphaned terminals from this workspace.
                         let terminals: Vec<TermInfo> = terms
                             .iter()
-                            .map(|(id, t)| TermInfo { id: *id, title: t.title.clone(), cwd: t.cwd.clone() })
+                            .filter(|(_, t)| t.owner.is_none() && &t.workspace == workspace)
+                            .map(|(id, t)| TermInfo { id: *id, title: t.title.clone(), cwd: t.workspace.clone() })
                             .collect();
-                        send(&mut client, Frame::Control(Msg::Welcome { terminals }));
+                        send(&mut conns, cid, Frame::Control(Msg::Welcome { terminals }));
                     } else {
-                        client = None; // reject unauthenticated peer
+                        conns.remove(&cid); // reject
                     }
+                    continue;
                 }
-                _ if !authed => {} // ignore everything until Hello succeeds
-                Frame::Control(Msg::Create { cwd, rows, cols }) => {
-                    if let Some(term) = spawn_term(&cwd, rows, cols, next_id, tx.clone()) {
-                        let id = next_id;
-                        next_id += 1;
-                        let title = term.title.clone();
-                        terms.insert(id, term);
-                        attached.insert(id);
-                        ever_had_term = true;
-                        send(&mut client, Frame::Control(Msg::Created { id, title }));
+                if !authed.contains(&cid) {
+                    continue;
+                }
+                match frame {
+                    Frame::Control(Msg::Create { cwd, rows, cols }) => {
+                        let workspace = workspaces.get(&cid).cloned().unwrap_or_else(|| cwd.clone());
+                        if let Some(term) = spawn_term(&cwd, &workspace, cid, rows, cols, next_id, tx.clone()) {
+                            let id = next_id;
+                            next_id += 1;
+                            let title = term.title.clone();
+                            terms.insert(id, term);
+                            send(&mut conns, cid, Frame::Control(Msg::Created { id, title }));
+                        }
                     }
-                }
-                Frame::Control(Msg::Attach { id }) => {
-                    attached.insert(id);
-                    let data = terms.get(&id).map(|t| t.backlog.iter().copied().collect()).unwrap_or_default();
-                    send(&mut client, Frame::Control(Msg::Backlog { id, data }));
-                }
-                Frame::Write { id, data } => {
-                    if let Some(t) = terms.get_mut(&id) {
-                        let _ = t.writer.write_all(&data);
-                        let _ = t.writer.flush();
+                    Frame::Control(Msg::Attach { id }) => {
+                        // Claim an orphaned (or already-owned) terminal; refuse one a
+                        // live window still holds.
+                        if let Some(t) = terms.get_mut(&id) {
+                            if t.owner.is_none() || t.owner == Some(cid) {
+                                t.owner = Some(cid);
+                                let data: Vec<u8> = t.backlog.iter().copied().collect();
+                                send(&mut conns, cid, Frame::Control(Msg::Backlog { id, data }));
+                            }
+                        }
                     }
-                }
-                Frame::Control(Msg::Resize { id, rows, cols }) => {
-                    if let Some(t) = terms.get_mut(&id) {
-                        let _ = t.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+                    Frame::Write { id, data } => {
+                        if let Some(t) = terms.get_mut(&id) {
+                            if t.owner == Some(cid) {
+                                let _ = t.writer.write_all(&data);
+                                let _ = t.writer.flush();
+                            }
+                        }
                     }
-                }
-                Frame::Control(Msg::Close { id }) => {
-                    if let Some(mut t) = terms.remove(&id) {
-                        let _ = t.child.kill();
+                    Frame::Control(Msg::Resize { id, rows, cols }) => {
+                        if let Some(t) = terms.get_mut(&id) {
+                            if t.owner == Some(cid) {
+                                let _ = t.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+                            }
+                        }
                     }
-                    attached.remove(&id);
+                    Frame::Control(Msg::Close { id }) => {
+                        if terms.get(&id).map(|t| t.owner == Some(cid)).unwrap_or(false) {
+                            if let Some(mut t) = terms.remove(&id) {
+                                let _ = t.child.kill();
+                            }
+                        }
+                    }
+                    Frame::Control(Msg::Detach { id }) => {
+                        if let Some(t) = terms.get_mut(&id) {
+                            if t.owner == Some(cid) {
+                                t.owner = None; // orphan: keeps running, reclaimable later
+                            }
+                        }
+                    }
+                    Frame::Control(Msg::QueryBusy) => {
+                        let count = terms.values().filter(|t| t.owner == Some(cid) && shell_busy(t)).count();
+                        send(&mut conns, cid, Frame::Control(Msg::BusyResult { count }));
+                    }
+                    Frame::Control(Msg::FocusWindow { workspace }) => {
+                        // Single-window-per-folder: find another live window that has
+                        // this workspace open and ask it to raise itself. Empty
+                        // workspaces (folder-less windows) never match each other.
+                        let target = if workspace.is_empty() {
+                            None
+                        } else {
+                            workspaces
+                                .iter()
+                                .find(|(other, w)| **other != cid && *w == &workspace)
+                                .map(|(other, _)| *other)
+                        };
+                        if let Some(other) = target {
+                            send(&mut conns, other, Frame::Control(Msg::Focus));
+                        }
+                        send(&mut conns, cid, Frame::Control(Msg::FocusResult { found: target.is_some() }));
+                    }
+                    Frame::Control(Msg::SetWorkspace { workspace }) => {
+                        // Re-offer the new folder's orphaned shells (a folder-less
+                        // window that just opened a project can now restore them).
+                        let terminals: Vec<TermInfo> = terms
+                            .iter()
+                            .filter(|(_, t)| t.owner.is_none() && !workspace.is_empty() && t.workspace == workspace)
+                            .map(|(id, t)| TermInfo { id: *id, title: t.title.clone(), cwd: t.workspace.clone() })
+                            .collect();
+                        workspaces.insert(cid, workspace);
+                        send(&mut conns, cid, Frame::Control(Msg::Welcome { terminals }));
+                    }
+                    Frame::Control(Msg::Ping) => send(&mut conns, cid, Frame::Control(Msg::Pong)),
+                    _ => {}
                 }
-                Frame::Control(Msg::Ping) => send(&mut client, Frame::Control(Msg::Pong)),
-                _ => {}
-            },
+            }
         }
     }
     // Best-effort: clear the stale discovery file so the next GUI spawns a fresh one.
@@ -183,17 +251,17 @@ pub fn run() -> io::Result<()> {
     Ok(())
 }
 
-fn send(client: &mut Option<TcpStream>, frame: Frame) {
-    if let Some(s) = client {
+fn send(conns: &mut HashMap<u64, TcpStream>, cid: u64, frame: Frame) {
+    if let Some(s) = conns.get_mut(&cid) {
         if frame.write_to(s).is_err() {
-            *client = None;
+            conns.remove(&cid);
         }
     }
 }
 
 /// Spawn the platform shell on a fresh PTY plus a reader thread that pumps its
 /// output into the event loop. Returns the owned `Term` on success.
-fn spawn_term(cwd: &str, rows: u16, cols: u16, id: TermId, tx: Sender<Event>) -> Option<Term> {
+fn spawn_term(cwd: &str, workspace: &str, owner: u64, rows: u16, cols: u16, id: TermId, tx: Sender<Event>) -> Option<Term> {
     let pty = native_pty_system();
     let pair = pty
         .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
@@ -233,12 +301,36 @@ fn spawn_term(cwd: &str, rows: u16, cols: u16, id: TermId, tx: Sender<Event>) ->
     });
     Some(Term {
         title,
-        cwd: cwd.to_string(),
+        workspace: workspace.to_string(),
+        owner: Some(owner),
         master: pair.master,
         writer,
         child,
         backlog: VecDeque::new(),
     })
+}
+
+/// True when the terminal's shell has a child process (a running command/TUI, not
+/// just an idle prompt). Unix: any child of the shell pid. Windows: not detected
+/// yet — reports idle, so closing never warns there.
+fn shell_busy(t: &Term) -> bool {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = t.child.process_id() {
+            return std::process::Command::new("pgrep")
+                .arg("-P")
+                .arg(pid.to_string())
+                .output()
+                .map(|o| !o.stdout.is_empty())
+                .unwrap_or(false);
+        }
+        false
+    }
+    #[cfg(windows)]
+    {
+        let _ = t;
+        false
+    }
 }
 
 /// The user's login shell (COMSPEC on Windows, else $SHELL → bash → sh).

@@ -790,6 +790,9 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // strip / title bar above (text is clipped via its TextArea bounds; quads
     // have no implicit clip, so we clamp them here). Skipped while the extension
     // page occupies the editor area.
+    // Screen anchor (top-left, just below the caret line) for the completion popup,
+    // captured during the editor draw where the fold offset + scroll are in scope.
+    let mut completion_anchor: Option<(f32, f32)> = None;
     if let Some(d) = app.detail.open_extension.is_none().then(|| app.workspace.active_doc()).flatten() {
         let etop = layout.editor_text.y;
         let ebot = layout.editor_text.y + layout.editor_text.h;
@@ -1008,6 +1011,14 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     theme::CURSOR(),
                 ));
             }
+        }
+
+        // Anchor the completion popup just below the caret's line.
+        if app.completion.active {
+            let (cx, cy, ch) = d.caret_visual();
+            let px = layout.editor_text.x + theme::EDITOR_PAD() + cx - d.scroll_x();
+            let py = layout.editor_text.y + theme::EDITOR_PAD() + cy - d.scroll_y() - foff(cur_line) + ch;
+            completion_anchor = Some((px, py));
         }
 
         // Editor scrollbars (auto-hide overlay; vertical + horizontal).
@@ -1814,6 +1825,81 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             }
         }
         gpu.queue.submit(Some(enc.finish()));
+    }
+
+    // ---- Code-completion popup (late pass over the editor) ----
+    if let (Some((ax, ay)), true) = (completion_anchor, app.completion.active && !app.completion.items.is_empty()) {
+        let total = app.completion.items.len();
+        let visible = total.min(crate::completion::VISIBLE_ROWS);
+        let row_h = theme::TREE_ROW_HEIGHT();
+        let pad = theme::zpx(4.0);
+        let pw = theme::zpx(340.0);
+        let ph = pad * 2.0 + row_h * visible as f32;
+        // Keep on-screen: clamp right, and flip above the line if there's no room below.
+        let x = (ax).min(cfg_w as f32 - pw - theme::zpx(8.0)).max(theme::zpx(8.0));
+        let y = if ay + ph > cfg_h as f32 - theme::zpx(8.0) {
+            (ay - row_h - ph).max(theme::zpx(8.0))
+        } else {
+            ay
+        };
+        let card = crate::widgets::Rect { x, y, w: pw, h: ph };
+        let inner = crate::widgets::Rect { x: card.x + pad, y: card.y + pad, w: card.w - pad * 2.0, h: ph - pad * 2.0 };
+        let r = theme::zpx(6.0);
+        let mut cq: Vec<Quad> = Vec::new();
+        cq.push(crate::widgets::Rect { x: card.x - 1.0, y: card.y - 1.0, w: card.w + 2.0, h: card.h + 2.0 }
+            .rounded_quad(theme::SEARCH_BORDER(), r + 1.0));
+        cq.push(card.rounded_quad(theme::SEARCH_BG(), r));
+        // Selected-row highlight (relative to the scroll window).
+        let sel_rel = app.completion.selected.saturating_sub(app.completion.scroll);
+        let sy = inner.y + sel_rel as f32 * row_h;
+        cq.push(crate::widgets::Rect { x: card.x + pad * 0.5, y: sy, w: card.w - pad, h: row_h }
+            .rounded_quad(theme::MENU_HOVER(), theme::zpx(4.0)));
+
+        // Shape the labels into the shared list buffer (tall enough for all rows).
+        let labels = app.completion.items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>().join("\n");
+        let content_h = total as f32 * row_h + row_h;
+        gpu.ui.completion_list.set_text(&mut gpu.font_system, &labels, inner.w, content_h);
+        let scroll_px = app.completion.scroll as f32 * row_h;
+
+        gpu.quad_renderer.prepare(&gpu.device, &gpu.queue, &cq, &[], (cfg_w, cfg_h));
+        let mut careas: Vec<TextArea> = Vec::new();
+        gpu.ui.completion_list.draw_at(inner, inner.y - scroll_px, theme::FG_TEXT(), &mut careas);
+        gpu.text_renderer.prepare(
+            &gpu.device,
+            &gpu.queue,
+            &mut gpu.font_system,
+            &mut gpu.atlas,
+            &gpu.viewport,
+            careas,
+            &mut gpu.swash_cache,
+        )?;
+        let mut encc = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("aether-completion-pass"),
+        });
+        {
+            let mut pass = encc.begin_render_pass(&RenderPassDescriptor {
+                label: Some("aether-completion"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            gpu.quad_renderer.render_bg(&mut pass);
+            // Clip the list text to the inner card so scrolled rows don't spill.
+            let sx = inner.x.max(0.0) as u32;
+            let syc = inner.y.max(0.0) as u32;
+            let sw = inner.w.max(0.0) as u32;
+            let sh = inner.h.max(0.0) as u32;
+            if sw > 0 && sh > 0 {
+                pass.set_scissor_rect(sx, syc, sw, sh);
+                gpu.text_renderer.render(&gpu.atlas, &gpu.viewport, &mut pass)?;
+            }
+        }
+        gpu.queue.submit(Some(encc.finish()));
     }
 
     // ---- Context menu overlay (second pass, drawn over everything) ----

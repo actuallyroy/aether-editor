@@ -28,25 +28,33 @@ pub enum Incoming {
     Backlog { id: TermId, data: Vec<u8> },
     Output { id: TermId, data: Vec<u8> },
     Exited { id: TermId },
+    /// Another instance opened this window's workspace — raise this window.
+    Focus,
+    /// Orphaned shells offered after a workspace switch (`SetWorkspace` reply) —
+    /// the just-opened folder's terminals, restorable when the panel opens.
+    Offered(Vec<TermInfo>),
 }
 
 pub struct Client {
     conn: Conn,
     rx: Receiver<Frame>,
+    /// Frames set aside by a blocking request (`focus_existing`) so they still reach
+    /// `poll()` afterwards in order.
+    stash: std::collections::VecDeque<Frame>,
 }
 
 impl Client {
     /// Connect to the running daemon, or spawn one (detached) and connect. Returns
     /// the client plus the daemon's current terminals (to re-attach on launch).
-    pub fn connect_or_spawn() -> Option<(Client, Vec<TermInfo>)> {
-        if let Some(c) = try_connect() {
+    pub fn connect_or_spawn(workspace: &str) -> Option<(Client, Vec<TermInfo>)> {
+        if let Some(c) = try_connect(workspace) {
             return Some(c);
         }
         spawn_daemon();
         // The daemon needs a moment to bind + write its discovery file.
         for _ in 0..60 {
             std::thread::sleep(Duration::from_millis(50));
-            if let Some(c) = try_connect() {
+            if let Some(c) = try_connect(workspace) {
                 return Some(c);
             }
         }
@@ -67,29 +75,72 @@ impl Client {
     pub fn close(&self, id: TermId) {
         send(&self.conn, Frame::Control(Msg::Close { id }));
     }
-    #[cfg(test)]
-    pub fn write(&self, id: TermId, data: &[u8]) {
-        send(&self.conn, Frame::Write { id, data: data.to_vec() });
+    /// Release a terminal back to the daemon (kept running, reclaimable later).
+    pub fn detach(&self, id: TermId) {
+        send(&self.conn, Frame::Control(Msg::Detach { id }));
+    }
+    /// Update this window's registered workspace after Open Folder.
+    pub fn set_workspace(&self, workspace: &str) {
+        send(&self.conn, Frame::Control(Msg::SetWorkspace { workspace: workspace.to_string() }));
+    }
+    /// How many of this window's shells are running a foreground process. Blocking
+    /// round-trip (bounded); unrelated frames are stashed for `poll`.
+    pub fn busy_count(&mut self) -> usize {
+        send(&self.conn, Frame::Control(Msg::QueryBusy));
+        let deadline = std::time::Instant::now() + Duration::from_millis(600);
+        while std::time::Instant::now() < deadline {
+            match self.rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(Frame::Control(Msg::BusyResult { count })) => return count,
+                Ok(other) => self.stash.push_back(other),
+                Err(_) => {}
+            }
+        }
+        0 // no reply — don't block the close on a wedged daemon
+    }
+
+    /// Ask the daemon to focus another live window that already has `workspace`
+    /// open. Returns true if one was found (so the caller should NOT open the folder
+    /// here). Waits briefly for the reply; unrelated frames are stashed for `poll`.
+    pub fn focus_existing(&mut self, workspace: &str) -> bool {
+        send(&self.conn, Frame::Control(Msg::FocusWindow { workspace: workspace.to_string() }));
+        let deadline = std::time::Instant::now() + Duration::from_millis(800);
+        while std::time::Instant::now() < deadline {
+            match self.rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(Frame::Control(Msg::FocusResult { found })) => return found,
+                Ok(other) => self.stash.push_back(other),
+                Err(_) => {}
+            }
+        }
+        false // no reply — behave as if not open elsewhere
     }
 
     /// Drain queued frames into GUI-facing events. Non-blocking.
-    pub fn poll(&self) -> Vec<Incoming> {
+    pub fn poll(&mut self) -> Vec<Incoming> {
         let mut out = Vec::new();
+        let mut handle = |frame: Frame| match frame {
+            Frame::Control(Msg::Created { id, title }) => out.push(Incoming::Created { id, title }),
+            Frame::Control(Msg::Backlog { id, data }) => out.push(Incoming::Backlog { id, data }),
+            Frame::Output { id, data } => out.push(Incoming::Output { id, data }),
+            Frame::Control(Msg::Exited { id }) => out.push(Incoming::Exited { id }),
+            Frame::Control(Msg::Focus) => out.push(Incoming::Focus),
+            // The handshake consumes the initial Welcome, so one seen here is the
+            // re-offer that follows a SetWorkspace (Open Folder).
+            Frame::Control(Msg::Welcome { terminals }) => out.push(Incoming::Offered(terminals)),
+            _ => {}
+        };
+        while let Some(f) = self.stash.pop_front() {
+            handle(f);
+        }
         while let Ok(frame) = self.rx.try_recv() {
-            match frame {
-                Frame::Control(Msg::Created { id, title }) => out.push(Incoming::Created { id, title }),
-                Frame::Control(Msg::Backlog { id, data }) => out.push(Incoming::Backlog { id, data }),
-                Frame::Output { id, data } => out.push(Incoming::Output { id, data }),
-                Frame::Control(Msg::Exited { id }) => out.push(Incoming::Exited { id }),
-                _ => {}
-            }
+            handle(frame);
         }
         out
     }
 }
 
-/// Read the discovery file, connect, authenticate, and start the reader thread.
-fn try_connect() -> Option<(Client, Vec<TermInfo>)> {
+/// Read the discovery file, connect, authenticate (declaring the window's workspace
+/// so re-attach is scoped to it), and start the reader thread.
+fn try_connect(workspace: &str) -> Option<(Client, Vec<TermInfo>)> {
     let path = super::info_path()?;
     let text = std::fs::read_to_string(&path).ok()?;
     let info: HostInfo = serde_json::from_str(&text).ok()?;
@@ -97,7 +148,9 @@ fn try_connect() -> Option<(Client, Vec<TermInfo>)> {
     stream.set_nodelay(true).ok();
     // Bounded handshake so a stale file (dead daemon on a reused port) doesn't hang.
     stream.set_read_timeout(Some(Duration::from_secs(3))).ok();
-    Frame::Control(Msg::Hello { token: info.token }).write_to(&mut stream).ok()?;
+    Frame::Control(Msg::Hello { token: info.token, workspace: workspace.to_string() })
+        .write_to(&mut stream)
+        .ok()?;
     let terminals = match Frame::read_from(&mut stream).ok()? {
         Frame::Control(Msg::Welcome { terminals }) => terminals,
         _ => return None,
@@ -116,7 +169,7 @@ fn try_connect() -> Option<(Client, Vec<TermInfo>)> {
             Err(_) => break, // daemon gone / socket closed
         }
     });
-    Some((Client { conn: Arc::new(Mutex::new(stream)), rx }, terminals))
+    Some((Client { conn: Arc::new(Mutex::new(stream)), rx, stash: std::collections::VecDeque::new() }, terminals))
 }
 
 /// Launch `aether --pty-host` fully detached so it outlives this GUI process.
@@ -154,7 +207,6 @@ pub fn run_daemon() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
 
     // One daemon, raw sockets, two checks in sequence (a single test so two
     // daemon-spawning tests can't clash on the shared discovery file):
@@ -171,7 +223,7 @@ mod tests {
         let raw = || -> Option<(TcpStream, String)> {
             let info: HostInfo =
                 serde_json::from_str(&std::fs::read_to_string(super::super::info_path()?).ok()?).ok()?;
-            let mut s = TcpStream::connect(("127.0.0.1", info.port)).ok()?;
+            let s = TcpStream::connect(("127.0.0.1", info.port)).ok()?;
             s.set_read_timeout(Some(Duration::from_secs(3))).ok();
             Some((s, info.token))
         };
@@ -187,7 +239,7 @@ mod tests {
 
         // --- Client A: hello, create a shell, echo a marker ---
         let (mut a, token) = connect(150).expect("daemon up");
-        Frame::Control(Msg::Hello { token: token.clone() }).write_to(&mut a).unwrap();
+        Frame::Control(Msg::Hello { token: token.clone(), workspace: "/tmp".into() }).write_to(&mut a).unwrap();
         assert!(matches!(Frame::read_from(&mut a), Ok(Frame::Control(Msg::Welcome { .. }))));
         Frame::Control(Msg::Create { cwd: "/tmp".into(), rows: 24, cols: 80 }).write_to(&mut a).unwrap();
 
@@ -213,16 +265,36 @@ mod tests {
         assert!(id.is_some(), "shell created");
         assert!(acc.windows(17).any(|w| w == b"aether_marker_123"), "echoed marker streamed back");
 
-        // --- Client A drops (GUI killed); Client B reconnects ---
+        let term_id = id.unwrap();
+
+        // --- Client A drops (GUI killed); Client B reconnects + reclaims ---
         a.shutdown(std::net::Shutdown::Both).ok();
         drop(a);
         let (mut b, token2) = connect(50).expect("reconnect");
-        Frame::Control(Msg::Hello { token: token2 }).write_to(&mut b).unwrap();
+        Frame::Control(Msg::Hello { token: token2.clone(), workspace: "/tmp".into() }).write_to(&mut b).unwrap();
         match Frame::read_from(&mut b) {
             Ok(Frame::Control(Msg::Welcome { terminals })) => {
-                assert!(!terminals.is_empty(), "surviving shell must be listed on reconnect");
+                assert!(terminals.iter().any(|t| t.id == term_id), "orphaned shell listed on reconnect");
             }
             other => panic!("expected Welcome on reconnect, got {other:?}"),
         }
+        // B claims it (Attach → owner = B), draining the backlog reply.
+        Frame::Control(Msg::Attach { id: term_id }).write_to(&mut b).unwrap();
+        assert!(matches!(Frame::read_from(&mut b), Ok(Frame::Control(Msg::Backlog { .. }))));
+
+        // --- Isolation: a concurrent window (same workspace) must NOT see B's shell ---
+        let (mut c, token3) = connect(50).expect("third client");
+        Frame::Control(Msg::Hello { token: token3, workspace: "/tmp".into() }).write_to(&mut c).unwrap();
+        match Frame::read_from(&mut c) {
+            Ok(Frame::Control(Msg::Welcome { terminals })) => {
+                assert!(
+                    terminals.is_empty(),
+                    "a second live window must not see another window's claimed terminal"
+                );
+            }
+            other => panic!("expected empty Welcome, got {other:?}"),
+        }
+        // Keep B alive until here so its ownership holds.
+        drop(b);
     }
 }

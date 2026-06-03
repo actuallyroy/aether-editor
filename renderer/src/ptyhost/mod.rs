@@ -23,9 +23,12 @@ pub type TermId = u64;
 /// (see `Frame::Output`) so the hot path isn't base64-bloated.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Msg {
-    /// First message from a client; authenticates with the token file's token.
-    Hello { token: String },
-    /// Daemon's reply to `Hello` — current terminals so the GUI can re-attach.
+    /// First message from a client; authenticates with the token file's token and
+    /// declares the window's workspace root (so re-attach is scoped to it).
+    Hello { token: String, workspace: String },
+    /// Daemon's reply to `Hello` — the *orphaned* terminals for this workspace (from
+    /// a closed window), which the client may re-claim. Terminals still owned by
+    /// another live window are never offered, so windows don't leak into each other.
     Welcome { terminals: Vec<TermInfo> },
     /// Spawn a new shell. Daemon replies with `Created`.
     Create { cwd: String, rows: u16, cols: u16 },
@@ -38,8 +41,23 @@ pub enum Msg {
     Resize { id: TermId, rows: u16, cols: u16 },
     /// Close (kill) a terminal.
     Close { id: TermId },
+    /// Release a terminal without killing it (window switched folders) — it becomes
+    /// an orphan, reclaimable by the next window that opens its workspace.
+    Detach { id: TermId },
     /// A terminal's shell exited (sent unsolicited).
     Exited { id: TermId },
+    /// Ask the daemon to focus the live window that has `workspace` open (single-
+    /// window-per-folder, like VSCode). Daemon replies `FocusResult`.
+    FocusWindow { workspace: String },
+    /// This window switched folders (Open Folder) — update its registry entry.
+    SetWorkspace { workspace: String },
+    /// How many of this window's shells have a foreground process running (not just
+    /// an idle prompt)? Used for the close-window warning. Replies `BusyResult`.
+    QueryBusy,
+    BusyResult { count: usize },
+    FocusResult { found: bool },
+    /// Daemon→GUI: another instance asked for this window — raise it.
+    Focus,
     /// Liveness check.
     Ping,
     Pong,
@@ -130,10 +148,12 @@ fn id_prefixed(id: TermId, data: &[u8]) -> Vec<u8> {
     v
 }
 
-/// Path to the daemon's discovery file (`~/.aether/ptyhost.json`), if a config dir
-/// is resolvable.
+/// Path to the daemon's discovery file, if a config dir is resolvable. The protocol
+/// version is part of the FILENAME: old builds (v1 single-client protocol at
+/// `ptyhost.json`) and new builds never read each other's files, so a stale install
+/// can't capture new windows (and vice versa).
 pub fn info_path() -> Option<std::path::PathBuf> {
-    crate::settings::config_dir().map(|d| d.join("ptyhost.json"))
+    crate::settings::config_dir().map(|d| d.join("ptyhost-v2.json"))
 }
 
 /// Contents of the discovery file: where to connect + the auth token.
