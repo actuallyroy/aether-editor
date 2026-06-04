@@ -1254,11 +1254,6 @@ impl Menu {
         self.base_w * theme::ui_zoom()
     }
 
-    pub fn set_items(&mut self, fs: &mut FontSystem, labels: &[&str]) {
-        let rows: Vec<(&str, &str, bool)> = labels.iter().map(|l| (*l, "", false)).collect();
-        self.set_entries(fs, &rows);
-    }
-
     /// Full rows: `(label, shortcut-hint, is_separator)`. Hints render dim after the
     /// label; separator rows draw as divider lines and don't hover or click.
     pub fn set_entries(&mut self, fs: &mut FontSystem, rows: &[(&str, &str, bool)]) {

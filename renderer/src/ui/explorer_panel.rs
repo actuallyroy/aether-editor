@@ -2,21 +2,19 @@
 // `Workspace` (the editor's file-open flow reads it too); this panel owns the
 // inline create/rename field state and the logic that drives it.
 //
-// NOTE (refactor staging): the context menu + tree-click routing still live on
-// `App`; folding those in is a follow-up. The inline-create field buffer
-// (`gpu.create_input`) stays in `gpu` since it's a glyph buffer.
+// NOTE (refactor staging): tree-click routing still lives on `App` (the right-
+// click menu now goes through the generic ctx-menu system there); folding it in
+// is a follow-up. The inline-create field buffer (`gpu.create_input`) stays in
+// `gpu` since it's a glyph buffer.
 
 use crate::gpu::GpuState;
 use crate::widgets::{ScrollOpts, ScrollView};
 use crate::workspace::Workspace;
-use crate::{ContextMenu, PendingCreate};
+use crate::PendingCreate;
 
 pub struct ExplorerPanel {
     /// Inline new-file / new-folder / rename field, when active.
     pub creating: Option<PendingCreate>,
-    /// Right-click context menu over the tree, when open.
-    pub context_menu: Option<ContextMenu>,
-    pub hovered_menu_item: Option<usize>,
     /// Vertical scroll for the file tree (content can exceed the viewport).
     pub scroll: ScrollView,
 }
@@ -25,8 +23,6 @@ impl ExplorerPanel {
     pub fn new() -> Self {
         Self {
             creating: None,
-            context_menu: None,
-            hovered_menu_item: None,
             scroll: ScrollView::new(ScrollOpts::vertical()),
         }
     }
@@ -115,28 +111,5 @@ impl ExplorerPanel {
     pub fn cancel_create(&mut self, gpu: &mut GpuState) {
         self.creating = None;
         gpu.create_input.focus(false);
-    }
-
-    // ---- Context menu ----
-    pub fn menu_open(&self) -> bool {
-        self.context_menu.is_some()
-    }
-    /// The tree node the menu was opened over (for Rename/Delete/Copy Path).
-    pub fn menu_target(&self) -> Option<usize> {
-        self.context_menu.as_ref().and_then(|m| m.target)
-    }
-    pub fn open_menu(&mut self, anchor: (f32, f32), target: Option<usize>) {
-        self.context_menu = Some(ContextMenu { anchor, target });
-    }
-    pub fn close_menu(&mut self) {
-        self.context_menu = None;
-        self.hovered_menu_item = None;
-    }
-    /// Which menu item is under `p`, delegating geometry to the Menu widget.
-    pub fn menu_item_at(&self, p: (f32, f32), gpu: &GpuState) -> Option<usize> {
-        let cm = self.context_menu.as_ref()?;
-        let win = (gpu.config.width as f32, gpu.config.height as f32);
-        let menu = gpu.ui.menu.rect(cm.anchor, win);
-        gpu.ui.menu.item_at(menu, p)
     }
 }

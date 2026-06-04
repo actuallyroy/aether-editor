@@ -107,23 +107,6 @@ pub(crate) struct PendingCreate {
     pub(crate) rename_from: Option<PathBuf>,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum MenuAction {
-    NewFile,
-    NewFolder,
-    Rename,
-    Delete,
-    CopyPath,
-}
-
-pub(crate) const MENU_ACTIONS: &[(MenuAction, &str)] = &[
-    (MenuAction::NewFile, "New File"),
-    (MenuAction::NewFolder, "New Folder"),
-    (MenuAction::Rename, "Rename"),
-    (MenuAction::Delete, "Delete"),
-    (MenuAction::CopyPath, "Copy Path"),
-];
-
 /// Rasterize the bundled Aether logo (SVG) to a window/taskbar icon. The SVG is the
 /// single source of truth; returns None if rendering fails (icon is non-critical).
 fn app_icon() -> Option<winit::window::Icon> {
@@ -156,11 +139,6 @@ fn is_image_path(path: &std::path::Path) -> bool {
 }
 
 /// An open right-click context menu over the file tree.
-pub(crate) struct ContextMenu {
-    pub(crate) anchor: (f32, f32),
-    pub(crate) target: Option<usize>, // tree node index; None = empty area (root scope)
-}
-
 /// Which sidebar view the activity bar has selected.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SidebarView {
@@ -231,6 +209,13 @@ pub(crate) enum CtxAction {
     RevealInOs(PathBuf),
     ScmIntent(ui::Intent),     // stage/unstage/discard/open — reuses apply_intent
     CopyText(String),          // copy an arbitrary string (paths)
+    CloseSavedTabs,
+    TreeNewFile,               // explorer flows (selected_tree is set by the right-click)
+    TreeNewFolder,
+    TreeRename(usize),
+    TreeDelete(usize),
+    OpenTerminalAt(PathBuf),   // new terminal tab whose shell starts in this folder
+    GitIgnore(String),         // append a repo-relative path to .gitignore
 }
 
 pub(crate) struct App {
@@ -528,27 +513,6 @@ impl App {
                     }
                 }
             }
-            if cursor != self.cursor_icon {
-                self.cursor_icon = cursor;
-                if let Some(g) = self.gpu.as_ref() {
-                    g.window.set_cursor(cursor);
-                }
-            }
-            return;
-        }
-
-        // Context menu (modal) captures hover when open.
-        if self.explorer.menu_open() {
-            let new_item = self.gpu.as_ref().and_then(|g| self.explorer.menu_item_at(p, g));
-            if new_item != self.explorer.hovered_menu_item {
-                self.explorer.hovered_menu_item = new_item;
-                self.redraw();
-            }
-            let cursor = if new_item.is_some() {
-                CursorIcon::Pointer
-            } else {
-                CursorIcon::Default
-            };
             if cursor != self.cursor_icon {
                 self.cursor_icon = cursor;
                 if let Some(g) = self.gpu.as_ref() {
@@ -891,7 +855,33 @@ impl App {
                         .and_then(|line| d.diff_file_at_line(line))
                         .is_some()
             });
-        let new_cursor = if self.sidebar_split.is_dragging() || over_handle {
+        // Floating overlays claim the cursor FIRST — otherwise whatever sits UNDER
+        // a menu / palette / popup picks the icon (e.g. the editor's I-beam showing
+        // over a context menu).
+        let over_overlay = {
+            let in_ctx = self
+                .ctx_menu
+                .as_ref()
+                .and_then(|(a, _)| self.gpu.as_ref().map(|g| {
+                    let win = (g.config.width as f32, g.config.height as f32);
+                    g.ui.ctx.rect(*a, win).contains(p)
+                }))
+                .unwrap_or(false);
+            let in_dd = self.open_menu.is_some() && self.menu_dd_rect().map_or(false, |r| r.contains(p));
+            let in_palette_list = layout.palette.as_ref().map_or(false, |pal| pal.box_.contains(p));
+            let in_palette_input = layout.palette.as_ref().map_or(false, |pal| pal.input.contains(p));
+            let modal = self.dialog.is_some() || self.feedback_form.is_some();
+            if in_palette_input {
+                Some(CursorIcon::Text)
+            } else if in_ctx || in_dd || in_palette_list || modal {
+                Some(CursorIcon::Default)
+            } else {
+                None
+            }
+        };
+        let new_cursor = if let Some(c) = over_overlay {
+            c
+        } else if self.sidebar_split.is_dragging() || over_handle {
             self.sidebar_split.cursor()
         } else if let Some(c) = find_cursor {
             c
@@ -1162,16 +1152,26 @@ impl App {
                         CtxEntry::key("Close", CtxAction::CloseTab(idx), "Ctrl+W"),
                         CtxEntry::new("Close Others", CtxAction::CloseOtherTabs(idx)),
                         CtxEntry::new("Close to the Right", CtxAction::CloseTabsRight(idx)),
+                        CtxEntry::new("Close Saved", CtxAction::CloseSavedTabs),
                         CtxEntry::new("Close All", CtxAction::CloseAllTabs),
                         CtxEntry::sep(),
                     ];
                     if let Some(p) = path {
+                        let rel = p.strip_prefix(&self.cwd).unwrap_or(&p).to_string_lossy().to_string();
                         items.push(CtxEntry::new("Copy Path", CtxAction::CopyText(p.to_string_lossy().to_string())));
+                        items.push(CtxEntry::new("Copy Relative Path", CtxAction::CopyText(rel)));
+                        items.push(CtxEntry::sep());
                         items.push(CtxEntry::new("Reveal in Finder", CtxAction::RevealInOs(p)));
+                        items.push(CtxEntry::stub("Reveal in Explorer View"));
+                        items.push(CtxEntry::stub("Reopen Editor With…"));
                         items.push(CtxEntry::sep());
                     }
-                    items.push(CtxEntry::stub("Split Editor"));
-                    items.push(CtxEntry::stub("Pin"));
+                    items.push(CtxEntry::stub("Keep Open"));
+                    items.push(CtxEntry::stub("Split Up"));
+                    items.push(CtxEntry::stub("Split Down"));
+                    items.push(CtxEntry::stub("Split Left"));
+                    items.push(CtxEntry::stub("Split Right"));
+                    items.push(CtxEntry::stub("Move into New Window"));
                     self.open_ctx_menu((x, y), items);
                 }
             }
@@ -1184,12 +1184,22 @@ impl App {
             && render::editor_region(&layout).contains((x, y))
         {
             let items = vec![
-                CtxEntry::stub("Go to Definition"),
-                CtxEntry::stub("Go to References"),
+                CtxEntry { label: "Go to Definition".into(), hint: "F12", action: CtxAction::Stub("Go to Definition") },
+                CtxEntry::stub("Go to Declaration"),
+                CtxEntry::stub("Go to Type Definition"),
+                CtxEntry::stub("Go to Implementations"),
+                CtxEntry { label: "Go to References".into(), hint: "Shift+F12", action: CtxAction::Stub("Go to References") },
                 CtxEntry::sep(),
-                CtxEntry::stub("Rename Symbol"),
+                CtxEntry::stub("Peek Definition"),
+                CtxEntry::stub("Find All References"),
+                CtxEntry::stub("Show Call Hierarchy"),
+                CtxEntry::sep(),
+                CtxEntry { label: "Rename Symbol".into(), hint: "F2", action: CtxAction::Stub("Rename Symbol") },
                 CtxEntry::stub("Change All Occurrences"),
                 CtxEntry::stub("Format Document"),
+                CtxEntry::stub("Format Selection"),
+                CtxEntry::stub("Refactor…"),
+                CtxEntry::stub("Source Action…"),
                 CtxEntry::sep(),
                 CtxEntry::key("Cut", CtxAction::Cut, "Ctrl+X"),
                 CtxEntry::key("Copy", CtxAction::Copy, "Ctrl+C"),
@@ -1210,9 +1220,11 @@ impl App {
             if let Some((path, staged, untracked)) =
                 self.source_control.as_ref().and_then(|scp| scp.row_at_point((x, y), region))
             {
+                let abs = self.cwd.join(&path);
                 let mut items = vec![
-                    CtxEntry::new("Open File", CtxAction::ScmIntent(ui::Intent::OpenFile { path: self.cwd.join(&path), line: 1, col: 0 })),
+                    CtxEntry::new("Open File", CtxAction::ScmIntent(ui::Intent::OpenFile { path: abs.clone(), line: 1, col: 0 })),
                     CtxEntry::new("Open Changes", CtxAction::ScmIntent(ui::Intent::OpenDiff { path: path.clone(), staged, untracked })),
+                    CtxEntry::stub("Open File (HEAD)"),
                     CtxEntry::sep(),
                 ];
                 if staged {
@@ -1221,8 +1233,12 @@ impl App {
                     items.push(CtxEntry::new("Stage Changes", CtxAction::ScmIntent(ui::Intent::GitStage(path.clone()))));
                     items.push(CtxEntry::new("Discard Changes", CtxAction::ScmIntent(ui::Intent::GitDiscard { path: path.clone(), untracked })));
                 }
+                items.push(CtxEntry::new("Add to .gitignore", CtxAction::GitIgnore(path.clone())));
                 items.push(CtxEntry::sep());
-                items.push(CtxEntry::new("Copy Path", CtxAction::CopyText(self.cwd.join(&path).to_string_lossy().to_string())));
+                items.push(CtxEntry::new("Copy Path", CtxAction::CopyText(abs.to_string_lossy().to_string())));
+                items.push(CtxEntry::new("Copy Relative Path", CtxAction::CopyText(path.clone())));
+                items.push(CtxEntry::sep());
+                items.push(CtxEntry::new("Reveal in Finder", CtxAction::RevealInOs(abs)));
                 self.open_ctx_menu((x, y), items);
             }
             return;
@@ -1239,13 +1255,39 @@ impl App {
             )
         });
         self.selected_tree = target;
-        self.explorer.open_menu((x, y), target);
-        self.redraw();
-    }
-
-    fn close_context_menu(&mut self) {
-        self.explorer.close_menu();
-        self.redraw();
+        let node = target.and_then(|t| self.workspace.tree.nodes.get(t).map(|n| (t, n.path.clone(), n.is_dir)));
+        let mut items = vec![
+            CtxEntry::new("New File…", CtxAction::TreeNewFile),
+            CtxEntry::new("New Folder…", CtxAction::TreeNewFolder),
+            CtxEntry::sep(),
+        ];
+        if let Some((t, path, is_dir)) = node {
+            let rel = path.strip_prefix(&self.cwd).unwrap_or(&path).to_string_lossy().to_string();
+            let dir = if is_dir { path.clone() } else { path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| self.cwd.clone()) };
+            items.push(CtxEntry::stub("Open to the Side"));
+            items.push(CtxEntry::stub("Open With…"));
+            items.push(CtxEntry::sep());
+            items.push(CtxEntry::new("Reveal in Finder", CtxAction::RevealInOs(path.clone())));
+            items.push(CtxEntry::new("Open in Integrated Terminal", CtxAction::OpenTerminalAt(dir)));
+            items.push(CtxEntry::sep());
+            items.push(CtxEntry::stub("Select for Compare"));
+            items.push(CtxEntry::sep());
+            items.push(CtxEntry::stub("Cut"));
+            items.push(CtxEntry::stub("Copy"));
+            items.push(CtxEntry::stub("Paste"));
+            items.push(CtxEntry::sep());
+            items.push(CtxEntry::new("Copy Path", CtxAction::CopyText(path.to_string_lossy().to_string())));
+            items.push(CtxEntry::new("Copy Relative Path", CtxAction::CopyText(rel)));
+            items.push(CtxEntry::sep());
+            items.push(CtxEntry::key("Rename…", CtxAction::TreeRename(t), "F2"));
+            items.push(CtxEntry::new("Delete", CtxAction::TreeDelete(t)));
+        } else {
+            items.push(CtxEntry::new("Reveal in Finder", CtxAction::RevealInOs(self.cwd.clone())));
+            items.push(CtxEntry::new("Open in Integrated Terminal", CtxAction::OpenTerminalAt(self.cwd.clone())));
+            items.push(CtxEntry::sep());
+            items.push(CtxEntry::stub("Paste"));
+        }
+        self.open_ctx_menu((x, y), items);
     }
 
     /// Open the generic context menu at `anchor` with `entries`.
@@ -1257,7 +1299,6 @@ impl App {
         if let Some(g) = self.gpu.as_mut() {
             g.ui.ctx.set_entries(&mut g.font_system, &rows);
         }
-        self.explorer.close_menu();
         self.close_app_menu();
         self.ctx_menu = Some((anchor, entries));
         self.ctx_hover = None;
@@ -1324,6 +1365,40 @@ impl App {
                     let _ = cb.set_text(text);
                 }
             }
+            CtxAction::CloseSavedTabs => {
+                for i in (0..self.workspace.documents.len()).rev() {
+                    if !self.workspace.documents[i].dirty {
+                        self.workspace.close_idx(i);
+                    }
+                }
+                self.redraw();
+            }
+            CtxAction::TreeNewFile => self.begin_create(false),
+            CtxAction::TreeNewFolder => self.begin_create(true),
+            CtxAction::TreeRename(t) => self.begin_rename(t),
+            CtxAction::TreeDelete(t) => self.request_delete(t),
+            CtxAction::OpenTerminalAt(dir) => {
+                // Spawn a tab whose shell starts in `dir`, then restore the workspace
+                // cwd for future tabs.
+                let old = self.cwd.clone();
+                self.terminal.set_cwd(dir);
+                if !self.terminal.visible {
+                    self.toggle_terminal();
+                } else {
+                    let panel = self.layout().terminal_panel;
+                    self.terminal.new_terminal_tab(panel, self.terminal_cell_w);
+                }
+                self.terminal.set_cwd(old);
+                self.redraw();
+            }
+            CtxAction::GitIgnore(rel) => {
+                use std::io::Write as _;
+                let gi = self.cwd.join(".gitignore");
+                if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(&gi) {
+                    let _ = writeln!(fh, "{rel}");
+                }
+                self.refresh_source_control();
+            }
         }
     }
 
@@ -1339,7 +1414,6 @@ impl App {
         if let Some(g) = self.gpu.as_mut() {
             g.ui.menu_dropdown.set_entries(&mut g.font_system, &rows);
         }
-        self.explorer.close_menu();
         self.open_menu = Some(idx);
         self.menu_dd_hover = None;
         self.redraw();
@@ -1521,35 +1595,6 @@ impl App {
                 cmd.process_group(0); // detach so it doesn't die with this process
             }
             let _ = cmd.spawn();
-        }
-    }
-
-    fn exec_menu_action(&mut self, action: MenuAction) {
-        let target = self.explorer.menu_target();
-        self.close_context_menu();
-        match action {
-            MenuAction::NewFile => self.begin_create(false),
-            MenuAction::NewFolder => self.begin_create(true),
-            MenuAction::Rename => {
-                if let Some(t) = target {
-                    self.begin_rename(t);
-                }
-            }
-            MenuAction::Delete => {
-                if let Some(t) = target {
-                    self.request_delete(t);
-                }
-            }
-            MenuAction::CopyPath => {
-                if let Some(t) = target {
-                    if let Some(n) = self.workspace.tree.nodes.get(t) {
-                        let s = n.path.display().to_string();
-                        if let Some(cb) = self.clipboard.as_mut() {
-                            let _ = cb.set_text(s);
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -3197,17 +3242,6 @@ impl App {
             }
         }
 
-        // A click while the context menu is open selects an item or dismisses it.
-        if self.explorer.menu_open() {
-            let item = self.gpu.as_ref().and_then(|g| self.explorer.menu_item_at((x, y), g));
-            if let Some(i) = item {
-                self.exec_menu_action(MENU_ACTIONS[i].0);
-            } else {
-                self.close_context_menu();
-            }
-            return;
-        }
-
         // A click while a top menu-bar dropdown is open: another title switches,
         // a dropdown entry runs, anywhere else dismisses.
         if let Some(open) = self.open_menu {
@@ -4189,11 +4223,6 @@ impl App {
             self.close_ctx_menu();
             return;
         }
-        if self.explorer.menu_open() && matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape)) {
-            self.close_context_menu();
-            return;
-        }
-
         if self.open_menu.is_some() && matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape)) {
             self.close_app_menu();
             return;
