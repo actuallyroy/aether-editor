@@ -98,7 +98,7 @@ impl OutlinePanel {
     /// the section sits inside the sidebar, which paints its own.)
     pub fn draw_quads(&self, region: Rect, now: std::time::Instant, bg: &mut Vec<Quad>, fg: &mut Vec<Quad>) {
         // Hairline above the section header (separates it from the file tree).
-        bg.push(Quad::new(region.x, region.y, region.w, 1.0, [1.0, 1.0, 1.0, 0.08]));
+        bg.push(Quad::new(region.x, region.y, region.w, 1.0, theme::PANEL_BORDER()));
         if let Some(i) = self.hover {
             let lr = Self::list_region(region);
             let y = lr.y + i as f32 * theme::TREE_ROW_HEIGHT() - self.scroll.offset().1;

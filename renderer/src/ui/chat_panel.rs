@@ -136,8 +136,9 @@ impl ChatPanel {
     /// Panel chrome: bg, hairlines, input box, message rails.
     pub fn draw_quads(&self, region: Rect, now: std::time::Instant, bg: &mut Vec<Quad>, fg: &mut Vec<Quad>) {
         bg.push(region.quad(theme::SIDEBAR_BG()));
-        bg.push(Quad::new(region.x, region.y, 1.0, region.h, [1.0, 1.0, 1.0, 0.08]));
-        bg.push(Quad::new(region.x, region.y + header_h() - 1.0, region.w, 1.0, [1.0, 1.0, 1.0, 0.06]));
+        // Left seam is drawn centrally with the other section dividers; only the
+        // header underline is panel-local.
+        bg.push(Quad::new(region.x, region.y + header_h() - 1.0, region.w, 1.0, theme::PANEL_BORDER()));
         // A thin accent rail beside each user message (visual role separation).
         let mr = Self::messages_region(region);
         let mut y = mr.y + pad() * 0.5 - self.scroll.offset().1;

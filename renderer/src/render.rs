@@ -722,19 +722,6 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             bg_quads.push(Rect { x: bx, y: by, w: bw, h: bh }.rounded_quad(theme::BADGE_BG(), bh * 0.5));
         }
     }
-    // Explorer OUTLINE section chrome: header divider, hover row, scrollbar.
-    if let (Some(hdr), Some(body)) = (layout.outline_header_rect(), layout.outline_body_rect()) {
-        if let Some(o) = app.outline.as_ref() {
-            let region = Rect { x: hdr.x, y: hdr.y, w: hdr.w, h: hdr.h + body.h };
-            o.draw_quads(region, now, &mut bg_quads, &mut fg_quads);
-        }
-    }
-    // Secondary sidebar (AI chat) chrome: bg, input box, role rails, scrollbar.
-    if app.right_sidebar_visible && layout.right_sidebar.w > 0.0 {
-        if let Some(c) = app.chat.as_ref() {
-            c.draw_quads(layout.right_sidebar, now, &mut bg_quads, &mut fg_quads);
-        }
-    }
     // Sidebar bg
     if app.sidebar_visible {
         bg_quads.push(layout.sidebar.quad(theme::SIDEBAR_BG()));
@@ -811,14 +798,41 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 scp.draw_quads(layout.panel_region(), app.cursor_blink_on, now, &mut bg_quads, &mut fg_quads);
             }
         }
-        // Subtle right border.
-        bg_quads.push(Quad::new(
-            layout.sidebar.x + layout.sidebar.w - 1.0,
-            layout.sidebar.y,
-            1.0,
-            layout.sidebar.h,
-            [0.10, 0.10, 0.10, 1.0],
-        ));
+    }
+    // Explorer OUTLINE section chrome: header divider, hover row, scrollbar.
+    // (After the sidebar bg so the hover/divider quads aren't painted over.)
+    if let (Some(hdr), Some(body)) = (layout.outline_header_rect(), layout.outline_body_rect()) {
+        if let Some(o) = app.outline.as_ref() {
+            let region = Rect { x: hdr.x, y: hdr.y, w: hdr.w, h: hdr.h + body.h };
+            o.draw_quads(region, now, &mut bg_quads, &mut fg_quads);
+        }
+    }
+    // Secondary sidebar (AI chat) chrome: bg, input box, role rails, scrollbar.
+    if app.right_sidebar_visible && layout.right_sidebar.w > 0.0 {
+        if let Some(c) = app.chat.as_ref() {
+            c.draw_quads(layout.right_sidebar, now, &mut bg_quads, &mut fg_quads);
+        }
+    }
+    // Low-contrast dividers between the workbench's sections (single source:
+    // theme::PANEL_BORDER) — a visible seam instead of relying on adjacent
+    // background colors alone. The terminal panel draws its own top edge.
+    {
+        let d = theme::PANEL_BORDER();
+        let tb = layout.title_bar;
+        bg_quads.push(Quad::new(tb.x, tb.y + tb.h - 1.0, tb.w, 1.0, d)); // title bar ↔ content
+        if layout.activity_bar.w > 0.0 {
+            let ab = layout.activity_bar;
+            bg_quads.push(Quad::new(ab.x + ab.w - 1.0, ab.y, 1.0, ab.h, d)); // activity ↔ sidebar
+        }
+        if app.sidebar_visible && layout.sidebar.w > 0.0 {
+            let sb = layout.sidebar;
+            bg_quads.push(Quad::new(sb.x + sb.w - 1.0, sb.y, 1.0, sb.h, d)); // sidebar ↔ editor
+        }
+        if layout.right_sidebar.w > 0.0 {
+            let rs = layout.right_sidebar;
+            bg_quads.push(Quad::new(rs.x, rs.y, 1.0, rs.h, d)); // editor ↔ chat
+        }
+        // (status-bar seam drawn after its bg fill, further down)
     }
     // Tab strip bg
     bg_quads.push(layout.tab_strip.quad(theme::TAB_BAR_BG()));
@@ -1273,8 +1287,12 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         app.detail.ext_detail_scroll.draw(now, &mut fg_quads);
     }
 
-    // Status bar
+    // Status bar (+ its low-contrast top seam, over the fill)
     bg_quads.push(layout.status_bar.quad(theme::STATUS_BAR_BG()));
+    if layout.status_bar.h > 0.0 {
+        let st = layout.status_bar;
+        bg_quads.push(Quad::new(st.x, st.y, st.w, 1.0, theme::PANEL_BORDER()));
+    }
 
     // (The find/replace widget draws in its own late pass — see below.)
 
