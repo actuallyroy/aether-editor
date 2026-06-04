@@ -1002,6 +1002,40 @@ impl Document {
         (self.lsp_byte(d.start_line, d.start_char), self.lsp_byte(d.end_line, d.end_char))
     }
 
+    /// Apply a batch of LSP TextEdits (formatting / rename) as ONE undo step.
+    /// Edits are sorted descending and applied bottom-up so earlier edits don't
+    /// shift later ranges (the LSP guarantees ranges don't overlap).
+    pub fn apply_text_edits(&mut self, edits: &[crate::lsp::TextEdit], fs: &mut FontSystem) {
+        if self.read_only || edits.is_empty() {
+            return;
+        }
+        let mut sorted: Vec<&crate::lsp::TextEdit> = edits.iter().collect();
+        sorted.sort_by_key(|e| (e.start_line, e.start_char));
+        let caret = self.sel.head;
+        self.break_undo_group();
+        let mut first = true;
+        for e in sorted.iter().rev() {
+            let lo = self.lsp_byte(e.start_line, e.start_char);
+            let hi = self.lsp_byte(e.end_line, e.end_char).max(lo);
+            if !first {
+                self.force_join = true;
+            }
+            if hi > lo {
+                let old = self.slice_str(lo, hi);
+                self.push_and_apply(EditOp::Delete(old), lo, Selection::caret(lo));
+                self.force_join = true;
+            }
+            if !e.new_text.is_empty() {
+                self.push_and_apply(EditOp::Insert(e.new_text.clone()), lo, Selection::caret(lo + e.new_text.len()));
+            }
+            first = false;
+        }
+        // Keep the caret near where it was (clamped — exact tracking through a
+        // reformat isn't meaningful).
+        self.sel = Selection::caret(caret.min(self.rope.len_bytes()));
+        self.reshape(fs);
+    }
+
     pub fn insert_str(&mut self, s: &str, fs: &mut FontSystem) {
         if self.read_only {
             return;
@@ -1311,6 +1345,35 @@ impl Document {
 
     /// Select the word (alphanumeric/underscore run) under `byte`; if the click
     /// is on a non-word char, select just that char.
+    /// Byte range of the identifier at `byte` (alnum/underscore run), if any.
+    pub fn word_at(&self, byte: usize) -> Option<(usize, usize)> {
+        let total = self.rope.len_chars();
+        if total == 0 {
+            return None;
+        }
+        let mut ci = self.rope.byte_to_char(byte.min(self.rope.len_bytes()));
+        if ci >= total {
+            ci = total - 1;
+        }
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        if !is_word(self.rope.char(ci)) {
+            // Directly after a word (caret at its end) still counts.
+            if ci == 0 || !is_word(self.rope.char(ci - 1)) {
+                return None;
+            }
+            ci -= 1;
+        }
+        let mut start = ci;
+        while start > 0 && is_word(self.rope.char(start - 1)) {
+            start -= 1;
+        }
+        let mut end = ci;
+        while end < total && is_word(self.rope.char(end)) {
+            end += 1;
+        }
+        Some((self.rope.char_to_byte(start), self.rope.char_to_byte(end)))
+    }
+
     pub fn select_word(&mut self, byte: usize) {
         let total = self.rope.len_chars();
         if total == 0 {
@@ -2139,5 +2202,36 @@ mod tests {
         d.place(7, false);
         d.goto_bracket();
         assert_eq!(d.sel.head, 13);
+    }
+
+    #[test]
+    fn text_edits_apply_as_one_undo_step() {
+        let mut fs = glyphon::FontSystem::new();
+        let mut d = doc("let foo = 1;\nprint(foo);\n", &mut fs);
+        let edit = |sl, sc, el, ec, t: &str| crate::lsp::TextEdit {
+            start_line: sl,
+            start_char: sc,
+            end_line: el,
+            end_char: ec,
+            new_text: t.into(),
+        };
+        // Rename foo → counter at both sites (server order is arbitrary).
+        d.apply_text_edits(
+            &[edit(1, 6, 1, 9, "counter"), edit(0, 4, 0, 7, "counter")],
+            &mut fs,
+        );
+        assert_eq!(d.text(), "let counter = 1;\nprint(counter);\n");
+        // One undo restores both occurrences.
+        d.undo(&mut fs);
+        assert_eq!(d.text(), "let foo = 1;\nprint(foo);\n");
+        // Pure insertion (formatting adds an indent) and pure deletion both work.
+        d.apply_text_edits(&[edit(1, 0, 1, 0, "    ")], &mut fs);
+        assert_eq!(d.text(), "let foo = 1;\n    print(foo);\n");
+        d.apply_text_edits(&[edit(1, 0, 1, 4, "")], &mut fs);
+        assert_eq!(d.text(), "let foo = 1;\nprint(foo);\n");
+        // word_at: identifier under / just after the caret.
+        assert_eq!(d.word_at(5), Some((4, 7))); // inside "foo"
+        assert_eq!(d.word_at(7), Some((4, 7))); // right after "foo"
+        assert_eq!(d.word_at(3), Some((0, 3))); // after "let"
     }
 }

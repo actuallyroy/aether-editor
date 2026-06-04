@@ -38,6 +38,8 @@ pub enum WorkerMsg {
     LspSemanticTokens { id: i64, data: Vec<u32> },              // semanticTokens/full response
     LspCompletion { id: i64, items: Vec<crate::lsp::CompletionItem> }, // textDocument/completion response
     LspLocations { id: i64, locs: Vec<crate::lsp::LspLocation> }, // definition/references/symbol response
+    LspTextEdits { id: i64, edits: Vec<crate::lsp::TextEdit> },   // formatting response (TextEdit[])
+    LspWorkspaceEdit { id: i64, changes: Vec<(String, Vec<crate::lsp::TextEdit>)> }, // rename response
     LspSemanticRefresh { server: &'static str },                // server asked us to re-pull semantic tokens
     LspLog { server: &'static str, message: String },           // server log / stderr line
     LspExited { server: &'static str },                         // server process ended

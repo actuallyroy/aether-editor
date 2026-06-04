@@ -198,6 +198,59 @@ pub fn parse_locations(r: &Value) -> Vec<LspLocation> {
     }
 }
 
+/// One LSP TextEdit: replace `range` with `new_text`. Positions are
+/// (line, UTF-16 col), like diagnostics.
+#[derive(Clone, Debug)]
+pub struct TextEdit {
+    pub start_line: u32,
+    pub start_char: u32,
+    pub end_line: u32,
+    pub end_char: u32,
+    pub new_text: String,
+}
+
+/// Parse a TextEdit[] response (formatting) — elements: { range, newText }.
+pub fn parse_text_edits(r: &Value) -> Vec<TextEdit> {
+    fn one(v: &Value) -> Option<TextEdit> {
+        let range = v.get("range")?;
+        let (s, e) = (range.get("start")?, range.get("end")?);
+        Some(TextEdit {
+            start_line: s.get("line")?.as_u64()? as u32,
+            start_char: s.get("character")?.as_u64()? as u32,
+            end_line: e.get("line")?.as_u64()? as u32,
+            end_char: e.get("character")?.as_u64()? as u32,
+            new_text: v.get("newText")?.as_str()?.to_string(),
+        })
+    }
+    r.as_array().map_or(Vec::new(), |a| a.iter().filter_map(one).collect())
+}
+
+/// Parse a WorkspaceEdit (rename response) into per-uri edit lists. Handles both
+/// the `changes` map and the newer `documentChanges` array (text edits only —
+/// create/rename/delete file ops are skipped).
+pub fn parse_workspace_edit(r: &Value) -> Vec<(String, Vec<TextEdit>)> {
+    let mut out: Vec<(String, Vec<TextEdit>)> = Vec::new();
+    if let Some(changes) = r.get("changes").and_then(|c| c.as_object()) {
+        for (uri, edits) in changes {
+            out.push((uri.clone(), parse_text_edits(edits)));
+        }
+    }
+    if let Some(dc) = r.get("documentChanges").and_then(|c| c.as_array()) {
+        for change in dc {
+            let Some(uri) = change
+                .get("textDocument")
+                .and_then(|t| t.get("uri"))
+                .and_then(|u| u.as_str())
+            else {
+                continue; // a create/rename/delete file operation — not applied
+            };
+            let edits = change.get("edits").map_or(Vec::new(), parse_text_edits);
+            out.push((uri.to_string(), edits));
+        }
+    }
+    out
+}
+
 /// Shape check for location-flavored responses (vs completion lists, which are
 /// also arrays): single Location object, null, or an array whose first element
 /// carries `uri` / `targetUri` / `location`.
@@ -717,6 +770,56 @@ impl LspClient {
         id
     }
 
+    /// Fire a `textDocument/formatting` (whole doc) or `rangeFormatting`
+    /// (selection) request. Returns the request id.
+    pub fn request_formatting(&mut self, uri: &str, range: Option<(u32, u32, u32, u32)>, tab_size: usize, insert_spaces: bool) -> i64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut params = json!({
+            "textDocument": { "uri": uri },
+            "options": { "tabSize": tab_size, "insertSpaces": insert_spaces }
+        });
+        let method = match range {
+            Some((sl, sc, el, ec)) => {
+                params["range"] = json!({
+                    "start": { "line": sl, "character": sc },
+                    "end": { "line": el, "character": ec }
+                });
+                "textDocument/rangeFormatting"
+            }
+            None => "textDocument/formatting",
+        };
+        let msg = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        if self.initialized {
+            self.send_raw(msg);
+        } else {
+            self.pending.push(msg);
+        }
+        id
+    }
+
+    /// Fire a `textDocument/rename` request; the response is a WorkspaceEdit.
+    pub fn request_rename(&mut self, uri: &str, line: u32, character: u32, new_name: &str) -> i64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "textDocument/rename",
+            "params": {
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character },
+                "newName": new_name
+            }
+        });
+        if self.initialized {
+            self.send_raw(msg);
+        } else {
+            self.pending.push(msg);
+        }
+        id
+    }
+
     /// Fire a `workspace/symbol` query.
     pub fn request_symbols(&mut self, query: &str) -> i64 {
         let id = self.next_id;
@@ -755,6 +858,8 @@ pub struct LspManager {
     sem_legend: Vec<String>,                              // semantic token-type names
     comp_pending: Option<i64>,                            // latest completion request id
     loc_pending: std::collections::HashMap<i64, LocKind>, // navigation request id → flavor
+    fmt_pending: std::collections::HashMap<i64, String>,  // formatting request id → uri
+    rename_pending: std::collections::HashSet<i64>,       // rename request ids
 }
 
 impl LspManager {
@@ -853,6 +958,52 @@ impl LspManager {
     /// not ours / superseded).
     pub fn take_locations(&mut self, id: i64) -> Option<LocKind> {
         self.loc_pending.remove(&id)
+    }
+
+    /// Format the whole document (or just `range`) on whatever running server
+    /// serves `lang`. Returns false when no server is up.
+    pub fn request_formatting(&mut self, lang: &str, uri: &str, range: Option<(u32, u32, u32, u32)>) -> bool {
+        let Some(name) = registry()
+            .iter()
+            .find(|s| s.languages.contains(&lang) && self.clients.iter().any(|c| c.server == s.name))
+            .map(|s| s.name)
+        else {
+            return false;
+        };
+        let s = crate::settings::current();
+        if let Some(c) = self.client_mut(name) {
+            let id = c.request_formatting(uri, range, s.editor_tab_size, s.editor_insert_spaces);
+            self.fmt_pending.insert(id, uri.to_string());
+            return true;
+        }
+        false
+    }
+
+    /// The uri a formatting response applies to (None ⇒ not a formatting reply).
+    pub fn take_formatting(&mut self, id: i64) -> Option<String> {
+        self.fmt_pending.remove(&id)
+    }
+
+    /// Rename the symbol at the caret across the workspace.
+    pub fn request_rename(&mut self, lang: &str, uri: &str, line: u32, character: u32, new_name: &str) -> bool {
+        let Some(name) = registry()
+            .iter()
+            .find(|s| s.languages.contains(&lang) && self.clients.iter().any(|c| c.server == s.name))
+            .map(|s| s.name)
+        else {
+            return false;
+        };
+        if let Some(c) = self.client_mut(name) {
+            let id = c.request_rename(uri, line, character, new_name);
+            self.rename_pending.insert(id);
+            return true;
+        }
+        false
+    }
+
+    /// True when `id` answers one of our rename requests.
+    pub fn take_rename(&mut self, id: i64) -> bool {
+        self.rename_pending.remove(&id)
     }
 
     /// The running server name that serves `lang` with completion, if any.
@@ -1229,6 +1380,17 @@ fn handle_server_message(server: &'static str, msg: &Value, reply_tx: &Sender<Ve
                         .map(|a| a.iter().filter_map(|n| n.as_u64().map(|x| x as u32)).collect())
                         .unwrap_or_default();
                     let _ = tx.send(WorkerMsg::LspSemanticTokens { id: id.as_i64().unwrap_or(0), data });
+                } else if r.as_array().map_or(false, |a| {
+                    a.first().map_or(false, |e| e.get("newText").is_some())
+                }) {
+                    // TextEdit[] (formatting). Checked before locations/completion —
+                    // `newText` is unique to edits.
+                    let edits = parse_text_edits(r);
+                    let _ = tx.send(WorkerMsg::LspTextEdits { id: id.as_i64().unwrap_or(0), edits });
+                } else if r.get("changes").is_some() || r.get("documentChanges").is_some() {
+                    // WorkspaceEdit (rename).
+                    let changes = parse_workspace_edit(r);
+                    let _ = tx.send(WorkerMsg::LspWorkspaceEdit { id: id.as_i64().unwrap_or(0), changes });
                 } else if looks_like_locations(r) {
                     // Location / LocationLink / SymbolInformation results (or null —
                     // "no definition found"). Routed by id on the main thread; empty

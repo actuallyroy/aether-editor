@@ -217,6 +217,14 @@ pub(crate) enum CtxAction {
     TreeDelete(usize),
     OpenTerminalAt(PathBuf),   // new terminal tab whose shell starts in this folder
     GitIgnore(String),         // append a repo-relative path to .gitignore
+    FileCut(PathBuf),          // explorer clipboard (move on paste)
+    FileCopy(PathBuf),         // explorer clipboard (copy on paste)
+    FilePaste(PathBuf),        // paste the clipboard entry into this directory
+    SelectForCompare(PathBuf), // remember one side of a two-file diff
+    CompareWith(PathBuf),      // diff the remembered file against this one
+    OpenAtHead(String),        // read-only tab with the file's HEAD version (repo-relative)
+    RevealInTree(PathBuf),     // select + scroll this path in the explorer
+    MoveToNewWindow(usize),    // reopen this tab's file in a fresh window, close it here
 }
 
 pub(crate) struct App {
@@ -339,6 +347,9 @@ pub(crate) struct App {
     pub(crate) last_edit: Instant,  // for files.autoSave (afterDelay)
     pub(crate) nav: nav::NavState,  // Go > Back / Forward jump list
     pub(crate) zen_saved: Option<(bool, bool)>, // pre-Zen (sidebar, terminal) visibility
+    pub(crate) pending_rename: Option<(String, &'static str, u32, u32)>, // (uri, lang, line, col) for the open rename input
+    pub(crate) file_clipboard: Option<(PathBuf, bool)>, // explorer Cut/Copy: (path, is_cut)
+    pub(crate) compare_select: Option<PathBuf>, // explorer "Select for Compare" anchor
     pub(crate) lsp_log: std::collections::VecDeque<String>, // ring buffer for the Output tab
     pub(crate) anim_start: Instant, // monotonic clock for GIF playback
     pub(crate) cursor_icon: CursorIcon,
@@ -430,6 +441,9 @@ impl App {
             last_edit: Instant::now(),
             nav: nav::NavState::default(),
             zen_saved: None,
+            pending_rename: None,
+            file_clipboard: None,
+            compare_select: None,
             lsp_log: std::collections::VecDeque::new(),
             anim_start: Instant::now(),
             cursor_icon: CursorIcon::Default,
@@ -1187,8 +1201,8 @@ impl App {
                         items.push(CtxEntry::new("Copy Path", CtxAction::CopyText(p.to_string_lossy().to_string())));
                         items.push(CtxEntry::new("Copy Relative Path", CtxAction::CopyText(rel)));
                         items.push(CtxEntry::sep());
-                        items.push(CtxEntry::new("Reveal in Finder", CtxAction::RevealInOs(p)));
-                        items.push(CtxEntry::stub("Reveal in Explorer View"));
+                        items.push(CtxEntry::new("Reveal in Finder", CtxAction::RevealInOs(p.clone())));
+                        items.push(CtxEntry::new("Reveal in Explorer View", CtxAction::RevealInTree(p)));
                         items.push(CtxEntry::stub("Reopen Editor With…"));
                         items.push(CtxEntry::sep());
                     }
@@ -1197,7 +1211,7 @@ impl App {
                     items.push(CtxEntry::stub("Split Down"));
                     items.push(CtxEntry::stub("Split Left"));
                     items.push(CtxEntry::stub("Split Right"));
-                    items.push(CtxEntry::stub("Move into New Window"));
+                    items.push(CtxEntry::new("Move into New Window", CtxAction::MoveToNewWindow(idx)));
                     self.open_ctx_menu((x, y), items);
                 }
             }
@@ -1220,10 +1234,10 @@ impl App {
                 CtxEntry { label: "Find All References".into(), hint: "", action: CtxAction::Command(Command::GotoReferences) },
                 CtxEntry::stub("Show Call Hierarchy"),
                 CtxEntry::sep(),
-                CtxEntry { label: "Rename Symbol".into(), hint: "F2", action: CtxAction::Stub("Rename Symbol") },
+                CtxEntry { label: "Rename Symbol".into(), hint: "F2", action: CtxAction::Command(Command::RenameSymbol) },
                 CtxEntry::stub("Change All Occurrences"),
-                CtxEntry::stub("Format Document"),
-                CtxEntry::stub("Format Selection"),
+                CtxEntry { label: "Format Document".into(), hint: "Shift+Alt+F", action: CtxAction::Command(Command::FormatDocument) },
+                CtxEntry { label: "Format Selection".into(), hint: "", action: CtxAction::Command(Command::FormatSelection) },
                 CtxEntry::stub("Refactor…"),
                 CtxEntry::stub("Source Action…"),
                 CtxEntry::sep(),
@@ -1250,7 +1264,7 @@ impl App {
                 let mut items = vec![
                     CtxEntry::new("Open File", CtxAction::ScmIntent(ui::Intent::OpenFile { path: abs.clone(), line: 1, col: 0 })),
                     CtxEntry::new("Open Changes", CtxAction::ScmIntent(ui::Intent::OpenDiff { path: path.clone(), staged, untracked })),
-                    CtxEntry::stub("Open File (HEAD)"),
+                    CtxEntry::new("Open File (HEAD)", CtxAction::OpenAtHead(path.clone())),
                     CtxEntry::sep(),
                 ];
                 if staged {
@@ -1294,13 +1308,21 @@ impl App {
             items.push(CtxEntry::stub("Open With…"));
             items.push(CtxEntry::sep());
             items.push(CtxEntry::new("Reveal in Finder", CtxAction::RevealInOs(path.clone())));
-            items.push(CtxEntry::new("Open in Integrated Terminal", CtxAction::OpenTerminalAt(dir)));
+            items.push(CtxEntry::new("Open in Integrated Terminal", CtxAction::OpenTerminalAt(dir.clone())));
             items.push(CtxEntry::sep());
-            items.push(CtxEntry::stub("Select for Compare"));
-            items.push(CtxEntry::sep());
-            items.push(CtxEntry::stub("Cut"));
-            items.push(CtxEntry::stub("Copy"));
-            items.push(CtxEntry::stub("Paste"));
+            if !is_dir {
+                items.push(CtxEntry::new("Select for Compare", CtxAction::SelectForCompare(path.clone())));
+                if let Some(sel) = self.compare_select.clone().filter(|s| s != &path) {
+                    let name = sel.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    items.push(CtxEntry::new(&format!("Compare with '{name}'"), CtxAction::CompareWith(path.clone())));
+                }
+                items.push(CtxEntry::sep());
+            }
+            items.push(CtxEntry::new("Cut", CtxAction::FileCut(path.clone())));
+            items.push(CtxEntry::new("Copy", CtxAction::FileCopy(path.clone())));
+            if self.file_clipboard.is_some() {
+                items.push(CtxEntry::new("Paste", CtxAction::FilePaste(dir)));
+            }
             items.push(CtxEntry::sep());
             items.push(CtxEntry::new("Copy Path", CtxAction::CopyText(path.to_string_lossy().to_string())));
             items.push(CtxEntry::new("Copy Relative Path", CtxAction::CopyText(rel)));
@@ -1310,8 +1332,10 @@ impl App {
         } else {
             items.push(CtxEntry::new("Reveal in Finder", CtxAction::RevealInOs(self.cwd.clone())));
             items.push(CtxEntry::new("Open in Integrated Terminal", CtxAction::OpenTerminalAt(self.cwd.clone())));
-            items.push(CtxEntry::sep());
-            items.push(CtxEntry::stub("Paste"));
+            if self.file_clipboard.is_some() {
+                items.push(CtxEntry::sep());
+                items.push(CtxEntry::new("Paste", CtxAction::FilePaste(self.cwd.clone())));
+            }
         }
         self.open_ctx_menu((x, y), items);
     }
@@ -1425,7 +1449,118 @@ impl App {
                 }
                 self.refresh_source_control();
             }
+            CtxAction::FileCut(p) => self.file_clipboard = Some((p, true)),
+            CtxAction::FileCopy(p) => self.file_clipboard = Some((p, false)),
+            CtxAction::FilePaste(dir) => self.paste_file_into(dir),
+            CtxAction::SelectForCompare(p) => self.compare_select = Some(p),
+            CtxAction::CompareWith(p) => {
+                if let Some(a) = self.compare_select.clone() {
+                    let d = diff::compute_files(&a, &p);
+                    if let Some(gpu) = self.gpu.as_mut() {
+                        self.workspace.open_diff(d, &mut gpu.font_system);
+                    }
+                }
+            }
+            CtxAction::OpenAtHead(rel) => self.open_file_at_head(rel),
+            CtxAction::RevealInTree(p) => self.reveal_in_tree(p),
+            CtxAction::MoveToNewWindow(i) => {
+                let path = self.workspace.documents.get(i).and_then(|d| d.path.clone());
+                if let (Some(path), Ok(exe)) = (path, std::env::current_exe()) {
+                    let mut cmd = std::process::Command::new(exe);
+                    cmd.arg(path);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::process::CommandExt;
+                        cmd.process_group(0); // detach so it doesn't die with this window
+                    }
+                    if cmd.spawn().is_ok() {
+                        self.workspace.close_idx(i);
+                    }
+                }
+            }
         }
+    }
+
+    /// Paste the explorer clipboard entry into `dir` (Cut moves, Copy duplicates;
+    /// directories copy recursively; name collisions get a " copy" suffix).
+    fn paste_file_into(&mut self, dir: PathBuf) {
+        let Some((src, is_cut)) = self.file_clipboard.clone() else { return };
+        if !src.exists() || !dir.is_dir() {
+            return;
+        }
+        // Refuse pasting a folder into itself/descendant — fs::rename would loop.
+        if dir.starts_with(&src) {
+            return self.show_info_dialog("Can't paste a folder into itself.");
+        }
+        let name = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let mut dest = dir.join(&name);
+        if dest.exists() && dest != src {
+            dest = unique_sibling(&dest);
+        }
+        let result = if is_cut {
+            if dest == src {
+                Ok(()) // cut + paste in place: nothing to do
+            } else {
+                std::fs::rename(&src, &dest)
+            }
+        } else {
+            if dest == src {
+                dest = unique_sibling(&dest); // copy beside the original
+            }
+            copy_recursive(&src, &dest)
+        };
+        match result {
+            Ok(()) => {
+                if is_cut {
+                    self.file_clipboard = None;
+                }
+                self.workspace.tree.rebuild();
+                self.refresh_source_control();
+            }
+            Err(e) => self.show_info_dialog(&format!("Paste failed: {e}")),
+        }
+        self.redraw();
+    }
+
+    /// SCM "Open File (HEAD)": the committed version in a read-only tab.
+    fn open_file_at_head(&mut self, rel: String) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.cwd)
+            .args(["show", &format!("HEAD:{rel}")])
+            .output();
+        let text = match out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+            _ => return self.show_info_dialog("No committed version of this file (new file?)."),
+        };
+        let name = format!("{} (HEAD)", rel.rsplit('/').next().unwrap_or(&rel));
+        if let Some(i) = self.workspace.documents.iter().position(|d| d.read_only && d.name == name) {
+            self.workspace.active = Some(i);
+        } else if let Some(gpu) = self.gpu.as_mut() {
+            let mut d = Document::new(Some(self.cwd.join(&rel)), text, &mut gpu.font_system);
+            d.name = name;
+            d.read_only = true;
+            d.path = None; // not the working file — don't let Save/LSP touch it
+            self.workspace.documents.push(d);
+            self.workspace.active = Some(self.workspace.documents.len() - 1);
+        }
+        self.redraw();
+    }
+
+    /// Tab "Reveal in Explorer View": show the explorer, expand the tree to the
+    /// file, select it, and scroll it into view.
+    fn reveal_in_tree(&mut self, path: PathBuf) {
+        self.show_sidebar_view(SidebarView::Explorer);
+        if let Some(parent) = path.parent() {
+            self.workspace.tree.expand(parent);
+        }
+        self.workspace.tree.rebuild();
+        if let Some(idx) = self.workspace.tree.nodes.iter().position(|n| n.path == path) {
+            self.selected_tree = Some(idx);
+            let y = idx as f32 * theme::TREE_ROW_HEIGHT();
+            self.explorer.scroll.scroll_to_y((y - theme::zpx(80.0)).max(0.0));
+        }
+        self.redraw();
     }
 
     // ---- Top menu-bar dropdowns (File / Edit / …) ----
@@ -2440,7 +2575,9 @@ impl App {
                     self.show_info_dialog("That folder no longer exists.");
                 }
             }
-            commands::PickKind::Problem | commands::PickKind::Location => {} // handled at the commit site (needs the full item)
+            commands::PickKind::Problem
+            | commands::PickKind::Location
+            | commands::PickKind::RenameSymbol => {} // handled at the commit site (need item/input)
             commands::PickKind::SetColorTheme => {
                 self.apply_theme_by_name(label);
                 settings::set_color_theme(label); // persist across restarts
@@ -2622,6 +2759,21 @@ impl App {
                 true
             }
             commands::PaletteMode::QuickPick(_) => {
+                // Rename input: the TYPED text is the new name (no item selection).
+                if matches!(self.palette.mode, commands::PaletteMode::QuickPick(commands::PickKind::RenameSymbol)) {
+                    let new_name = self
+                        .gpu
+                        .as_ref()
+                        .map(|g| g.ui.palette_input.text().trim().to_string())
+                        .unwrap_or_default();
+                    self.palette.close();
+                    if let Some((uri, lang, line, col)) = self.pending_rename.take() {
+                        if !new_name.is_empty() && !self.lsp.request_rename(lang, &uri, line, col, &new_name) {
+                            self.show_info_dialog("The language server isn't running yet.");
+                        }
+                    }
+                    return true;
+                }
                 if let Some((kind, label)) = self.palette.selected_pick() {
                     let item = self.palette.selected_item().cloned();
                     self.palette.close();
@@ -2843,6 +2995,9 @@ impl App {
             Command::GotoTypeDefinition => self.lsp_goto(lsp::LocKind::TypeDefinition),
             Command::GotoImplementations => self.lsp_goto(lsp::LocKind::Implementation),
             Command::GotoReferences => self.lsp_goto(lsp::LocKind::References),
+            Command::FormatDocument => self.lsp_format(false),
+            Command::FormatSelection => self.lsp_format(true),
+            Command::RenameSymbol => self.open_rename_input(),
         }
         self.redraw();
     }
@@ -2857,6 +3012,111 @@ impl App {
         let (line, col) = d.lsp_pos(d.caret_byte());
         if !self.lsp.request_locations(lang, &uri, line, col, kind) {
             self.show_info_dialog("The language server isn't running yet.");
+        }
+    }
+
+    /// Format Document / Format Selection: the server's TextEdits arrive as
+    /// `WorkerMsg::LspTextEdits` and apply as one undo step.
+    fn lsp_format(&mut self, selection_only: bool) {
+        self.flush_doc_to_lsp(); // format against the current text, not the debounce
+        let Some(d) = self.workspace.active_doc() else { return };
+        let (Some(uri), Some(lang)) = (d.uri(), d.language_id()) else {
+            return self.show_info_dialog("No language server for this file type.");
+        };
+        let range = if selection_only {
+            if d.sel.is_empty() {
+                return self.show_info_dialog("Select some text to format first.");
+            }
+            let (lo, hi) = d.sel.range();
+            let (sl, sc) = d.lsp_pos(lo);
+            let (el, ec) = d.lsp_pos(hi);
+            Some((sl, sc, el, ec))
+        } else {
+            None
+        };
+        if !self.lsp.request_formatting(lang, &uri, range) {
+            self.show_info_dialog("The language server isn't running yet.");
+        }
+    }
+
+    /// Rename Symbol (F2): open the palette as an input box seeded with the
+    /// identifier at the caret; Enter fires `textDocument/rename`.
+    fn open_rename_input(&mut self) {
+        self.flush_doc_to_lsp();
+        let Some(d) = self.workspace.active_doc() else { return };
+        let (Some(uri), Some(lang)) = (d.uri(), d.language_id()) else {
+            return self.show_info_dialog("No language server for this file type.");
+        };
+        let Some((lo, hi)) = d.word_at(d.caret_byte()) else {
+            return self.show_info_dialog("Place the caret on a symbol to rename it.");
+        };
+        let current = d.rope.byte_slice(lo..hi).to_string();
+        let (line, col) = d.lsp_pos(lo);
+        self.pending_rename = Some((uri, lang, line, col));
+        self.palette.open_quick_pick(
+            commands::PickKind::RenameSymbol,
+            vec![commands::PickItem::new("Press Enter to rename, Esc to cancel", "")],
+        );
+        if let Some(g) = self.gpu.as_mut() {
+            g.ui.palette_input.set_text(&mut g.font_system, &current);
+            g.ui.palette_input.select_all();
+            g.ui.palette_input.focus(true);
+        }
+        self.redraw();
+    }
+
+    /// Apply a WorkspaceEdit (rename response) across files: open docs get the
+    /// edits in place (one undo step each, left dirty); unopened files are opened
+    /// first so the change is visible and undoable.
+    fn apply_workspace_edit(&mut self, changes: Vec<(String, Vec<lsp::TextEdit>)>) {
+        let mut files = 0usize;
+        let mut total = 0usize;
+        for (uri, edits) in changes {
+            if edits.is_empty() {
+                continue;
+            }
+            let Some(path) = lsp::uri_to_path(&uri) else { continue };
+            let open_idx = self.workspace.documents.iter().position(|d| d.path.as_deref() == Some(path.as_path()));
+            let idx = match open_idx {
+                Some(i) => Some(i),
+                None => {
+                    let Some(gpu) = self.gpu.as_mut() else { continue };
+                    if self.workspace.open_file(&path, &mut gpu.font_system).is_ok() {
+                        self.workspace.active
+                    } else {
+                        None
+                    }
+                }
+            };
+            if let (Some(i), Some(gpu)) = (idx, self.gpu.as_mut()) {
+                if let Some(d) = self.workspace.documents.get_mut(i) {
+                    d.apply_text_edits(&edits, &mut gpu.font_system);
+                    files += 1;
+                    total += edits.len();
+                }
+            }
+        }
+        if files == 0 {
+            self.show_info_dialog("Nothing to rename here.");
+        } else if files > 1 {
+            // Single-file renames are self-evident; summarize multi-file ones.
+            self.show_info_dialog(&format!("Renamed {total} occurrence(s) across {files} files (unsaved)."));
+        }
+        self.redraw();
+    }
+
+    /// Send any unsent edits of the active doc to its language servers right now
+    /// (rename/format must see the latest text, not the debounced version).
+    fn flush_doc_to_lsp(&mut self) {
+        let Some(d) = self.workspace.active_doc_mut() else { return };
+        if !d.lsp_dirty {
+            return;
+        }
+        if let Some(uri) = d.uri() {
+            let (text, version) = (d.text(), d.version);
+            for server in d.lsp_servers.clone() {
+                self.lsp.did_change(server, &uri, version, &text);
+            }
         }
     }
 
@@ -5043,6 +5303,20 @@ impl App {
                     });
                     return;
                 }
+                // F2: rename the symbol at the caret.
+                if matches!(event.logical_key.as_ref(), Key::Named(NamedKey::F2)) {
+                    self.exec_command(Command::RenameSymbol);
+                    return;
+                }
+                // Shift+Alt+F: format document (physical key — Alt remaps logicals).
+                if self.mods.alt_key() && self.mods.shift_key() {
+                    if let winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyF) =
+                        event.physical_key
+                    {
+                        self.exec_command(Command::FormatDocument);
+                        return;
+                    }
+                }
                 // F8 / Shift+F8: cycle through the document's problems.
                 if matches!(event.logical_key.as_ref(), Key::Named(NamedKey::F8)) {
                     self.exec_command(if self.mods.shift_key() {
@@ -5706,6 +5980,26 @@ impl ApplicationHandler for App {
                         self.apply_locations(kind, locs);
                     }
                 }
+                WorkerMsg::LspTextEdits { id, edits } => {
+                    // Formatting result: apply to the doc it was requested for.
+                    if let Some(uri) = self.lsp.take_formatting(id) {
+                        if edits.is_empty() {
+                            self.show_info_dialog("Already formatted.");
+                        } else if let Some(gpu) = self.gpu.as_mut() {
+                            if let Some(d) = self.workspace.documents.iter_mut().find(|d| d.uri().as_deref() == Some(uri.as_str())) {
+                                d.apply_text_edits(&edits, &mut gpu.font_system);
+                            }
+                        }
+                        self.redraw();
+                    }
+                }
+                WorkerMsg::LspWorkspaceEdit { id, changes } => {
+                    // Rename result: apply each file's edits (opening files as needed,
+                    // leaving them dirty for the user to save — VSCode behavior).
+                    if self.lsp.take_rename(id) {
+                        self.apply_workspace_edit(changes);
+                    }
+                }
                 WorkerMsg::LspSemanticRefresh { server } => {
                     self.lsp.refresh_semantic(&self.workspace.documents, server);
                 }
@@ -6074,6 +6368,40 @@ fn reveal_in_os(path: &Path) {
 /// repeated drops form an argument list).
 fn shell_quoted(path: &Path) -> String {
     format!("'{}' ", path.to_string_lossy().replace('\'', r"'\''"))
+}
+
+/// First non-existing "name copy[ N]" sibling of `dest` (Finder-style collision
+/// names for explorer paste).
+fn unique_sibling(dest: &Path) -> PathBuf {
+    let dir = dest.parent().unwrap_or_else(|| Path::new("."));
+    let stem = dest.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let ext = dest.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    for n in 0..1000 {
+        let name = if n == 0 {
+            format!("{stem} copy{ext}")
+        } else {
+            format!("{stem} copy {}{ext}", n + 1)
+        };
+        let cand = dir.join(name);
+        if !cand.exists() {
+            return cand;
+        }
+    }
+    dest.to_path_buf()
+}
+
+/// Copy a file or directory tree (explorer Copy/Paste).
+fn copy_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
+    if src.is_dir() {
+        std::fs::create_dir_all(dest)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            copy_recursive(&entry.path(), &dest.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        std::fs::copy(src, dest).map(|_| ())
+    }
 }
 
 fn main() -> Result<()> {

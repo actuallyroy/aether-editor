@@ -236,8 +236,15 @@ impl Layout {
 
     /// The layout-toggle buttons (left of the window controls).
     pub fn layout_btn_rects(&self) -> Vec<Rect> {
-        let cw = theme::zpx(36.0);
-        let right = self.title_bar.w - 3.0 * theme::TITLE_BTN_W();
+        let cw = theme::zpx(28.0);
+        // The buttons hug the right edge. Windows/Linux reserve space for the
+        // drawn window controls (min/max/close); macOS traffic lights are native
+        // on the LEFT, so only a small pad remains.
+        let right = if cfg!(target_os = "macos") {
+            self.title_bar.w - theme::zpx(8.0)
+        } else {
+            self.title_bar.w - 3.0 * theme::TITLE_BTN_W()
+        };
         (0..3)
             .map(|i| Rect {
                 x: right - (3 - i) as f32 * cw,

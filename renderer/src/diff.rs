@@ -82,6 +82,23 @@ pub fn compute(root: &Path, path: &str, staged: bool, untracked: bool) -> Diff {
     b.finish()
 }
 
+/// Compare two arbitrary files (explorer "Select for Compare" → "Compare with
+/// Selected"): `git diff --no-index` works outside any repository and exits
+/// non-zero when the files differ, which `git()` deliberately ignores.
+pub fn compute_files(a: &Path, b: &Path) -> Diff {
+    let title = format!("{} ↔ {}", file_name(&a.to_string_lossy()), file_name(&b.to_string_lossy()));
+    let cwd = a.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+    let (sa, sb) = (a.to_string_lossy().to_string(), b.to_string_lossy().to_string());
+    let raw = git(&cwd, &["diff", "--no-color", "--no-index", "--", &sa, &sb]).unwrap_or_default();
+    let mut bld = Builder::new(title);
+    if raw.trim().is_empty() {
+        bld.row(RowKind::Context, None, None, "Files are identical.", "Files are identical.");
+    } else {
+        bld.parse_into(&raw);
+    }
+    bld.finish()
+}
+
 /// Combined "Open Changes" view: every entry's diff stacked under a per-file header
 /// row (`RowKind::File`). `entries` is `(repo-relative path, untracked)`; `staged`
 /// selects the index-vs-HEAD diff. The header text carries an expanded chevron;

@@ -37,7 +37,10 @@ pub enum Command {
     GotoTypeDefinition,
     GotoImplementations,
     GotoReferences,
-}   
+    FormatDocument,
+    FormatSelection,
+    RenameSymbol,
+}
 
 pub const COMMANDS: &[(Command, &str, &str)] = &[
     (Command::Save, "File: Save", "Ctrl+S"),
@@ -75,6 +78,9 @@ pub const COMMANDS: &[(Command, &str, &str)] = &[
     (Command::GotoTypeDefinition, "Go: Go to Type Definition", ""),
     (Command::GotoImplementations, "Go: Go to Implementations", ""),
     (Command::GotoReferences, "Go: Go to References", "Shift+F12"),
+    (Command::FormatDocument, "Edit: Format Document", "Shift+Alt+F"),
+    (Command::FormatSelection, "Edit: Format Selection", ""),
+    (Command::RenameSymbol, "Edit: Rename Symbol", "F2"),
 ];
 
 /// What a quick-pick selection does. Each variant carries no data here; the chosen
@@ -84,7 +90,8 @@ pub enum PickKind {
     SetColorTheme,
     OpenRecent,
     Problem,
-    Location, // jump targets from an LSP definition/references response
+    Location,     // jump targets from an LSP definition/references response
+    RenameSymbol, // palette-as-input: the typed text is the new name
 }
 
 /// One row in a quick-pick list (dynamic, unlike the fixed `COMMANDS`).
