@@ -112,9 +112,19 @@ pub fn decode_semantic(data: &[u32], legend: &[String]) -> Vec<(u32, u32, u32, C
     out
 }
 
-/// The color for the top of a scope stack (deepest scope drives the color).
+/// The color for the top of a scope stack (deepest scope drives the color) —
+/// with one whole-stack exception: a string inside a mapping KEY context (JSON
+/// object keys, YAML keys) colors as a property name, not a string. Without
+/// this, an entire JSON document reads as one uniform string color (#37).
 fn color_for_stack(stack: &ScopeStack) -> Color {
-    match stack.as_slice().last() {
+    let scopes = stack.as_slice();
+    if scopes.iter().any(|s| {
+        let st = scope_string(*s);
+        st.starts_with("meta.mapping.key") || st.starts_with("support.type.property-name")
+    }) {
+        return crate::theme::SYN_VARIABLE(); // VSCode's JSON-key blue
+    }
+    match scopes.last() {
         Some(scope) => scope_color(&scope_string(*scope)),
         None => crate::theme::FG_TEXT(),
     }
@@ -123,6 +133,66 @@ fn color_for_stack(stack: &ScopeStack) -> Color {
 /// Build the dotted string for a syntect `Scope` (via the global scope repo).
 fn scope_string(scope: Scope) -> String {
     scope.build_string()
+}
+
+/// JSON key coloring (#37): the bundled grammar scopes object keys and string
+/// values identically, so a whole JSON document reads as one uniform color.
+/// JSON's structure is unambiguous — a string followed by `:` IS a key — so
+/// recolor those ranges (quotes included, like VSCode's property-name blue).
+fn recolor_json_keys(line: &str, spans: &mut Vec<(String, Color)>) {
+    let bytes = line.as_bytes();
+    let mut keys: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'"' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        i += 1;
+        while i < bytes.len() && bytes[i] != b'"' {
+            i += if bytes[i] == b'\\' { 2 } else { 1 };
+        }
+        if i >= bytes.len() {
+            break; // unterminated string on this line
+        }
+        let end = i + 1; // past the closing quote
+        let mut j = end;
+        while j < bytes.len() && matches!(bytes[j], b' ' | b'\t') {
+            j += 1;
+        }
+        if j < bytes.len() && bytes[j] == b':' {
+            keys.push((start, end));
+        }
+        i = end;
+    }
+    if keys.is_empty() {
+        return;
+    }
+    let key_color = crate::theme::SYN_VARIABLE();
+    let mut out: Vec<(String, Color)> = Vec::with_capacity(spans.len() + keys.len() * 2);
+    let mut off = 0usize;
+    for (s, c) in spans.drain(..) {
+        let s_end = off + s.len();
+        let mut cur = off;
+        for &(klo, khi) in &keys {
+            if khi <= cur || klo >= s_end {
+                continue;
+            }
+            let lo = klo.max(cur);
+            let hi = khi.min(s_end);
+            if lo > cur {
+                out.push((s[(cur - off)..(lo - off)].to_string(), c));
+            }
+            out.push((s[(lo - off)..(hi - off)].to_string(), key_color));
+            cur = hi;
+        }
+        if cur < s_end {
+            out.push((s[(cur - off)..].to_string(), c));
+        }
+        off = s_end;
+    }
+    *spans = out;
 }
 
 /// Per-document incremental tokenizer state: the parse state + scope stack at the
@@ -249,6 +319,9 @@ impl LineCache {
             } else {
                 line_spans.push((line.to_string(), crate::theme::FG_TEXT()));
             }
+            if matches!(self.ext.as_str(), "json" | "jsonc" | "mcp") {
+                recolor_json_keys(line, &mut line_spans);
+            }
             if i < self.spans.len() {
                 self.spans[i] = line_spans;
             } else {
@@ -313,6 +386,30 @@ mod tests {
             out.push_str(&format!("fn func_{i}() {{ let x = {i}; /* body */ println!(\"{{}}\", x); }}\n"));
         }
         out
+    }
+
+    // #37: JSON keys and values must be DIFFERENT colors (VSCode: property-name
+    // blue vs string orange) — not one uniform string color across the document.
+    #[test]
+    fn json_keys_and_values_color_differently() {
+        let src = "{\n  \"name\": \"aether\",\n  \"count\": 42,\n  \"on\": true\n}\n";
+        let mut cache = LineCache::new("json").expect("json grammar");
+        let spans = cache.highlight(src, 0);
+        let color_of = |needle: &str| {
+            spans
+                .iter()
+                .find(|(s, _)| s.contains(needle))
+                .map(|(_, c)| *c)
+                .unwrap_or_else(|| panic!("token {needle:?} not found in {spans:?}"))
+        };
+        let key = color_of("name");
+        let val = color_of("aether");
+        assert_ne!(key, val, "JSON key vs string value must differ");
+        assert_eq!(key, crate::theme::SYN_VARIABLE(), "keys use property-name color");
+        assert_eq!(val, crate::theme::SYN_STRING(), "values stay string-colored");
+        // Numbers / booleans keep their own colors too.
+        assert_eq!(color_of("42"), crate::theme::SYN_NUMBER());
+        assert_ne!(color_of("true"), val);
     }
 
     // Editing one line must NOT re-tokenize the rest of the file (#36: one
