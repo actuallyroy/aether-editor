@@ -162,18 +162,43 @@ impl Client {
 /// so re-attach is scoped to it), and start the reader thread.
 fn try_connect(workspace: &str) -> Option<(Client, Vec<TermInfo>)> {
     let path = super::info_path()?;
-    let text = std::fs::read_to_string(&path).ok()?;
-    let info: HostInfo = serde_json::from_str(&text).ok()?;
-    let mut stream = TcpStream::connect(("127.0.0.1", info.port)).ok()?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[ptyhost] no discovery file ({e})");
+            return None;
+        }
+    };
+    let info: HostInfo = match serde_json::from_str(&text) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("[ptyhost] bad discovery file ({e})");
+            return None;
+        }
+    };
+    let mut stream = match TcpStream::connect(("127.0.0.1", info.port)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[ptyhost] connect to {} (pid {}) failed: {e}", info.port, info.pid);
+            return None;
+        }
+    };
     stream.set_nodelay(true).ok();
     // Bounded handshake so a stale file (dead daemon on a reused port) doesn't hang.
     stream.set_read_timeout(Some(Duration::from_secs(3))).ok();
     Frame::Control(Msg::Hello { token: info.token, workspace: workspace.to_string() })
         .write_to(&mut stream)
         .ok()?;
-    let terminals = match Frame::read_from(&mut stream).ok()? {
-        Frame::Control(Msg::Welcome { terminals }) => terminals,
-        _ => return None,
+    let terminals = match Frame::read_from(&mut stream) {
+        Ok(Frame::Control(Msg::Welcome { terminals })) => terminals,
+        Ok(other) => {
+            eprintln!("[ptyhost] expected Welcome, got {other:?}");
+            return None;
+        }
+        Err(e) => {
+            eprintln!("[ptyhost] handshake read failed: {e}");
+            return None;
+        }
     };
     // Back to blocking reads for the streaming phase.
     stream.set_read_timeout(None).ok();

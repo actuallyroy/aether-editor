@@ -801,9 +801,113 @@ impl Document {
         // Layer-1 highlight, incrementally from the lowest edited line (usize::MAX =
         // no text change since last highlight → returns cached spans, no re-tokenize).
         let dirty = std::mem::replace(&mut self.hl_dirty_from, usize::MAX);
-        let spans = self.hl.as_mut().map(|h| h.highlight(&text, dirty));
+        if let Some(hl) = self.hl.as_mut() {
+            let (s, e) = hl.refresh(&text, dirty);
+            // Fast path: a text edit whose tokenization converged — rebuild ONLY
+            // the re-tokenized buffer lines instead of re-setting and re-shaping
+            // the whole document. set_rich_text on a ~6000-line file costs
+            // hundreds of ms PER KEYSTROKE (#36); swapping a few BufferLines is
+            // near-free and keeps every other line's shape/layout caches.
+            if dirty != usize::MAX && self.reshape_lines_partial(fs, s, e) {
+                crate::perf::log(&format!(
+                    "reshape-partial({lines} lines, rows {s}..{e}): total {:?}",
+                    t1.elapsed()
+                ));
+                return;
+            }
+        }
+        let spans = self.hl.as_ref().map(|h| h.flatten());
         apply_buffer_text(&mut self.buffer, fs, &text, lines, self.lang, &self.ext, self.wrap_width, spans, &self.semantic);
         crate::perf::log(&format!("reshape({lines} lines): to_string {:?}, highlight+shape {:?}", t_str, t1.elapsed()));
+    }
+
+    /// Rebuild buffer lines `[start, end)` in place from the highlight cache,
+    /// keeping every other line's shape/layout caches. Returns false when the
+    /// preconditions don't hold (line-count/metrics drift, wrap, missing cache)
+    /// and the caller must run the full `apply_buffer_text` instead.
+    fn reshape_lines_partial(&mut self, fs: &mut FontSystem, start: usize, end: usize) -> bool {
+        use glyphon::cosmic_text::LineEnding;
+        use glyphon::AttrsList;
+        let Some(hl) = self.hl.as_ref() else { return false };
+        // Both counts are display lines the cosmic-text way (a trailing '\n'
+        // makes the ROPE one longer — never compare against it). When the edit
+        // changed the line count, the rebuilt range is SPLICED into the buffer:
+        // the shifted tail keeps its shape/layout caches.
+        let total = hl.line_count();
+        let buf_total = self.buffer.lines.len();
+        if start >= end || self.wrap_width.is_some() {
+            return false;
+        }
+        let delta = total as isize - buf_total as isize;
+        let old_end = end as isize - delta;
+        if old_end < start as isize || old_end as usize > buf_total {
+            return false; // rebuilt range doesn't map cleanly — full reshape
+        }
+        // Metrics changes (zoom, font settings) need the full pass.
+        let want = Metrics::new(theme::FONT_SIZE(), theme::LINE_HEIGHT());
+        if self.buffer.metrics() != want {
+            return false;
+        }
+        // Display-text offsets per line, from the cache's own span lengths (cheap
+        // usize sums; also validates every line is cached).
+        let mut starts = Vec::with_capacity(total + 1);
+        starts.push(0usize);
+        let mut acc = 0usize;
+        for i in 0..total {
+            let Some(sp) = hl.line_spans(i) else { return false };
+            acc += sp.iter().map(|(s, _)| s.len()).sum::<usize>();
+            starts.push(acc);
+        }
+        let mono = Attrs::new().family(Family::Name(theme::MONO_FAMILY()));
+        let build = |i: usize| -> (String, glyphon::AttrsList, LineEnding) {
+            let spans = hl.line_spans(i).unwrap_or(&[]);
+            let line_text: String = spans.iter().map(|(s, _)| s.as_str()).collect();
+            let (ls, le) = (starts[i], starts[i + 1]);
+            // Semantic (Layer-2) ranges intersecting this line, rebased to it.
+            let sem: Vec<(usize, usize, Color)> = self
+                .semantic
+                .iter()
+                .filter(|(a, b, _)| *a < le && *b > ls)
+                .map(|(a, b, c)| ((*a).max(ls) - ls, (*b).min(le) - ls, *c))
+                .collect();
+            let merged = merge_spans(&line_text, spans.to_vec(), &sem, mono);
+            let has_nl = line_text.ends_with('\n');
+            let text = line_text.trim_end_matches('\n').to_string();
+            let mut al = AttrsList::new(mono);
+            let mut off = 0usize;
+            for (s, a) in &merged {
+                let seg_end = (off + s.len()).min(text.len());
+                if seg_end > off {
+                    al.add_span(off..seg_end, *a);
+                }
+                off += s.len();
+            }
+            let ending = if has_nl { LineEnding::Lf } else { LineEnding::None };
+            (text, al, ending)
+        };
+        let end = end.min(total);
+        if delta == 0 {
+            for i in start..end {
+                let (text, al, ending) = build(i);
+                self.buffer.lines[i].set_text(text, ending, al);
+            }
+        } else {
+            // Line count changed (Enter / paste / line delete): splice the
+            // rebuilt range over the old one; the tail shifts intact.
+            let new_lines: Vec<glyphon::BufferLine> = (start..end)
+                .map(|i| {
+                    let (text, al, ending) = build(i);
+                    glyphon::BufferLine::new(text, ending, al, Shaping::Advanced)
+                })
+                .collect();
+            self.buffer.lines.splice(start..old_end as usize, new_lines);
+            // The buffer's height tracks the line count (full-shape invariant).
+            let h = (total as f32 + 2.0) * theme::LINE_HEIGHT() + 200.0;
+            self.buffer.set_size(fs, self.wrap_width, Some(h));
+        }
+        self.buffer.set_redraw(true);
+        self.buffer.shape_until_scroll(fs, false);
+        true
     }
 
     // ---- Large-file shaped window ----
@@ -864,6 +968,51 @@ impl Document {
             .iter()
             .map(|&(line, start, len, c)| (self.lsp_byte(line, start), self.lsp_byte(line, start + len), c))
             .collect();
+    }
+
+    /// Apply a fresh semantic-token set and recolor ONLY the lines whose tokens
+    /// actually changed. A full `set_semantic` + `reshape` costs hundreds of ms on
+    /// a big file, and rust-analyzer re-delivers tokens continuously while typing
+    /// — full reshapes per delivery froze the editor in waves (#36).
+    pub fn apply_semantic_tokens(&mut self, toks: &[(u32, u32, u32, Color)], fs: &mut FontSystem) {
+        use std::collections::BTreeMap;
+        let new: Vec<(usize, usize, Color)> = toks
+            .iter()
+            .map(|&(line, start, len, c)| (self.lsp_byte(line, start), self.lsp_byte(line, start + len), c))
+            .collect();
+        let old = std::mem::replace(&mut self.semantic, new);
+        if self.large {
+            return; // large mode draws plain text — nothing to recolor
+        }
+        // Per-line buckets of both sets; a line is dirty when its buckets differ.
+        let mut buckets: BTreeMap<usize, (Vec<(usize, usize, Color)>, Vec<(usize, usize, Color)>)> =
+            BTreeMap::new();
+        let max_b = self.rope.len_bytes();
+        for (which, set) in [old.as_slice(), self.semantic.as_slice()].into_iter().enumerate() {
+            for &(a, b, c) in set {
+                let l = self.rope.byte_to_line(a.min(max_b));
+                let e = buckets.entry(l).or_default();
+                if which == 0 {
+                    e.0.push((a, b, c));
+                } else {
+                    e.1.push((a, b, c));
+                }
+            }
+        }
+        let changed: Vec<usize> = buckets
+            .into_iter()
+            .filter(|(_, (o, n))| o != n)
+            .map(|(l, _)| l)
+            .collect();
+        let (Some(&lo), Some(&hi)) = (changed.first(), changed.last()) else {
+            return; // identical token sets — nothing to redraw
+        };
+        // A tight dirty band (typical while typing) recolors in place; a sweeping
+        // change (first delivery, big refactor) takes the full reshape.
+        if hi - lo < 400 && self.reshape_lines_partial(fs, lo, hi + 1) {
+            return;
+        }
+        self.reshape(fs);
     }
 
     /// Replace the entire document from an external on-disk change (e.g. Replace
@@ -1273,6 +1422,11 @@ impl Document {
                 EditOp::Delete(s) => EditOp::Insert(s.clone()),
             };
             self.apply_op(&inverse_op, edit.at_byte);
+            // Mark the highlight dirty like any edit — otherwise the tokenizer
+            // cache keeps the pre-undo lines and the buffer rebuilds from STALE
+            // spans (wrong text on screen after a structural undo).
+            let line = self.rope.byte_to_line(edit.at_byte.min(self.rope.len_bytes()));
+            self.hl_dirty_from = self.hl_dirty_from.min(line);
             self.sel = Selection {
                 anchor: edit.sel_before.0,
                 head: edit.sel_before.1,
@@ -1282,6 +1436,9 @@ impl Document {
         }
         self.pending_stop = true; // typing after an undo starts a fresh group
         self.dirty = true;
+        // The text changed: language servers need a didChange like any edit.
+        self.version += 1;
+        self.lsp_dirty = true;
         self.reshape(fs);
         true
     }
@@ -1297,6 +1454,8 @@ impl Document {
         while self.future.last().map_or(false, |e| e.group == group) {
             let edit = self.future.pop().expect("checked above");
             self.apply_op(&edit.op, edit.at_byte);
+            let line = self.rope.byte_to_line(edit.at_byte.min(self.rope.len_bytes()));
+            self.hl_dirty_from = self.hl_dirty_from.min(line);
             self.sel = Selection {
                 anchor: edit.sel_after.0,
                 head: edit.sel_after.1,
@@ -1306,6 +1465,8 @@ impl Document {
         }
         self.pending_stop = true;
         self.dirty = true;
+        self.version += 1;
+        self.lsp_dirty = true;
         self.reshape(fs);
         true
     }
@@ -2406,5 +2567,109 @@ mod tests {
         assert_eq!(d.word_at(5), Some((4, 7))); // inside "foo"
         assert_eq!(d.word_at(7), Some((4, 7))); // right after "foo"
         assert_eq!(d.word_at(3), Some((0, 3))); // after "let"
+    }
+
+    /// Every buffer line's text must equal the document's display line — the
+    /// invariant the partial reshape / splice paths must never break.
+    #[cfg(test)]
+    fn assert_buffer_matches(d: &Document) {
+        let display = d.rope.to_string().replace('\r', "");
+        let mut doc_lines: Vec<&str> = display.split('\n').collect();
+        // cosmic-text doesn't create a line after a trailing newline.
+        if display.ends_with('\n') {
+            doc_lines.pop();
+        }
+        if doc_lines.is_empty() {
+            doc_lines.push("");
+        }
+        assert_eq!(
+            d.buffer.lines.len(),
+            doc_lines.len(),
+            "buffer line count vs document"
+        );
+        for (i, want) in doc_lines.iter().enumerate() {
+            assert_eq!(d.buffer.lines[i].text(), *want, "buffer line {i} text");
+        }
+    }
+
+    // Structural edits (Enter / line deletion) must stay fast AND splice the
+    // buffer correctly — every line of the buffer equals the document after.
+    #[test]
+    fn enter_and_delete_line_splice_correctly() {
+        let mut fs = glyphon::FontSystem::new();
+        let mut src = String::new();
+        for i in 0..2000 {
+            src.push_str(&format!("fn f_{i}() {{ let v = {i}; }}\n"));
+        }
+        let mut d = Document::new(Some(std::path::PathBuf::from("big.rs")), src, &mut fs);
+        d.reshape(&mut fs);
+        // Enter in the middle of line 1000.
+        let mid = d.rope.line_to_byte(1000) + 10;
+        d.place(mid, false);
+        let t0 = std::time::Instant::now();
+        d.insert_str("\n", &mut fs);
+        let dt = t0.elapsed();
+        assert_buffer_matches(&d);
+        assert!(dt < std::time::Duration::from_millis(150), "Enter took {dt:?}");
+        // Undo (removes the line) must splice back.
+        d.undo(&mut fs);
+        assert_buffer_matches(&d);
+        // Paste with multiple newlines.
+        d.place(d.rope.line_to_byte(500), false);
+        d.insert_str("// a\n// b\n// c\n", &mut fs);
+        assert_buffer_matches(&d);
+        // Delete a whole line (selection across the newline).
+        let ls = d.rope.line_to_byte(500);
+        let le = d.rope.line_to_byte(501);
+        d.sel = Selection { anchor: ls, head: le, desired_col: None };
+        d.delete_selection(&mut fs);
+        assert_buffer_matches(&d);
+    }
+
+    // Semantic-token deliveries recolor in place without breaking the buffer.
+    #[test]
+    fn semantic_tokens_apply_partially() {
+        let mut fs = glyphon::FontSystem::new();
+        let mut src = String::new();
+        for i in 0..1000 {
+            src.push_str(&format!("fn g_{i}() {{}}\n"));
+        }
+        let mut d = Document::new(Some(std::path::PathBuf::from("t.rs")), src, &mut fs);
+        d.reshape(&mut fs);
+        let color = Color::rgb(10, 200, 10);
+        // First delivery: tokens on lines 10..14.
+        let toks: Vec<(u32, u32, u32, Color)> = (10..14).map(|l| (l, 3, 4, color)).collect();
+        d.apply_semantic_tokens(&toks, &mut fs);
+        assert_buffer_matches(&d);
+        // Second delivery: one line's token moves — only that band recolors.
+        let toks2: Vec<(u32, u32, u32, Color)> =
+            vec![(10, 3, 4, color), (11, 4, 4, color), (12, 3, 4, color), (13, 3, 4, color)];
+        let t0 = std::time::Instant::now();
+        d.apply_semantic_tokens(&toks2, &mut fs);
+        let dt = t0.elapsed();
+        assert_buffer_matches(&d);
+        assert!(dt < std::time::Duration::from_millis(50), "semantic apply took {dt:?}");
+    }
+
+    // #36 regression: one keystroke in a ~6000-line .rs must stay interactive.
+    // (The freeze was syntect re-parsing to EOF; convergence fixed it. This
+    // guards the whole insert path — rope edit + incremental highlight + full
+    // buffer reshape.)
+    #[test]
+    fn keystroke_in_large_rust_file_is_fast() {
+        let mut fs = glyphon::FontSystem::new();
+        let mut src = String::new();
+        for i in 0..6000 {
+            src.push_str(&format!("fn func_{i}() {{ let x = {i}; println!(\"{{}}\", x); }}\n"));
+        }
+        let mut d = Document::new(Some(std::path::PathBuf::from("big.rs")), src, &mut fs);
+        d.reshape(&mut fs); // initial full highlight+shape (not measured)
+        let mid = d.rope.line_to_byte(3000);
+        d.place(mid, false);
+        let t0 = std::time::Instant::now();
+        d.insert_str("x", &mut fs);
+        let dt = t0.elapsed();
+        // Generous bound for CI variance; the pre-fix cost was multiple SECONDS.
+        assert!(dt < std::time::Duration::from_millis(250), "keystroke took {dt:?}");
     }
 }

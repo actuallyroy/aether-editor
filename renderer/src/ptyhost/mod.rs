@@ -194,7 +194,17 @@ pub const PROTO_VERSION: u32 = 4;
 /// and DefaultHasher isn't pinned across toolchains — which minted a fresh
 /// daemon (and stranded the old one + its shells) on updates and even launches.
 fn flavor() -> &'static str {
-    if cfg!(debug_assertions) { "dev" } else { "app" }
+    // Tests get their OWN discovery file: the daemon test spawns a real daemon,
+    // and sharing the dev file let every `cargo test` run usurp the live dev
+    // daemon — stranding its shells invisibly (the exact leak this module
+    // exists to prevent).
+    if cfg!(test) {
+        "test"
+    } else if cfg!(debug_assertions) {
+        "dev"
+    } else {
+        "app"
+    }
 }
 
 fn info_name(flavor: &str) -> String {

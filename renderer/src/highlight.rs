@@ -134,6 +134,10 @@ pub struct LineCache {
     starts: Vec<(ParseState, ScopeStack)>,
     /// Cached colored spans (substring, color) for line `i`, including its `\n`.
     spans: Vec<Vec<(String, Color)>>,
+    /// Exclusive end of the line range the last `highlight` actually re-tokenized
+    /// (start = the dirty line it was given). Drives the editor's partial buffer
+    /// reshape: lines outside this range kept their cached spans verbatim.
+    last_end: usize,
 }
 
 impl LineCache {
@@ -143,19 +147,88 @@ impl LineCache {
             ext: ext.to_string(),
             starts: vec![(ParseState::new(syntax), ScopeStack::new())],
             spans: Vec::new(),
+            last_end: 0,
         })
+    }
+
+    /// Exclusive end of the last pass's re-tokenized line range.
+    pub fn last_changed_end(&self) -> usize {
+        self.last_end
+    }
+
+    /// The cached spans for one line (substring, color), if tokenized.
+    pub fn line_spans(&self, line: usize) -> Option<&[(String, Color)]> {
+        self.spans.get(line).map(|v| v.as_slice())
+    }
+
+    /// Number of cached lines (display-text lines, as cosmic-text counts them —
+    /// a trailing '\n' does NOT produce an extra empty line).
+    pub fn line_count(&self) -> usize {
+        self.spans.len()
     }
 
     /// Re-tokenize `text` from `dirty_line` onward, reusing cached line states
     /// before it. Returns the full document's rich-text spans (concatenated lines).
     /// Pass `dirty_line = 0` for a fresh document.
+    ///
+    /// CONVERGENCE: re-parsing stops as soon as a line's resulting parse state
+    /// matches the cached state of the next line (and the line count is
+    /// unchanged) — every later line would tokenize identically, so its cached
+    /// spans are reused. Without this, one keystroke re-parses from the edit to
+    /// the END of the file: in a ~6000-line .rs file that's seconds of syntect
+    /// per letter — the app "freezes" while typing (#36).
     pub fn highlight(&mut self, text: &str, dirty_line: usize) -> Vec<(String, Color)> {
+        self.refresh(text, dirty_line);
+        self.flatten()
+    }
+
+    /// The cached whole-document spans, flattened (the `highlight` return shape).
+    pub fn flatten(&self) -> Vec<(String, Color)> {
+        self.spans.iter().flatten().cloned().collect()
+    }
+
+    /// Re-tokenize without flattening; returns the `[start, end)` line range that
+    /// was actually re-tokenized (callers can rebuild just those buffer lines).
+    pub fn refresh(&mut self, text: &str, dirty_line: usize) -> (usize, usize) {
         let ss = syntax_set();
         let lines: Vec<&str> = LinesWithEndingsIter::new(text).collect();
-        // Truncate caches to the dirty boundary (keep states for [0, dirty_line]).
         let start = dirty_line.min(self.starts.len().saturating_sub(1));
-        self.starts.truncate(start + 1);
-        self.spans.truncate(start);
+        // Convergence needs the cached tail to correspond 1:1 to the current
+        // text. When the line count CHANGED (Enter / paste / delete-line), align
+        // the caches first: insert placeholders at the edit for added lines, or
+        // drop the removed ones — the shifted tail then lines up again, so the
+        // re-parse still stops at convergence instead of running to EOF.
+        let old_count = self.spans.len();
+        let new_count = lines.len();
+        let mut no_break_before = start;
+        if old_count != 0 && new_count != old_count && start < new_count {
+            if new_count > old_count {
+                let k = new_count - old_count;
+                let at = start.min(self.spans.len());
+                for _ in 0..k {
+                    self.spans.insert(at, Vec::new());
+                }
+                let st_idx = (at + 1).min(self.starts.len() - 1);
+                let st = self.starts[st_idx].clone();
+                for _ in 0..k {
+                    self.starts.insert(at + 1, st.clone());
+                }
+                // The inserted lines (and the split line itself) must all be
+                // re-parsed before convergence may stop the loop.
+                no_break_before = start + k;
+            } else {
+                let k = old_count - new_count;
+                for _ in 0..k {
+                    if start < self.spans.len() {
+                        self.spans.remove(start);
+                    }
+                    if start + 1 < self.starts.len() {
+                        self.starts.remove(start + 1);
+                    }
+                }
+            }
+        }
+        let counts_match = self.spans.len() == lines.len();
 
         for i in start..lines.len() {
             let (mut state, mut stack) = self.starts[i].clone();
@@ -181,9 +254,14 @@ impl LineCache {
             } else {
                 self.spans.push(line_spans);
             }
-            // Snapshot the state at the start of the NEXT line.
+            // Snapshot the state at the start of the NEXT line; stop once it
+            // matches the cached snapshot (the tail can't tokenize differently).
             let next = (state, stack);
+            self.last_end = i + 1;
             if i + 1 < self.starts.len() {
+                if counts_match && i >= start && i + 1 > no_break_before && self.starts[i + 1] == next {
+                    break;
+                }
                 self.starts[i + 1] = next;
             } else {
                 self.starts.push(next);
@@ -192,8 +270,8 @@ impl LineCache {
         // Drop any trailing caches if the document shrank.
         self.spans.truncate(lines.len());
         self.starts.truncate(lines.len() + 1);
-
-        self.spans.iter().flatten().cloned().collect()
+        self.last_end = self.last_end.min(lines.len());
+        (start, self.last_end.max(start))
     }
 
     pub fn ext(&self) -> &str {
@@ -222,5 +300,53 @@ impl<'a> Iterator for LinesWithEndingsIter<'a> {
         let line = &rest[..end];
         self.pos += end;
         Some(line)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rust_doc(lines: usize) -> String {
+        let mut out = String::new();
+        for i in 0..lines {
+            out.push_str(&format!("fn func_{i}() {{ let x = {i}; /* body */ println!(\"{{}}\", x); }}\n"));
+        }
+        out
+    }
+
+    // Editing one line must NOT re-tokenize the rest of the file (#36: one
+    // keystroke in a ~6k-line .rs froze the app). Correctness: the converged
+    // incremental result must equal a from-scratch highlight. Performance: the
+    // incremental pass must be drastically faster than the initial full pass.
+    #[test]
+    fn highlight_converges_after_single_line_edit() {
+        let n = 6000;
+        let mut text = rust_doc(n);
+        let mut cache = LineCache::new("rs").expect("rust grammar");
+        let t0 = std::time::Instant::now();
+        cache.highlight(&text, 0);
+        let full = t0.elapsed();
+
+        // Same-length edit on line 100 (replace 'x' with 'y' once).
+        let line_start: usize = text.lines().take(100).map(|l| l.len() + 1).sum();
+        let off = line_start + text[line_start..].find('x').unwrap();
+        text.replace_range(off..off + 1, "y");
+
+        let t1 = std::time::Instant::now();
+        let inc = cache.highlight(&text, 100);
+        let inc_time = t1.elapsed();
+
+        // Correctness: identical to a fresh highlight of the edited text.
+        let mut fresh = LineCache::new("rs").unwrap();
+        let want = fresh.highlight(&text, 0);
+        assert_eq!(inc, want, "incremental spans must match a fresh highlight");
+
+        // Perf: convergence should make the edit pass at least 20x faster than
+        // the initial full tokenize (in practice it is hundreds of times).
+        assert!(
+            inc_time < full / 20,
+            "incremental highlight too slow: {inc_time:?} vs full {full:?}"
+        );
     }
 }

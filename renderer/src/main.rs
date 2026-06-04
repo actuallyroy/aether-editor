@@ -3231,6 +3231,7 @@ impl App {
     /// Send any unsent edits of the active doc to its language servers right now
     /// (rename/format must see the latest text, not the debounced version).
     fn flush_doc_to_lsp(&mut self) {
+        let _probe = crate::perf::Probe::new("flush_doc_to_lsp", 8);
         let Some(d) = self.workspace.active_doc_mut() else { return };
         if !d.lsp_dirty {
             return;
@@ -3719,6 +3720,7 @@ impl App {
     /// Drive language-server document sync from the idle tick (delegated to the
     /// manager, which owns the open/change/pull logic).
     fn sync_lsp(&mut self) {
+        let _probe = crate::perf::Probe::new("sync_lsp", 8);
         // Language servers come only from Aether's own store (+ PATH for standalone
         // binaries). We deliberately do NOT scan the user's VS Code extensions.
         let Some(ext_dir) = crate::extensions::extensions_dir() else { return };
@@ -5840,6 +5842,7 @@ impl App {
     /// and fire an async LSP request (if a server serves this language) whose richer
     /// results replace the word-based ones when they arrive.
     fn recompute_completion(&mut self) {
+        let _probe = crate::perf::Probe::new("recompute_completion", 8);
         let Some(d) = self.workspace.active_doc() else {
             self.completion.close();
             self.completion_req = None;

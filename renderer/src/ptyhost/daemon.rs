@@ -51,6 +51,24 @@ pub fn run() -> io::Result<()> {
     let token = gen_token(port);
     write_info(port, &token)?;
 
+    // Usurpation watchdog: if the discovery file ever stops pointing at THIS
+    // process (another daemon overwrote it, or it was deleted), this daemon is
+    // unreachable forever — no GUI can learn its port/token again. Exit instead
+    // of running invisibly; dropping the pty masters HUPs the shells.
+    std::thread::spawn(|| {
+        let me = std::process::id();
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            let current = super::info_path()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .and_then(|t| serde_json::from_str::<super::HostInfo>(&t).ok())
+                .map(|i| i.pid);
+            if current != Some(me) {
+                std::process::exit(0);
+            }
+        }
+    });
+
     let (tx, rx) = channel::<Event>();
 
     // Acceptor thread → NewClient events.

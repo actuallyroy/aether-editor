@@ -13,3 +13,25 @@ pub fn log(msg: &str) {
         let _ = writeln!(f, "{msg}");
     }
 }
+
+/// Scope timer: logs `name: <elapsed>` on drop when it exceeded `min_ms`.
+pub struct Probe {
+    name: &'static str,
+    min: std::time::Duration,
+    t0: std::time::Instant,
+}
+
+impl Probe {
+    pub fn new(name: &'static str, min_ms: u64) -> Probe {
+        Probe { name, min: std::time::Duration::from_millis(min_ms), t0: std::time::Instant::now() }
+    }
+}
+
+impl Drop for Probe {
+    fn drop(&mut self) {
+        let dt = self.t0.elapsed();
+        if dt >= self.min {
+            log(&format!("{}: {dt:?}", self.name));
+        }
+    }
+}

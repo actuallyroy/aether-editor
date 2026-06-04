@@ -1257,14 +1257,41 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 }
                 // Thin blinking caret (editor-style) in the focused pane, when the
                 // shell shows the cursor (DECTCEM) and we're at the live bottom.
+                // CRITICAL: the caret must live in the SAME coordinate space as the
+                // text — visual row = (scrollback + grid row) - top_line. Assuming
+                // the window starts exactly at scrollback.len() drifts one row off
+                // whenever the scroll offset isn't a perfect line multiple, painting
+                // the caret beside the wrong line while the grid is fully correct.
                 let focused = app.terminal.focused && i == g.focused;
                 if focused && pane.term.cursor_visible() && at_bottom && app.term_blink_on {
                     let (cc, cr) = pane.term.cursor();
-                    let cx = rect.x + theme::zpx(8.0) + cc as f32 * char_w;
-                    let cy = rect.y + theme::zpx(4.0) + cr as f32 * line_h;
-                    let caret_w = theme::zpx(2.0).max(1.0);
-                    if cx < right && cy + line_h <= rect.y + rect.h {
-                        bg_quads.push(Quad::new(cx, cy, caret_w, line_h, theme::CURSOR()));
+                    let (_, grid_rows) = pane.term.dims();
+                    let back = pane.term.total_lines().saturating_sub(grid_rows);
+                    // Same clamp as window_from: the text never starts past `back`.
+                    let eff_top = top_line.min(back);
+                    let visual = (back + cr) as isize - eff_top as isize;
+                    // Debug builds: dump the caret-draw inputs (overwrite, tiny) so a
+                    // misplaced caret report can be matched against a grid replay.
+                    #[cfg(debug_assertions)]
+                    {
+                        let _ = std::fs::write(
+                            "/tmp/aether_caret_dbg.txt",
+                            format!(
+                                "cc={cc} cr={cr} grid_rows={grid_rows} total={} back={back} top_line={top_line} eff_top={eff_top} visual={visual} scroll={:.2} rect.y={:.1} rect.h={:.1} line_h={line_h:.2}\n",
+                                pane.term.total_lines(),
+                                pane.scroll.offset().1,
+                                rect.y,
+                                rect.h,
+                            ),
+                        );
+                    }
+                    if visual >= 0 {
+                        let cx = rect.x + theme::zpx(8.0) + cc as f32 * char_w;
+                        let cy = rect.y + theme::zpx(4.0) + visual as f32 * line_h;
+                        let caret_w = theme::zpx(2.0).max(1.0);
+                        if cx < right && cy + line_h <= rect.y + rect.h {
+                            bg_quads.push(Quad::new(cx, cy, caret_w, line_h, theme::CURSOR()));
+                        }
                     }
                 }
                 // Auto-hiding scrollback scrollbar (overlay) for this pane.
@@ -1781,6 +1808,8 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
 
     // (The command palette draws in its own late pass — see below.)
 
+    let t_prep = std::time::Instant::now();
+    let n_areas = areas.len();
     gpu.text_renderer.prepare(
         &gpu.device,
         &gpu.queue,
@@ -1790,6 +1819,10 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         areas,
         &mut gpu.swash_cache,
     )?;
+    let prep = t_prep.elapsed();
+    if prep > std::time::Duration::from_millis(8) {
+        crate::perf::log(&format!("frame text prepare: {prep:?} ({n_areas} areas)"));
+    }
 
     // ---- Submit ----
     let frame = gpu.surface.get_current_texture()?;

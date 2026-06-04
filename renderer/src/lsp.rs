@@ -1234,8 +1234,9 @@ impl LspManager {
         let Some(uri) = self.sem_pending.remove(&id) else { return false };
         let toks = crate::highlight::decode_semantic(&data, &self.sem_legend);
         if let Some(d) = Self::doc_for(docs, &uri) {
-            d.set_semantic(&toks);
-            d.reshape(fs);
+            // Line-diffed application: only the lines whose tokens changed are
+            // recolored (a full reshape per delivery froze large files, #36).
+            d.apply_semantic_tokens(&toks, fs);
             true
         } else {
             false

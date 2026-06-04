@@ -208,7 +208,40 @@ impl Grid {
         for row in &mut self.cells {
             row.resize(cols, Cell::blank());
         }
-        self.cells.resize(rows, vec![Cell::blank(); cols]);
+        // Row changes follow xterm: shrinking PRESERVES THE CURSOR'S LINE by
+        // first dropping blank rows below the cursor, then pushing top rows into
+        // scrollback; growing pulls rows back so content stays glued to the
+        // bottom. The old truncate-the-bottom + clamp silently moved the cursor
+        // onto a DIFFERENT content line, desyncing every relative move the app
+        // makes afterwards (the alt screen skips this — TUIs repaint on resize).
+        while self.cells.len() > rows {
+            let last_blank = self.cells.last().map_or(false, |r| r.iter().all(|c| c.ch == ' ' && c.bg.is_none()));
+            if last_blank && self.cur_row + 1 < self.cells.len() {
+                self.cells.pop();
+            } else if self.cur_row > 0 {
+                let line = self.cells.remove(0);
+                if self.alt.is_none() {
+                    self.scrollback.push(line);
+                    if self.scrollback.len() > MAX_SCROLLBACK {
+                        self.scrollback.remove(0);
+                    }
+                }
+                self.cur_row -= 1;
+            } else {
+                self.cells.pop(); // cursor on the top row: nothing above to save
+            }
+        }
+        while self.cells.len() < rows {
+            if self.alt.is_none() && !self.scrollback.is_empty() {
+                let line = self.scrollback.pop().unwrap();
+                let mut line = line;
+                line.resize(cols, Cell::blank());
+                self.cells.insert(0, line);
+                self.cur_row += 1;
+            } else {
+                self.cells.push(vec![Cell::blank(); cols]);
+            }
+        }
         self.rows = rows;
         self.cols = cols;
         self.scroll_top = 0;
@@ -463,12 +496,28 @@ fn xterm256(n: u8) -> [f32; 4] {
 
 impl Perform for Grid {
     fn print(&mut self, c: char) {
+        // Display width in cells: wide glyphs (CJK, emoji, ⏵-style symbols — all
+        // over Claude Code's UI) take TWO. Getting this wrong desyncs every wrap
+        // and every relative cursor move the app computes from the real widths,
+        // so its redraws land on the wrong rows and park the cursor mid-text.
+        // Zero-width marks combine into the previous cell (best effort: appended
+        // glyph is dropped, but the COLUMN stays correct, which is what matters).
+        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
+        if w == 0 {
+            return;
+        }
         // Deferred autowrap: the wrap from the previous last-column write happens now,
         // when an actual printable char arrives (a cursor move would have disarmed it).
         if self.wrap_pending {
             self.cur_col = 0;
             self.newline();
             self.wrap_pending = false;
+        }
+        // A wide char that doesn't fit in the remaining columns wraps NOW (it
+        // can't straddle the edge).
+        if w == 2 && self.cur_col + 2 > self.cols {
+            self.cur_col = 0;
+            self.newline();
         }
         // Resolve the effective foreground: bold brightens the base ANSI colors,
         // dim (SGR 2) blends toward the background — that's what makes Claude
@@ -495,12 +544,21 @@ impl Perform for Grid {
         if let Some(cell) = self.cells.get_mut(self.cur_row).and_then(|r| r.get_mut(self.cur_col)) {
             *cell = Cell { ch: c, fg, bg };
         }
+        // A wide glyph's second cell is a continuation: blank, same colors, so
+        // erases/overwrites of either cell behave; the renderer draws the glyph
+        // from the first cell with double advance.
+        if w == 2 {
+            if let Some(cell) = self.cells.get_mut(self.cur_row).and_then(|r| r.get_mut(self.cur_col + 1)) {
+                *cell = Cell { ch: ' ', fg, bg };
+            }
+        }
         // At the last column, arm the pending wrap instead of moving past it; otherwise
-        // advance normally.
-        if self.cur_col + 1 >= self.cols {
+        // advance by the glyph's display width.
+        if self.cur_col + w >= self.cols {
+            self.cur_col = self.cols - 1;
             self.wrap_pending = true;
         } else {
-            self.cur_col += 1;
+            self.cur_col += w;
         }
     }
 
@@ -774,6 +832,19 @@ impl Terminal {
 
     /// Feed a chunk of shell output (raw VT bytes) into the grid.
     pub fn feed(&mut self, data: &[u8]) {
+        // Debug builds: tap the exact byte stream (per terminal) to /tmp so a
+        // user-reported rendering bug replays deterministically in a test.
+        #[cfg(debug_assertions)]
+        {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(format!("/tmp/aether_term_tap_{}.bin", self.id))
+            {
+                let _ = f.write_all(data);
+            }
+        }
         for &b in data {
             self.parser.advance(&mut self.grid, b);
         }
@@ -1123,5 +1194,206 @@ mod tests {
         // Outside the region the screen edges still apply.
         feed(&mut grid, &mut parser, b"\x1b[9;1H\x1b[99B");
         assert_eq!(grid.cur_row, 9);
+    }
+
+
+    // Same end-to-end assertion as the zsh -f fixture, but with the user's REAL
+    // interactive zsh (loads ~/.zshrc: OSC 7 cwd reports, the %-trick, custom
+    // prompt) — claude → double Ctrl+C → prompt. The prompt must be the LAST
+    // content, with the cursor right after it and no claude residue below.
+    #[test]
+    fn interactive_zsh_claude_exit_is_clean() {
+        let data = include_bytes!("fixtures_claude_session_zshi.bin");
+        let mut grid = Grid::new(30, 120);
+        let mut parser = Parser::new();
+        feed(&mut grid, &mut parser, data);
+        let prompt_row = (0..grid.rows)
+            .rev()
+            .find(|&r| row_text(&grid, r).contains("mac@macs-MacBook-Pro"))
+            .expect("interactive prompt visible after exit");
+        assert_eq!(grid.cur_row, prompt_row, "cursor on the prompt row");
+        let line = row_text(&grid, prompt_row);
+        assert!(line.trim_end().ends_with('%'), "prompt line: {line:?}");
+        assert_eq!(grid.cur_col, line.len() + 1, "cursor right after '% '");
+        // Everything below the prompt must be blank (zsh's ESC[J cleared it).
+        for r in (prompt_row + 1)..grid.rows {
+            assert!(row_text(&grid, r).is_empty(), "residue on row {r}: {:?}", row_text(&grid, r));
+        }
+    }
+
+    // Wide glyphs (CJK / emoji / ⏵-symbols all over Claude Code's UI) occupy TWO
+    // cells; narrow accounting desyncs the app's wrap/relative-move math and its
+    // redraws land on the wrong rows.
+    #[test]
+    fn wide_chars_take_two_cells() {
+        let mut grid = Grid::new(5, 10);
+        let mut parser = Parser::new();
+        for b in "中文 ok".as_bytes() {
+            parser.advance(&mut grid, *b);
+        }
+        // 2 wide chars (2 cells each) + " ok" (3) = col 7.
+        assert_eq!(grid.cur_col, 7);
+        assert_eq!(grid.cells[0][0].ch, '中');
+        assert_eq!(grid.cells[0][1].ch, ' '); // continuation cell
+        assert_eq!(grid.cells[0][2].ch, '文');
+        // Symbols like ⏵ are width-1 in wcwidth terms (xterm agrees).
+        let mut g3 = Grid::new(2, 10);
+        let mut p3 = Parser::new();
+        for b in "⏵⏵".as_bytes() {
+            p3.advance(&mut g3, *b);
+        }
+        assert_eq!(g3.cur_col, 2);
+        // A wide char with one column left wraps to the next row first.
+        let mut g2 = Grid::new(5, 5);
+        let mut p2 = Parser::new();
+        for b in "abcd中".as_bytes() {
+            p2.advance(&mut g2, *b);
+        }
+        assert_eq!(g2.cells[0][3].ch, 'd');
+        assert_eq!(g2.cells[1][0].ch, '中'); // wrapped, not straddling
+        assert_eq!((g2.cur_row, g2.cur_col), (1, 2));
+    }
+
+    // LIVE end-to-end repro of the user's flow: a real zsh -il in a real pty,
+    // `claude` started and double-Ctrl+C'd, with our Grid in the loop INCLUDING
+    // its query replies (CPR/DA fed back into the pty like the app does). The
+    // passive fixtures can't see reply-feedback effects; this can. Ignored by
+    // default (spawns claude, ~20s) — run with: cargo test live_claude -- --ignored
+    #[test]
+    #[ignore]
+    fn live_claude_roundtrip_ends_at_prompt() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        use std::io::{Read, Write};
+        let (rows, cols) = (30usize, 100usize);
+        let pty = native_pty_system();
+        let pair = pty
+            .openpty(PtySize { rows: rows as u16, cols: cols as u16, pixel_width: 0, pixel_height: 0 })
+            .unwrap();
+        let mut cmd = CommandBuilder::new("zsh");
+        cmd.args(["-il"]);
+        cmd.env("TERM", "xterm-256color");
+        cmd.cwd("/Users/mac/Desktop/Amit Personal/chrome-mcp"); // user's project: MCP servers load
+        let mut child = pair.slave.spawn_command(cmd).unwrap();
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let mut writer = pair.master.take_writer().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut grid = Grid::new(rows, cols);
+        let mut parser = Parser::new();
+        let mut all: Vec<u8> = Vec::new();
+        let pump = |grid: &mut Grid, parser: &mut Parser, writer: &mut dyn Write, all: &mut Vec<u8>, secs: f32| {
+            let end = std::time::Instant::now() + std::time::Duration::from_secs_f32(secs);
+            while std::time::Instant::now() < end {
+                match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                    Ok(data) => {
+                        all.extend_from_slice(&data);
+                        for &b in &data {
+                            parser.advance(grid, b);
+                        }
+                        // Mirror Terminal::feed: send provoked replies back.
+                        let replies = std::mem::take(&mut grid.replies);
+                        if !replies.is_empty() {
+                            let _ = writer.write_all(&replies);
+                            let _ = writer.flush();
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+        };
+        pump(&mut grid, &mut parser, &mut *writer, &mut all, 2.5);
+        writer.write_all(b"claude\r").unwrap();
+        writer.flush().unwrap();
+        pump(&mut grid, &mut parser, &mut *writer, &mut all, 15.0);
+        // The user's cadence: a first press whose window expires (hint shows,
+        // then fades), then a quick double press that actually exits.
+        writer.write_all(b"\x03").unwrap();
+        writer.flush().unwrap();
+        pump(&mut grid, &mut parser, &mut *writer, &mut all, 2.0);
+        writer.write_all(b"\x03").unwrap();
+        writer.flush().unwrap();
+        pump(&mut grid, &mut parser, &mut *writer, &mut all, 0.4);
+        writer.write_all(b"\x03").unwrap();
+        writer.flush().unwrap();
+        pump(&mut grid, &mut parser, &mut *writer, &mut all, 8.0);
+        let _ = child.kill();
+        // Dump the transcript for offline analysis on failure.
+        let _ = std::fs::write("/tmp/live_claude_transcript.bin", &all);
+        let dump: Vec<String> = (0..grid.rows)
+            .map(|r| format!("{r:2} {:?}", row_text(&grid, r)))
+            .collect();
+        let prompt_row = (0..grid.rows)
+            .rev()
+            .find(|&r| row_text(&grid, r).contains("mac@macs-MacBook-Pro"))
+            .unwrap_or_else(|| panic!("no prompt after exit; screen:\n{}", dump.join("\n")));
+        assert_eq!(
+            grid.cur_row, prompt_row,
+            "cursor row vs prompt row; screen:\n{}\ncursor=({},{})",
+            dump.join("\n"),
+            grid.cur_row,
+            grid.cur_col
+        );
+        let line = row_text(&grid, prompt_row);
+        assert_eq!(grid.cur_col, line.len() + 1, "cursor right after '% '");
+    }
+
+    // Resizing rows must preserve the CURSOR'S LINE (xterm): shrink pushes top
+    // rows to scrollback (after dropping blank bottom rows), grow pulls them
+    // back. The old truncate-the-bottom moved the cursor onto different content.
+    #[test]
+    fn row_resize_preserves_cursor_line() {
+        let mut grid = Grid::new(6, 20);
+        let mut parser = Parser::new();
+        feed(&mut grid, &mut parser, b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nprompt");
+        assert_eq!((grid.cur_row, grid.cur_col), (5, 6));
+        grid.resize(4, 20);
+        // Cursor still sits on the "prompt" line; two lines went to scrollback.
+        assert_eq!(row_text(&grid, grid.cur_row), "prompt");
+        assert_eq!(grid.scrollback.len(), 2);
+        assert_eq!(grid.scrollback[0].iter().map(|c| c.ch).collect::<String>().trim_end(), "one");
+        grid.resize(6, 20);
+        // Growing pulls the lines back; cursor still on "prompt".
+        assert_eq!(row_text(&grid, grid.cur_row), "prompt");
+        assert_eq!(grid.scrollback.len(), 0);
+        assert_eq!(row_text(&grid, 0), "one");
+    }
+
+    // Replay of the USER'S OWN tapped session (debug-build byte tap of the NCH
+    // terminal: long claude --resume session, resize mid-way 130→133 cols, first
+    // Ctrl+C hint state, then full exit). Scratch diagnostics — prints state at
+    // the hint moment and at the end.
+    #[test]
+    #[ignore]
+    fn replay_user_tap() {
+        let data = std::fs::read("/tmp/aether_term_tap_1.bin").unwrap();
+        let (rows, cols) = (44usize, 133usize);
+        let mut grid = Grid::new(rows, cols);
+        let mut parser = Parser::new();
+        // Hint state: feed through the resume-text region (byte 86270ish).
+        for &b in &data[..86300] {
+            parser.advance(&mut grid, b);
+        }
+        let dump = |grid: &Grid, label: &str| {
+            println!("==== {label}: cursor=({}, {}) visible={}", grid.cur_row, grid.cur_col, grid.cursor_visible);
+            for r in 0..grid.rows {
+                let t = row_text(grid, r);
+                if !t.is_empty() {
+                    println!("{r:2} {t:?}");
+                }
+            }
+        };
+        dump(&grid, "AT HINT STATE");
+        for &b in &data[86300..] {
+            parser.advance(&mut grid, b);
+        }
+        dump(&grid, "FINAL");
     }
 }

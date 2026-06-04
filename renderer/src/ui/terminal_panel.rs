@@ -151,9 +151,19 @@ impl TerminalPanel {
                 Incoming::Backlog { id, data } => {
                     if let Some(p) = self.term_by_id(id) {
                         p.term.feed(&data);
-                        // Replay done at the pty's original size — the panel's size
-                        // sync may now resize (the SIGWINCH repaints TUIs cleanly).
                         p.term.pending_backlog = false;
+                        // A backlog replay can NEVER reconstruct exact terminal
+                        // state: the ring buffer starts mid-stream after a long
+                        // session, so setup sequences are gone and relative
+                        // positioning replays from a wrong baseline. Don't trust
+                        // it — wiggle the pty one row so the SIGWINCH forces the
+                        // running TUI (claude code) to repaint a clean frame; the
+                        // per-frame size sync immediately resizes to the panel,
+                        // delivering the second SIGWINCH back at the real size.
+                        let (cols, rows) = p.term.dims();
+                        if rows > 1 {
+                            p.term.resize(rows - 1, cols);
+                        }
                         p.dirty = true;
                     }
                 }
