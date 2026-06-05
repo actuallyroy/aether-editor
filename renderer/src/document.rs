@@ -93,6 +93,12 @@ pub struct Document {
     // Matching-bracket highlight memo: (caret, version) → pair. Cell because the
     // render loop only holds &Document; the scan reruns only when the key changes.
     bracket_hl_cache: std::cell::Cell<Option<(usize, i32, Option<(usize, usize)>)>>,
+    // Detected indentation unit (in columns) for indent guides, keyed by version so
+    // it follows the file's own style (2-space, 4-space, tabs) rather than a setting.
+    indent_unit_cache: std::cell::Cell<Option<(i32, usize)>>,
+    // Cached widest shaped line (px) for the horizontal scroll range, keyed by
+    // (version, shape epoch). Avoids an O(lines) scan of both diff buffers per frame.
+    maxw_cache: std::cell::Cell<Option<(i32, u64, f32)>>,
     pub info: Option<crate::ui::info_page::InfoPage>, // Some ⇒ designed info page (Welcome / Tips / Shortcuts)
     /// Large-file mode: only a sliding window of lines is shaped into `buffer`
     /// (shaping a 450k-line file whole takes ~50s). Highlighting, LSP, folding and
@@ -337,6 +343,8 @@ impl Document {
             semantic: Vec::new(),
             expand_stack: Vec::new(),
             bracket_hl_cache: std::cell::Cell::new(None),
+            indent_unit_cache: std::cell::Cell::new(None),
+            maxw_cache: std::cell::Cell::new(None),
             info: None,
             large,
             buf_first: 0,
@@ -411,6 +419,8 @@ impl Document {
             semantic: Vec::new(),
             expand_stack: Vec::new(),
             bracket_hl_cache: std::cell::Cell::new(None),
+            indent_unit_cache: std::cell::Cell::new(None),
+            maxw_cache: std::cell::Cell::new(None),
             info: None,
             large: false,
             buf_first: 0,
@@ -501,6 +511,8 @@ impl Document {
             semantic: Vec::new(),
             expand_stack: Vec::new(),
             bracket_hl_cache: std::cell::Cell::new(None),
+            indent_unit_cache: std::cell::Cell::new(None),
+            maxw_cache: std::cell::Cell::new(None),
             info: None,
             large: false,
             buf_first: 0,
@@ -567,15 +579,56 @@ impl Document {
         }
     }
 
+    /// Window the diff buffers to the visible viewport so glyphon only processes
+    /// visible rows (otherwise it iterates every line of both panes each frame — the
+    /// multi-file-diff scroll lag). Sets each buffer's vertical scroll to `scroll_y`
+    /// and its height to `visible_h`; cosmic-text's layout iterator then skips rows
+    /// above (line_y < 0) and stops below (line_y > height). After this, a run's
+    /// `line_top` is viewport-relative, so diff draw code adds it to the pane top
+    /// directly (no `- scroll_y`). No-op for non-diff docs.
+    pub fn window_diff(&mut self, fs: &mut FontSystem, scroll_y: f32, visible_h: f32) {
+        if self.diff_right.is_none() {
+            return;
+        }
+        let scroll = glyphon::cosmic_text::Scroll::new(0, scroll_y.max(0.0), 0.0);
+        self.buffer.set_scroll(scroll);
+        if self.buffer.size().1 != Some(visible_h) {
+            let w = self.buffer.size().0;
+            self.buffer.set_size(fs, w, Some(visible_h));
+        }
+        if let Some(right) = self.diff_right.as_mut() {
+            right.set_scroll(scroll);
+            if right.size().1 != Some(visible_h) {
+                let rw = right.size().0;
+                right.set_size(fs, rw, Some(visible_h));
+            }
+        }
+    }
+
     /// Widest shaped line in pixels (for horizontal scrolling).
     pub fn max_line_width(&self) -> f32 {
+        // Cache by (version, shape epoch): scanning every line of both diff buffers
+        // each frame is the multi-file-diff scroll lag. Large-file mode isn't cached —
+        // its windowed buffer reshapes (and its width changes) as you scroll.
+        let key = (self.version, theme::shape_epoch());
+        if !self.large {
+            if let Some((v, e, w)) = self.maxw_cache.get() {
+                if (v, e) == key {
+                    return w;
+                }
+            }
+        }
         let left = self.buffer.layout_runs().map(|r| r.line_w).fold(0.0_f32, f32::max);
         // In a side-by-side diff the right pane has its own buffer; the widest line
-        // across both panes drives the (shared) horizontal scroll range.
-        match self.diff_right.as_ref() {
+        // across both panes drives the horizontal scroll range.
+        let w = match self.diff_right.as_ref() {
             Some(right) => right.layout_runs().map(|r| r.line_w).fold(left, f32::max),
             None => left,
+        };
+        if !self.large {
+            self.maxw_cache.set(Some((key.0, key.1, w)));
         }
+        w
     }
 
     /// Current scroll offset (px). Backed by the document's `ScrollView`.
@@ -2242,10 +2295,90 @@ impl Document {
         None
     }
 
-    /// Matching-bracket pair to highlight for the current caret (None while a
-    /// selection is active or the caret isn't beside a bracket). Cached per
-    /// (caret, version) — the render loop asks every frame but the scan should
-    /// only run when the caret actually moved or the text changed.
+    /// The quote at/just beside `head` plus its matching quote on the same line, as
+    /// byte offsets. Quotes don't nest — they pair up in order along the line
+    /// (0–1, 2–3, …), skipping backslash-escaped ones — so the partner is whichever
+    /// slot ours shares. None if the quote is unbalanced (odd count).
+    pub fn quote_pair_at(&self, head: usize) -> Option<(usize, usize)> {
+        let quotes = ['"', '\'', '`'];
+        let head = head.min(self.rope.len_bytes());
+        let hc = self.rope.byte_to_char(head);
+        let total = self.rope.len_chars();
+        for (ci, before) in [(hc, false), (hc.saturating_sub(1), true)] {
+            if ci >= total || (before && hc == 0) {
+                continue;
+            }
+            let q = self.rope.char(ci);
+            if !quotes.contains(&q) {
+                continue;
+            }
+            let byte = self.rope.char_to_byte(ci);
+            let line = self.rope.byte_to_line(byte);
+            // Unescaped `q` byte positions on this line, in order.
+            let mut positions: Vec<usize> = Vec::new();
+            let mut b = self.rope.line_to_byte(line);
+            let mut escaped = false;
+            for ch in self.rope.line(line).chars() {
+                if ch == q && !escaped {
+                    positions.push(b);
+                }
+                escaped = ch == '\\' && !escaped;
+                b += ch.len_utf8();
+            }
+            let idx = positions.iter().position(|&p| p == byte)?;
+            let partner = if idx % 2 == 0 { positions.get(idx + 1) } else { positions.get(idx - 1) };
+            return partner.map(|&p| (byte, p));
+        }
+        None
+    }
+
+    /// The file's indentation unit in columns, detected from its own content (so
+    /// indent guides follow 2-space / 4-space / tab styles, not a global setting).
+    /// The most common single-step indent *increase* wins; falls back to `tab` when
+    /// nothing is indented. Cached per version (a full scan is capped to 2000 lines).
+    pub fn indent_unit(&self, tab: usize) -> usize {
+        if let Some((v, u)) = self.indent_unit_cache.get() {
+            if v == self.version {
+                return u;
+            }
+        }
+        let tab = tab.max(1);
+        let mut tally = [0u32; 9]; // counts for indent increments 1..=8 columns
+        let mut prev = 0usize;
+        for line in 0..self.rope.len_lines().min(2000) {
+            let (mut cols, mut blank) = (0usize, true);
+            for c in self.rope.line(line).chars() {
+                match c {
+                    ' ' => cols += 1,
+                    '\t' => cols += tab - (cols % tab),
+                    '\n' | '\r' => break, // blank line — don't disturb `prev`
+                    _ => {
+                        blank = false;
+                        break;
+                    }
+                }
+            }
+            if blank {
+                continue;
+            }
+            if cols > prev {
+                let d = cols - prev;
+                if (1..=8).contains(&d) {
+                    tally[d] += 1;
+                }
+            }
+            prev = cols;
+        }
+        let unit = (1..=8).filter(|&d| tally[d] > 0).max_by_key(|&d| tally[d]).unwrap_or(tab);
+        self.indent_unit_cache.set(Some((self.version, unit)));
+        unit
+    }
+
+    /// Matching pair to highlight for the current caret: a bracket pair when the
+    /// caret is beside a bracket, else a quote pair when beside a quote. None while
+    /// a selection is active or the caret isn't beside either. Cached per (caret,
+    /// version) — the render loop asks every frame but the scan only runs when the
+    /// caret actually moved or the text changed.
     pub fn bracket_highlight(&self) -> Option<(usize, usize)> {
         if !self.sel.is_empty() {
             return None;
@@ -2256,7 +2389,7 @@ impl Document {
                 return r;
             }
         }
-        let r = self.bracket_pair_at(head);
+        let r = self.bracket_pair_at(head).or_else(|| self.quote_pair_at(head));
         self.bracket_hl_cache.set(Some((head, self.version, r)));
         r
     }
@@ -2548,6 +2681,27 @@ mod tests {
         d2.backspace(&mut fs); // "(x"
         d2.place(0, false);
         assert_eq!(d2.bracket_highlight(), None);
+    }
+
+    #[test]
+    fn quote_pair_highlight() {
+        let mut fs = glyphon::FontSystem::new();
+        //                   0123456789012345678
+        let mut d = doc("let s = \"hello\" + x;", &mut fs);
+        // Caret before the opening quote (byte 8) → pairs with the closing quote (14).
+        d.place(8, false);
+        assert_eq!(d.bracket_highlight(), Some((8, 14)));
+        // Caret after the closing quote → char-before rule pairs it back.
+        d.place(15, false);
+        assert_eq!(d.bracket_highlight(), Some((14, 8)));
+        // Inside the string (not beside a quote) → nothing.
+        d.place(11, false);
+        assert_eq!(d.bracket_highlight(), None);
+        // Escaped quote is skipped when pairing.
+        let mut d2 = doc("x = \"a\\\"b\";", &mut fs); // x = "a\"b";
+        d2.place(4, false); // before opening "
+        // Bytes: " at 4, \ at 6, escaped " at 7, real closing " at 9.
+        assert_eq!(d2.bracket_highlight(), Some((4, 9)));
     }
 
     // Diagnostic timing for huge files (run with --ignored --nocapture). Mirrors a

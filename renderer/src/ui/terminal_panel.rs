@@ -685,24 +685,26 @@ impl TerminalPanel {
     /// End any in-progress selection drag; drop a zero-width selection (plain click).
     pub fn selection_release(&mut self) {
         // A plain click (released without dragging a selection) walks the shell
-        // cursor to the clicked column with arrow keys — only at a normal prompt
-        // (not in a full-screen app) and only on the row the cursor is on.
+        // cursor to the clicked cell with arrow keys — only at a normal prompt (not
+        // in a full-screen app). A long prompt input wraps across several rows but is
+        // one logical line of width `cols`, so the cursor delta spans rows:
+        // (line - cursor_line) * cols + (col - cur_col). This makes clicking anywhere
+        // in a wrapped command work, not just the row the cursor happens to be on.
         if let Some((line, col)) = self.click_cell.take() {
             if let Some(g) = self.groups.get_mut(self.active) {
                 if let Some(p) = g.panes.get_mut(g.focused) {
                     let no_drag = p.sel.map_or(true, |(a, b)| a == b);
                     if no_drag && !p.term.is_alt() {
                         let (cur_col, cur_row) = p.term.cursor();
-                        let (_, rows) = p.term.dims();
+                        let (cols, rows) = p.term.dims();
                         let cursor_line = p.term.total_lines().saturating_sub(rows) + cur_row;
-                        if line == cursor_line {
-                            let delta = col as i64 - cur_col as i64;
-                            let one: &[u8] = if delta > 0 { b"\x1b[C" } else { b"\x1b[D" };
-                            let n = delta.unsigned_abs().min(512) as usize;
-                            if n > 0 {
-                                let bytes: Vec<u8> = one.iter().copied().cycle().take(one.len() * n).collect();
-                                p.term.write(&bytes);
-                            }
+                        let delta = (line as i64 - cursor_line as i64) * cols as i64
+                            + (col as i64 - cur_col as i64);
+                        let one: &[u8] = if delta > 0 { b"\x1b[C" } else { b"\x1b[D" };
+                        let n = delta.unsigned_abs().min(512) as usize;
+                        if n > 0 {
+                            let bytes: Vec<u8> = one.iter().copied().cycle().take(one.len() * n).collect();
+                            p.term.write(&bytes);
                         }
                     }
                 }

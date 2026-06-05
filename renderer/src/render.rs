@@ -264,6 +264,12 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             layout.editor_text
         };
         d.scroll.set_metrics(vp, (content_w, content_h));
+        // Side-by-side diff: window both buffers to the viewport so glyphon only
+        // processes visible rows (multi-file diffs were O(all lines) per frame).
+        if d.diff.is_some() {
+            let vh = layout.editor_text.h - theme::EDITOR_PAD();
+            d.window_diff(&mut gpu.font_system, d.scroll_y(), vh);
+        }
         // Large-file mode: keep the shaped window covering the viewport (no-op
         // while the view stays inside; reshapes ~1.5k lines when it drifts out).
         if d.large {
@@ -278,15 +284,14 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         let fs = &mut gpu.font_system;
         let cache = &mut app.ui_cache;
 
-        // Header command-center label — active file, or the project name.
-        let header_label = match app.workspace.active_doc() {
-            Some(d) => d.name.clone(),
-            None => app
-                .cwd
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Search".into()),
-        };
+        // Header command-center label — always the root workspace folder name,
+        // shown in all caps (VSCode shows the active file, but the user prefers
+        // the project root here as a stable command-center identity).
+        let header_label = app
+            .cwd
+            .file_name()
+            .map(|n| n.to_string_lossy().to_uppercase())
+            .unwrap_or_else(|| "SEARCH".into());
         gpu.search.set(fs, &header_label);
         // Activity-bar icons and window controls are IconButton widgets now
         // (rendered below from layout rects) — no per-glyph buffer juggling here.
@@ -330,49 +335,37 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             .set_rich(fs, &ws_name, &root_spans, Attrs::new().family(Family::Name(theme::UI_FAMILY())));
 
         // Sidebar — file tree with monochrome MDL2 folder/file icons (rich text:
-        // icon glyphs in the icon font, names in the UI font).
-        let mut sidebar_key = String::new();
-        for node in app.workspace.tree.nodes.iter() {
-            sidebar_key.push_str(&node.depth.to_string());
-            sidebar_key.push(if node.is_dir {
-                if node.expanded {
-                    'v'
-                } else {
-                    '>'
-                }
-            } else {
-                '.'
-            });
-            sidebar_key.push_str(&node.name);
-            sidebar_key.push('\n');
-        }
+        // icon glyphs in the icon font, names in the UI font). The IconList owns the
+        // centered-icon rendering; we just feed it one row spec per node. Folders use
+        // an enlarged (1.25×) chevron; files a 1.0× file-type glyph.
         {
-            let ui_attrs = Attrs::new()
-                .family(Family::Name(theme::UI_FAMILY()))
-                .color(theme::FG_TEXT());
-            let icon_attrs = |color| Attrs::new().family(Family::Name(theme::ICON_FAMILY)).color(color);
-            let mut spans: Vec<(String, Attrs)> = Vec::new();
-            for node in app.workspace.tree.nodes.iter() {
-                spans.push(("  ".repeat(node.depth), ui_attrs));
-                // A type/name-specific glyph + color from the shared icon source.
-                let (glyph, color) = if node.is_dir {
-                    theme::folder_icon(&node.name, node.expanded)
-                } else {
-                    theme::file_icon(&node.name)
-                };
-                spans.push((format!("{}  ", glyph), icon_attrs(color)));
-                spans.push((format!("{}\n", node.name), ui_attrs));
-            }
+            let mut sidebar_key = String::new();
+            let name_c = theme::FG_TEXT();
+            let rows: Vec<crate::widgets::IconRow> = app
+                .workspace
+                .tree
+                .nodes
+                .iter()
+                .map(|node| {
+                    let (glyph, color, scale) = if node.is_dir {
+                        let (g, c) = theme::folder_icon(&node.name, node.expanded);
+                        (g, c, 1.25)
+                    } else {
+                        let (g, c) = theme::file_icon(&node.name);
+                        (g, c, 1.0)
+                    };
+                    sidebar_key.push_str(&format!("{}{}{}\n", node.depth, glyph, node.name));
+                    crate::widgets::IconRow {
+                        depth: node.depth,
+                        icon: Some((glyph, color, scale)),
+                        label: vec![(node.name.clone(), name_c)],
+                    }
+                })
+                .collect();
             // Lay the buffer out tall enough for every row (not just the visible
             // viewport) so scrolling past the first screenful isn't clipped.
             let full_h = app.workspace.tree.nodes.len() as f32 * theme::TREE_ROW_HEIGHT() + 200.0;
-            gpu.ui.sidebar.set_rich(
-                fs,
-                &sidebar_key,
-                &spans,
-                layout.sidebar.w,
-                full_h.max(layout.sidebar.h),
-            );
+            gpu.ui.sidebar.set_rows(fs, &sidebar_key, &rows, layout.sidebar.w, full_h.max(layout.sidebar.h));
         }
 
         // Tab strip — one label per document, plus the open extension page as its
@@ -587,7 +580,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         // Find-in-files panel shapes its own buffers (results list, inputs, labels).
         if app.sidebar_view == SidebarView::Search {
             if let Some(sp) = app.search.as_mut() {
-                sp.update(fs, layout.tree_region());
+                sp.update(fs, layout.sidebar);
             }
         }
 
@@ -619,13 +612,10 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 let mut list_text = String::new();
                 match app.palette.mode {
                     crate::commands::PaletteMode::Commands => {
+                        // Labels only — shortcuts draw as right-aligned keycap pills
+                        // in the palette's late pass (see Keycaps below).
                         for &i in app.palette.filtered.iter() {
-                            let (_, label, shortcut) = COMMANDS[i];
-                            if shortcut.is_empty() {
-                                list_text.push_str(&format!(" {}\n", label));
-                            } else {
-                                list_text.push_str(&format!(" {}   [{}]\n", label, shortcut));
-                            }
+                            list_text.push_str(&format!(" {}\n", COMMANDS[i].1));
                         }
                     }
                     // `%` rows already carry file:line in the label — no detail tag.
@@ -771,6 +761,16 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     }
                 }
             }
+            // Indent guides (hover-revealed + animated, owned by the IconList). The
+            // open file's parent guide stays highlighted even when not hovering.
+            {
+                let active = app.workspace.active_doc().and_then(|d| d.path.clone()).and_then(|path| {
+                    app.workspace.tree.nodes.iter().position(|n| n.path == path)
+                });
+                gpu.ui.sidebar.set_active_row(active);
+                let sy = app.explorer.scroll.offset().1;
+                gpu.ui.sidebar.draw_guides(tr, tr.y - sy, now, &mut bg_quads);
+            }
             // Auto-hiding file-tree scrollbar.
             if !modal_open {
                 app.explorer.scroll.draw(now, &mut fg_quads);
@@ -786,7 +786,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             // match highlights, and scrollbar overlay.
             if let Some(sp) = app.search.as_ref() {
                 sp.draw_quads(
-                    layout.tree_region(),
+                    layout.sidebar,
                     app.cursor_blink_on,
                     std::time::Instant::now(),
                     &mut bg_quads,
@@ -960,7 +960,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             let (rt_x, rt_w) = (editor_full.x + half + theme::GUTTER_WIDTH(), (editor_full.w - half - theme::GUTTER_WIDTH()).max(0.0));
             for run in d.buffer.layout_runs() {
                 let Some(row) = diff.rows.get(run.line_i) else { continue };
-                let y = editor_full.y + theme::EDITOR_PAD() + run.line_top - d.scroll_y();
+                // line_top is viewport-relative (window_diff sets the buffer scroll).
+                let y = editor_full.y + theme::EDITOR_PAD() + run.line_top;
+                if y > editor_full.y + editor_full.h {
+                    break; // runs are ordered top→bottom; nothing more is visible
+                }
                 let Some((qy, qh)) = clip_v(y, run.line_height) else { continue };
                 match row.kind {
                     RowKind::Hunk => bg_quads.push(Quad::new(editor_full.x, qy, editor_full.w, qh, theme::DIFF_HUNK_BG())),
@@ -988,6 +992,78 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             let rx = layout.editor_text.x + theme::EDITOR_PAD() + rulers as f32 * char_w - d.scroll_x();
             if rx > layout.editor_text.x && rx < layout.editor_text.x + layout.editor_text.w {
                 bg_quads.push(Quad::new(rx, layout.editor_text.y, 1.0, layout.editor_text.h, theme::BORDER()));
+            }
+        }
+
+        // Indentation guides: a faint vertical line at each indent stop a line is
+        // indented past (VSCode's editor.guides.indentation). Skipped in large-file
+        // mode (the buffer holds a window, so line_i ≠ document line) and in diffs.
+        if !d.large && d.diff.is_none() {
+            // `tab` is used only to expand tab characters into columns; the guide
+            // STEP is the unit detected from the file's own indentation.
+            let tab = crate::settings::current().editor_tab_size.max(1);
+            let unit = d.indent_unit(tab).max(1);
+            let char_w = theme::FONT_SIZE() * 0.6;
+            let gw = theme::zpx(1.0).max(1.0);
+            let faint = [0.50, 0.52, 0.62, 0.14];
+            let active_c = [0.58, 0.62, 0.78, 0.5]; // active block's guide, like the trees
+            let ex0 = layout.editor_text.x;
+            let ex1 = layout.editor_text.x + layout.editor_text.w;
+            let nlines = d.rope.len_lines();
+            // Indent level of a line (None for a blank/whitespace-only line).
+            let level_of = |line: usize| -> Option<usize> {
+                let mut cols = 0usize;
+                for c in d.rope.line(line).chars() {
+                    match c {
+                        ' ' => cols += 1,
+                        '\t' => cols += tab - (cols % tab),
+                        '\n' | '\r' => return None,
+                        _ => return Some(cols / unit),
+                    }
+                }
+                None
+            };
+            // Active guide: the guide of the block the caret is in — column (cursor
+            // level − 1), spanning the contiguous lines indented at least that deep
+            // (interior blank lines bridged, edge blanks trimmed). Like VSCode's
+            // editor.guides.highlightActiveIndentation.
+            let active = level_of(cur_line).filter(|&la| la >= 1).map(|la| {
+                let mut s = cur_line;
+                while s > 0 && level_of(s - 1).map_or(true, |l| l >= la) {
+                    s -= 1;
+                }
+                while s < cur_line && level_of(s).is_none() {
+                    s += 1; // trim leading blank lines
+                }
+                let mut e = cur_line;
+                while e + 1 < nlines && level_of(e + 1).map_or(true, |l| l >= la) {
+                    e += 1;
+                }
+                while e > cur_line && level_of(e).is_none() {
+                    e -= 1; // trim trailing blank lines
+                }
+                (la - 1, s, e)
+            });
+            for run in d.buffer.layout_runs() {
+                let line = run.line_i;
+                if line >= nlines || d.is_line_hidden(line) {
+                    continue;
+                }
+                let levels = level_of(line).unwrap_or(0);
+                if levels == 0 {
+                    continue;
+                }
+                let y = layout.editor_text.y + theme::EDITOR_PAD() + run.line_top - d.scroll_y() - foff(line);
+                if let Some((qy, qh)) = clip_v(y, run.line_height) {
+                    for k in 0..levels {
+                        let gx = (ex0 + theme::EDITOR_PAD() + (k * unit) as f32 * char_w - d.scroll_x()).round();
+                        if gx < ex0 || gx >= ex1 {
+                            continue;
+                        }
+                        let hot = active.map_or(false, |(col, s, e)| k == col && line >= s && line <= e);
+                        bg_quads.push(Quad::new(gx, qy, gw, qh, if hot { active_c } else { faint }));
+                    }
+                }
             }
         }
 
@@ -1514,6 +1590,9 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             ui.root_label
                 .draw_left(layout.root_row_rect(), theme::zpx(10.0), theme::FG_TEXT(), &mut areas);
             let sy = app.explorer.scroll.offset().1;
+            // The IconList draws each row's text + centered icon overlay together.
+            // Inline-create splits the list into two slices (above/below the insert
+            // slot), with the create field drawn between them.
             if let Some(pc) = app.explorer.creating.as_ref() {
                 let rowh = theme::TREE_ROW_HEIGHT();
                 // Scrolled tree origin: rows (and the inline create field) shift up by `sy`.
@@ -1522,7 +1601,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 let split = stop + pc.row as f32 * rowh; // top of the create row
                 if split > tr.y {
                     let clip_a = Rect { x: tr.x, y: tr.y, w: tr.w, h: (split - tr.y).min(tr.h) };
-                    ui.sidebar.draw_at(clip_a, stop, theme::FG_TEXT(), &mut areas);
+                    ui.sidebar.draw_slice(clip_a, stop, theme::FG_TEXT(), &mut areas);
                 }
                 gpu.create_icons[pc.is_dir as usize].draw(icon_rect, theme::ICON_FILE_COLOR(), &mut areas);
                 gpu.create_input.draw(field, 0.0, theme::FG_TEXT(), &mut areas);
@@ -1533,11 +1612,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     w: tr.w,
                     h: (tr.y + tr.h - below_y).max(0.0),
                 };
-                // The rows after the create row keep their natural positions; draw the
-                // buffer shifted so row (pc.row+1) lands at `below_y`'s logical slot.
-                ui.sidebar.draw_at(clip_b, stop + rowh, theme::FG_TEXT(), &mut areas);
+                // Rows at/after the insert slot shift down one row; draw the buffer
+                // shifted so row (pc.row) lands one slot lower.
+                ui.sidebar.draw_slice(clip_b, stop + rowh, theme::FG_TEXT(), &mut areas);
             } else {
-                ui.sidebar.draw_at(tr, tr.y - sy, theme::FG_TEXT(), &mut areas);
+                ui.sidebar.draw_slice(tr, tr.y - sy, theme::FG_TEXT(), &mut areas);
             }
         } else if let Some(ep) = (app.sidebar_view == SidebarView::Extensions)
             .then(|| app.extensions_panel.as_ref())
@@ -1550,7 +1629,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             // Search panel renders its own text (inputs, toggle captions, results
             // list with bright file headers + chevrons).
             if let Some(sp) = app.search.as_ref() {
-                sp.draw_text(tr, &mut areas);
+                sp.draw_text(layout.sidebar, &mut areas);
             }
         } else if app.sidebar_view == SidebarView::SourceControl {
             if let Some(scp) = app.source_control.as_ref() {
@@ -1650,7 +1729,9 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 areas.push(TextArea {
                     buffer: buf,
                     left: r.x + theme::EDITOR_PAD() - d.scroll_x(),
-                    top: r.y + theme::EDITOR_PAD() - d.scroll_y(),
+                    // Vertical offset is handled by the buffer's own scroll (window_diff),
+                    // so run positions are already viewport-relative.
+                    top: r.y + theme::EDITOR_PAD(),
                     scale: 1.0,
                     bounds: TextBounds { left: r.x as i32, top: r.y as i32, right: (r.x + r.w) as i32, bottom: (r.y + r.h) as i32 },
                     default_color: theme::FG_TEXT(),
@@ -1662,12 +1743,13 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             if let Some(diff) = d.diff.as_ref() {
                 if diff.combined {
                     for run in d.buffer.layout_runs() {
-                        let Some(row) = diff.rows.get(run.line_i) else { continue };
-                        if row.kind != crate::diff::RowKind::File {
-                            continue;
+                        // line_top is viewport-relative (window_diff sets the buffer scroll).
+                        let y = lt.y + theme::EDITOR_PAD() + run.line_top;
+                        if y > lt.y + lt.h {
+                            break; // ordered runs; past the visible area
                         }
-                        let y = lt.y + theme::EDITOR_PAD() + run.line_top - d.scroll_y();
-                        if y + run.line_height < lt.y || y > lt.y + lt.h {
+                        let Some(row) = diff.rows.get(run.line_i) else { continue };
+                        if row.kind != crate::diff::RowKind::File || y + run.line_height < lt.y {
                             continue;
                         }
                         let chev = if d.diff_collapsed.contains(&row.file) {
@@ -2358,6 +2440,28 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         if app.cursor_blink_on {
             pfg.push(gpu.ui.palette_input.caret_quad(pal.input, theme::zpx(14.0)));
         }
+        // Shortcut keycap pills, right-aligned per Commands-mode row. Built here so
+        // their fills land in `pq` (drawn under the glyphs); the `Keycaps` own their
+        // glyph buffers, so they're kept in `row_caps` until the text pass prepares.
+        let mut row_caps: Vec<crate::widgets::Keycaps> = Vec::new();
+        if app.palette.mode == crate::commands::PaletteMode::Commands {
+            let right = pal.list.x + pal.list.w - theme::zpx(12.0);
+            for (pos, &i) in app.palette.filtered.iter().enumerate() {
+                let shortcut = COMMANDS[i].2;
+                if shortcut.is_empty() {
+                    continue;
+                }
+                let r = gpu.ui.palette_list.row_rect(pal.list, pos);
+                let cy = r.y - scroll + r.h * 0.5;
+                // Skip rows scrolled out of the visible list band.
+                if cy + r.h * 0.5 < pal.list.y || cy - r.h * 0.5 > pal.list.y + pal.list.h {
+                    continue;
+                }
+                let caps = crate::widgets::Keycaps::new(&mut gpu.font_system, shortcut, right, cy);
+                caps.quads(&mut pq);
+                row_caps.push(caps);
+            }
+        }
         // Scrollbar thumb for the list (when it overflows).
         if content_h > pal.list.h {
             let track_h = pal.list.h;
@@ -2370,6 +2474,9 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         let mut pareas: Vec<TextArea> = Vec::new();
         gpu.ui.palette_input.draw(pal.input, theme::zpx(14.0), theme::FG_TEXT(), &mut pareas);
         gpu.ui.palette_list.draw_at(pal.list, pal.list.y - scroll, theme::FG_TEXT(), &mut pareas);
+        for caps in &row_caps {
+            caps.draw(theme::FG_TEXT(), &mut pareas);
+        }
         gpu.text_renderer.prepare(&gpu.device, &gpu.queue, &mut gpu.font_system, &mut gpu.atlas, &gpu.viewport, pareas, &mut gpu.swash_cache)?;
         let mut encp = gpu.device.create_command_encoder(&CommandEncoderDescriptor { label: Some("aether-palette-pass") });
         {

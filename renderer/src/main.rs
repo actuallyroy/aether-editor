@@ -108,6 +108,17 @@ pub(crate) struct PendingCreate {
     pub(crate) rename_from: Option<PathBuf>,
 }
 
+/// Window title shown in the title bar and — more importantly on macOS — in the
+/// Dock's right-click window list and Mission Control. VSCode-style "<root folder>
+/// — Aether" so the active project is identifiable from the Dock. (The Dock hover
+/// tooltip itself is the static bundle name and can't be made folder-dynamic.)
+fn window_title(cwd: &std::path::Path) -> String {
+    match cwd.file_name() {
+        Some(name) => format!("{} — Aether", name.to_string_lossy()),
+        None => "Aether".to_string(),
+    }
+}
+
 /// Rasterize the bundled Aether logo (SVG) to a window/taskbar icon. The SVG is the
 /// single source of truth; returns None if rendering fails (icon is non-critical).
 fn app_icon() -> Option<winit::window::Icon> {
@@ -155,6 +166,7 @@ pub(crate) enum DialogAction {
     CloseDoc(usize),
     GitDiscard { path: String, untracked: bool },
     GitDiscardAll,
+    GitStash,
     InstallUpdate,
     /// Closing the window while terminals have running processes: kill them, keep
     /// them running in the background (daemon), or cancel the close.
@@ -308,6 +320,12 @@ pub(crate) struct App {
     /// Generation of the palette's in-flight `%` text search (offset far above the
     /// Search panel's gens so streamed results route to the right consumer).
     pub(crate) palette_search_gen: u64,
+    /// Cached go-to-file index (the full workspace file walk). Built lazily on the
+    /// first Files-mode use and reused across mode switches / palette opens so that
+    /// deleting the `>` prefix (Commands → Files) is instant instead of re-walking
+    /// the tree on the UI thread. Invalidated to `None` whenever files are
+    /// added/removed/renamed or the workspace folder changes.
+    pub(crate) palette_file_cache: Option<Vec<commands::PickItem>>,
     /// Line range (0-based, inclusive) tinted while previewing an `@` symbol — the
     /// symbol's whole block (via the indentation fold range), not just its name.
     pub(crate) palette_preview_region: Option<(usize, usize)>,
@@ -435,6 +453,7 @@ impl App {
             tab_drag: None,
             palette_preview_return: None,
             palette_search_gen: 1 << 32,
+            palette_file_cache: None,
             palette_preview_region: None,
             last_shift: None,
             ctx_menu: None,
@@ -591,6 +610,18 @@ impl App {
         if new_tree != self.hovered_tree {
             self.hovered_tree = new_tree;
             changed = true;
+        }
+        // Explorer indent guides: revealed (eased) while hovering the tree.
+        let in_tree = self.sidebar_visible
+            && self.sidebar_view == SidebarView::Explorer
+            && layout.tree_region().contains(p);
+        if let Some(g) = self.gpu.as_mut() {
+            if g.ui.sidebar.set_guides_hovered(in_tree) {
+                changed = true;
+            }
+            if g.ui.sidebar.set_hover_row(if in_tree { self.hovered_tree } else { None }) {
+                changed = true;
+            }
         }
 
         let tab_rects = layout.tab_rects(self.tab_count());
@@ -818,7 +849,7 @@ impl App {
         }
         if self.sidebar_visible && self.sidebar_view == SidebarView::Search {
             if let Some(sp) = self.search.as_mut() {
-                if sp.hover(p, layout.tree_region()) {
+                if sp.hover(p, layout.sidebar) {
                     changed = true;
                 }
             }
@@ -1001,7 +1032,7 @@ impl App {
                 .map(|g| g.explorer_btns[i].cursor())
                 .unwrap_or(CursorIcon::Default)
         } else if let Some(c) = (self.sidebar_visible && self.sidebar_view == SidebarView::Search)
-            .then(|| self.search.as_ref().and_then(|sp| sp.cursor(p, layout.tree_region())))
+            .then(|| self.search.as_ref().and_then(|sp| sp.cursor(p, layout.sidebar)))
             .flatten()
         {
             // The Search panel resolves its own cursor (toggles/results = pointer,
@@ -1174,6 +1205,11 @@ impl App {
                 consider(p.scroll.next_wake(now));
             }
         }
+        // Indent-guide hover fades (explorer tree + source-control groups).
+        consider(self.gpu.as_ref().and_then(|g| g.ui.sidebar.guides_next_wake(now)));
+        if let Some(scp) = self.source_control.as_ref() {
+            consider(scp.guides_next_wake(now));
+        }
         earliest
     }
 
@@ -1210,6 +1246,7 @@ impl App {
         if let Some(g) = self.gpu.as_mut() {
             self.explorer.commit_create(&mut self.workspace, g);
         }
+        self.invalidate_file_index(); // a new file/folder may now exist on disk
         self.redraw();
     }
     fn cancel_create(&mut self) {
@@ -1603,6 +1640,7 @@ impl App {
                     self.file_clipboard = None;
                 }
                 self.workspace.tree.rebuild();
+                self.invalidate_file_index();
                 self.refresh_source_control();
             }
             Err(e) => self.show_info_dialog(&format!("Paste failed: {e}")),
@@ -1643,6 +1681,7 @@ impl App {
             self.workspace.tree.expand(parent);
         }
         self.workspace.tree.rebuild();
+        self.invalidate_file_index();
         if let Some(idx) = self.workspace.tree.nodes.iter().position(|n| n.path == path) {
             self.selected_tree = Some(idx);
             let y = idx as f32 * theme::TREE_ROW_HEIGHT();
@@ -2030,8 +2069,7 @@ impl App {
                 self.confirm_discard_all();
             }
             ui::Intent::GitStash => {
-                git::stash(&self.cwd);
-                self.refresh_source_control();
+                self.confirm_stash();
             }
             ui::Intent::GitRefresh => self.refresh_source_control(),
             ui::Intent::GitCommitPush { msg, stage_all } => {
@@ -2044,6 +2082,77 @@ impl App {
                 }
                 self.redraw();
             }
+            ui::Intent::OpenCommitMenu { anchor, msg, stage_all } => {
+                let items = vec![
+                    CtxEntry::new("Commit", CtxAction::ScmIntent(ui::Intent::GitCommit { msg: msg.clone(), stage_all })),
+                    CtxEntry::new("Commit & Push", CtxAction::ScmIntent(ui::Intent::GitCommitPush { msg, stage_all })),
+                ];
+                self.open_ctx_menu(anchor, items);
+            }
+            ui::Intent::OpenMoreMenu { anchor, tree_mode } => {
+                let view_label = if tree_mode { "View as List" } else { "View as Tree" };
+                let items = vec![
+                    CtxEntry::new(view_label, CtxAction::ScmIntent(ui::Intent::GitToggleView)),
+                    CtxEntry::sep(),
+                    CtxEntry::new("Checkout to…", CtxAction::ScmIntent(ui::Intent::GitOpenCheckout)),
+                    CtxEntry::new("Create Branch…", CtxAction::ScmIntent(ui::Intent::GitOpenCreateBranch)),
+                    CtxEntry::new("Rename Branch…", CtxAction::ScmIntent(ui::Intent::GitOpenRenameBranch)),
+                    CtxEntry::new("Delete Branch…", CtxAction::ScmIntent(ui::Intent::GitOpenDeleteBranch)),
+                    CtxEntry::sep(),
+                    CtxEntry::new("Pull", CtxAction::ScmIntent(ui::Intent::GitPull)),
+                    CtxEntry::new("Push", CtxAction::ScmIntent(ui::Intent::GitPush)),
+                    CtxEntry::new("Fetch", CtxAction::ScmIntent(ui::Intent::GitFetch)),
+                    CtxEntry::sep(),
+                    CtxEntry::new("Stage All Changes", CtxAction::ScmIntent(ui::Intent::GitStageAll)),
+                    CtxEntry::new("Unstage All Changes", CtxAction::ScmIntent(ui::Intent::GitUnstageAll)),
+                    CtxEntry::new("Discard All Changes", CtxAction::ScmIntent(ui::Intent::GitDiscardAll)),
+                    CtxEntry::sep(),
+                    CtxEntry::new("Stash Changes", CtxAction::ScmIntent(ui::Intent::GitStash)),
+                    CtxEntry::new("Pop Latest Stash", CtxAction::ScmIntent(ui::Intent::GitStashPop)),
+                    CtxEntry::new("Apply Latest Stash", CtxAction::ScmIntent(ui::Intent::GitStashApply)),
+                    CtxEntry::sep(),
+                    CtxEntry::new("Refresh", CtxAction::ScmIntent(ui::Intent::GitRefresh)),
+                ];
+                self.open_ctx_menu(anchor, items);
+            }
+            ui::Intent::GitPush => {
+                git::push(&self.cwd);
+                self.refresh_source_control();
+            }
+            ui::Intent::GitPull => {
+                git::pull(&self.cwd);
+                self.refresh_source_control();
+                self.apply_intent(ui::Intent::ReloadOpenDocs);
+            }
+            ui::Intent::GitFetch => {
+                git::fetch(&self.cwd);
+                self.refresh_source_control();
+            }
+            ui::Intent::GitToggleView => {
+                if let Some(scp) = self.source_control.as_mut() {
+                    scp.toggle_view();
+                }
+                self.redraw();
+            }
+            ui::Intent::GitStashPop => {
+                git::stash_pop(&self.cwd);
+                self.refresh_source_control();
+                self.apply_intent(ui::Intent::ReloadOpenDocs);
+            }
+            ui::Intent::GitStashApply => {
+                git::stash_apply(&self.cwd);
+                self.refresh_source_control();
+                self.apply_intent(ui::Intent::ReloadOpenDocs);
+            }
+            ui::Intent::GitOpenCheckout => self.open_branch_pick(commands::PickKind::Checkout),
+            ui::Intent::GitOpenDeleteBranch => self.open_branch_pick(commands::PickKind::DeleteBranch),
+            ui::Intent::GitOpenCreateBranch => {
+                self.open_branch_input(commands::PickKind::CreateBranch, "", "Type a name, Enter to create the branch, Esc to cancel");
+            }
+            ui::Intent::GitOpenRenameBranch => {
+                let cur = git::branch(&self.cwd).unwrap_or_default();
+                self.open_branch_input(commands::PickKind::RenameBranch, &cur, "Edit the branch name, Enter to rename, Esc to cancel");
+            }
             ui::Intent::ReloadOpenDocs => {
                 if let Some(gpu) = self.gpu.as_mut() {
                     for d in self.workspace.documents.iter_mut() {
@@ -2055,11 +2164,27 @@ impl App {
                     }
                 }
             }
+            ui::Intent::OpenSearchEditor { text } => {
+                if let Some(gpu) = self.gpu.as_mut() {
+                    let d = Document::new(None, text, &mut gpu.font_system);
+                    self.workspace.documents.push(d);
+                    self.workspace.active = Some(self.workspace.documents.len() - 1);
+                    self.terminal.maximized = false;
+                }
+            }
         }
     }
 
     /// Open `path` and place the caret at (1-based `line`, byte `col`).
     fn open_file_at(&mut self, path: PathBuf, line: usize, col: usize) {
+        // Opening a file reveals the editor: if the terminal is maximized (filling
+        // the editor area), hide the whole bottom panel so the file content shows.
+        // The shells keep running — this only collapses the panel, like VSCode's
+        // toggle; reopen it with the terminal toggle and the sessions are intact.
+        if self.terminal.maximized {
+            self.terminal.maximized = false;
+            self.terminal.visible = false;
+        }
         if is_image_path(&path) {
             self.open_image(path);
             return;
@@ -2339,6 +2464,7 @@ impl App {
             };
             if res.is_ok() {
                 self.workspace.tree.refresh();
+                self.invalidate_file_index();
             }
         }
         self.redraw();
@@ -2383,6 +2509,22 @@ impl App {
         }
         self.dialog = Some(DialogState {
             action: DialogAction::GitDiscardAll,
+            has_check: false,
+            checked: false,
+            hovered: None,
+        });
+        self.redraw();
+    }
+
+    fn confirm_stash(&mut self) {
+        let msg = "Stash all changes? This moves your uncommitted changes onto the stash (recoverable with `git stash pop`).";
+        if let Some(g) = self.gpu.as_mut() {
+            g.ui
+                .dialog
+                .set(&mut g.font_system, msg, &["Stash Changes", "Cancel"], None);
+        }
+        self.dialog = Some(DialogState {
+            action: DialogAction::GitStash,
             has_check: false,
             checked: false,
             hovered: None,
@@ -2494,6 +2636,13 @@ impl App {
                 // 0 = Discard All Changes, 1 = Cancel
                 if i == 0 {
                     git::discard_all(&self.cwd);
+                    self.refresh_source_control();
+                }
+            }
+            DialogAction::GitStash => {
+                // 0 = Stash Changes, 1 = Cancel
+                if i == 0 {
+                    git::stash(&self.cwd);
                     self.refresh_source_control();
                 }
             }
@@ -2668,7 +2817,24 @@ impl App {
             commands::PickKind::Problem
             | commands::PickKind::Location
             | commands::PickKind::RenameSymbol
-            | commands::PickKind::RenameTerminal => {} // handled at the commit site (need item/input)
+            | commands::PickKind::RenameTerminal
+            | commands::PickKind::CreateBranch
+            | commands::PickKind::RenameBranch => {} // handled at the commit site (need item/input)
+            commands::PickKind::Checkout => {
+                if git::checkout(&self.cwd, label) {
+                    self.refresh_source_control();
+                    self.apply_intent(ui::Intent::ReloadOpenDocs);
+                } else {
+                    self.show_info_dialog("Couldn't switch branch — commit or stash your changes first.");
+                }
+            }
+            commands::PickKind::DeleteBranch => {
+                if git::branch(&self.cwd).as_deref() == Some(label) {
+                    self.show_info_dialog("Can't delete the branch you're on — switch first.");
+                } else if !git::delete_branch(&self.cwd, label) {
+                    self.show_info_dialog("Couldn't delete the branch.");
+                }
+            }
             commands::PickKind::SetColorTheme => {
                 self.apply_theme_by_name(label);
                 settings::set_color_theme(label); // persist across restarts
@@ -2686,6 +2852,24 @@ impl App {
 
     /// All files under the workspace root (skipping VCS/build dirs), as Files-mode
     /// items. `label` is the repo-relative path (filtered + opened on commit).
+    /// Go-to-file index, memoized. The first call walks the workspace; later calls
+    /// (e.g. deleting the `>` prefix to drop into Files mode) clone the cached list,
+    /// which keeps the mode switch off the slow filesystem path. Cleared by
+    /// `invalidate_file_index` on any tree mutation.
+    fn file_index(&mut self) -> Vec<commands::PickItem> {
+        if self.palette_file_cache.is_none() {
+            self.palette_file_cache = Some(self.build_file_items());
+        }
+        self.palette_file_cache.clone().unwrap_or_default()
+    }
+
+    /// Drop the cached go-to-file index so the next palette open rebuilds it. Call
+    /// after any change to the set of files on disk (create/delete/rename/move) or a
+    /// workspace-folder switch.
+    fn invalidate_file_index(&mut self) {
+        self.palette_file_cache = None;
+    }
+
     fn build_file_items(&self) -> Vec<commands::PickItem> {
         const SKIP: &[&str] = &[
             ".git", "target", "node_modules", ".aether", "dist", "build", "out", ".next", ".venv",
@@ -2781,6 +2965,7 @@ impl App {
                 self.cwd.clone(),
                 q,
                 crate::search::SearchOpts::default(),
+                crate::search::Filters::default(),
             );
             return;
         }
@@ -2820,7 +3005,7 @@ impl App {
             match mode {
                 commands::PaletteMode::Commands => self.palette.set_source(mode, Vec::new()),
                 commands::PaletteMode::Files => {
-                    let items = self.build_file_items();
+                    let items = self.file_index();
                     self.palette.set_source(mode, items);
                 }
                 commands::PaletteMode::Symbols => {
@@ -2876,6 +3061,27 @@ impl App {
                     if let Some(i) = self.pending_term_rename.take() {
                         if !new_name.is_empty() {
                             self.terminal.rename_tab(i, &new_name);
+                        }
+                    }
+                    return true;
+                }
+                // Create / rename branch: typed text is the branch name.
+                if let commands::PaletteMode::QuickPick(k @ (commands::PickKind::CreateBranch | commands::PickKind::RenameBranch)) = self.palette.mode {
+                    let name = self
+                        .gpu
+                        .as_ref()
+                        .map(|g| g.ui.palette_input.text().trim().to_string())
+                        .unwrap_or_default();
+                    self.palette.close();
+                    if !name.is_empty() {
+                        let ok = match k {
+                            commands::PickKind::RenameBranch => git::rename_branch(&self.cwd, &name),
+                            _ => git::create_branch(&self.cwd, &name),
+                        };
+                        if ok {
+                            self.refresh_source_control();
+                        } else {
+                            self.show_info_dialog("Couldn't update the branch (name may already exist).");
                         }
                     }
                     return true;
@@ -3211,6 +3417,39 @@ impl App {
         self.redraw();
     }
 
+    /// Open a branch quick-pick (Checkout / Delete) listing local branches.
+    fn open_branch_pick(&mut self, kind: commands::PickKind) {
+        let cur = git::branch(&self.cwd);
+        let items: Vec<commands::PickItem> = git::branches(&self.cwd)
+            .into_iter()
+            .map(|b| {
+                let detail = if Some(&b) == cur.as_ref() { "current" } else { "" };
+                commands::PickItem::new(b, detail)
+            })
+            .collect();
+        if items.is_empty() {
+            self.show_info_dialog("No branches found (is this a git repo?).");
+            return;
+        }
+        self.palette.open_quick_pick(kind, items);
+        if let Some(g) = self.gpu.as_mut() {
+            g.ui.palette_input.set_text(&mut g.font_system, "");
+            g.ui.palette_input.focus(true);
+        }
+        self.redraw();
+    }
+
+    /// Open the palette as a text input (create/rename branch), seeded with `prefill`.
+    fn open_branch_input(&mut self, kind: commands::PickKind, prefill: &str, prompt: &str) {
+        self.palette.open_quick_pick(kind, vec![commands::PickItem::new(prompt, "")]);
+        if let Some(g) = self.gpu.as_mut() {
+            g.ui.palette_input.set_text(&mut g.font_system, prefill);
+            g.ui.palette_input.select_all();
+            g.ui.palette_input.focus(true);
+        }
+        self.redraw();
+    }
+
     /// Terminal tab rename: the palette becomes the input, seeded with the
     /// current title (same flow as Rename Symbol).
     fn open_term_rename(&mut self, i: usize) {
@@ -3371,11 +3610,15 @@ impl App {
             return;
         }
         self.cwd = folder.clone();
+        if let Some(g) = self.gpu.as_ref() {
+            g.window.set_title(&window_title(&folder)); // Dock window-list / title bar
+        }
         self.terminal.set_cwd(folder.clone()); // new shells start in the new root
         if let Some(scp) = self.source_control.as_mut() {
             scp.set_root(folder.clone());
         }
         self.workspace.tree = crate::workspace::FileTree::new(folder);
+        self.invalidate_file_index(); // new root → rebuild go-to-file index on next open
         self.sidebar_view = SidebarView::Explorer;
         self.sidebar_visible = true;
         if let Some(sp) = self.search.as_mut() {
@@ -3390,6 +3633,9 @@ impl App {
     /// editors are kept; the explorer empties out.
     fn open_folder_less(&mut self) {
         self.cwd = PathBuf::new();
+        if let Some(g) = self.gpu.as_ref() {
+            g.window.set_title("Aether");
+        }
         self.terminal.set_cwd(PathBuf::new());
         if let Some(scp) = self.source_control.as_mut() {
             scp.set_root(PathBuf::new());
@@ -3682,6 +3928,7 @@ impl App {
             g.ui.find.reshape(&mut g.font_system);
             g.ui.diff_chev_down.reshape(&mut g.font_system); // fold + combined-diff chevrons
             g.ui.diff_chev_right.reshape(&mut g.font_system);
+            g.ui.sidebar.reshape_icons(&mut g.font_system); // explorer tree icons
             g.create_input.rezoom(&mut g.font_system);
             for b in g.create_icons.iter_mut() {
                 b.reshape(&mut g.font_system); // inline new-file/folder row icons
@@ -4166,6 +4413,29 @@ impl App {
             return;
         }
 
+        // Command palette is modal: handle it before any region handler (terminal,
+        // editor, sidebar) so a click outside it dismisses it instead of being
+        // swallowed by whatever is underneath (e.g. the terminal panel).
+        if let Some(pal) = layout.palette.as_ref() {
+            // The input is the title-bar pill now — clicking it keeps the palette open.
+            if !pal.box_.contains((x, y)) && !pal.input.contains((x, y)) {
+                self.palette_restore_preview();
+                self.palette.close();
+                self.redraw();
+                return;
+            }
+            let row = self
+                .gpu
+                .as_ref()
+                .and_then(|gpu| gpu.ui.palette_list.row_at_scrolled(pal.list, self.palette.scroll, (x, y), self.palette.filtered.len()));
+            if let Some(idx) = row {
+                self.palette.selected = idx;
+                self.commit_palette();
+                self.redraw();
+            }
+            return;
+        }
+
         // Image tab: zoom-control buttons, else begin drag-to-pan.
         if let Some(key) = self.workspace.active_doc().and_then(|d| d.image.clone()) {
             let region = render::editor_region(&layout);
@@ -4415,27 +4685,6 @@ impl App {
             return;
         }
 
-        // Palette
-        if let Some(pal) = layout.palette.as_ref() {
-            // The input is the title-bar pill now — clicking it keeps the palette open.
-            if !pal.box_.contains((x, y)) && !pal.input.contains((x, y)) {
-                self.palette_restore_preview();
-                self.palette.close();
-                self.redraw();
-                return;
-            }
-            let row = self
-                .gpu
-                .as_ref()
-                .and_then(|gpu| gpu.ui.palette_list.row_at_scrolled(pal.list, self.palette.scroll, (x, y), self.palette.filtered.len()));
-            if let Some(idx) = row {
-                self.palette.selected = idx;
-                self.commit_palette();
-                self.redraw();
-            }
-            return;
-        }
-
         if layout.status_bar.contains((x, y)) {
             let cells = render::zoom_ctrl_cells(layout.status_bar);
             if cells[0].contains((x, y)) {
@@ -4521,7 +4770,7 @@ impl App {
             && self.sidebar_view == SidebarView::Search
             && layout.sidebar.contains((x, y))
         {
-            let region = layout.tree_region();
+            let region = layout.sidebar;
             let double = self.register_click(x, y);
             let root = self.cwd.clone();
             let mut intents = Vec::new();
@@ -4578,7 +4827,10 @@ impl App {
                 match i {
                     0 => self.begin_create(false),
                     1 => self.begin_create(true),
-                    2 => self.workspace.tree.refresh(),
+                    2 => {
+                        self.workspace.tree.refresh();
+                        self.invalidate_file_index();
+                    }
                     3 => self.workspace.tree.collapse_all(),
                     _ => {}
                 }
@@ -4732,6 +4984,12 @@ impl App {
             }
             let consecutive = self.register_click(x, y);
             let extend = self.mods.shift_key();
+            // Empty editor (no files open): a double-click on the blank area opens a
+            // new Untitled file, like VSCode's empty workbench.
+            if consecutive && self.workspace.active_doc().is_none() && self.detail.open_extension.is_none() {
+                self.exec_command(Command::NewFile);
+                return;
+            }
             // Combined diff: a click on a file header collapses/expands that file.
             let toggle = self.workspace.active_doc().and_then(|d| {
                 d.diff_full.as_ref()?;
@@ -4832,7 +5090,7 @@ impl App {
             }
         }
         if self.mouse_pressed && self.sidebar_view == SidebarView::Search {
-            let region = self.layout().tree_region();
+            let region = self.layout().sidebar;
             if let Some(sp) = self.search.as_mut() {
                 if sp.on_drag((x, y), region) {
                     self.redraw();
@@ -5061,6 +5319,7 @@ impl App {
             }
         }
         self.workspace.tree.refresh();
+        self.invalidate_file_index();
         self.refresh_source_control();
     }
 
@@ -5121,7 +5380,7 @@ impl App {
         }
         // Search results scroll when the cursor is over the results region.
         if self.sidebar_visible && self.sidebar_view == SidebarView::Search {
-            let region = layout.tree_region();
+            let region = layout.sidebar;
             if let Some(sp) = self.search.as_mut() {
                 if sp.on_wheel(p, region, dy) {
                     self.redraw();
@@ -5194,7 +5453,9 @@ impl App {
                 if self.last_shift.map_or(false, |t| now.duration_since(t) < Duration::from_millis(350)) {
                     self.last_shift = None;
                     if !self.palette.active {
-                        self.open_palette();
+                        // Double-Shift opens quick-open (go-to-file, empty input) —
+                        // no `>` command prefix. Ctrl+Shift+P is the command palette.
+                        self.open_quick_open();
                     }
                     return;
                 }
@@ -6439,7 +6700,7 @@ impl ApplicationHandler for App {
             return;
         }
         let mut attrs = Window::default_attributes()
-            .with_title("Aether")
+            .with_title(window_title(&self.cwd))
             .with_window_icon(app_icon())
             .with_inner_size(LogicalSize::new(1400.0, 900.0));
         // macOS: keep the native traffic lights (top-left) but let our content fill

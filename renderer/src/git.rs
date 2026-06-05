@@ -119,6 +119,66 @@ pub fn push(root: &Path) -> bool {
     git(root, &["push"]).is_some()
 }
 
+/// Pull the current branch (`git pull`). Returns true on success.
+pub fn pull(root: &Path) -> bool {
+    git(root, &["pull"]).is_some()
+}
+
+/// Fetch all remotes (`git fetch --all`). Returns true on success.
+pub fn fetch(root: &Path) -> bool {
+    git(root, &["fetch", "--all"]).is_some()
+}
+
+/// Local branch short-names (`git branch`), current branch first.
+pub fn branches(root: &Path) -> Vec<String> {
+    let Some(out) = git(root, &["branch", "--format=%(refname:short)"]) else {
+        return Vec::new();
+    };
+    let cur = branch(root);
+    let mut names: Vec<String> = out.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+    // Current branch to the top so it reads as the default selection.
+    if let Some(c) = &cur {
+        names.sort_by_key(|n| (n != c, n.clone()));
+    }
+    names
+}
+
+/// Switch to an existing branch (`git checkout <branch>`). Returns true on success.
+pub fn checkout(root: &Path, branch: &str) -> bool {
+    git(root, &["checkout", branch]).is_some()
+}
+
+/// Create and switch to a new branch (`git checkout -b <name>`).
+pub fn create_branch(root: &Path, name: &str) -> bool {
+    if name.trim().is_empty() {
+        return false;
+    }
+    git(root, &["checkout", "-b", name]).is_some()
+}
+
+/// Rename the current branch (`git branch -m <name>`).
+pub fn rename_branch(root: &Path, name: &str) -> bool {
+    if name.trim().is_empty() {
+        return false;
+    }
+    git(root, &["branch", "-m", name]).is_some()
+}
+
+/// Delete a branch (`git branch -D <name>`, force so it works off-branch).
+pub fn delete_branch(root: &Path, name: &str) -> bool {
+    git(root, &["branch", "-D", name]).is_some()
+}
+
+/// Pop the most recent stash (`git stash pop`). Returns true on success.
+pub fn stash_pop(root: &Path) -> bool {
+    git(root, &["stash", "pop"]).is_some()
+}
+
+/// Apply the most recent stash without dropping it (`git stash apply`).
+pub fn stash_apply(root: &Path) -> bool {
+    git(root, &["stash", "apply"]).is_some()
+}
+
 /// Commit with `msg`. When `stage_all` is set (nothing was explicitly staged),
 /// stages every change first (`git add -A`). Returns true on success.
 pub fn commit(root: &Path, msg: &str, stage_all: bool) -> bool {

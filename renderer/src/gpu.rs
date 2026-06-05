@@ -20,14 +20,14 @@ use crate::quad::QuadRenderer;
 use crate::theme;
 use crate::ext_detail::ExtensionDetail;
 use crate::widgets::{
-    make_ui_buffer, Dialog, Gutter, HoverCard, IconButton, ListView, Menu,
+    make_ui_buffer, Dialog, Gutter, HoverCard, IconButton, IconList, ListView, Menu,
     MenuBar, SearchField, TextInput, TextLabel,
 };
 
 pub struct UiBuffers {
     pub sidebar_header: TextLabel,
     pub root_label: TextLabel,
-    pub sidebar: ListView,
+    pub sidebar: IconList, // explorer file tree (indent + centered icon + name)
     pub tabs: Buffer,
     pub status: TextLabel,
     pub status_right: TextLabel,
@@ -211,13 +211,14 @@ impl GpuState {
         let ui = UiBuffers {
             sidebar_header: TextLabel::new(&mut font_system, theme::SIDEBAR_WIDTH(), 60.0),
             root_label: TextLabel::new(&mut font_system, theme::SIDEBAR_WIDTH(), theme::TREE_ROW_HEIGHT()),
-            sidebar: ListView::new(
+            sidebar: IconList::new(
                 &mut font_system,
                 theme::SIDEBAR_WIDTH(),
                 800.0,
                 theme::TREE_ROW_HEIGHT(),
                 12.0,
-            ),
+            )
+            .with_indent(4), // room for the indent guides + centered icons per level
             tabs: make_ui_buffer(&mut font_system, 4000.0, theme::TAB_HEIGHT()),
             status: TextLabel::new(&mut font_system, 4000.0, theme::STATUS_BAR_HEIGHT()),
             status_right: TextLabel::new(&mut font_system, 4000.0, theme::STATUS_BAR_HEIGHT()),

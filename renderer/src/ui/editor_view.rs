@@ -60,7 +60,10 @@ impl EditorView {
     /// Line is driven by `y`, so a click anywhere across the row resolves correctly.
     pub fn line_at(doc: &Document, layout: &Layout, x: f32, y: f32) -> Option<usize> {
         let buf_x = x - (layout.editor_text.x + theme::EDITOR_PAD()) + doc.scroll_x();
-        let buf_y = y - (layout.editor_text.y + theme::EDITOR_PAD()) + doc.scroll_y();
+        // Diffs window the buffer with its own vertical scroll, so `hit` already works
+        // in viewport-relative coords — don't add scroll_y again.
+        let sy = if doc.diff.is_some() { 0.0 } else { doc.scroll_y() };
+        let buf_y = y - (layout.editor_text.y + theme::EDITOR_PAD()) + sy;
         doc.buffer.hit(buf_x, buf_y).map(|h| h.line)
     }
 

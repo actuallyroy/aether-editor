@@ -8,11 +8,11 @@ use glyphon::{Attrs, Family, FontSystem, TextArea};
 use crate::document::Document;
 use crate::quad::Quad;
 use crate::theme;
-use crate::widgets::{ListView, Rect, ScrollOpts, ScrollView};
+use crate::widgets::{IconList, IconRow, Rect, ScrollOpts, ScrollView};
 
 pub struct OutlinePanel {
     pub scroll: ScrollView,
-    list: ListView,
+    list: IconList,
     header: crate::widgets::TextLabel,
     lines: Vec<usize>, // 1-based jump target per row
     hover: Option<usize>,
@@ -26,7 +26,7 @@ impl OutlinePanel {
     pub fn new(fs: &mut FontSystem) -> Self {
         Self {
             scroll: ScrollView::new(ScrollOpts::vertical()),
-            list: ListView::new(fs, 200.0, 100_000.0, 22.0, 10.0),
+            list: IconList::new(fs, 200.0, 100_000.0, 22.0, 10.0),
             header: crate::widgets::TextLabel::new(fs, 200.0, header_h()),
             lines: Vec::new(),
             hover: None,
@@ -63,33 +63,34 @@ impl OutlinePanel {
             return; // body hidden — keep the previous rows for re-expand
         }
         let lr = Self::list_region(region);
-        let ui_attrs = Attrs::new().family(Family::Name(theme::UI_FAMILY())).color(theme::FG_TEXT());
-        let (key, spans, lines) = match doc {
+        let fg = theme::FG_TEXT();
+        let dim = theme::FG_DIM();
+        let (key, rows, lines) = match doc {
             Some(d) => {
                 let symbols = crate::extract_symbols(&d.text(), d.ext());
                 let mut key = format!("OUTLINE {} v{}\n", d.name, d.version);
-                let mut spans: Vec<(String, Attrs)> = Vec::new();
+                let mut rows: Vec<IconRow> = Vec::new();
                 let mut lines = Vec::new();
                 if symbols.is_empty() {
-                    spans.push(("  No symbols in this file".into(), ui_attrs.color(theme::FG_DIM())));
+                    rows.push(IconRow { depth: 0, icon: None, label: vec![("  No symbols in this file".into(), dim)] });
                     key.push_str("(empty)");
                 }
                 for (name, kind, line) in symbols {
                     let (g, col) = theme::symbol_icon(&kind);
-                    spans.push((format!(" {}  ", g), Attrs::new().family(Family::Name(theme::ICON_FAMILY)).color(col)));
-                    spans.push((format!("{name}\n"), ui_attrs));
+                    rows.push(IconRow::new(0, g, col, name, fg));
                     lines.push(line);
                 }
-                (key, spans, lines)
+                (key, rows, lines)
             }
             None => (
                 "OUTLINE (no doc)".to_string(),
-                vec![("  No editor open".to_string(), ui_attrs.color(theme::FG_DIM()))],
+                vec![IconRow { depth: 0, icon: None, label: vec![("  No editor open".to_string(), dim)] }],
                 Vec::new(),
             ),
         };
         let content_h = (lines.len().max(1) as f32) * theme::TREE_ROW_HEIGHT();
-        self.list.set_rich(fs, &key, &spans, lr.w, content_h.max(lr.h));
+        self.list.set_rows(fs, &key, &rows, lr.w, content_h.max(lr.h));
+        self.list.reshape_icons(fs); // pick up zoom changes (cheap no-op otherwise)
         self.lines = lines;
         self.scroll.set_metrics(lr, (lr.w, content_h + theme::zpx(8.0)));
     }
@@ -118,7 +119,7 @@ impl OutlinePanel {
             areas,
         );
         let lr = Self::list_region(region);
-        self.list.draw_at(lr, lr.y - self.scroll.offset().1, theme::FG_TEXT(), areas);
+        self.list.draw_slice(lr, lr.y - self.scroll.offset().1, theme::FG_TEXT(), areas);
     }
 
     /// Row index under `p`, if it maps to a symbol.

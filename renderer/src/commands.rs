@@ -93,6 +93,10 @@ pub enum PickKind {
     Location,     // jump targets from an LSP definition/references response
     RenameSymbol, // palette-as-input: the typed text is the new name
     RenameTerminal, // palette-as-input: the typed text is the tab title
+    Checkout,     // git: switch to the picked branch
+    CreateBranch, // palette-as-input: the typed text is the new branch name
+    RenameBranch, // palette-as-input: rename the current branch
+    DeleteBranch, // git: delete the picked branch
 }
 
 /// One row in a quick-pick list (dynamic, unlike the fixed `COMMANDS`).

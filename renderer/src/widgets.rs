@@ -137,6 +137,13 @@ impl IconButton {
     /// background is drawn separately in the bg phase from the same rect, so the
     /// two always align.
     pub fn draw<'a>(&'a self, rect: Rect, color: glyphon::Color, areas: &mut Vec<TextArea<'a>>) {
+        self.draw_clipped(rect, rect, color, areas);
+    }
+
+    /// `draw`, but the glyph is positioned/centered in `rect` while pixels are
+    /// clipped to `clip` — for a glyph centered in a scrolled row that must not
+    /// bleed past the viewport (e.g. tree twisties under the header).
+    pub fn draw_clipped<'a>(&'a self, rect: Rect, clip: Rect, color: glyphon::Color, areas: &mut Vec<TextArea<'a>>) {
         let gw = self.glyph_w();
         areas.push(TextArea {
             buffer: &self.buffer,
@@ -144,10 +151,10 @@ impl IconButton {
             top: rect.text_top(self.size, self.align) - 1.0,
             scale: 1.0,
             bounds: TextBounds {
-                left: rect.x as i32,
-                top: rect.y as i32,
-                right: (rect.x + rect.w) as i32,
-                bottom: (rect.y + rect.h) as i32,
+                left: clip.x as i32,
+                top: clip.y as i32,
+                right: (clip.x + clip.w) as i32,
+                bottom: (clip.y + clip.h) as i32,
             },
             default_color: color,
             custom_glyphs: &[],
@@ -319,6 +326,10 @@ pub struct TextInput {
     width: f32,      // content width (for re-applying the wrap width on reshape)
     caret: usize,  // byte index of the caret in `text`
     anchor: usize, // selection anchor; == caret when there's no selection
+    // Multiline vertical scroll (px), recomputed in `draw` to keep the caret in
+    // view. Cell so `draw` can update it while staying `&self`.
+    scroll_y: std::cell::Cell<f32>,
+    last_caret: std::cell::Cell<usize>, // caret at the previous draw (caret-follow gate)
 }
 
 impl TextInput {
@@ -336,7 +347,21 @@ impl TextInput {
             width: w,
             caret: 0,
             anchor: 0,
+            scroll_y: std::cell::Cell::new(0.0),
+            last_caret: std::cell::Cell::new(usize::MAX),
         }
+    }
+
+    /// Total shaped content height (px) — for sizing/scrolling a multiline field.
+    pub fn content_height(&self) -> f32 {
+        self.buffer
+            .layout_runs()
+            .map(|r| r.line_top + r.line_height)
+            .fold(0.0_f32, f32::max)
+    }
+
+    pub fn is_multiline(&self) -> bool {
+        self.multiline
     }
 
     /// Enable multi-line editing (word-wrap + top-aligned, layout-aware caret).
@@ -367,6 +392,19 @@ impl TextInput {
 
     pub fn focus(&mut self, on: bool) {
         self.focused = on;
+    }
+
+    /// Set the multiline wrap width to match the drawn box (zoomed px), reshaping if
+    /// it changed. Without this the field wraps at its creation width and overflows
+    /// a narrower box.
+    pub fn set_wrap_width(&mut self, fs: &mut FontSystem, zoomed_w: f32) {
+        let base = (zoomed_w / theme::ui_zoom()).max(20.0);
+        if (self.width - base).abs() < 0.5 {
+            return;
+        }
+        self.width = base;
+        self.shown.clear(); // force a reshape at the new wrap width
+        self.reshape(fs);
     }
 
     fn reshape(&mut self, fs: &mut FontSystem) {
@@ -424,6 +462,40 @@ impl TextInput {
     /// Buffer-local (x, top, height) of the caret. cosmic-text glyph offsets are
     /// per-logical-line, so we resolve the caret's line + column first, then place
     /// it — including on a freshly-inserted empty line (no glyphs yet).
+    /// The multiline vertical scroll for `rect`, recomputed each draw to keep the
+    /// caret row in view and clamped to the content. Stored so caret/click/selection
+    /// (which run between draws) use the same offset.
+    fn scroll_for(&self, rect: Rect) -> f32 {
+        let pad = theme::zpx(4.0);
+        let visible = (rect.h - pad * 2.0).max(theme::UI_LINE_HEIGHT());
+        let content = self.content_height();
+        let (_, top, lh) = self.caret_xy();
+        let mut s = self.scroll_y.get();
+        // Follow the caret only when it moved — otherwise leave the offset where the
+        // user wheel-scrolled it (so free scrolling isn't snapped back every frame).
+        let caret_moved = self.last_caret.get() != self.caret;
+        self.last_caret.set(self.caret);
+        if caret_moved {
+            if top < s {
+                s = top; // caret above the view → scroll up to it
+            }
+            if top + lh > s + visible {
+                s = top + lh - visible; // caret below → scroll down
+            }
+        }
+        s = s.clamp(0.0, (content - visible).max(0.0));
+        self.scroll_y.set(s);
+        s
+    }
+
+    /// Scroll a multiline field by `dy` px (mouse wheel); clamped to content on the
+    /// next draw. No-op for single-line fields.
+    pub fn scroll_by(&self, dy: f32) {
+        if self.multiline {
+            self.scroll_y.set((self.scroll_y.get() + dy).max(0.0));
+        }
+    }
+
     fn caret_xy(&self) -> (f32, f32, f32) {
         let lh = theme::UI_LINE_HEIGHT();
         let caret = self.caret.min(self.text.len());
@@ -589,6 +661,35 @@ impl TextInput {
         }
     }
 
+    /// Move the caret to the visual row above/below at the same x (multiline only).
+    pub fn move_up(&mut self, extend: bool) {
+        if !self.multiline {
+            return;
+        }
+        let (cx, top, lh) = self.caret_xy();
+        if top <= 0.5 {
+            return; // already on the first row
+        }
+        self.caret = self.byte_at_local(cx, top - lh * 0.5);
+        if !extend {
+            self.anchor = self.caret;
+        }
+    }
+
+    pub fn move_down(&mut self, extend: bool) {
+        if !self.multiline {
+            return;
+        }
+        let (cx, top, lh) = self.caret_xy();
+        if top + lh >= self.content_height() - 0.5 {
+            return; // already on the last row
+        }
+        self.caret = self.byte_at_local(cx, top + lh * 1.5);
+        if !extend {
+            self.anchor = self.caret;
+        }
+    }
+
     pub fn move_home(&mut self, extend: bool) {
         self.caret = 0;
         if !extend {
@@ -660,7 +761,7 @@ impl TextInput {
 
     fn local_top(&self, rect: Rect) -> f32 {
         if self.multiline {
-            rect.y + theme::zpx(4.0)
+            rect.y + theme::zpx(4.0) - self.scroll_y.get()
         } else {
             rect.text_top(theme::UI_LINE_HEIGHT(), self.align)
         }
@@ -744,7 +845,14 @@ impl TextInput {
         if self.multiline {
             let (cx, top, lh) = self.caret_xy();
             let h = (lh - 4.0).max(6.0);
-            return Quad::new(rect.x + pad_x + cx, rect.y + theme::zpx(4.0) + top + 2.0, 1.5, h, theme::CURSOR());
+            // Use the same (fresh) scroll the text uses, and never let the caret bar
+            // render outside the box — a scrolled-off caret would otherwise bleed
+            // over the panels below.
+            let y = rect.y + theme::zpx(4.0) + top + 2.0 - self.scroll_for(rect);
+            if y + h <= rect.y || y >= rect.y + rect.h {
+                return Quad::new(-10.0, -10.0, 0.0, 0.0, theme::CURSOR()); // off-screen
+            }
+            return Quad::new(rect.x + pad_x + cx, y, 1.5, h, theme::CURSOR());
         }
         let x = rect.x + pad_x + self.x_for_byte(self.caret);
         let h = theme::UI_LINE_HEIGHT() - 6.0;
@@ -760,7 +868,13 @@ impl TextInput {
         }
         let (a, b) = self.sel_range();
         let left = rect.x + pad_x;
-        let top0 = self.local_top(rect);
+        // Use the same fresh scroll as the text; for multiline keep highlights inside
+        // the box so a scrolled-off selection doesn't bleed over panels below.
+        let top0 = if self.multiline {
+            rect.y + theme::zpx(4.0) - self.scroll_for(rect)
+        } else {
+            self.local_top(rect)
+        };
         for run in self.buffer.layout_runs() {
             let ls = self.line_start_byte(run.line_i);
             let (mut x0, mut x1) = (f32::MAX, f32::MIN);
@@ -774,6 +888,9 @@ impl TextInput {
             }
             if x1 > x0 {
                 let y = top0 + if self.multiline { run.line_top } else { 0.0 };
+                if self.multiline && (y + run.line_height <= rect.y || y >= rect.y + rect.h) {
+                    continue; // row scrolled out of the box
+                }
                 out.push(Quad::new(left + x0, y + 1.0, (x1 - x0).max(1.0), run.line_height - 2.0, theme::SELECTION()));
             }
         }
@@ -781,7 +898,7 @@ impl TextInput {
 
     pub fn draw<'a>(&'a self, rect: Rect, pad_x: f32, color: glyphon::Color, areas: &mut Vec<TextArea<'a>>) {
         let top = if self.multiline {
-            rect.y + theme::zpx(4.0)
+            rect.y + theme::zpx(4.0) - self.scroll_for(rect)
         } else {
             rect.text_top(theme::UI_LINE_HEIGHT(), self.align)
         };
@@ -942,6 +1059,7 @@ pub struct Gutter {
     last_rows: usize,
     last_active: usize,
     last_epoch: u64,
+    last_diff: Option<(usize, usize, usize, u64)>, // diff fingerprint (len, first, last, epoch)
 }
 
 impl Gutter {
@@ -952,6 +1070,7 @@ impl Gutter {
             last_rows: usize::MAX,
             last_active: usize::MAX,
             last_epoch: u64::MAX,
+            last_diff: None,
         }
     }
 
@@ -1055,6 +1174,21 @@ impl Gutter {
     /// when `left`, else the new number; blank on filler/hunk rows. Aligns 1:1 with
     /// that side's diff buffer.
     pub fn set_from_diff_side(&mut self, fs: &mut FontSystem, rows: &[crate::diff::DiffRow], left: bool) {
+        // Change-gate: this is called every frame, but the row numbers only change
+        // when the diff is (re)opened, collapsed, or zoomed. Rebuilding + re-shaping
+        // every row each frame was the multi-file-diff scroll lag. Fingerprint by
+        // (len, first/last shown number, zoom epoch).
+        let num = |r: &crate::diff::DiffRow| (if left { r.left } else { r.right }).unwrap_or(0) as usize;
+        let key = (
+            rows.len(),
+            rows.first().map_or(0, num),
+            rows.last().map_or(0, num),
+            theme::shape_epoch(),
+        );
+        if self.last_diff == Some(key) {
+            return;
+        }
+        self.last_diff = Some(key);
         let mut s = String::with_capacity(rows.len() * 6);
         for r in rows {
             match if left { r.left } else { r.right } {
@@ -1140,7 +1274,7 @@ impl ListView {
         }
     }
 
-    fn row_h(&self) -> f32 {
+    pub fn row_h(&self) -> f32 {
         self.base_row_h * theme::ui_zoom()
     }
 
@@ -1243,6 +1377,17 @@ impl ListView {
         self.base_pad_x * theme::ui_zoom()
     }
 
+    /// Widest shaped row (px) including the left+right padding — for sizing a popup
+    /// (e.g. a context menu) to its content instead of a fixed width.
+    pub fn content_width(&self) -> f32 {
+        let max = self
+            .buffer
+            .layout_runs()
+            .map(|r| r.line_w)
+            .fold(0.0_f32, f32::max);
+        max + self.pad_x() * 2.0
+    }
+
     /// Draw the buffer with row 0 placed at `top`, clipped to `clip`. Lets a
     /// caller render a vertical slice (e.g. rows above/below an inline insert).
     pub fn draw_at<'a>(&'a self, clip: Rect, top: f32, color: glyphon::Color, areas: &mut Vec<TextArea<'a>>) {
@@ -1263,6 +1408,483 @@ impl ListView {
     }
 }
 
+/// One row of an [`IconList`]: an indent, an optional leading icon, and a label
+/// of one-or-more colored segments. The icon is reserved transparently in the
+/// shared text line (so labels share a column) and painted as a *centered*
+/// overlay — codicons sit at the em-center (above the lowercase text center), so
+/// drawn in-line they ride high above the label; centering them in the row fixes
+/// that uniformly for every list that uses this component.
+pub struct IconRow {
+    pub depth: usize,
+    /// `(glyph, color, scale)`. `scale` multiplies the UI font size (1.0 = match a
+    /// file icon, ~1.25 for a chunkier twistie). A fully-transparent color reserves
+    /// the column without painting an overlay (e.g. a file's empty twistie slot).
+    pub icon: Option<(char, glyphon::Color, f32)>,
+    pub label: Vec<(String, glyphon::Color)>,
+}
+
+impl IconRow {
+    /// Convenience: an indented row with one icon and a single-color label.
+    pub fn new(depth: usize, glyph: char, color: glyphon::Color, label: impl Into<String>, label_color: glyphon::Color) -> Self {
+        Self { depth, icon: Some((glyph, color, 1.0)), label: vec![(label.into(), label_color)] }
+    }
+}
+
+/// A scrollable list of `indent + centered-icon + label` rows. Wraps a
+/// [`ListView`] for row geometry/hit-testing/text and adds a glyph→[`IconButton`]
+/// cache so icons of any glyph are drawn centered in their row (the single source
+/// of truth for that behaviour, shared by the explorer tree and the outline). The
+/// caller owns scrolling and supplies the region.
+/// A 0→1 fade driven by an on/off flag — for hover-revealed overlays that should
+/// ease in/out rather than pop. `alpha(now)` ramps toward the target; `set`
+/// records the transition (back-dated so a mid-fade reversal continues smoothly).
+pub struct Fade {
+    on: bool,
+    since: Instant,
+    dur: Duration,
+}
+
+impl Fade {
+    pub fn new(dur_ms: u64) -> Self {
+        Self { on: false, since: Instant::now() - Duration::from_millis(dur_ms), dur: Duration::from_millis(dur_ms.max(1)) }
+    }
+    /// Set the target state; returns true if it changed (caller should redraw).
+    pub fn set(&mut self, on: bool) -> bool {
+        if on == self.on {
+            return false;
+        }
+        let now = Instant::now();
+        let a = self.alpha(now);
+        self.on = on;
+        // Back-date so alpha is continuous across the reversal.
+        let progressed = if on { a } else { 1.0 - a };
+        self.since = now - self.dur.mul_f32(progressed.clamp(0.0, 1.0));
+        true
+    }
+    pub fn alpha(&self, now: Instant) -> f32 {
+        let t = (now.saturating_duration_since(self.since).as_secs_f32() / self.dur.as_secs_f32()).clamp(0.0, 1.0);
+        if self.on {
+            t
+        } else {
+            1.0 - t
+        }
+    }
+    /// Next frame time while the fade is still moving (drives the event loop), else None.
+    pub fn next_wake(&self, now: Instant) -> Option<Instant> {
+        (now < self.since + self.dur).then(|| now + Duration::from_millis(16))
+    }
+}
+
+/// Base color of the tree indent guides (low contrast; multiplied by the hover fade).
+const INDENT_GUIDE: [f32; 4] = [0.56, 0.59, 0.72, 0.16];
+/// Brighter "active" guide — the one for the hovered row's parent level (VSCode's
+/// tree.indentGuidesStroke).
+const INDENT_GUIDE_ACTIVE: [f32; 4] = [0.62, 0.66, 0.82, 0.55];
+
+pub struct IconList {
+    list: ListView,
+    icons: std::collections::HashMap<(char, u16), IconButton>,
+    // Per-row icon draw info, parallel to the rows passed to `set_rows`.
+    row_icons: Vec<Option<(char, glyphon::Color, u16, usize, usize)>>, // (glyph, color, key, byte_start, byte_end)
+    row_depths: Vec<usize>, // per-row indent depth (for the indent guides)
+    // ASCII spaces of indent per depth level. Must be wide enough that one level's
+    // icon doesn't spill into the next level's column — a tree drawing indent guides
+    // (Source Control) needs the icons to sit clear of the guide lines.
+    indent_spaces: usize,
+    guides: Fade,              // hover-revealed faint indent guides, eased in/out
+    active_row: Option<usize>, // selected/open row — its parent guide stays highlighted
+    hover_row: Option<usize>,  // hovered row — its parent guide highlights while hovering
+}
+
+impl IconList {
+    pub fn new(fs: &mut FontSystem, w: f32, h: f32, row_h: f32, pad_x: f32) -> Self {
+        Self {
+            list: ListView::new(fs, w, h, row_h, pad_x),
+            icons: std::collections::HashMap::new(),
+            row_icons: Vec::new(),
+            row_depths: Vec::new(),
+            indent_spaces: 2,
+            guides: Fade::new(140),
+            active_row: None,
+            hover_row: None,
+        }
+    }
+
+    /// Set the indent width (ASCII spaces per depth level). Default 2 (compact, for
+    /// flat/shallow lists); a tree with indent guides + icons wants ~4 so each
+    /// level's icon clears the guide.
+    pub fn with_indent(mut self, spaces: usize) -> Self {
+        self.indent_spaces = spaces;
+        self
+    }
+
+    fn scale_key(scale: f32) -> u16 {
+        (scale * 100.0).round() as u16
+    }
+
+    /// Rebuild from row specs. `key` is the change-detection string (reshape only
+    /// when it changes). Builds the shared text buffer (indent + transparent icon
+    /// reservation + label) and ensures every icon glyph exists in the cache.
+    pub fn set_rows(&mut self, fs: &mut FontSystem, key: &str, rows: &[IconRow], w: f32, h: f32) {
+        let ui = Attrs::new().family(Family::Name(theme::UI_FAMILY()));
+        let clear = glyphon::Color::rgba(0, 0, 0, 0);
+        let mut spans: Vec<(String, Attrs)> = Vec::new();
+        self.row_icons.clear();
+        self.row_depths.clear();
+        for row in rows {
+            self.row_depths.push(row.depth);
+            spans.push((" ".repeat(row.depth * self.indent_spaces), ui));
+            let bstart = row.depth * self.indent_spaces; // ASCII spaces per indent level
+            match row.icon {
+                Some((glyph, color, scale)) => {
+                    // Reserve the icon column transparently; the visible glyph is an
+                    // overlay (see `draw_slice`).
+                    spans.push((format!("{glyph}  "), Attrs::new().family(Family::Name(theme::ICON_FAMILY)).color(clear)));
+                    let sk = Self::scale_key(scale);
+                    self.icons
+                        .entry((glyph, sk))
+                        .or_insert_with(|| IconButton::new(fs, glyph, theme::ICON_FAMILY, theme::UI_FONT_SIZE() * scale));
+                    // alpha 0 ⇒ reserve only (no overlay).
+                    let draw = (color.as_rgba()[3]) != 0;
+                    self.row_icons.push(draw.then_some((glyph, color, sk, bstart, bstart + glyph.len_utf8())));
+                }
+                None => self.row_icons.push(None),
+            }
+            let n = row.label.len();
+            for (i, (text, color)) in row.label.iter().enumerate() {
+                let tail = if i + 1 == n { "\n" } else { "" };
+                spans.push((format!("{text}{tail}"), ui.color(*color)));
+            }
+            if row.label.is_empty() {
+                spans.push(("\n".to_string(), ui));
+            }
+        }
+        self.list.set_rich(fs, key, &spans, w, h);
+    }
+
+    /// Re-shape every cached icon after a zoom change.
+    pub fn reshape_icons(&mut self, fs: &mut FontSystem) {
+        for ib in self.icons.values_mut() {
+            ib.reshape(fs);
+        }
+    }
+
+    /// Draw the rows whose natural slot lands in `clip`, with row 0 at `top`:
+    /// the shared text buffer plus each row's centered icon overlay. A single
+    /// slice covers the normal case; the explorer's inline-create uses two slices
+    /// (above/below the insert) by calling this with different `clip`/`top`.
+    pub fn draw_slice<'a>(&'a self, clip: Rect, top: f32, default_color: glyphon::Color, areas: &mut Vec<TextArea<'a>>) {
+        self.list.draw_at(clip, top, default_color, areas);
+        let rh = self.list.row_h();
+        for (idx, ri) in self.row_icons.iter().enumerate() {
+            let Some((glyph, color, sk, b0, b1)) = *ri else { continue };
+            let row = Rect { x: clip.x, y: top + idx as f32 * rh, w: clip.w, h: rh };
+            if row.y + row.h <= clip.y || row.y >= clip.y + clip.h {
+                continue;
+            }
+            let Some((x0, x1)) = self.list.line_x_range(idx, b0, b1) else { continue };
+            let slot = Rect { x: clip.x + self.list.pad_x() + x0, y: row.y, w: (x1 - x0).max(1.0), h: rh };
+            if let Some(ib) = self.icons.get(&(glyph, sk)) {
+                ib.draw_clipped(slot, clip, color, areas);
+            }
+        }
+    }
+
+    // ---- Geometry / hit-testing (delegate to the inner ListView) ----
+    pub fn row_rect(&self, region: Rect, i: usize) -> Rect {
+        self.list.row_rect(region, i)
+    }
+    pub fn row_at_scrolled(&self, region: Rect, scroll_y: f32, p: (f32, f32), count: usize) -> Option<usize> {
+        self.list.row_at_scrolled(region, scroll_y, p, count)
+    }
+    pub fn row_at(&self, region: Rect, p: (f32, f32), count: usize) -> Option<usize> {
+        self.list.row_at(region, p, count)
+    }
+    /// Pixel x-span (relative to the buffer's left) of a row's icon glyph — for
+    /// aligning decorations (e.g. tree indent guides) to the icon column without the
+    /// caller hard-coding the indent layout.
+    pub fn icon_x_span(&self, row: usize) -> Option<(f32, f32)> {
+        let (_, _, _, b0, b1) = self.row_icons.get(row).copied().flatten()?;
+        self.list.line_x_range(row, b0, b1)
+    }
+    /// Pixel x-span of a byte range within a row's text — for highlighting substrings
+    /// (e.g. search matches). Byte offsets are into the full rendered row text, so
+    /// callers add the row's indent/icon prefix length themselves.
+    pub fn line_x_range(&self, row: usize, byte_start: usize, byte_end: usize) -> Option<(f32, f32)> {
+        self.list.line_x_range(row, byte_start, byte_end)
+    }
+    pub fn pad_x(&self) -> f32 {
+        self.list.pad_x()
+    }
+
+    // ---- Indent guides (hover-revealed, animated) ----
+
+    /// Set whether the indent guides should be shown (eased in/out). Returns true if
+    /// the fade target changed, so the caller can redraw.
+    pub fn set_guides_hovered(&mut self, on: bool) -> bool {
+        self.guides.set(on)
+    }
+    /// Next frame time while the guide fade is still animating (for the event loop).
+    pub fn guides_next_wake(&self, now: Instant) -> Option<Instant> {
+        self.guides.next_wake(now)
+    }
+    /// The selected/open row whose parent guide stays highlighted even when not
+    /// hovering (VSCode's active-file indent guide). Returns true if it changed.
+    pub fn set_active_row(&mut self, row: Option<usize>) -> bool {
+        if self.active_row == row {
+            return false;
+        }
+        self.active_row = row;
+        true
+    }
+    /// The hovered row whose parent guide highlights while the guides are shown.
+    pub fn set_hover_row(&mut self, row: Option<usize>) -> bool {
+        if self.hover_row == row {
+            return false;
+        }
+        self.hover_row = row;
+        true
+    }
+
+    /// The guide for `row` as (level, row_start, row_end): the row's parent level,
+    /// spanning the contiguous sibling block under that parent.
+    fn guide_span(&self, row: Option<usize>) -> Option<(usize, usize, usize)> {
+        let r = row?;
+        let d = *self.row_depths.get(r)?;
+        if d == 0 {
+            return None; // a top-level row has no parent guide
+        }
+        let level = d - 1;
+        let mut start = r;
+        while start > 0 && self.row_depths[start - 1] > level {
+            start -= 1;
+        }
+        let mut end = r + 1;
+        while end < self.row_depths.len() && self.row_depths[end] > level {
+            end += 1;
+        }
+        Some((level, start, end))
+    }
+
+    /// The icon-column center x per depth, measured from the shaped buffer so guides
+    /// land exactly on each level's icon at any zoom/indent. Index = depth.
+    fn depth_centers(&self) -> Vec<f32> {
+        let mut centers: Vec<f32> = Vec::new();
+        for (i, &d) in self.row_depths.iter().enumerate() {
+            if centers.len() > d && centers[d] >= 0.0 {
+                continue;
+            }
+            if let Some((x0, x1)) = self.icon_x_span(i) {
+                while centers.len() <= d {
+                    centers.push(-1.0);
+                }
+                centers[d] = (x0 + x1) * 0.5;
+            }
+        }
+        centers
+    }
+
+    /// Draw the indent guides for the rows whose slot lands in `clip`, with row 0 at
+    /// `top` — one faint vertical line per ancestor level, evenly spaced and aligned
+    /// to the icon columns. Faded by the hover state; nothing drawn when fully out.
+    pub fn draw_guides(&self, clip: Rect, top: f32, now: Instant, bg: &mut Vec<Quad>) {
+        let a = self.guides.alpha(now);
+        let active = self.guide_span(self.active_row); // persistent (open file)
+        // Nothing to draw: no hover fade AND no persistent active guide.
+        if (a <= 0.0 && active.is_none()) || self.row_depths.iter().all(|&d| d == 0) {
+            return;
+        }
+        let centers = self.depth_centers();
+        let base = centers.iter().copied().find(|&c| c >= 0.0).unwrap_or(7.0 * theme::ui_zoom());
+        let unit = match (centers.first(), centers.get(1)) {
+            (Some(&p), Some(&q)) if p >= 0.0 && q >= 0.0 => q - p,
+            _ => 13.0 * theme::ui_zoom(),
+        };
+        let origin = clip.x + self.list.pad_x();
+        let rh = self.list.row_h();
+        let w = theme::zpx(1.0).max(1.0);
+        let faint = [INDENT_GUIDE[0], INDENT_GUIDE[1], INDENT_GUIDE[2], INDENT_GUIDE[3] * a];
+        let act = INDENT_GUIDE_ACTIVE;
+        let act_faded = [act[0], act[1], act[2], act[3] * a];
+        let hover = self.guide_span(self.hover_row); // transient
+        let matches = |g: Option<(usize, usize, usize)>, k: usize, i: usize| {
+            g.map_or(false, |(l, s, e)| k == l && i >= s && i < e)
+        };
+        for (idx, &depth) in self.row_depths.iter().enumerate() {
+            let y = top + idx as f32 * rh;
+            if y + rh <= clip.y || y >= clip.y + clip.h {
+                continue;
+            }
+            let qy = y.max(clip.y);
+            let qb = (y + rh).min(clip.y + clip.h);
+            if qb <= qy {
+                continue;
+            }
+            for k in 0..depth {
+                // Persistent active guide is full-strength always; the faint set and
+                // the hovered-row guide ride the hover fade.
+                let color = if matches(active, k, idx) {
+                    act
+                } else if a > 0.0 {
+                    if matches(hover, k, idx) {
+                        act_faded
+                    } else {
+                        faint
+                    }
+                } else {
+                    continue; // not hovering, not the active guide → nothing
+                };
+                let x = (origin + base + k as f32 * unit).round();
+                bg.push(Quad::new(x, qy, w, qb - qy, color));
+            }
+        }
+    }
+    pub fn cursor(&self) -> CursorIcon {
+        self.list.cursor()
+    }
+}
+
+/// Reformat a raw accelerator string (`"Ctrl+Shift+P"`, `"Ctrl+\`"`) into compact
+/// menu key-caps. On macOS the modifiers become Apple's glyphs and join without
+/// separators (`⇧⌘P`), matching the native menus; the leading `Ctrl` maps to ⌘
+/// because that's the primary modifier the app actually binds on macOS. Elsewhere
+/// only the obvious symbol substitutions are made and the `+` joins are kept.
+pub fn pretty_hint(raw: &str) -> String {
+    let keys = shortcut_keys(raw);
+    if cfg!(target_os = "macos") {
+        keys.concat() // Apple joins caps with no separator: ⇧⌘P
+    } else {
+        keys.join("+") // familiar Ctrl+⇧+P
+    }
+}
+
+/// Split a raw accelerator (`"Ctrl+Shift+P"`) into individual key-cap labels,
+/// already symbolized and ordered. On macOS modifiers become Apple's glyphs in the
+/// canonical ⌃⌥⇧⌘ order (leading `Ctrl` → ⌘, the app's primary modifier); the
+/// final key trails. This is the single source of truth for both the joined text
+/// form ([`pretty_hint`]) and the pill form ([`Keycaps`]).
+pub fn shortcut_keys(raw: &str) -> Vec<String> {
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    let mac = cfg!(target_os = "macos");
+    // Modifier rank for Apple's canonical order (⌃⌥⇧⌘); non-modifiers get usize::MAX
+    // so the key always trails.
+    let mut toks: Vec<(usize, String)> = Vec::new();
+    for part in raw.split('+') {
+        let p = part.trim();
+        let (rank, sym): (usize, String) = match p.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" | "cmd" | "command" | "super" | "meta" | "win" => {
+                (3, if mac { "⌘".into() } else { "Ctrl".into() })
+            }
+            "alt" | "option" | "opt" => (1, if mac { "⌥".into() } else { "Alt".into() }),
+            "shift" => (2, "⇧".into()),
+            "enter" | "return" => (usize::MAX, "↩".into()),
+            "tab" => (usize::MAX, "⇥".into()),
+            "backspace" => (usize::MAX, "⌫".into()),
+            "delete" | "del" => (usize::MAX, "⌦".into()),
+            "escape" | "esc" => (usize::MAX, "⎋".into()),
+            "up" => (usize::MAX, "↑".into()),
+            "down" => (usize::MAX, "↓".into()),
+            "left" => (usize::MAX, "←".into()),
+            "right" => (usize::MAX, "→".into()),
+            "pageup" | "pgup" => (usize::MAX, "⇞".into()),
+            "pagedown" | "pgdn" => (usize::MAX, "⇟".into()),
+            "home" => (usize::MAX, "↖".into()),
+            "end" => (usize::MAX, "↘".into()),
+            "space" => (usize::MAX, "Space".into()),
+            "" => (usize::MAX, "+".into()), // empty token came from a literal "+" key
+            other => {
+                // Single letters/digits read best uppercased; multi-char names
+                // (F5, etc.) pass through verbatim.
+                let s = if other.chars().count() == 1 { other.to_uppercase().to_string() } else { p.to_string() };
+                (usize::MAX, s)
+            }
+        };
+        toks.push((rank, sym));
+    }
+    // Apple orders the modifiers regardless of how they were written; other
+    // platforms keep author order.
+    if mac {
+        toks.sort_by_key(|(r, _)| *r);
+    }
+    toks.into_iter().map(|(_, s)| s).collect()
+}
+
+/// Right-aligned keyboard-shortcut pills, VS Code-style: each key in its own
+/// rounded cap. Built per-frame from a raw accelerator string; owns its glyph
+/// buffers so it must live until the text pass is prepared. `quads` paints the cap
+/// fills/borders, `draw` the centered glyphs — the single source of truth for
+/// shortcut chips wherever the app shows them (command palette, etc.).
+pub struct Keycaps {
+    caps: Vec<(Buffer, Rect)>, // (centered glyph buffer, absolute pill rect)
+}
+
+impl Keycaps {
+    /// Lay out caps for `raw`, right-aligned so the rightmost cap ends at `right`,
+    /// each vertically centered on `cy` (all absolute coords). Empty if no keys.
+    pub fn new(fs: &mut FontSystem, raw: &str, right: f32, cy: f32) -> Self {
+        let z = theme::ui_zoom();
+        let pad_x = (6.0 * z).round();
+        let gap = (4.0 * z).round();
+        let cap_h = (theme::UI_FONT_SIZE() + 8.0 * z).round();
+        // Measure each cap's glyph width.
+        let mut measured: Vec<(Buffer, f32)> = Vec::new();
+        for k in shortcut_keys(raw) {
+            let mut buf = make_ui_buffer(fs, 400.0, cap_h);
+            buf.set_metrics(fs, Metrics::new(theme::UI_FONT_SIZE(), theme::UI_LINE_HEIGHT()));
+            buf.set_size(fs, Some(400.0), Some(cap_h));
+            buf.set_wrap(fs, Wrap::None);
+            buf.set_text(fs, &k, Attrs::new().family(Family::Name(theme::UI_FAMILY())), Shaping::Advanced);
+            buf.shape_until_scroll(fs, false);
+            let gw = buf.layout_runs().next().map(|r| r.line_w).unwrap_or(0.0);
+            measured.push((buf, gw));
+        }
+        // Uniform pill width: every cap is the same box (the widest glyph + padding,
+        // never narrower than a square) so the chips line up like a real keyboard.
+        let widest = measured.iter().fold(0.0f32, |m, (_, gw)| m.max(*gw));
+        let pw = (widest + pad_x * 2.0).max(cap_h);
+        let total = pw * measured.len() as f32 + gap * measured.len().saturating_sub(1) as f32;
+        let mut x = right - total;
+        let mut caps = Vec::new();
+        for (buf, _) in measured {
+            caps.push((buf, Rect { x, y: cy - cap_h * 0.5, w: pw, h: cap_h }));
+            x += pw + gap;
+        }
+        Self { caps }
+    }
+
+    pub fn quads(&self, out: &mut Vec<Quad>) {
+        let r = (4.0 * theme::ui_zoom()).round().max(2.0);
+        for (_, rect) in &self.caps {
+            out.push(rect.rounded_quad(theme::KEYCAP_BORDER(), r));
+            let inner = Rect { x: rect.x + 1.0, y: rect.y + 1.0, w: rect.w - 2.0, h: rect.h - 2.0 };
+            out.push(inner.rounded_quad(theme::KEYCAP_BG(), (r - 1.0).max(1.0)));
+        }
+    }
+
+    pub fn draw<'a>(&'a self, color: glyphon::Color, areas: &mut Vec<TextArea<'a>>) {
+        for (buf, rect) in &self.caps {
+            let gw = buf.layout_runs().next().map(|r| r.line_w).unwrap_or(0.0);
+            let left = rect.x + (rect.w - gw) * 0.5;
+            areas.push(TextArea {
+                buffer: buf,
+                left,
+                top: rect.text_top(theme::UI_LINE_HEIGHT(), VAlign::Center),
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: rect.x as i32,
+                    top: rect.y as i32,
+                    right: (rect.x + rect.w) as i32,
+                    bottom: (rect.y + rect.h) as i32,
+                },
+                default_color: color,
+                custom_glyphs: &[],
+            });
+        }
+    }
+}
+
 /// A floating popup menu (right-click context menu): a bordered box of rows,
 /// positioned from an anchor and clamped to the window. Wraps a `ListView` for
 /// row geometry/hit-test/draw, so item rects are the single source of truth for
@@ -1270,7 +1892,8 @@ impl ListView {
 pub struct Menu {
     list: ListView,
     count: usize,
-    base_w: f32, // unzoomed width; width() scales it so items don't wrap when zoomed
+    base_w: f32,  // unzoomed MAX width (the menu never grows past this)
+    box_w: f32,   // current zoomed width, sized to the entries' content
     seps: Vec<usize>, // separator row indices — drawn as divider lines, not clickable
 }
 
@@ -1280,16 +1903,21 @@ impl Menu {
             list: ListView::new(fs, width, 400.0, theme::MENU_ITEM_H(), 12.0),
             count: 0,
             base_w: width / theme::ui_zoom(),
+            box_w: width,
             seps: Vec::new(),
         }
     }
 
+    /// Current popup width — sized to the widest entry (set in `set_entries`),
+    /// clamped to a sensible minimum and the configured maximum.
     fn width(&self) -> f32 {
-        self.base_w * theme::ui_zoom()
+        self.box_w
     }
 
     /// Full rows: `(label, shortcut-hint, is_separator)`. Hints render dim after the
-    /// label; separator rows draw as divider lines and don't hover or click.
+    /// label; separator rows draw as divider lines and don't hover or click. Raw
+    /// hint strings (`"Ctrl+Shift+P"`) are reformatted into compact key-cap symbols
+    /// (`⇧⌘P` on macOS, `Ctrl+⇧+P`-style elsewhere) so they read like a real menu.
     pub fn set_entries(&mut self, fs: &mut FontSystem, rows: &[(&str, &str, bool)]) {
         let label_attrs = glyphon::Attrs::new()
             .family(glyphon::Family::Name(theme::UI_FAMILY()))
@@ -1308,17 +1936,22 @@ impl Menu {
                 continue;
             }
             spans.push((format!(" {}", label), label_attrs));
-            if hint.is_empty() {
+            let pretty = pretty_hint(hint);
+            if pretty.is_empty() {
                 spans.push(("\n".to_string(), label_attrs));
             } else {
-                spans.push((format!("    {}\n", hint), hint_attrs));
+                spans.push((format!("    {}\n", pretty), hint_attrs));
             }
             key.push_str(label);
             key.push(' ');
-            key.push_str(hint);
+            key.push_str(&pretty);
             key.push('\n');
         }
-        self.list.set_rich(fs, &key, &spans, self.width(), 4000.0);
+        // Shape at the max width (no wrap), then size the box to the actual content
+        // so short menus aren't needlessly wide. Clamp to a minimum and the max.
+        let max_w = self.base_w * theme::ui_zoom();
+        self.list.set_rich(fs, &key, &spans, max_w, 4000.0);
+        self.box_w = (self.list.content_width() + theme::zpx(20.0)).clamp(theme::zpx(120.0), max_w);
         self.count = rows.len();
     }
 
@@ -2451,7 +3084,13 @@ pub(crate) fn edit_input(
                 KeyCode::KeyV => {
                     if let Some(cb) = clip {
                         if let Ok(t) = cb.get_text() {
-                            let t: String = t.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+                            // Single-line inputs strip newlines; multiline keeps them
+                            // (CRLF → LF) so pasting a commit body works.
+                            let t: String = if input.is_multiline() {
+                                t.replace("\r\n", "\n").replace('\r', "\n")
+                            } else {
+                                t.chars().filter(|c| *c != '\n' && *c != '\r').collect()
+                            };
                             input.insert(fs, &t);
                             return Some(true);
                         }
@@ -2470,6 +3109,14 @@ pub(crate) fn edit_input(
         }
         Key::Named(NamedKey::ArrowRight) => {
             input.move_right(shift);
+            Some(false)
+        }
+        Key::Named(NamedKey::ArrowUp) => {
+            input.move_up(shift);
+            Some(false)
+        }
+        Key::Named(NamedKey::ArrowDown) => {
+            input.move_down(shift);
             Some(false)
         }
         Key::Named(NamedKey::Home) => {

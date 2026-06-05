@@ -43,6 +43,8 @@ pub enum Intent {
     OpenExtDetail(OpenExt),
     /// Reload every open document from disk (after a Replace All rewrote files).
     ReloadOpenDocs,
+    /// Open the current search results as a new (untitled) editor document.
+    OpenSearchEditor { text: String },
     /// Commit with `msg`; `stage_all` stages everything first (nothing was staged).
     GitCommit { msg: String, stage_all: bool },
     /// Stage / unstage / discard a single repo-relative path.
@@ -58,4 +60,26 @@ pub enum Intent {
     GitRefresh,
     /// Commit then push (the Commit button's split-dropdown action).
     GitCommitPush { msg: String, stage_all: bool },
+    /// Open the commit split-button dropdown menu (Commit / Commit & Push) at
+    /// `anchor`, carrying the current message + stage-all state.
+    OpenCommitMenu { anchor: (f32, f32), msg: String, stage_all: bool },
+    /// Open the source-control "More actions" (…) menu at `anchor`. `tree_mode`
+    /// drives the "View as List/Tree" label.
+    OpenMoreMenu { anchor: (f32, f32), tree_mode: bool },
+    /// Network git ops (the … menu).
+    GitPush,
+    GitPull,
+    GitFetch,
+    /// Toggle the changed-files view between flat list and folder tree.
+    GitToggleView,
+    GitStashPop,
+    GitStashApply,
+    /// Open the branch quick-pick (Checkout to…).
+    GitOpenCheckout,
+    /// Open the palette-as-input to create a new branch.
+    GitOpenCreateBranch,
+    /// Open the palette-as-input to rename the current branch.
+    GitOpenRenameBranch,
+    /// Open the branch quick-pick to delete a branch.
+    GitOpenDeleteBranch,
 }

@@ -17,6 +17,71 @@ pub struct SearchOpts {
     pub regex: bool,
 }
 
+/// Include / exclude path globs, comma-separated (VSCode-style: `*.rs, src/**`).
+/// Compiled once per search. An empty include set matches everything; any matching
+/// exclude glob drops the file.
+#[derive(Default)]
+pub struct Filters {
+    include: Vec<Regex>,
+    exclude: Vec<Regex>,
+}
+
+impl Filters {
+    pub fn new(include: &str, exclude: &str) -> Self {
+        Self { include: compile_globs(include), exclude: compile_globs(exclude) }
+    }
+    /// Does this repo-relative (forward-slash) path pass the filters?
+    fn allows(&self, rel: &str) -> bool {
+        if !self.include.is_empty() && !self.include.iter().any(|re| re.is_match(rel).unwrap_or(false)) {
+            return false;
+        }
+        !self.exclude.iter().any(|re| re.is_match(rel).unwrap_or(false))
+    }
+}
+
+/// Compile a comma-separated glob list into anchored regexes. Patterns with no `/`
+/// match against any path segment (so `*.rs` finds files anywhere); patterns with a
+/// `/` anchor from the path root.
+fn compile_globs(patterns: &str) -> Vec<Regex> {
+    patterns
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .filter_map(|p| Regex::new(&glob_to_regex(p)).ok())
+        .collect()
+}
+
+fn glob_to_regex(glob: &str) -> String {
+    let mut re = String::new();
+    let has_slash = glob.contains('/');
+    // No slash → match the basename / any segment; slash → anchor at the root.
+    re.push_str(if has_slash { "^" } else { "(^|/)" });
+    let bytes: Vec<char> = glob.chars().collect();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match c {
+            '*' => {
+                if i + 1 < bytes.len() && bytes[i + 1] == '*' {
+                    re.push_str(".*"); // ** spans directories
+                    i += 1;
+                } else {
+                    re.push_str("[^/]*"); // * stays within a segment
+                }
+            }
+            '?' => re.push_str("[^/]"),
+            '.' | '+' | '(' | ')' | '|' | '^' | '$' | '{' | '}' | '[' | ']' | '\\' => {
+                re.push('\\');
+                re.push(c);
+            }
+            _ => re.push(c),
+        }
+        i += 1;
+    }
+    re.push('$');
+    re
+}
+
 /// One matching line within a file: the (1-based) line number, its text, and the
 /// byte ranges within that text that matched (for highlighting).
 #[derive(Clone)]
@@ -34,53 +99,181 @@ pub struct FileMatches {
     pub lines: Vec<LineMatch>,
 }
 
-/// A flattened display row: a collapsible file header (`line == None`) or a match
-/// line (`line == Some(1-based)`). `ranges` are byte ranges in `text` to highlight.
-pub struct SearchRow {
-    pub file: usize,
-    pub line: Option<usize>,
-    pub text: String,
-    pub ranges: Vec<(usize, usize)>, // byte ranges in `text` to highlight
-    pub col: usize,                  // byte offset of the first match in the original line
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RowKind {
+    Dir,
+    File,
+    Match,
 }
 
-/// Flatten results into display rows: a header per file, then (unless that file is
-/// collapsed) its match lines with leading whitespace trimmed and match ranges
-/// re-based onto the displayed text. No line numbers — VSCode-style.
-pub fn build_rows(results: &[FileMatches], collapsed: &HashSet<usize>) -> Vec<SearchRow> {
-    const INDENT: &str = "    ";
-    let mut rows = Vec::new();
+/// One row of the results *folder tree* (VSCode "view as tree"): directory groups,
+/// file nodes, and match lines, each at a `depth`. Directories and files are
+/// collapsible via their `key`; match rows carry the highlight `ranges`.
+pub struct TreeRow {
+    pub depth: usize,
+    pub kind: RowKind,
+    pub label: String,            // dir/file name (+ count) or the trimmed match text
+    pub file: usize,              // result index (File / Match rows)
+    pub rel: String,              // file's repo-relative path (File rows — for the icon)
+    pub line: Option<usize>,      // 1-based line (Match rows)
+    pub col: usize,               // first-match byte offset in the original line
+    pub ranges: Vec<(usize, usize)>, // highlight ranges in `label` (Match rows)
+    pub key: String,              // collapse id ("d:<path>" / "f:<rel>"); empty for matches
+}
+
+#[derive(Default)]
+struct Dir {
+    subdirs: std::collections::BTreeMap<String, Dir>,
+    files: Vec<usize>, // indices into `results`, sorted by basename at emit time
+}
+
+fn count_matches(node: &Dir, results: &[FileMatches]) -> usize {
+    let mut n: usize = node.files.iter().map(|&fi| results[fi].lines.len()).sum();
+    for sub in node.subdirs.values() {
+        n += count_matches(sub, results);
+    }
+    n
+}
+
+/// Build the results as a collapsible directory tree. Single-child directory chains
+/// are compressed (`renderer/src` shown as one node), matching VSCode.
+pub fn build_tree_rows(results: &[FileMatches], collapsed: &HashSet<String>) -> Vec<TreeRow> {
+    // 1. Bucket files into a directory trie.
+    let mut root = Dir::default();
     for (fi, f) in results.iter().enumerate() {
-        // Leading spaces leave room for the codicon chevron drawn over them.
-        rows.push(SearchRow {
+        let mut segs: Vec<&str> = f.rel.split('/').collect();
+        segs.pop(); // drop the filename — the leaf is the file itself
+        let mut node = &mut root;
+        for seg in segs {
+            node = node.subdirs.entry(seg.to_string()).or_default();
+        }
+        node.files.push(fi);
+    }
+    // 2. Depth-first emit.
+    let mut rows = Vec::new();
+    emit_children(&root, "", 0, collapsed, results, &mut rows);
+    rows
+}
+
+fn emit_children(node: &Dir, base: &str, depth: usize, collapsed: &HashSet<String>, results: &[FileMatches], rows: &mut Vec<TreeRow>) {
+    for (seg, child) in &node.subdirs {
+        emit_dir(child, seg.clone(), join_path(base, seg), depth, collapsed, results, rows);
+    }
+    let mut files = node.files.clone();
+    files.sort_by(|&a, &b| basename(&results[a].rel).cmp(basename(&results[b].rel)));
+    for fi in files {
+        emit_file(fi, depth, collapsed, results, rows);
+    }
+}
+
+fn emit_dir(node: &Dir, mut name: String, mut path: String, depth: usize, collapsed: &HashSet<String>, results: &[FileMatches], rows: &mut Vec<TreeRow>) {
+    // Compress single-child dir chains: `renderer` + `src` -> `renderer/src`.
+    let mut node = node;
+    while node.subdirs.len() == 1 && node.files.is_empty() {
+        let (seg, child) = node.subdirs.iter().next().unwrap();
+        name = format!("{name}/{seg}");
+        path = join_path(&path, seg);
+        node = child;
+    }
+    let key = format!("d:{path}");
+    rows.push(TreeRow {
+        depth,
+        kind: RowKind::Dir,
+        label: format!("{name}  ({})", count_matches(node, results)),
+        file: 0,
+        rel: String::new(),
+        line: None,
+        col: 0,
+        ranges: Vec::new(),
+        key: key.clone(),
+    });
+    if collapsed.contains(&key) {
+        return;
+    }
+    emit_children(node, &path, depth + 1, collapsed, results, rows);
+}
+
+fn emit_file(fi: usize, depth: usize, collapsed: &HashSet<String>, results: &[FileMatches], rows: &mut Vec<TreeRow>) {
+    let f = &results[fi];
+    let key = format!("f:{}", f.rel);
+    rows.push(TreeRow {
+        depth,
+        kind: RowKind::File,
+        label: format!("{}  ({})", basename(&f.rel), f.lines.len()),
+        file: fi,
+        rel: f.rel.clone(),
+        line: None,
+        col: 0,
+        ranges: Vec::new(),
+        key: key.clone(),
+    });
+    if collapsed.contains(&key) {
+        return;
+    }
+    for lm in &f.lines {
+        let lead = lm.text.len() - lm.text.trim_start().len();
+        let text = lm.text[lead..].to_string();
+        let max = text.len();
+        let ranges = lm
+            .ranges
+            .iter()
+            .filter_map(|&(s, e)| {
+                let s2 = s.saturating_sub(lead);
+                let e2 = e.saturating_sub(lead).min(max);
+                (e2 > s2).then_some((s2, e2))
+            })
+            .collect();
+        let col = lm.ranges.first().map(|&(s, _)| s).unwrap_or(0);
+        rows.push(TreeRow {
+            depth: depth + 1,
+            kind: RowKind::Match,
+            label: text,
             file: fi,
-            line: None,
-            text: format!("    {}  ({})", f.rel, f.lines.len()),
-            ranges: Vec::new(),
-            col: 0,
+            rel: String::new(),
+            line: Some(lm.line),
+            col,
+            ranges,
+            key: String::new(),
         });
-        if collapsed.contains(&fi) {
-            continue;
-        }
-        for lm in &f.lines {
-            let lead = lm.text.len() - lm.text.trim_start().len();
-            let text = format!("{INDENT}{}", &lm.text[lead..]);
-            let max = text.len();
-            let off = INDENT.len() as isize - lead as isize;
-            let ranges = lm
-                .ranges
-                .iter()
-                .filter_map(|&(s, e)| {
-                    let s2 = (s as isize + off).max(INDENT.len() as isize) as usize;
-                    let e2 = ((e as isize + off).max(0) as usize).min(max);
-                    (e2 > s2).then_some((s2, e2))
-                })
-                .collect();
-            let col = lm.ranges.first().map(|&(s, _)| s).unwrap_or(0);
-            rows.push(SearchRow { file: fi, line: Some(lm.line), text, ranges, col });
-        }
+    }
+}
+
+/// Flat (non-tree) view: every file at depth 0 with its matches at depth 1, no
+/// directory grouping — VSCode's "view as list".
+pub fn build_flat_rows(results: &[FileMatches], collapsed: &HashSet<String>) -> Vec<TreeRow> {
+    let mut rows = Vec::new();
+    for fi in 0..results.len() {
+        emit_file(fi, 0, collapsed, results, &mut rows);
     }
     rows
+}
+
+/// Every collapse key in the tree (for "collapse all").
+pub fn all_group_keys(results: &[FileMatches]) -> HashSet<String> {
+    let mut keys = HashSet::new();
+    for f in results {
+        keys.insert(format!("f:{}", f.rel));
+        let mut segs: Vec<&str> = f.rel.split('/').collect();
+        segs.pop();
+        let mut path = String::new();
+        for seg in segs {
+            path = join_path(&path, seg);
+            keys.insert(format!("d:{path}"));
+        }
+    }
+    keys
+}
+
+fn basename(rel: &str) -> &str {
+    rel.rsplit('/').next().unwrap_or(rel)
+}
+
+fn join_path(base: &str, seg: &str) -> String {
+    if base.is_empty() {
+        seg.to_string()
+    } else {
+        format!("{base}/{seg}")
+    }
 }
 
 /// Directories never worth searching, and a per-file size ceiling.
@@ -135,7 +328,7 @@ fn line_ranges(re: &Regex, line: &str) -> Vec<(usize, usize)> {
 /// Search `root` recursively for `query` on a background thread, streaming batches
 /// of `FileMatches` over `tx` (tagged with `gen` so stale results can be ignored),
 /// then a final `SearchDone`.
-pub fn search_async(tx: Sender<WorkerMsg>, gen: u64, root: PathBuf, query: String, opts: SearchOpts) {
+pub fn search_async(tx: Sender<WorkerMsg>, gen: u64, root: PathBuf, query: String, opts: SearchOpts, filters: Filters) {
     std::thread::spawn(move || {
         let Some(re) = build_regex(&query, opts) else {
             let _ = tx.send(WorkerMsg::SearchDone { gen });
@@ -159,6 +352,14 @@ pub fn search_async(tx: Sender<WorkerMsg>, gen: u64, root: PathBuf, query: Strin
                 if !ft.is_file() {
                     continue;
                 }
+                let rel = path
+                    .strip_prefix(&root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if !filters.allows(&rel) {
+                    continue;
+                }
                 if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > MAX_FILE_BYTES {
                     continue;
                 }
@@ -179,11 +380,6 @@ pub fn search_async(tx: Sender<WorkerMsg>, gen: u64, root: PathBuf, query: Strin
                     }
                 }
                 if !lines.is_empty() {
-                    let rel = path
-                        .strip_prefix(&root)
-                        .unwrap_or(&path)
-                        .to_string_lossy()
-                        .replace('\\', "/");
                     batch.push(FileMatches { path: path.clone(), rel, lines });
                     if batch.len() >= BATCH_FILES {
                         let _ = tx.send(WorkerMsg::SearchHits { gen, files: std::mem::take(&mut batch) });
