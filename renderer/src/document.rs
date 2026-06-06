@@ -86,6 +86,9 @@ pub struct Document {
     // Stage/Unstage/Revert can build and apply a patch. None ⇒ not a file diff.
     pub diff_path: Option<String>,
     pub diff_staged: bool,
+    /// Commit-graph view (Visualize Repository History). Some ⇒ this read-only tab
+    /// renders the laid-out graph instead of file text.
+    pub graph: Option<crate::graph::Graph>,
     pub folds: std::collections::BTreeMap<usize, usize>, // folded regions: header line → last hidden line
     pub image: Option<String>,           // Some(media key) => this tab renders an image
     pub image_scale: Option<f32>,        // None = fit-to-window; Some(s) = absolute scale
@@ -342,6 +345,7 @@ impl Document {
             diff_hbar: [Scrollbar::new(Axis::Horizontal), Scrollbar::new(Axis::Horizontal)],
             diff_path: None,
             diff_staged: false,
+            graph: None,
             folds: std::collections::BTreeMap::new(),
             image: None,
             image_scale: None,
@@ -372,6 +376,29 @@ impl Document {
         d.name = page.title.clone();
         d.read_only = true;
         d.info = Some(page);
+        d
+    }
+
+    /// A read-only commit-graph tab (Visualize Repository History). The buffer holds
+    /// one line per commit (inline refs + subject + author/date); the renderer draws
+    /// the lane graph to the left and offsets this text past it.
+    pub fn new_graph(graph: crate::graph::Graph, fs: &mut FontSystem) -> Self {
+        let mut text = String::new();
+        for r in &graph.rows {
+            let refs: String = r.refs.iter().map(|rf| format!("‹{}› ", rf.label)).collect();
+            // Truncate the subject so rows don't run long; full message shows on hover.
+            let subject: String = if r.subject.chars().count() > 72 {
+                let s: String = r.subject.chars().take(71).collect();
+                format!("{s}…")
+            } else {
+                r.subject.clone()
+            };
+            text.push_str(&format!("{}  {}{}    {} · {}\n", r.short, refs, subject, r.author, r.when));
+        }
+        let mut d = Document::new(None, text, fs);
+        d.name = graph.title.clone();
+        d.read_only = true;
+        d.graph = Some(graph);
         d
     }
 
@@ -422,6 +449,7 @@ impl Document {
             diff_hbar: [Scrollbar::new(Axis::Horizontal), Scrollbar::new(Axis::Horizontal)],
             diff_path: None,
             diff_staged: false,
+            graph: None,
             folds: std::collections::BTreeMap::new(),
             image: Some(key),
             image_scale: None,
@@ -522,6 +550,7 @@ impl Document {
             diff_hbar: [Scrollbar::new(Axis::Horizontal), Scrollbar::new(Axis::Horizontal)],
             diff_path: None,
             diff_staged: false,
+            graph: None,
             folds: std::collections::BTreeMap::new(),
             image: None,
             image_scale: None,
@@ -695,6 +724,17 @@ impl Document {
             fbe += 1;
         }
         crate::diff::block_patch(full, path, fbs, fbe)
+    }
+
+    /// Full commit message of the graph row under screen-y `y` (uniform row height).
+    pub fn graph_message_at_y(&self, region: Rect, y: f32) -> Option<&str> {
+        let g = self.graph.as_ref()?;
+        let lh = theme::LINE_HEIGHT().max(1.0);
+        let rel = y - (region.y + theme::EDITOR_PAD()) + self.scroll_y();
+        if rel < 0.0 {
+            return None;
+        }
+        g.rows.get((rel / lh) as usize).map(|r| r.message.as_str())
     }
 
     /// This file's line ending: "\n" or "\r\n".

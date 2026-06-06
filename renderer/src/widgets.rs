@@ -1514,6 +1514,7 @@ pub struct IconList {
     guides: Fade,              // hover-revealed faint indent guides, eased in/out
     active_row: Option<usize>, // selected/open row — its parent guide stays highlighted
     hover_row: Option<usize>,  // hovered row — its parent guide highlights while hovering
+    measure: Buffer,           // scratch buffer for measuring label widths (ellipsis fitting)
 }
 
 impl IconList {
@@ -1527,7 +1528,66 @@ impl IconList {
             guides: Fade::new(140),
             active_row: None,
             hover_row: None,
+            measure: make_ui_buffer(fs, 4000.0, row_h),
         }
+    }
+
+    /// Pixel width of `text` shaped in `attrs` (UI or icon font), using the scratch
+    /// buffer — the single source of truth for label fitting.
+    fn text_w(&mut self, fs: &mut FontSystem, text: &str, attrs: Attrs) -> f32 {
+        self.measure.set_metrics(fs, Metrics::new(theme::UI_FONT_SIZE(), theme::UI_LINE_HEIGHT()));
+        self.measure.set_size(fs, None, Some(theme::UI_LINE_HEIGHT() * 2.0));
+        self.measure.set_text(fs, text, attrs, Shaping::Advanced);
+        self.measure.shape_until_scroll(fs, false);
+        self.measure.layout_runs().next().map(|r| r.line_w).unwrap_or(0.0)
+    }
+
+    /// Ellipsize `label` spans (cutting from the end, keeping per-span colors) so the
+    /// whole label fits `avail` px. Returns the original spans untouched if they fit.
+    fn fit_label(&mut self, fs: &mut FontSystem, label: &[(String, glyphon::Color)], avail: f32) -> Vec<(String, glyphon::Color)> {
+        let ui = Attrs::new().family(Family::Name(theme::UI_FAMILY()));
+        let full: String = label.iter().map(|(s, _)| s.as_str()).collect();
+        if avail <= 0.0 || self.text_w(fs, &full, ui) <= avail {
+            return label.to_vec();
+        }
+        let ell_w = self.text_w(fs, "…", ui);
+        let target = (avail - ell_w).max(0.0);
+        // Binary-search the longest char prefix of the combined label that fits.
+        let chars: Vec<char> = full.chars().collect();
+        let (mut lo, mut hi) = (0usize, chars.len());
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2;
+            let s: String = chars[..mid].iter().collect();
+            if self.text_w(fs, &s, ui) <= target {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        // Re-distribute the kept char prefix back across the original spans, then add
+        // the ellipsis to the last kept span (so its colour matches).
+        let mut kept = lo;
+        let mut out: Vec<(String, glyphon::Color)> = Vec::new();
+        for (s, c) in label {
+            if kept == 0 {
+                break;
+            }
+            let n = s.chars().count();
+            if n <= kept {
+                out.push((s.clone(), *c));
+                kept -= n;
+            } else {
+                let t: String = s.chars().take(kept).collect();
+                out.push((t, *c));
+                kept = 0;
+            }
+        }
+        if let Some(last) = out.last_mut() {
+            last.0.push('…');
+        } else {
+            out.push(("…".to_string(), label.last().map(|(_, c)| *c).unwrap_or(glyphon::Color::rgb(0xcc, 0xcc, 0xcc))));
+        }
+        out
     }
 
     /// Set the indent width (ASCII spaces per depth level). Default 2 (compact, for
@@ -1558,12 +1618,14 @@ impl IconList {
             match row.icon {
                 Some((glyph, color, scale)) => {
                     // Reserve the icon column transparently; the visible glyph is an
-                    // overlay (see `draw_slice`).
-                    spans.push((format!("{glyph}  "), Attrs::new().family(Family::Name(theme::ICON_FAMILY)).color(clear)));
+                    // overlay (see `draw_slice`). File logos live in the Seti font, UI
+                    // glyphs (chevrons) in codicon — `icon_family` routes per glyph.
+                    let fam = theme::icon_family(glyph);
+                    spans.push((format!("{glyph}  "), Attrs::new().family(Family::Name(fam)).color(clear)));
                     let sk = Self::scale_key(scale);
                     self.icons
                         .entry((glyph, sk))
-                        .or_insert_with(|| IconButton::new(fs, glyph, theme::ICON_FAMILY, theme::UI_FONT_SIZE() * scale));
+                        .or_insert_with(|| IconButton::new(fs, glyph, fam, theme::UI_FONT_SIZE() * scale));
                     // alpha 0 ⇒ reserve only (no overlay).
                     let draw = (color.as_rgba()[3]) != 0;
                     self.row_icons.push(draw.then_some((glyph, color, sk, bstart, bstart + glyph.len_utf8())));
@@ -1580,6 +1642,29 @@ impl IconList {
             }
         }
         self.list.set_rich(fs, key, &spans, w, h);
+    }
+
+    /// Like `set_rows`, but ellipsizes each row's label (measuring glyph widths) so
+    /// it fits the row minus `reserve_right` px (reserved for a status letter and/or
+    /// hover-action icons at the right edge). The single source of truth for row
+    /// truncation — callers no longer estimate char widths themselves.
+    pub fn set_rows_fit(&mut self, fs: &mut FontSystem, key: &str, rows: &[IconRow], w: f32, h: f32, reserve_right: f32) {
+        let ui = Attrs::new().family(Family::Name(theme::UI_FAMILY()));
+        let icon_attrs = Attrs::new().family(Family::Name(theme::ICON_FAMILY));
+        let pad = self.list.pad_x();
+        let fitted: Vec<IconRow> = rows
+            .iter()
+            .map(|row| {
+                let indent_px = self.text_w(fs, &" ".repeat(row.depth * self.indent_spaces), ui);
+                let icon_px = match row.icon {
+                    Some((glyph, _, _)) => self.text_w(fs, &format!("{glyph}  "), icon_attrs),
+                    None => 0.0,
+                };
+                let avail = w - reserve_right - pad - indent_px - icon_px - theme::zpx(4.0);
+                IconRow { depth: row.depth, icon: row.icon, label: self.fit_label(fs, &row.label, avail) }
+            })
+            .collect();
+        self.set_rows(fs, key, &fitted, w, h);
     }
 
     /// Re-shape every cached icon after a zoom change.
@@ -2934,6 +3019,25 @@ impl HoverCard {
             href: None,
             link_w: 0.0,
         }
+    }
+
+    /// Populate from plain (wrapped) text — used for the commit-message tooltip in
+    /// the graph view. No footer/link.
+    pub fn set_text(&mut self, fs: &mut FontSystem, text: &str) {
+        if self.last == text && self.epoch == theme::shape_epoch() {
+            return;
+        }
+        self.epoch = theme::shape_epoch();
+        self.last = text.to_string();
+        self.href = None;
+        self.link_w = 0.0;
+        let base = Attrs::new().family(Family::Name(theme::UI_FAMILY()));
+        let z = theme::ui_zoom();
+        self.buffer.set_metrics(fs, Metrics::new(theme::UI_FONT_SIZE(), theme::UI_LINE_HEIGHT()));
+        self.buffer.set_wrap(fs, Wrap::WordOrGlyph);
+        self.buffer.set_size(fs, Some(self.base_max_w * z), Some(4000.0));
+        self.buffer.set_text(fs, text, base.color(theme::FG_TEXT()), Shaping::Advanced);
+        self.buffer.shape_until_scroll(fs, false);
     }
 
     /// Populate from a diagnostic hover: the message, then a `source(rule)` line —

@@ -173,6 +173,71 @@ pub fn apply_patch(root: &Path, patch: &str, cached: bool, reverse: bool) -> boo
     }
 }
 
+/// One raw commit record from `git log` (parents + ref decorations included), for
+/// the commit-graph view. Fields are split on ASCII unit/record separators so
+/// subjects with arbitrary characters survive.
+pub struct LogEntry {
+    pub hash: String,
+    pub parents: Vec<String>,
+    pub refs: Vec<String>, // decoration names: "HEAD -> main", "origin/main", "tag: v1", …
+    pub author: String,
+    pub timestamp: i64,
+    pub subject: String,
+    pub body: String, // commit body (after the subject line); for the hover tooltip
+}
+
+/// Read up to `limit` commits across all refs, newest-first in date order, with
+/// parent hashes and ref decorations — the input to the commit-graph layout.
+pub fn commit_log(root: &Path, limit: usize) -> Vec<LogEntry> {
+    // %x1f = unit separator between fields, %x1e = record separator between commits.
+    // %b (body) is last so its embedded newlines don't break field parsing.
+    let fmt = format!("--pretty=format:%H%x1f%P%x1f%D%x1f%an%x1f%at%x1f%s%x1f%b%x1e");
+    // --branches/--remotes/--tags (not --all) so refs/stash and its internal index/
+    // untracked commits don't show up as separate nodes (VSCode-style).
+    let args = ["log", "--branches", "--remotes", "--tags", "--date-order", &format!("-n{limit}"), &fmt];
+    let raw = git(root, &args).unwrap_or_default();
+    raw.split('\u{1e}')
+        .filter_map(|rec| {
+            let rec = rec.trim_start_matches('\n');
+            if rec.is_empty() {
+                return None;
+            }
+            let mut f = rec.split('\u{1f}');
+            let hash = f.next()?.to_string();
+            let parents = f.next()?.split_whitespace().map(String::from).collect();
+            let refs = f
+                .next()?
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let author = f.next()?.to_string();
+            let timestamp = f.next()?.parse().unwrap_or(0);
+            let subject = f.next().unwrap_or("").to_string();
+            let body = f.next().unwrap_or("").trim_end().to_string();
+            Some(LogEntry { hash, parents, refs, author, timestamp, subject, body })
+        })
+        .collect()
+}
+
+/// Files changed in a single commit, as `(status, repo-relative path)`. Status is
+/// git's letter (A/M/D/R…). Drives the commit-graph's expandable file list.
+pub fn commit_files(root: &Path, hash: &str) -> Vec<(char, String)> {
+    // `git show --first-parent` lists a MERGE's changes vs its first parent (plain
+    // diff-tree shows nothing for merges); `--format=` drops the commit header, so
+    // only the name-status lines remain. Works for normal/root/stash commits too.
+    let out = git(root, &["show", "--no-color", "--first-parent", "--name-status", "--format=", "-M", hash]).unwrap_or_default();
+    out.lines()
+        .filter_map(|l| {
+            let mut it = l.split('\t');
+            let status = it.next()?.chars().next().filter(|c| c.is_ascii_alphabetic())?;
+            // For renames (R100) git emits old\tnew — take the new path (last field).
+            let path = it.last()?.trim();
+            (!path.is_empty()).then(|| (status, path.to_string()))
+        })
+        .collect()
+}
+
 /// Push the current branch (`git push`). Returns true on success.
 pub fn push(root: &Path) -> bool {
     git(root, &["push"]).is_some()

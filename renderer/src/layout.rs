@@ -251,8 +251,10 @@ impl Layout {
         if n == 0 {
             return Vec::new();
         }
-        let ideal = theme::TAB_MAX_WIDTH().min(self.tab_strip.w / n as f32);
-        let tab_w = ideal.max(theme::TAB_MIN_WIDTH()).min(theme::TAB_MAX_WIDTH());
+        // Always fit every tab in the strip: equal columns of (strip / n), capped at
+        // MAX (so few tabs don't stretch huge) and floored only at a tiny width that
+        // still shows the file icon — full name shows on hover.
+        let tab_w = (self.tab_strip.w / n as f32).min(theme::TAB_MAX_WIDTH()).max(theme::zpx(30.0));
         (0..n)
             .map(|i| Rect {
                 x: self.tab_strip.x + i as f32 * tab_w,

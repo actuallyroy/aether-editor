@@ -23,6 +23,12 @@ use crate::widgets::{IconButton, IconList, IconRow, Rect, ScrollOpts, ScrollView
 // Geometry is reactive, not frozen: row height tracks the sidebar's (which scales
 // with UI zoom) and the paddings scale with zoom too, so the whole panel stays
 // proportional at any zoom — no hardcoded pixel sizes.
+/// A GRAPH list row resolves to either a commit or one of an expanded commit's files.
+enum GView {
+    Commit(usize),
+    File(usize),
+}
+
 fn row_h() -> f32 { theme::TREE_ROW_HEIGHT() }
 fn pad_x() -> f32 { 30.0 * theme::ui_zoom() } // row text indent
 fn hdr_chev_w() -> f32 { 18.0 * theme::ui_zoom() } // collapse chevron column on a group header
@@ -144,6 +150,20 @@ pub struct SourceControlPanel {
     pub scroll: ScrollView,
     root: PathBuf,
     change_count: usize, // unique changed files (for the activity-bar badge)
+    // GRAPH accordion (below the change groups): the commit graph + a buffer holding
+    // one truncated subject per row, plus the collapsed state. Built on refresh.
+    graph: Option<crate::graph::Graph>,
+    graph_buf: glyphon::Buffer,
+    graph_open: bool,
+    changes_open: bool, // CHANGES section collapsed/expanded
+    graph_frac: f32,    // fraction of the area below the commit box given to GRAPH
+    graph_resizing: bool, // dragging the CHANGES/GRAPH divider
+    graph_expanded: Option<usize>, // commit row whose changed-files list is open
+    graph_files: Vec<(char, String)>, // (status, repo-relative path) for the expanded commit
+    graph_files_list: IconList,       // reusable icon+label list for the expanded files
+    graph_dirty: bool, // the GRAPH subjects buffer needs rebuilding (expand toggled)
+    pub graph_scroll: ScrollView, // independent scroll for the pinned GRAPH section
+    l_graph: TextLabel, // "GRAPH" section header
 }
 
 impl SourceControlPanel {
@@ -215,6 +235,20 @@ impl SourceControlPanel {
             scroll: ScrollView::new(ScrollOpts { vertical: true, horizontal: false, stick_to_end: false }),
             root,
             change_count: 0,
+            graph: None,
+            graph_buf: glyphon::Buffer::new(fs, glyphon::Metrics::new(theme::FONT_SIZE(), row_h())),
+            graph_open: true,
+            changes_open: true,
+            graph_frac: 0.45,
+            graph_resizing: false,
+            graph_expanded: None,
+            graph_files: Vec::new(),
+            // Tiny pad: the graph offsets the list past the lanes itself (no chevron
+            // column like the tree), so the files hug the lanes too.
+            graph_files_list: IconList::new(fs, theme::SIDEBAR_WIDTH(), 8000.0, row_h(), 2.0 * theme::ui_zoom()),
+            graph_dirty: false,
+            graph_scroll: ScrollView::new(ScrollOpts { vertical: true, horizontal: false, stick_to_end: false }),
+            l_graph: mk(fs, "GRAPH"),
         }
     }
 
@@ -245,6 +279,7 @@ impl SourceControlPanel {
             &mut self.ic_flat,
             &mut self.ic_chevron,
             &mut self.ic_sparkle,
+            &mut self.l_graph,
         ] {
             l.reshape(fs);
         }
@@ -255,6 +290,12 @@ impl SourceControlPanel {
         self.unstaged.reshape_icons(fs);
         self.chev_down.reshape(fs);
         self.chev_right.reshape(fs);
+        // Re-shape the commit-subjects buffer at the new zoom (metrics scale with it);
+        // file-row icons are rebuilt at the new size on the next update.
+        self.graph_buf.set_metrics(fs, glyphon::Metrics::new(theme::UI_FONT_SIZE(), row_h()));
+        self.graph_buf.shape_until_scroll(fs, false);
+        self.graph_files_list.reshape_icons(fs);
+        self.graph_dirty = true;
         self.last_w = -1.0; // force row reflow (IconList re-shapes via shape epoch)
     }
 
@@ -311,6 +352,16 @@ impl SourceControlPanel {
         self.count_unstaged.set(fs, &self.unstaged_rows.len().to_string(), theme::UI_FAMILY());
         self.hovered = None;
         self.set_selected(None); // vis indices change on refresh; drop the highlight
+        // Rebuild the GRAPH accordion's commit data (recent commits across all refs).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let entries = git::commit_log(&self.root, 200);
+        self.graph = Some(crate::graph::build(String::new(), entries, now));
+        self.graph_expanded = None;
+        self.graph_files.clear();
+        self.rebuild_graph_text(fs);
         self.last_w = -1.0; // force re-ellipsize on the next `update`
         // Shape immediately at the last known width so a refresh isn't blank for a frame.
         let w = if self.last_w > 0.0 { self.last_w } else { theme::SIDEBAR_WIDTH() };
@@ -344,7 +395,11 @@ impl SourceControlPanel {
             self.msg.scroll_by(-dy);
             return true;
         }
-        if !Self::groups_viewport(region).contains(pt) {
+        // Wheel over the pinned GRAPH section scrolls its own list.
+        if self.graph.is_some() && self.graph_open && self.graph_viewport(region).contains(pt) {
+            return self.graph_scroll.on_wheel(0.0, dy);
+        }
+        if !self.groups_viewport(region).contains(pt) {
             return false;
         }
         self.scroll.on_wheel(0.0, dy)
@@ -368,10 +423,23 @@ impl SourceControlPanel {
         self.reflow(fs, region.w);
         // Feed the scroll component the viewport + unscrolled content height (it
         // clamps the offset and sizes the thumb from these).
-        let vp = Self::groups_viewport(region);
+        let vp = self.groups_viewport(region);
         let ul = self.unstaged_list(region);
-        let content_h = (ul.y + ul.h + self.scroll.offset().1) - Self::groups_top(region) + theme::zpx(8.0);
+        let content_h = (ul.y + ul.h + self.scroll.offset().1) - self.groups_top(region) + theme::zpx(8.0);
         self.scroll.set_metrics(vp, (vp.w, content_h));
+        // Rebuild the subjects buffer if a commit was just toggled; the file-row list
+        // is change-detected (key includes the width, so it re-ellipsizes on resize).
+        if self.graph_dirty {
+            self.graph_dirty = false;
+            self.rebuild_graph_text(fs);
+        }
+        self.rebuild_graph_files(fs, region);
+        // GRAPH section: its own scroll over the pinned bottom band.
+        if self.graph.is_some() && self.graph_open {
+            let gv = self.graph_viewport(region);
+            let content = self.graph_view_rows() as f32 * row_h() + theme::zpx(6.0);
+            self.graph_scroll.set_metrics(gv, (gv.w, content));
+        }
     }
 
     fn reflow(&mut self, fs: &mut FontSystem, w: f32) {
@@ -538,19 +606,64 @@ impl SourceControlPanel {
         let m = Self::msg_rect(r);
         Rect { x: m.x, y: m.y + m.h + 6.0 * z, w: m.w, h: 28.0 * z }
     }
-    /// Top of the scrollable groups area (just under the commit button).
-    fn groups_top(r: Rect) -> f32 {
-        let c = Self::commit_rect(r);
-        c.y + c.h + 10.0 * theme::ui_zoom()
+    /// Top of the scrollable groups area: under the commit button when CHANGES is
+    /// expanded, or right under the CHANGES header when collapsed.
+    fn groups_top(&self, r: Rect) -> f32 {
+        if self.changes_open {
+            let c = Self::commit_rect(r);
+            c.y + c.h + 10.0 * theme::ui_zoom()
+        } else {
+            Self::changes_hdr(r).y + row_h() + 6.0 * theme::ui_zoom()
+        }
     }
-    /// Fixed viewport the group headers + file lists scroll within.
-    fn groups_viewport(r: Rect) -> Rect {
-        let top = Self::groups_top(r);
+    /// Viewport the change groups scroll within — ends above the pinned GRAPH
+    /// section at the bottom of the panel.
+    fn groups_viewport(&self, r: Rect) -> Rect {
+        let top = self.groups_top(r);
+        let bottom = self.graph_section_top(r);
+        Rect { x: r.x, y: top, w: r.w, h: (bottom - top).max(0.0) }
+    }
+    /// Header height of the GRAPH section (with its top divider gap).
+    fn graph_header_h() -> f32 {
+        row_h() + 6.0 * theme::ui_zoom()
+    }
+    /// Total height the pinned GRAPH section occupies at the bottom of the panel.
+    fn graph_section_h(&self, r: Rect) -> f32 {
+        if self.graph.is_none() {
+            return 0.0;
+        }
+        let header = Self::graph_header_h();
+        if !self.graph_open {
+            return header;
+        }
+        let avail = (r.y + r.h - self.groups_top(r)).max(0.0);
+        // CHANGES collapsed ⇒ GRAPH fills the whole area; otherwise it takes the
+        // user-draggable `graph_frac` of it (clamped so each section keeps a minimum).
+        let list = if !self.changes_open {
+            (avail - header).max(0.0)
+        } else {
+            (avail * self.graph_frac).clamp(row_h() * 2.0, (avail - row_h() * 2.0).max(0.0))
+        };
+        header + list
+    }
+    /// Top y of the pinned GRAPH section.
+    fn graph_section_top(&self, r: Rect) -> f32 {
+        r.y + r.h - self.graph_section_h(r)
+    }
+    /// The GRAPH section's pinned header rect.
+    fn graph_hdr(&self, r: Rect) -> Rect {
+        let z = theme::ui_zoom();
+        let top = self.graph_section_top(r) + 6.0 * z;
+        Rect { x: r.x + 8.0 * z, y: top, w: r.w - 16.0 * z, h: row_h() }
+    }
+    /// Scrollable viewport for the GRAPH commit list (below its header).
+    fn graph_viewport(&self, r: Rect) -> Rect {
+        let top = self.graph_section_top(r) + Self::graph_header_h();
         Rect { x: r.x, y: top, w: r.w, h: (r.y + r.h - top).max(0.0) }
     }
     fn staged_hdr(&self, r: Rect) -> Rect {
         let z = theme::ui_zoom();
-        Rect { x: r.x + 8.0 * z, y: Self::groups_top(r) - self.scroll.offset().1, w: r.w - 16.0 * z, h: row_h() }
+        Rect { x: r.x + 8.0 * z, y: self.groups_top(r) - self.scroll.offset().1, w: r.w - 16.0 * z, h: row_h() }
     }
     fn staged_list(&self, r: Rect) -> Rect {
         let h = self.staged_hdr(r);
@@ -574,13 +687,159 @@ impl SourceControlPanel {
     fn unstaged_hdr(&self, r: Rect) -> Rect {
         let z = theme::ui_zoom();
         let gap = if self.has_staged() { 8.0 * z } else { 0.0 };
-        let y = Self::groups_top(r) - self.scroll.offset().1 + self.staged_section_h() + gap;
+        let y = self.groups_top(r) - self.scroll.offset().1 + self.staged_section_h() + gap;
         Rect { x: r.x + 8.0 * z, y, w: r.w - 16.0 * z, h: row_h() }
     }
     fn unstaged_list(&self, r: Rect) -> Rect {
         let h = self.unstaged_hdr(r);
         let n = if self.unstaged_open { self.unstaged_vis.len() } else { 0 };
         Rect { x: r.x, y: h.y + row_h(), w: r.w, h: n as f32 * row_h() }
+    }
+
+    // ---- GRAPH accordion: commit rows ----
+    fn graph_rows(&self) -> usize {
+        self.graph.as_ref().map_or(0, |g| g.rows.len())
+    }
+    /// Number of expanded file rows inserted (at least one — a "(no changes)"
+    /// placeholder — so expanding a commit with no first-parent diff is still visible).
+    fn graph_file_rows(&self) -> usize {
+        if self.graph_expanded.is_some() { self.graph_files.len().max(1) } else { 0 }
+    }
+    /// Total visible rows in the GRAPH list (commits + any expanded file rows).
+    fn graph_view_rows(&self) -> usize {
+        self.graph_rows() + self.graph_file_rows()
+    }
+    /// What a GRAPH view-row holds: a commit (index into rows) or an expanded file.
+    fn graph_view_item(&self, vr: usize) -> Option<GView> {
+        let total = self.graph_rows();
+        match self.graph_expanded {
+            Some(e) => {
+                let nf = self.graph_file_rows(); // includes the "(no changes)" placeholder
+                if vr <= e {
+                    (vr < total).then_some(GView::Commit(vr))
+                } else if vr <= e + nf {
+                    Some(GView::File(vr - e - 1))
+                } else {
+                    let ci = vr - nf;
+                    (ci < total).then_some(GView::Commit(ci))
+                }
+            }
+            None => (vr < total).then_some(GView::Commit(vr)),
+        }
+    }
+    /// View-row index where commit `i` is drawn (shifted down past inserted files).
+    fn commit_view_row(&self, i: usize) -> usize {
+        match self.graph_expanded {
+            Some(e) if i > e => i + self.graph_file_rows(),
+            _ => i,
+        }
+    }
+    /// Rebuild the subjects buffer in view order — commit subjects, plus a BLANK line
+    /// for each expanded file row (those rows are rendered by the reusable IconList,
+    /// `graph_files_list`, drawn on top). Keeping the blanks holds the view-row
+    /// positions so commits + lanes below stay aligned.
+    fn rebuild_graph_text(&mut self, fs: &mut FontSystem) {
+        let mut text = String::new();
+        if let Some(g) = self.graph.as_ref() {
+            for (i, r) in g.rows.iter().enumerate() {
+                let subject: String = if r.subject.chars().count() > 64 {
+                    format!("{}…", r.subject.chars().take(63).collect::<String>())
+                } else {
+                    r.subject.clone()
+                };
+                text.push_str(&subject);
+                text.push('\n');
+                if self.graph_expanded == Some(i) {
+                    for _ in 0..self.graph_files.len().max(1) {
+                        text.push('\n'); // reserved for the IconList file row(s)
+                    }
+                }
+            }
+        }
+        self.graph_buf.set_metrics(fs, glyphon::Metrics::new(theme::UI_FONT_SIZE(), row_h()));
+        self.graph_buf.set_size(fs, None, Some(20000.0));
+        self.graph_buf.set_text(fs, &text, glyphon::Attrs::new().family(glyphon::Family::Name(theme::UI_FAMILY())), glyphon::Shaping::Advanced);
+        self.graph_buf.shape_until_scroll(fs, false);
+    }
+
+    /// Build the reusable IconList for the expanded commit's files (icon + bright
+    /// filename + dim dir, ellipsized to `avail`). Status letters draw separately.
+    fn rebuild_graph_files(&mut self, fs: &mut FontSystem, region: Rect) {
+        // Full (untruncated) labels — IconList measures + ellipsizes to fit, reserving
+        // the status column on the right.
+        if self.graph_expanded.is_some() && self.graph_files.is_empty() {
+            let row = IconRow { depth: 0, icon: None, label: vec![("(no changes)".to_string(), theme::FG_DIM())] };
+            let fx = self.graph_files_x(region);
+            let w = (region.x + region.w - fx).max(40.0);
+            self.graph_files_list.set_rows_fit(fs, "empty", &[row], w, 8000.0, theme::zpx(8.0));
+            return;
+        }
+        let rows: Vec<IconRow> = self
+            .graph_files
+            .iter()
+            .map(|(_, path)| {
+                let path = path.trim_end_matches(['/', '\\']);
+                let fname = path.rsplit(['/', '\\']).next().unwrap_or(path);
+                let dir = path[..path.len().saturating_sub(fname.len())].trim_end_matches(['/', '\\']);
+                let (glyph, color) = theme::file_icon(fname);
+                let label = vec![(format!("{fname}  "), theme::FG_TEXT()), (dir.to_string(), theme::FG_DIM())];
+                IconRow { depth: 0, icon: Some((glyph, color, 1.0)), label }
+            })
+            .collect();
+        // Files start just past the commit's continuation lanes; fit within the
+        // remaining width (reserving the status column).
+        let fx = self.graph_files_x(region);
+        let w = (region.x + region.w - fx).max(40.0);
+        let key = format!("{:?}:{}:{}", self.graph_expanded, self.graph_files.len(), region.w as i32);
+        self.graph_files_list.set_rows_fit(fs, &key, &rows, w, 8000.0, status_w() + theme::zpx(8.0));
+    }
+    /// Per-lane pixel width in the compact sidebar graph. Wide enough that adjacent
+    /// lanes read as distinct (per-row text positioning keeps single-lane rows tight).
+    fn graph_lane_w() -> f32 {
+        11.0 * theme::ui_zoom()
+    }
+    /// Left pad before the first lane.
+    fn graph_pad() -> f32 {
+        4.0 * theme::ui_zoom()
+    }
+    /// X where the expanded commit's file rows start: just past the lanes that
+    /// continue down through them (the commit's outgoing verticals), so the file list
+    /// also hugs the graph contour.
+    fn graph_files_x(&self, r: Rect) -> f32 {
+        use crate::graph::{Half, Seg};
+        let mc = self
+            .graph
+            .as_ref()
+            .zip(self.graph_expanded)
+            .and_then(|(g, e)| g.rows.get(e))
+            .map(|row| {
+                let mut mc = 0u16;
+                for seg in &row.segs {
+                    if let Seg::V { col, half, .. } = seg {
+                        if matches!(half, Half::Full | Half::Bottom) {
+                            mc = mc.max(*col);
+                        }
+                    }
+                }
+                mc
+            })
+            .unwrap_or(0);
+        r.x + Self::graph_pad() + (mc as f32 + 1.0) * Self::graph_lane_w() + 2.0 * theme::ui_zoom()
+    }
+    /// X where ONE commit's subject starts: just past the rightmost lane present in
+    /// that row (its node + any lanes passing through / branching), so the text wraps
+    /// tightly around the graph contour row-by-row.
+    fn graph_row_text_x(&self, r: Rect, row: &crate::graph::Row) -> f32 {
+        use crate::graph::Seg;
+        let mut max_col = row.node_col;
+        for seg in &row.segs {
+            match seg {
+                Seg::V { col, .. } => max_col = max_col.max(*col),
+                Seg::H { a, b, .. } => max_col = max_col.max((*a).max(*b)),
+                Seg::Bend { col, .. } => max_col = max_col.max(*col),
+            }
+        }
+        r.x + Self::graph_pad() + (max_col as f32 + 1.0) * Self::graph_lane_w() + 2.0 * theme::ui_zoom()
     }
 
     /// Hover-action icon rects for a row, right-to-left ending before the status.
@@ -660,6 +919,7 @@ impl SourceControlPanel {
 
     // ---- Drawing ----
     pub fn draw_quads(&self, region: Rect, blink: bool, now: std::time::Instant, bg: &mut Vec<Quad>, fg: &mut Vec<Quad>) {
+        if self.changes_open {
         let m = Self::msg_rect(region);
         let ir = theme::zpx(7.0);
         let border = Rect { x: m.x - 1.0, y: m.y - 1.0, w: m.w + 2.0, h: m.h + 2.0 };
@@ -699,7 +959,7 @@ impl SourceControlPanel {
             let pill = Rect { x: hdr.x + hdr.w - w, y: hdr.y + theme::zpx(3.0), w, h: row_h() - theme::zpx(6.0) };
             // Pills scroll with their headers — drop them once they leave the
             // viewport instead of floating over the toolbar/commit button.
-            let vp = Self::groups_viewport(region);
+            let vp = self.groups_viewport(region);
             if pill.y >= vp.y && pill.y + pill.h <= vp.y + vp.h {
                 bg.push(pill.rounded_quad(theme::ACCENT_DIM(), pill.h * 0.5));
             }
@@ -711,7 +971,7 @@ impl SourceControlPanel {
             if shown {
                 let lr = if staged { self.staged_list(region) } else { self.unstaged_list(region) };
                 let y = lr.y + idx as f32 * row_h();
-                if let Some(r) = vclip(Rect { x: region.x, y, w: region.w, h: row_h() }, Self::groups_viewport(region)) {
+                if let Some(r) = vclip(Rect { x: region.x, y, w: region.w, h: row_h() }, self.groups_viewport(region)) {
                     bg.push(Quad::new(r.x, r.y, r.w, r.h, theme::TREE_SELECTED()));
                 }
             }
@@ -720,13 +980,13 @@ impl SourceControlPanel {
         if let Some((staged, idx)) = self.hovered {
             let lr = if staged { self.staged_list(region) } else { self.unstaged_list(region) };
             let y = lr.y + idx as f32 * row_h();
-            if let Some(r) = vclip(Rect { x: region.x, y, w: region.w, h: row_h() }, Self::groups_viewport(region)) {
+            if let Some(r) = vclip(Rect { x: region.x, y, w: region.w, h: row_h() }, self.groups_viewport(region)) {
                 bg.push(Quad::new(r.x, r.y, r.w, r.h, theme::TREE_HOVER()));
             }
         }
         // Tree-mode indent guides (hover-revealed + animated, owned by the IconList).
         if self.tree_mode {
-            let vp = Self::groups_viewport(region);
+            let vp = self.groups_viewport(region);
             if self.has_staged() && self.staged_open {
                 self.staged.draw_guides(vp, self.staged_list(region).y, now, bg);
             }
@@ -736,11 +996,107 @@ impl SourceControlPanel {
         }
         // Auto-hiding scrollbar for the groups area.
         self.scroll.draw(now, fg);
+        } // end changes_open
+
+        // GRAPH accordion (pinned bottom section): top divider, then lane lines +
+        // node dots in the section's own viewport (its own scroll).
+        if self.graph.is_some() {
+            let sec_top = self.graph_section_top(region);
+            fg.push(Quad::new(region.x, sec_top, region.w, 1.0, theme::PANEL_BORDER()));
+        }
+        if self.graph_open {
+            if let Some(g) = self.graph.as_ref() {
+                use crate::graph::{Half, Seg};
+                let vp = self.graph_viewport(region);
+                let lane_w = Self::graph_lane_w();
+                let lw = theme::zpx(1.5).max(1.0);
+                let x0 = region.x + Self::graph_pad();
+                let cx = |col: u16| x0 + col as f32 * lane_w + lane_w * 0.5;
+                let scroll_y = self.graph_scroll.offset().1;
+                let push_v = |bg: &mut Vec<Quad>, col: u16, y: f32, h: f32, color: u8| {
+                    if let Some(r) = vclip(Rect { x: cx(col) - lw * 0.5, y, w: lw, h }, vp) {
+                        bg.push(Quad::new(r.x, r.y, r.w, r.h, theme::GRAPH_LANE(color)));
+                    }
+                };
+                for (i, row) in g.rows.iter().enumerate() {
+                    let band_top = vp.y + self.commit_view_row(i) as f32 * row_h() - scroll_y;
+                    if band_top >= vp.y + vp.h {
+                        break;
+                    }
+                    if band_top + row_h() > vp.y {
+                        let mid = band_top + row_h() * 0.5;
+                        for seg in &row.segs {
+                            match seg {
+                                Seg::V { col, half, color } => {
+                                    let (y, h) = match half {
+                                        Half::Full => (band_top, row_h()),
+                                        Half::Top => (band_top, row_h() * 0.5),
+                                        Half::Bottom => (mid, row_h() * 0.5),
+                                    };
+                                    push_v(bg, *col, y, h, *color);
+                                }
+                                Seg::H { a, b, color } => {
+                                    let (xa, xb) = (cx(*a).min(cx(*b)), cx(*a).max(cx(*b)));
+                                    if let Some(r) = vclip(Rect { x: xa, y: mid - lw * 0.5, w: (xb - xa) + lw, h: lw }, vp) {
+                                        bg.push(Quad::new(r.x, r.y, r.w, r.h, theme::GRAPH_LANE(*color)));
+                                    }
+                                }
+                                Seg::Bend { col, top, color } => {
+                                    // Curved merge/branch connector — drawn only when the
+                                    // row is fully visible (the arc can't be vclipped).
+                                    if band_top >= vp.y && band_top + row_h() <= vp.y + vp.h {
+                                        for q in crate::graph::bend_quads(cx(row.node_col), cx(*col), band_top, band_top + row_h(), mid, *top, lw, theme::GRAPH_LANE(*color)) {
+                                            bg.push(q);
+                                        }
+                                    } else {
+                                        // Edge fallback: a plain vclipped horizontal join.
+                                        let (xa, xb) = (cx(*col).min(cx(row.node_col)), cx(*col).max(cx(row.node_col)));
+                                        if let Some(r) = vclip(Rect { x: xa, y: mid - lw * 0.5, w: (xb - xa) + lw, h: lw }, vp) {
+                                            bg.push(Quad::new(r.x, r.y, r.w, r.h, theme::GRAPH_LANE(*color)));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let rad = theme::zpx(4.0);
+                        if let Some(r) = vclip(Rect { x: cx(row.node_col) - rad, y: mid - rad, w: rad * 2.0, h: rad * 2.0 }, vp) {
+                            bg.push(Quad::rounded(r.x, r.y, r.w, r.h, theme::GRAPH_LANE(row.color), rad));
+                        }
+                    }
+                    // Expanded commit: continue its outgoing lanes straight down through
+                    // the inserted file rows so the graph stays connected.
+                    if self.graph_expanded == Some(i) {
+                        let exits: Vec<(u16, u8)> = row
+                            .segs
+                            .iter()
+                            .filter_map(|s| match s {
+                                Seg::V { col, half, color } if matches!(half, Half::Full | Half::Bottom) => Some((*col, *color)),
+                                _ => None,
+                            })
+                            .collect();
+                        for fr in 0..self.graph_files.len() {
+                            let y = band_top + (fr + 1) as f32 * row_h();
+                            if y >= vp.y + vp.h {
+                                break;
+                            }
+                            for (col, color) in &exits {
+                                push_v(bg, *col, y, row_h(), *color);
+                            }
+                        }
+                    }
+                }
+            }
+            // The GRAPH section's own auto-hiding scrollbar.
+            self.graph_scroll.draw(now, fg);
+        }
     }
 
     pub fn draw_text<'b>(&'b self, region: Rect, areas: &mut Vec<TextArea<'b>>) {
         let ch = Self::changes_hdr(region);
-        self.l_changes.push(ch.x, ch, theme::FG_DIM(), areas);
+        // Collapse twistie + "CHANGES" header.
+        let chev = Rect { x: ch.x, y: ch.y, w: hdr_chev_w(), h: ch.h };
+        (if self.changes_open { &self.chev_down } else { &self.chev_right }).draw_clipped(chev, ch, theme::FG_DIM(), areas);
+        self.l_changes.push(ch.x + hdr_chev_w(), ch, theme::FG_DIM(), areas);
         // Top toolbar: ✨ generate · stash · tree/list toggle · refresh · more.
         let [sparkle, stash, tree, refresh, more] = Self::toolbar_rects(region);
         // The sparkle accents when active, dims while a generation is in flight.
@@ -752,6 +1108,7 @@ impl SourceControlPanel {
         self.push_icon(&self.ic_refresh, refresh, theme::FG_DIM(), areas);
         self.push_icon(&self.ic_more, more, theme::FG_DIM(), areas);
 
+        if self.changes_open {
         let m = Self::msg_rect(region);
         let mc = if self.msg.text().is_empty() { theme::FG_DIM() } else { theme::FG_TEXT() };
         self.msg.draw(m, theme::zpx(6.0), mc, areas);
@@ -760,7 +1117,7 @@ impl SourceControlPanel {
         self.l_commit.push(cm.x + (cm.w - self.l_commit.width()) * 0.5, cm, theme::FG_TEXT(), areas);
         self.push_icon(&self.ic_chevron, Self::commit_chevron(region), theme::FG_TEXT(), areas);
 
-        let vp = Self::groups_viewport(region);
+        let vp = self.groups_viewport(region);
         // Staged Changes group — only shown when something is staged.
         if self.has_staged() {
             let sh = self.staged_hdr(region);
@@ -795,6 +1152,72 @@ impl SourceControlPanel {
             };
             self.draw_rows(&self.unstaged, &self.unstaged_vis, &self.unstaged_rows, self.unstaged_list(region), vp, false, uh_idx, areas);
         }
+        } // end changes_open
+
+        // GRAPH accordion (pinned bottom): header (always visible) + commit subjects
+        // in the section's own scrolled viewport (lanes/dots are quads).
+        if self.graph.is_some() {
+            let gh = self.graph_hdr(region);
+            // The header is pinned (not inside the groups scroll) — clip to itself.
+            self.draw_group_chevron(gh, gh, self.graph_open, areas);
+            self.l_graph.push_in(gh.x + hdr_chev_w(), gh, gh, theme::FG_DIM(), areas);
+            if self.graph_open {
+                let gv = self.graph_viewport(region);
+                let scroll_y = self.graph_scroll.offset().1;
+                // Draw each commit's subject as its own slice, positioned right after
+                // THAT row's lanes — so the text hugs the graph contour (tight wrap),
+                // instead of all sharing one column reserved for the widest row.
+                if let Some(g) = self.graph.as_ref() {
+                    for (i, row) in g.rows.iter().enumerate() {
+                        let vr = self.commit_view_row(i);
+                        let band_top = gv.y + vr as f32 * row_h() - scroll_y;
+                        if band_top + row_h() <= gv.y {
+                            continue;
+                        }
+                        if band_top >= gv.y + gv.h {
+                            break;
+                        }
+                        let tx = self.graph_row_text_x(region, row);
+                        areas.push(TextArea {
+                            buffer: &self.graph_buf,
+                            left: tx,
+                            // Shift the buffer so its line `vr` lands at this band.
+                            top: band_top - vr as f32 * row_h(),
+                            scale: 1.0,
+                            // Clip to just this row's band (and start past its lanes).
+                            bounds: glyphon::TextBounds {
+                                left: tx as i32,
+                                top: band_top.max(gv.y) as i32,
+                                right: (gv.x + gv.w) as i32,
+                                bottom: (band_top + row_h()).min(gv.y + gv.h) as i32,
+                            },
+                            default_color: theme::FG_TEXT(),
+                            custom_glyphs: &[],
+                        });
+                    }
+                }
+                // Expanded commit's files via the reusable IconList (icon + ellipsized
+                // path) at the file rows, plus right-aligned status letters.
+                if let Some(e) = self.graph_expanded {
+                    let base_vr = self.commit_view_row(e) + 1;
+                    let top = gv.y + base_vr as f32 * row_h() - self.graph_scroll.offset().1;
+                    // Files start just past the commit's continuation lanes (tight wrap).
+                    let fx = self.graph_files_x(region);
+                    let fclip = Rect { x: fx, y: gv.y, w: (gv.x + gv.w - fx).max(0.0), h: gv.h };
+                    self.graph_files_list.draw_slice(fclip, top, theme::FG_TEXT(), areas);
+                    for (fi, (status, _)) in self.graph_files.iter().enumerate() {
+                        let y = top + fi as f32 * row_h();
+                        if y + row_h() <= gv.y || y >= gv.y + gv.h {
+                            continue;
+                        }
+                        let bi = badge_for(*status);
+                        let (rr, gg, bb) = BADGE_RGB[bi];
+                        let st = Rect { x: region.x + region.w - status_w(), y, w: status_w(), h: row_h() };
+                        self.badges[bi].push_in(st.x, st, gv, Color::rgb(rr, gg, bb), areas);
+                    }
+                }
+            }
+        }
     }
 
     /// The group-header collapse twistie (▾ open / ▸ collapsed), centered in the
@@ -815,7 +1238,7 @@ impl SourceControlPanel {
     }
 
     fn draw_header_actions<'b>(&'b self, region: Rect, staged: bool, areas: &mut Vec<TextArea<'b>>) {
-        let vp = Self::groups_viewport(region);
+        let vp = self.groups_viewport(region);
         for (act, ar) in self.header_actions(region, staged) {
             self.push_icon_in(self.icon_for(act), ar, vp, theme::FG_TEXT(), areas);
         }
@@ -892,7 +1315,7 @@ impl SourceControlPanel {
 
     // ---- Input ----
     pub fn hover(&mut self, pt: (f32, f32), region: Rect) -> bool {
-        let in_groups = Self::groups_viewport(region).contains(pt);
+        let in_groups = self.groups_viewport(region).contains(pt);
         let sl = self.staged_list(region);
         let ul = self.unstaged_list(region);
         let new = if !in_groups {
@@ -976,7 +1399,7 @@ impl SourceControlPanel {
     /// The file row under `pt` as (repo-relative path, in-staged-group, untracked) —
     /// drives the right-click context menu.
     pub fn row_at_point(&self, pt: (f32, f32), region: Rect) -> Option<(String, bool, bool)> {
-        if !Self::groups_viewport(region).contains(pt) {
+        if !self.groups_viewport(region).contains(pt) {
             return None;
         }
         for staged in [true, false] {
@@ -1007,6 +1430,16 @@ impl SourceControlPanel {
     /// Extend the commit-box selection while the mouse is dragged. Returns true
     /// when a box drag-select is active (caller redraws).
     pub fn on_drag(&mut self, pt: (f32, f32), region: Rect) -> bool {
+        if self.graph_resizing {
+            // Map the cursor to the GRAPH fraction of the area below the commit box.
+            let top = self.groups_top(region);
+            let avail = (region.y + region.h - top).max(1.0);
+            let header = Self::graph_header_h();
+            let list = (region.y + region.h - pt.1 - header).clamp(0.0, avail);
+            self.graph_frac = (list / avail).clamp(0.12, 0.85);
+            self.last_w = -1.0;
+            return true;
+        }
         if self.msg_dragging && self.msg_active {
             self.msg.on_drag(Self::msg_rect(region), theme::zpx(6.0), pt.0, pt.1);
             return true;
@@ -1016,14 +1449,36 @@ impl SourceControlPanel {
 
     pub fn on_release(&mut self) {
         self.msg_dragging = false;
+        self.graph_resizing = false;
+    }
+
+    /// Whether the CHANGES/GRAPH divider is being dragged (so the host keeps routing
+    /// moves here and shows a resize cursor).
+    pub fn resizing(&self) -> bool {
+        self.graph_resizing
+    }
+
+    /// True when `pt` is on the draggable CHANGES/GRAPH divider (for the cursor).
+    pub fn over_divider(&self, pt: (f32, f32), region: Rect) -> bool {
+        self.graph.is_some()
+            && self.graph_open
+            && (pt.1 - self.graph_section_top(region)).abs() <= 5.0 * theme::ui_zoom()
     }
 
     pub fn on_press(&mut self, pt: (f32, f32), region: Rect, clicks: u32, out: &mut Vec<Intent>) -> bool {
+        // Grab the CHANGES/GRAPH divider to resize the split.
+        if self.graph.is_some() && self.graph_open {
+            let div = self.graph_section_top(region);
+            if (pt.1 - div).abs() <= 5.0 * theme::ui_zoom() {
+                self.graph_resizing = true;
+                return true;
+            }
+        }
         // The groups scrollbar claims its presses (thumb drag / track jump).
         if self.scroll.press(pt) {
             return true;
         }
-        if Self::msg_rect(region).contains(pt) {
+        if self.changes_open && Self::msg_rect(region).contains(pt) {
             self.msg_active = true;
             // on_click handles multiline caret-by-(x,y), double-click word, and
             // triple-click select-all; it also sets focus.
@@ -1057,6 +1512,14 @@ impl SourceControlPanel {
             out.push(Intent::OpenMoreMenu { anchor: (more.x, more.y + more.h), tree_mode: self.tree_mode });
             return true;
         }
+        // CHANGES header body (left of the toolbar): collapse/expand the section.
+        if Self::changes_hdr(region).contains(pt) && pt.0 < sparkle.x {
+            self.changes_open = !self.changes_open;
+            self.last_w = -1.0;
+            return true;
+        }
+        // The commit box + button only exist when CHANGES is expanded.
+        if self.changes_open {
         // Commit split button: main = Commit; chevron opens a dropdown (Commit /
         // Commit & Push).
         if Self::commit_chevron(region).contains(pt) {
@@ -1075,8 +1538,51 @@ impl SourceControlPanel {
             }
             return true;
         }
+        } // end CHANGES-expanded commit buttons
+        // GRAPH accordion (pinned bottom section, outside the groups viewport): header
+        // toggles it; its scrollbar claims drags; a commit row opens the full graph tab.
+        if self.graph.is_some() {
+            if self.graph_hdr(region).contains(pt) {
+                self.graph_open = !self.graph_open;
+                self.last_w = -1.0;
+                return true;
+            }
+            if self.graph_open {
+                if self.graph_scroll.press(pt) {
+                    return true;
+                }
+                let gv = self.graph_viewport(region);
+                if gv.contains(pt) {
+                    let vr = ((pt.1 - gv.y + self.graph_scroll.offset().1) / row_h()) as usize;
+                    match self.graph_view_item(vr) {
+                        Some(GView::Commit(ci)) => {
+                            // Toggle this commit's changed-files list inline.
+                            if self.graph_expanded == Some(ci) {
+                                self.graph_expanded = None;
+                                self.graph_files.clear();
+                            } else if let Some(g) = self.graph.as_ref() {
+                                let hash = g.rows[ci].short.clone();
+                                self.graph_files = git::commit_files(&self.root, &hash);
+                                self.graph_expanded = Some(ci);
+                            }
+                            self.graph_dirty = true;
+                            self.last_w = -1.0;
+                        }
+                        Some(GView::File(fi)) => {
+                            if let (Some(g), Some(e)) = (self.graph.as_ref(), self.graph_expanded) {
+                                if let Some((_, path)) = self.graph_files.get(fi) {
+                                    out.push(Intent::OpenCommitDiff { hash: g.rows[e].short.clone(), path: path.clone() });
+                                }
+                            }
+                        }
+                        None => {}
+                    }
+                    return true;
+                }
+            }
+        }
         // Everything below lives in the scrollable groups area.
-        if !Self::groups_viewport(region).contains(pt) {
+        if !self.groups_viewport(region).contains(pt) {
             return false;
         }
         // Group-header composite actions (hit-tested by position; they only draw on

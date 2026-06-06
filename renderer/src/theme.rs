@@ -580,6 +580,21 @@ pub fn DIFF_DEL_BG() -> [f32; 4] { [0.50, 0.18, 0.18, 0.30] }
 pub fn DIFF_HUNK_BG() -> [f32; 4] { [0.20, 0.30, 0.42, 0.28] }
 pub fn DIFF_FILLER_BG() -> [f32; 4] { [0.0, 0.0, 0.0, 0.22] } // "no line here" on a side
 pub fn DIFF_GAP_BG() -> [f32; 4] { [0.40, 0.44, 0.56, 0.20] } // collapsed-unchanged separator band
+
+/// Commit-graph lane colours (cycled by lane). Distinct, readable on the dark bg.
+pub fn GRAPH_LANE(i: u8) -> [f32; 4] {
+    const C: [[f32; 4]; 8] = [
+        [0.36, 0.66, 0.95, 1.0], // blue
+        [0.45, 0.80, 0.46, 1.0], // green
+        [0.90, 0.55, 0.35, 1.0], // orange
+        [0.78, 0.55, 0.92, 1.0], // purple
+        [0.92, 0.45, 0.55, 1.0], // red
+        [0.40, 0.80, 0.78, 1.0], // teal
+        [0.88, 0.78, 0.40, 1.0], // yellow
+        [0.62, 0.70, 0.82, 1.0], // gray-blue
+    ];
+    C[(i as usize) % C.len()]
+}
 // Activity-bar count badge (e.g. Source Control changed-file count).
 pub fn BADGE_BG() -> [f32; 4] { [0.0, 0.48, 0.80, 1.0] }
 pub fn BADGE_FG() -> Color { Color::rgb(0xFF, 0xFF, 0xFF) }
@@ -600,53 +615,95 @@ pub fn CONTEXT_SEL() -> [f32; 4] { current().read().unwrap().context_sel }
 /// Icon glyph + color for a file row, by well-known filename then extension. The
 /// single source of truth for file icons everywhere (explorer, SCM, tabs). The
 /// glyph is a Codicon category icon; the color carries the language/type signal.
+/// Brand file-icon font (Symbols Nerd Font = Seti + devicon glyphs). Distinct from
+/// `ICON_FAMILY` (codicon, used for UI glyphs like chevrons/toolbar buttons).
+pub const SETI_FAMILY: &str = "Symbols Nerd Font Mono";
+
+/// Which icon font a glyph belongs to: the Seti brand range (file-type logos) vs
+/// codicon (UI). Lets one icon list mix folder chevrons (codicon) + file logos (Seti).
+pub fn icon_family(glyph: char) -> &'static str {
+    let g = glyph as u32;
+    if (0xe5fa..0xe900).contains(&g) {
+        SETI_FAMILY
+    } else {
+        ICON_FAMILY
+    }
+}
+
+/// Per-file-type icon (Seti brand glyph + brand color), VSCode-style. Whole-filename
+/// matches win over the extension.
 pub fn file_icon(name: &str) -> (char, Color) {
     let lower = name.to_ascii_lowercase();
     let c = |r, g, b| Color::rgb(r, g, b);
-    // Well-known whole filenames take priority over the extension.
+    let gray = c(0x9C, 0x9C, 0x9C);
+    // Seti/devicon glyphs (Symbols Nerd Font codepoints).
+    let (js, ts, react, py, rust, go, cc, cpp, csharp, java, ruby) =
+        ('\u{e60c}', '\u{e628}', '\u{e625}', '\u{e606}', '\u{e68b}', '\u{e627}', '\u{e649}', '\u{e646}', '\u{e648}', '\u{e66d}', '\u{e605}');
+    let (html, css, sass, json, md, vue, svelte, php, swift, kotlin) =
+        ('\u{e60e}', '\u{e614}', '\u{e603}', '\u{e60b}', '\u{e609}', '\u{e6a0}', '\u{e697}', '\u{e608}', '\u{e699}', '\u{e634}');
+    let (yaml, toml, xml, lua, dart, shell, db, image, video, lock) =
+        ('\u{e6a8}', '\u{e6b2}', '\u{e619}', '\u{e620}', '\u{e64c}', '\u{e691}', '\u{e64d}', '\u{e60d}', '\u{e69f}', '\u{e672}');
+    let (license, font_g, csv, default_g, config_g, docker, eslint, prettier, babel, firebase) =
+        ('\u{e60a}', '\u{e659}', '\u{e64a}', '\u{e64e}', '\u{e615}', '\u{e650}', '\u{e655}', '\u{e6b4}', '\u{e639}', '\u{e657}');
+    let (webpack, yarn, npm, git, pdf, zip) = ('\u{e6a3}', '\u{e6a7}', '\u{e616}', '\u{e65d}', '\u{e67d}', '\u{e6aa}');
+
+    // Whole-filename specials (project config / tooling).
     match lower.as_str() {
-        "dockerfile" | ".dockerignore" => return (ICON_FILE_CODE, c(0x4F, 0x9E, 0xE0)),
-        ".gitignore" | ".gitattributes" | ".gitmodules" | ".git" => return (ICON_GEAR_FILE, c(0xE0, 0x6C, 0x4E)),
-        "makefile" | "cmakelists.txt" | ".editorconfig" => return (ICON_GEAR_FILE, c(0x9C, 0x9C, 0x9C)),
-        "license" | "license.md" | "license.txt" | "copying" => return (ICON_KEY, c(0xD4, 0xB8, 0x6A)),
+        "package.json" | "package-lock.json" => return (npm, c(0xCB, 0x34, 0x37)),
+        "tsconfig.json" | "tsconfig.base.json" => return (ts, c(0x3F, 0x8E, 0xD0)),
+        ".eslintrc" | ".eslintrc.js" | ".eslintrc.cjs" | ".eslintrc.json" | ".eslintrc.yml" | "eslint.config.js" => return (eslint, c(0x86, 0x80, 0xD9)),
+        ".prettierrc" | ".prettierrc.js" | ".prettierrc.json" | ".prettierrc.yml" | "prettier.config.js" => return (prettier, c(0x5B, 0xA7, 0xC4)),
+        n if n.starts_with("babel.config") || n == ".babelrc" => return (babel, c(0xE8, 0xD4, 0x4D)),
+        "firebase.json" | ".firebaserc" => return (firebase, c(0xE0, 0x6C, 0x4E)),
+        n if n.starts_with("webpack.config") => return (webpack, c(0x5A, 0x9F, 0xD4)),
+        "yarn.lock" | ".yarnrc" => return (yarn, c(0x4F, 0x8E, 0xC4)),
+        ".env" | ".env.local" | ".env.development" | ".env.production" => return (config_g, c(0xE8, 0xD4, 0x4D)),
+        "dockerfile" | ".dockerignore" | "docker-compose.yml" | "docker-compose.yaml" => return (docker, c(0x4F, 0x9E, 0xE0)),
+        ".gitignore" | ".gitattributes" | ".gitmodules" => return (git, c(0xE0, 0x6C, 0x4E)),
+        "makefile" | "cmakelists.txt" | ".editorconfig" => return (config_g, gray),
+        "license" | "license.md" | "license.txt" | "copying" => return (license, c(0xD4, 0xB8, 0x6A)),
         _ => {}
     }
     let ext = lower.rsplit('.').next().unwrap_or("");
     match ext {
-        "rs" => (ICON_FILE_CODE, c(0xDE, 0xA5, 0x84)),
-        "ts" | "tsx" => (ICON_FILE_CODE, c(0x3F, 0x8E, 0xD0)),
-        "js" | "jsx" | "mjs" | "cjs" => (ICON_FILE_CODE, c(0xE8, 0xD4, 0x4D)),
-        "py" | "pyw" | "pyi" => (ICON_FILE_CODE, c(0x5A, 0x9F, 0xD4)),
-        "go" => (ICON_FILE_CODE, c(0x4F, 0xC3, 0xE0)),
-        "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hxx" => (ICON_FILE_CODE, c(0x6F, 0x9F, 0xD8)),
-        "cs" => (ICON_FILE_CODE, c(0x6E, 0xC4, 0x8F)),
-        "java" | "kt" | "kts" => (ICON_FILE_CODE, c(0xC9, 0x7B, 0x4E)),
-        "rb" => (ICON_RUBY, c(0xCC, 0x42, 0x3A)),
-        "php" => (ICON_FILE_CODE, c(0x8A, 0x8F, 0xD0)),
-        "swift" => (ICON_FILE_CODE, c(0xE0, 0x6C, 0x4E)),
-        "sh" | "bash" | "zsh" | "fish" | "bat" | "cmd" | "ps1" => (ICON_TERMINAL_FILE, c(0x89, 0xD1, 0x85)),
-        "html" | "htm" | "xhtml" => (ICON_FILE_CODE, c(0xE3, 0x6C, 0x4E)),
-        "css" | "scss" | "sass" | "less" => (ICON_FILE_CODE, c(0x42, 0xA5, 0xF5)),
-        "vue" | "svelte" => (ICON_FILE_CODE, c(0x6B, 0xC4, 0x8F)),
-        "wgsl" | "glsl" | "hlsl" | "shader" | "metal" => (ICON_FILE_CODE, c(0x8F, 0xBC, 0x8F)),
-        "json" | "jsonc" | "json5" | "mcp" => (ICON_JSON, c(0xCB, 0xCB, 0x41)),
-        "md" | "markdown" | "mdx" | "rst" => (ICON_MARKDOWN, c(0x51, 0x9A, 0xBA)),
-        "toml" | "yaml" | "yml" | "ini" | "cfg" | "conf" | "env" | "properties" | "xml" => {
-            (ICON_GEAR_FILE, c(0x9C, 0x9C, 0x9C))
-        }
-        "lock" => (ICON_LOCK_FILE, c(0x9C, 0x9C, 0x9C)),
-        "png" | "jpg" | "jpeg" | "gif" | "ico" | "bmp" | "webp" | "svg" | "avif" => {
-            (ICON_FILE_MEDIA, c(0xA0, 0x74, 0xC4))
-        }
-        "zip" | "tar" | "gz" | "tgz" | "rar" | "7z" | "xz" | "bz2" => (ICON_FILE_ZIP, c(0xB0, 0x90, 0x4A)),
-        "pdf" => (ICON_FILE_PDF, c(0xD0, 0x65, 0x4E)),
-        "db" | "sqlite" | "sqlite3" | "sql" => (ICON_DATABASE, c(0x6B, 0xA5, 0xC4)),
-        "exe" | "dll" | "so" | "dylib" | "o" | "a" | "bin" | "wasm" | "class" => {
-            (ICON_FILE_BINARY, c(0x9C, 0x9C, 0x9C))
-        }
-        "csv" | "tsv" => (ICON_FILE_TEXT, c(0x89, 0xD1, 0x85)),
-        "txt" | "log" | "text" => (ICON_FILE_TEXT, c(0xB0, 0xB4, 0xBA)),
-        _ => (ICON_FILE, c(0xC5, 0xC5, 0xC5)),
+        "rs" => (rust, c(0xDE, 0xA5, 0x84)),
+        "tsx" => (react, c(0x3F, 0x8E, 0xD0)),
+        "ts" | "mts" | "cts" => (ts, c(0x3F, 0x8E, 0xD0)),
+        "jsx" => (react, c(0x5A, 0xC8, 0xE0)),
+        "js" | "mjs" | "cjs" => (js, c(0xE8, 0xD4, 0x4D)),
+        "py" | "pyw" | "pyi" => (py, c(0x5A, 0x9F, 0xD4)),
+        "go" => (go, c(0x4F, 0xC3, 0xE0)),
+        "c" | "h" => (cc, c(0x6F, 0x9F, 0xD8)),
+        "cpp" | "cc" | "cxx" | "hpp" | "hxx" => (cpp, c(0x6F, 0x9F, 0xD8)),
+        "cs" => (csharp, c(0x6E, 0xC4, 0x8F)),
+        "java" => (java, c(0xC9, 0x7B, 0x4E)),
+        "kt" | "kts" => (kotlin, c(0xC9, 0x7B, 0xD0)),
+        "rb" => (ruby, c(0xCC, 0x42, 0x3A)),
+        "php" => (php, c(0x8A, 0x8F, 0xD0)),
+        "swift" => (swift, c(0xE0, 0x6C, 0x4E)),
+        "dart" => (dart, c(0x4F, 0xB8, 0xD4)),
+        "lua" => (lua, c(0x6F, 0x8F, 0xD8)),
+        "sh" | "bash" | "zsh" | "fish" | "bat" | "cmd" | "ps1" => (shell, c(0x89, 0xD1, 0x85)),
+        "html" | "htm" | "xhtml" => (html, c(0xE3, 0x6C, 0x4E)),
+        "css" | "less" => (css, c(0x42, 0xA5, 0xF5)),
+        "scss" | "sass" => (sass, c(0xCC, 0x66, 0x99)),
+        "vue" => (vue, c(0x6B, 0xC4, 0x8F)),
+        "svelte" => (svelte, c(0xE3, 0x6C, 0x4E)),
+        "json" | "jsonc" | "json5" | "mcp" => (json, c(0xCB, 0xCB, 0x41)),
+        "md" | "markdown" | "mdx" | "rst" => (md, c(0x51, 0x9A, 0xBA)),
+        "yaml" | "yml" => (yaml, c(0xBB, 0x6B, 0xD0)),
+        "toml" => (toml, c(0x9C, 0x70, 0x4A)),
+        "xml" | "xaml" => (xml, c(0xE3, 0x6C, 0x4E)),
+        "ini" | "cfg" | "conf" | "env" | "properties" => (config_g, gray),
+        "lock" => (lock, gray),
+        "png" | "jpg" | "jpeg" | "gif" | "ico" | "bmp" | "webp" | "svg" | "avif" => (image, c(0xA0, 0x74, 0xC4)),
+        "mp4" | "mov" | "avi" | "mkv" | "webm" => (video, c(0xA0, 0x74, 0xC4)),
+        "ttf" | "otf" | "woff" | "woff2" | "eot" => (font_g, c(0xC4, 0x9A, 0x6A)),
+        "zip" | "tar" | "gz" | "tgz" | "rar" | "7z" | "xz" | "bz2" => (zip, c(0xB0, 0x90, 0x4A)),
+        "pdf" => (pdf, c(0xD0, 0x65, 0x4E)),
+        "db" | "sqlite" | "sqlite3" | "sql" => (db, c(0x6B, 0xA5, 0xC4)),
+        "csv" | "tsv" => (csv, c(0x89, 0xD1, 0x85)),
+        _ => (default_g, c(0xC5, 0xC5, 0xC5)),
     }
 }
 

@@ -40,6 +40,7 @@ pub struct UiBuffers {
     pub diff_unstage: TextLabel, // per-block unstage button (←)
     pub diff_revert: TextLabel, // per-block revert button (discard)
     pub block_tip: TextLabel, // hover tooltip for the per-block buttons
+    pub tab_icons: std::collections::HashMap<char, crate::widgets::IconButton>, // per-tab file-type icon overlays
     pub menu_dropdown: Menu,   // top menu-bar dropdown (File/Edit/…)
     pub scm_badge: TextLabel,  // change-count badge on the Source Control icon
     pub img_minus: TextLabel,  // image zoom-out control
@@ -57,6 +58,7 @@ pub struct UiBuffers {
     pub ctx: Menu, // generic right-click context menu (editor / tabs / SCM / …)
     pub dialog: Dialog,
     pub diag_hover: HoverCard, // floating tooltip for the diagnostic under the pointer
+    pub commit_card: HoverCard, // commit-graph: full message on hover
     pub ext_detail: ExtensionDetail,
     pub terminal_panes: Vec<Buffer>, // one monospace grid buffer per visible split pane
     pub term_tablist: ListView,      // right-side terminal tab switcher (multi-tab only)
@@ -146,6 +148,11 @@ impl GpuState {
         font_system
             .db_mut()
             .load_font_data(include_bytes!("../assets/codicon.ttf").to_vec());
+        // Symbols Nerd Font (MIT/OFL) — Seti + devicon brand glyphs for per-type file
+        // icons (React, JS/TS, Python, …), matching VSCode's Seti theme.
+        font_system
+            .db_mut()
+            .load_font_data(include_bytes!("../assets/symbols.ttf").to_vec());
         // Bundle Cascadia Code (SIL OFL) so the editor's default mono font is the
         // same everywhere, with no reliance on system-installed fonts.
         font_system
@@ -260,6 +267,7 @@ impl GpuState {
                 l
             },
             block_tip: TextLabel::new(&mut font_system, 240.0, theme::UI_LINE_HEIGHT()),
+            tab_icons: std::collections::HashMap::new(),
             palette_input: TextInput::new(&mut font_system, 600.0, theme::PALETTE_INPUT_HEIGHT()),
             palette_list: ListView::new(
                 &mut font_system,
@@ -309,6 +317,7 @@ impl GpuState {
             drag_ghost: TextLabel::new(&mut font_system, 320.0, theme::TREE_ROW_HEIGHT()),
             dialog: Dialog::new(&mut font_system),
             diag_hover: HoverCard::new(&mut font_system),
+            commit_card: HoverCard::new(&mut font_system),
             ext_detail: ExtensionDetail::new(&mut font_system),
             terminal_panes: Vec::new(), // grown on demand as panes are split
             term_tablist: ListView::new(

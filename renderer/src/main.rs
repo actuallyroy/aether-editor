@@ -17,6 +17,7 @@ mod ext_runtime;
 mod extensions;
 mod feedback_upload;
 mod gpu;
+mod graph;
 mod icon;
 mod git;
 mod highlight;
@@ -304,6 +305,10 @@ pub(crate) struct App {
     pub(crate) hovered_diff_block: Option<(usize, usize)>,
     // Tooltip for the hovered per-block button: (label, anchor x, anchor y).
     pub(crate) block_tip: Option<(String, f32, f32)>,
+    // Commit-graph: full message of the hovered commit row + anchor (x, y).
+    pub(crate) commit_tip: Option<(String, f32, f32)>,
+    // Editor tab hover: full file name + anchor (x, y) — tabs truncate to fit.
+    pub(crate) tab_tip: Option<(String, f32, f32)>,
     pub(crate) sidebar_view: SidebarView,
     // Find-in-files (Search view): a self-contained panel (built once the GPU/font
     // system exists, in `resumed`). Owns all of its own state + buffers.
@@ -455,6 +460,8 @@ impl App {
             gap_drag: None,
             hovered_diff_block: None,
             block_tip: None,
+            commit_tip: None,
+            tab_tip: None,
             sidebar_view: SidebarView::Explorer,
             search: None, // built in `resumed` once the font system exists
             source_control: None, // built in `resumed`
@@ -646,6 +653,17 @@ impl App {
             new_tab.filter(|&i| Layout::tab_close_rect(tab_rects[i]).contains(p));
         if new_tab != self.hovered_tab {
             self.hovered_tab = new_tab;
+            changed = true;
+        }
+        // Full-name tooltip for the hovered document tab (names truncate to fit).
+        let tab_tip = new_tab
+            .filter(|&i| i < self.workspace.documents.len())
+            .map(|i| {
+                let r = tab_rects[i];
+                (self.workspace.documents[i].name.clone(), r.x + theme::zpx(8.0), r.y + r.h)
+            });
+        if tab_tip != self.tab_tip {
+            self.tab_tip = tab_tip;
             changed = true;
         }
         if new_close != self.hovered_tab_close {
@@ -1083,6 +1101,14 @@ impl App {
             // The Extensions panel resolves its own cursor (filter = text, rows =
             // pointer, scrollbar/empty = arrow).
             c
+        } else if self.sidebar_visible
+            && self.sidebar_view == SidebarView::SourceControl
+            && self
+                .source_control
+                .as_ref()
+                .map_or(false, |scp| scp.resizing() || scp.over_divider(p, layout.panel_region()))
+        {
+            CursorIcon::RowResize
         } else if self.sidebar_visible
             && self.sidebar_view == SidebarView::SourceControl
             && self
@@ -2144,6 +2170,34 @@ impl App {
                 }
                 self.redraw();
             }
+            ui::Intent::GitCommitGraph => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let entries = git::commit_log(&self.cwd, 2000);
+                let g = graph::build("Commit Graph".to_string(), entries, now);
+                if let Some(i) = self.workspace.documents.iter().position(|d| d.graph.is_some()) {
+                    if let Some(gpu) = self.gpu.as_mut() {
+                        self.workspace.documents[i] = Document::new_graph(g, &mut gpu.font_system);
+                        self.workspace.active = Some(i);
+                    }
+                } else if let Some(gpu) = self.gpu.as_mut() {
+                    let d = Document::new_graph(g, &mut gpu.font_system);
+                    self.workspace.documents.push(d);
+                    self.workspace.active = Some(self.workspace.documents.len() - 1);
+                }
+                self.redraw();
+            }
+            ui::Intent::OpenCommitDiff { hash, path } => {
+                if let Some(g) = self.gpu.as_mut() {
+                    let d = diff::compute_commit(&self.cwd, &path, &hash);
+                    self.workspace.open_diff(d, &mut g.font_system);
+                    self.detail.open_extension = None;
+                }
+                self.ensure_cursor_visible();
+                self.redraw();
+            }
             ui::Intent::GitRefresh => self.refresh_source_control(),
             ui::Intent::GitCommitPush { msg, stage_all } => {
                 if git::commit(&self.cwd, &msg, stage_all) {
@@ -2184,6 +2238,7 @@ impl App {
                     CtxEntry::new("Pop Latest Stash", CtxAction::ScmIntent(ui::Intent::GitStashPop)),
                     CtxEntry::new("Apply Latest Stash", CtxAction::ScmIntent(ui::Intent::GitStashApply)),
                     CtxEntry::sep(),
+                    CtxEntry::new("View Commit Graph", CtxAction::ScmIntent(ui::Intent::GitCommitGraph)),
                     CtxEntry::new("Refresh", CtxAction::ScmIntent(ui::Intent::GitRefresh)),
                 ];
                 self.open_ctx_menu(anchor, items);
@@ -4070,6 +4125,9 @@ impl App {
             g.ui.diff_unstage.reshape(&mut g.font_system);
             g.ui.diff_revert.reshape(&mut g.font_system);
             g.ui.block_tip.reshape(&mut g.font_system);
+            for ib in g.ui.tab_icons.values_mut() {
+                ib.reshape(&mut g.font_system);
+            }
             g.ui.sidebar.reshape_icons(&mut g.font_system); // explorer tree icons
             g.create_input.rezoom(&mut g.font_system);
             for b in g.create_icons.iter_mut() {
@@ -5277,6 +5335,22 @@ impl App {
                 self.redraw();
             }
         }
+        // Commit graph: full-message tooltip for the hovered commit row.
+        if !self.mouse_pressed {
+            let region = render::editor_region(&self.layout());
+            let ctip = if region.contains((x, y)) {
+                self.workspace
+                    .active_doc()
+                    .and_then(|d| d.graph_message_at_y(region, y))
+                    .map(|m| (m.to_string(), x, y))
+            } else {
+                None
+            };
+            if ctip != self.commit_tip {
+                self.commit_tip = ctip;
+                self.redraw();
+            }
+        }
         // Feedback form: drag-select within the focused field.
         if self.mouse_pressed && self.feedback_form.is_some() {
             let win = self.gpu.as_ref().map_or((1280.0, 800.0), |g| (g.config.width as f32, g.config.height as f32));
@@ -5408,7 +5482,9 @@ impl App {
         // Source Control scrollbar thumb drag.
         if self.mouse_pressed {
             if let Some(scp) = self.source_control.as_mut() {
-                if scp.scroll.is_dragging() && scp.scroll.drag((x, y)) {
+                if (scp.scroll.is_dragging() && scp.scroll.drag((x, y)))
+                    || (scp.graph_scroll.is_dragging() && scp.graph_scroll.drag((x, y)))
+                {
                     self.redraw();
                     return;
                 }
@@ -5568,6 +5644,7 @@ impl App {
         self.explorer.scroll.release();
         if let Some(scp) = self.source_control.as_mut() {
             scp.scroll.release();
+            scp.graph_scroll.release();
             scp.on_release();
         }
         if let Some(ep) = self.extensions_panel.as_mut() {

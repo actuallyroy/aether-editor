@@ -60,6 +60,10 @@ pub enum Intent {
     GitRefresh,
     /// Generate a commit message from the current diff via Azure OpenAI (✨).
     GitGenerateCommitMessage,
+    /// Open the commit graph (Visualize Repository History).
+    GitCommitGraph,
+    /// Open the diff a commit introduced for one file (from the graph's file list).
+    OpenCommitDiff { hash: String, path: String },
     /// Commit then push (the Commit button's split-dropdown action).
     GitCommitPush { msg: String, stage_all: bool },
     /// Open the commit split-button dropdown menu (Commit / Commit & Push) at

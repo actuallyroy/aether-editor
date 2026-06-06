@@ -38,6 +38,18 @@ impl Quad {
             params: [radius, 0.0, 0.0, 0.0],
         }
     }
+
+    /// A circular ring band (outer..inner radius) centered at `(cx, cy)` in pixels,
+    /// drawn only within rect `(x,y,w,h)` — so a quadrant-sized rect yields a quarter
+    /// arc. Used for curved graph connectors. `inner` must be > 0.
+    pub fn arc(x: f32, y: f32, w: f32, h: f32, color: [f32; 4], outer: f32, inner: f32, cx: f32, cy: f32) -> Self {
+        // Center is passed in local (rect-relative) px so the shader needs no origin.
+        Self {
+            rect: [x, y, w, h],
+            color,
+            params: [outer, inner.max(0.01), cx - x, cy - y],
+        }
+    }
 }
 
 pub struct QuadRenderer {

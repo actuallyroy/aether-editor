@@ -451,6 +451,21 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             );
             gpu.ui.tabs.shape_until_scroll(fs, false);
             cache.tabs = tab_text;
+            // Ensure a cached icon overlay exists for each tab's file type.
+            for d in &app.workspace.documents {
+                let g = theme::file_icon(&d.name).0;
+                gpu.ui
+                    .tab_icons
+                    .entry(g)
+                    .or_insert_with(|| crate::widgets::IconButton::new(fs, g, theme::icon_family(g), theme::UI_FONT_SIZE()));
+            }
+            if app.detail.open_extension.is_some() {
+                let g = theme::ICON_EXTENSIONS;
+                gpu.ui
+                    .tab_icons
+                    .entry(g)
+                    .or_insert_with(|| crate::widgets::IconButton::new(fs, g, theme::icon_family(g), theme::UI_FONT_SIZE()));
+            }
         }
 
 
@@ -972,6 +987,14 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             let bot = (y + h).min(ebot);
             (bot > top).then_some((top, bot - top))
         };
+        // Horizontal clamp to the editor text column — keeps highlight boxes from
+        // bleeding into the gutter/sidebar when scrolled right.
+        let (ex_lo, ex_hi) = (layout.editor_text.x, layout.editor_text.x + layout.editor_text.w);
+        let clip_h = |x: f32, w: f32| -> Option<(f32, f32)> {
+            let l = x.max(ex_lo);
+            let r = (x + w).min(ex_hi);
+            (r > l).then_some((l, r - l))
+        };
         // Code folding shifts every line up by the height of collapsed regions above
         // it; `foff(line)` is that pixel offset (0 when nothing is folded). Hidden
         // lines (`d.is_line_hidden`) are skipped entirely by the per-line loops below.
@@ -998,6 +1021,64 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             let line_y = layout.editor_text.y + theme::EDITOR_PAD() + ltop - d.scroll_y() - foff(cur_line);
             if let Some((qy, qh)) = clip_v(line_y, lh) {
                 bg_quads.push(Quad::new(editor_full.x, qy, editor_full.w, qh, theme::LINE_HIGHLIGHT()));
+            }
+        }
+
+        // Commit graph: lane lines + node dots in the left margin (text drawn offset
+        // past them in the areas phase). Right-angle style (axis-aligned quads).
+        if let Some(g) = d.graph.as_ref() {
+            use crate::graph::{Half, Seg};
+            let lh = theme::LINE_HEIGHT();
+            let lane_w = theme::zpx(14.0);
+            let lw = theme::zpx(2.0).max(1.0);
+            let x0 = editor_full.x + theme::EDITOR_PAD();
+            let scroll_y = d.scroll_y();
+            let cx = |col: u16| x0 + col as f32 * lane_w + lane_w * 0.5;
+            for (i, row) in g.rows.iter().enumerate() {
+                let band_top = editor_full.y + theme::EDITOR_PAD() + i as f32 * lh - scroll_y;
+                if band_top + lh <= editor_full.y {
+                    continue;
+                }
+                if band_top > editor_full.y + editor_full.h {
+                    break;
+                }
+                let mid = band_top + lh * 0.5;
+                for seg in &row.segs {
+                    match seg {
+                        Seg::V { col, half, color } => {
+                            let (y, h) = match half {
+                                Half::Full => (band_top, lh),
+                                Half::Top => (band_top, lh * 0.5),
+                                Half::Bottom => (mid, lh * 0.5),
+                            };
+                            if let Some((qy, qh)) = clip_v(y, h) {
+                                bg_quads.push(Quad::new(cx(*col) - lw * 0.5, qy, lw, qh, theme::GRAPH_LANE(*color)));
+                            }
+                        }
+                        Seg::H { a, b, color } => {
+                            let (xa, xb) = (cx(*a).min(cx(*b)), cx(*a).max(cx(*b)));
+                            if let Some((qy, qh)) = clip_v(mid - lw * 0.5, lw) {
+                                bg_quads.push(Quad::new(xa, qy, (xb - xa) + lw, qh, theme::GRAPH_LANE(*color)));
+                            }
+                        }
+                        Seg::Bend { col, top, color } => {
+                            if band_top >= editor_full.y && band_top + lh <= editor_full.y + editor_full.h {
+                                for q in crate::graph::bend_quads(cx(row.node_col), cx(*col), band_top, band_top + lh, mid, *top, lw, theme::GRAPH_LANE(*color)) {
+                                    bg_quads.push(q);
+                                }
+                            } else {
+                                let (xa, xb) = (cx(*col).min(cx(row.node_col)), cx(*col).max(cx(row.node_col)));
+                                if let Some((qy, qh)) = clip_v(mid - lw * 0.5, lw) {
+                                    bg_quads.push(Quad::new(xa, qy, (xb - xa) + lw, qh, theme::GRAPH_LANE(*color)));
+                                }
+                            }
+                        }
+                    }
+                }
+                let r = theme::zpx(4.5);
+                if let Some((qy, qh)) = clip_v(mid - r, r * 2.0) {
+                    bg_quads.push(Quad::rounded(cx(row.node_col) - r, qy, r * 2.0, qh, theme::GRAPH_LANE(row.color), r));
+                }
             }
         }
 
@@ -1217,14 +1298,9 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     let (xs, xe) = x_range_in_run(&run, cs, ce);
                     let w = (xe - xs).max(2.0);
                     let my = layout.editor_text.y + theme::EDITOR_PAD() + run.line_top - d.scroll_y() - foff(line);
-                    if let Some((qy, qh)) = clip_v(my, run.line_height) {
-                        bg_quads.push(Quad::new(
-                            layout.editor_text.x + theme::EDITOR_PAD() + xs - d.scroll_x(),
-                            qy,
-                            w,
-                            qh,
-                            theme::FIND_MATCH(),
-                        ));
+                    let mx = layout.editor_text.x + theme::EDITOR_PAD() + xs - d.scroll_x();
+                    if let (Some((qy, qh)), Some((x0, cw))) = (clip_v(my, run.line_height), clip_h(mx, w)) {
+                        bg_quads.push(Quad::new(x0, qy, cw, qh, theme::FIND_MATCH()));
                     }
                 }
             }
@@ -1254,14 +1330,9 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 let (xs, xe) = x_range_in_run(&run, col_start, col_end);
                 let w = (xe - xs).max(2.0);
                 let sel_y = layout.editor_text.y + theme::EDITOR_PAD() + run.line_top - d.scroll_y() - foff(line);
-                if let Some((qy, qh)) = clip_v(sel_y, run.line_height) {
-                    bg_quads.push(Quad::new(
-                        layout.editor_text.x + theme::EDITOR_PAD() + xs - d.scroll_x(),
-                        qy,
-                        w,
-                        qh,
-                        theme::SELECTION(),
-                    ));
+                let sx = layout.editor_text.x + theme::EDITOR_PAD() + xs - d.scroll_x();
+                if let (Some((qy, qh)), Some((x0, cw))) = (clip_v(sel_y, run.line_height), clip_h(sx, w)) {
+                    bg_quads.push(Quad::new(x0, qy, cw, qh, theme::SELECTION()));
                 }
             }
         }
@@ -1285,6 +1356,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                         let w = (xe - xs).max(2.0);
                         let by = layout.editor_text.y + theme::EDITOR_PAD() + run.line_top - d.scroll_y() - foff(line);
                         let bx = layout.editor_text.x + theme::EDITOR_PAD() + xs - d.scroll_x();
+                        // Clip horizontally to the editor: when scrolled right, a
+                        // bracket left of the viewport must not bleed into the gutter/sidebar.
+                        if bx + w <= layout.editor_text.x || bx >= layout.editor_text.x + layout.editor_text.w {
+                            continue;
+                        }
                         if let Some((qy, qh)) = clip_v(by, run.line_height) {
                             let bw = 1.0_f32.max(theme::ui_zoom().floor());
                             let bc = theme::BRACKET_MATCH_BORDER();
@@ -1332,14 +1408,10 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     let w = (xe - xs).max(3.0 * uz);
                     let line_y = layout.editor_text.y + theme::EDITOR_PAD() + run.line_top - d.scroll_y() - foff(line);
                     let under_y = line_y + run.line_height - 2.0 * uz;
-                    if let Some((qy, qh)) = clip_v(under_y, 2.0 * uz) {
-                        fg_quads.push(Quad::new(
-                            layout.editor_text.x + theme::EDITOR_PAD() + xs - d.scroll_x(),
-                            qy,
-                            w,
-                            qh,
-                            color,
-                        ));
+                    let ux = layout.editor_text.x + theme::EDITOR_PAD() + xs - d.scroll_x();
+                    let in_x = ux + w > layout.editor_text.x && ux < layout.editor_text.x + layout.editor_text.w;
+                    if let Some((qy, qh)) = clip_v(under_y, 2.0 * uz).filter(|_| in_x) {
+                        fg_quads.push(Quad::new(ux, qy, w, qh, color));
                     }
                 }
             }
@@ -1352,9 +1424,12 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         if app.cursor_blink_on && !d.read_only && !modal_open && !app.find.focused {
             let (cx, cy, ch) = d.caret_visual();
             let cursor_y = layout.editor_text.y + theme::EDITOR_PAD() + cy - d.scroll_y() - foff(cur_line);
-            if let Some((qy, qh)) = clip_v(cursor_y, ch) {
+            let cursor_x = layout.editor_text.x + theme::EDITOR_PAD() + cx - d.scroll_x();
+            // Don't draw a caret scrolled off the left into the gutter/sidebar.
+            let cursor_in = cursor_x >= layout.editor_text.x && cursor_x < layout.editor_text.x + layout.editor_text.w;
+            if let Some((qy, qh)) = clip_v(cursor_y, ch).filter(|_| cursor_in) {
                 fg_quads.push(Quad::new(
-                    layout.editor_text.x + theme::EDITOR_PAD() + cx - d.scroll_x(),
+                    cursor_x,
                     qy,
                     theme::CURSOR_WIDTH(),
                     qh,
@@ -1815,16 +1890,33 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         } else {
             theme::TAB_FG_INACTIVE()
         };
+        // File-type icon overlay at the tab's left (Seti brand glyph), centered.
+        let icon = if i < app.workspace.documents.len() {
+            Some(theme::file_icon(&app.workspace.documents[i].name))
+        } else if app.detail.open_extension.is_some() {
+            Some((theme::ICON_EXTENSIONS, theme::FG_DIM()))
+        } else {
+            None
+        };
+        let label_x = if let Some((glyph, gcolor)) = icon {
+            if let Some(ib) = ui.tab_icons.get(&glyph) {
+                let slot = Rect { x: tab.x + theme::zpx(8.0), y: tab.y, w: theme::zpx(20.0), h: tab.h };
+                ib.draw_clipped(slot, *tab, gcolor, &mut areas);
+            }
+            tab.x + theme::zpx(30.0)
+        } else {
+            tab.x + theme::zpx(12.0)
+        };
         let label_top = tab.text_top(theme::UI_LINE_HEIGHT(), VAlign::Center);
         areas.push(TextArea {
             buffer: &ui.tabs,
-            left: tab.x + theme::zpx(12.0),
+            left: label_x,
             top: label_top - line_top,
             scale: 1.0,
             // Clip to just this label's line band (the buffer holds every tab's
             // label, one per line) so neighbours don't bleed in.
             bounds: TextBounds {
-                left: tab.x as i32 + theme::zpx(6.0) as i32,
+                left: label_x as i32,
                 top: (label_top - 2.0) as i32,
                 right: (tab.x + tab.w - theme::zpx(26.0)) as i32,
                 bottom: (label_top + theme::UI_LINE_HEIGHT()) as i32,
@@ -1861,6 +1953,27 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
 
         if d.image.is_some() {
             // Image tab: the picture is drawn in the media pass below; no text/gutter.
+        } else if let Some(g) = d.graph.as_ref() {
+            // Commit graph: lanes are drawn in the quad phase; here draw the per-row
+            // text (refs + subject + author/date) offset past the lane columns.
+            let et = layout.editor_text;
+            let lane_w = theme::zpx(14.0);
+            let graph_w = (g.max_col + 1) as f32 * lane_w + theme::zpx(10.0);
+            let clip = TextBounds {
+                left: et.x as i32,
+                top: et.y as i32,
+                right: (et.x + et.w) as i32,
+                bottom: (et.y + et.h) as i32,
+            };
+            areas.push(TextArea {
+                buffer: &d.buffer,
+                left: et.x + theme::EDITOR_PAD() + graph_w - d.scroll_x(),
+                top: et.y + theme::EDITOR_PAD() - d.scroll_y(),
+                scale: 1.0,
+                bounds: clip,
+                default_color: theme::FG_TEXT(),
+                custom_glyphs: &[],
+            });
         } else if let Some(page) = d.info.as_ref() {
             // Info tab: the hand-designed page draws its own text in a centered
             // reading column (its quads are added in the quad-build phase above).
@@ -2728,11 +2841,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         gpu.queue.submit(Some(encf.finish()));
     }
 
-    // ---- Per-block button tooltip ----
-    // A small label ("Stage Block" / "Revert Block" / "Unstage Block") next to the
-    // hovered diff-block button.
+    // ---- Small label tooltip ----
+    // Reused for the per-block diff buttons (Stage/Revert/Unstage) and the editor
+    // tab full-name on hover (tabs truncate to fit). Only one is set at a time.
     if app.dialog.is_none() && app.feedback_form.is_none() {
-        if let Some((text, ax, ay)) = app.block_tip.clone() {
+        if let Some((text, ax, ay)) = app.block_tip.clone().or_else(|| app.tab_tip.clone()) {
             gpu.ui.block_tip.set(&mut gpu.font_system, &text, theme::UI_FAMILY());
             let padx = theme::zpx(7.0);
             let w = gpu.ui.block_tip.width() + padx * 2.0;
@@ -2768,6 +2881,38 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 gpu.text_renderer.render(&gpu.atlas, &gpu.viewport, &mut pass)?;
             }
             gpu.queue.submit(Some(entt.finish()));
+        }
+    }
+
+    // ---- Commit-graph message hover card ----
+    if app.dialog.is_none() && app.feedback_form.is_none() {
+        if let Some((msg, hx, hy)) = app.commit_tip.clone() {
+            gpu.ui.commit_card.set_text(&mut gpu.font_system, &msg);
+            let screen = Rect { x: 0.0, y: 0.0, w: cfg_w as f32, h: cfg_h as f32 };
+            let card = gpu.ui.commit_card.rect((hx, hy), screen);
+            let mut hq: Vec<Quad> = Vec::new();
+            gpu.ui.commit_card.draw_quads(card, &mut hq);
+            gpu.quad_renderer.prepare(&gpu.device, &gpu.queue, &hq, &[], (cfg_w, cfg_h));
+            let mut hareas: Vec<TextArea> = Vec::new();
+            gpu.ui.commit_card.draw_text(card, &mut hareas);
+            gpu.text_renderer.prepare(&gpu.device, &gpu.queue, &mut gpu.font_system, &mut gpu.atlas, &gpu.viewport, hareas, &mut gpu.swash_cache)?;
+            let mut enc = gpu.device.create_command_encoder(&CommandEncoderDescriptor { label: Some("aether-commitcard-pass") });
+            {
+                let mut pass = enc.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("aether-commitcard"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                gpu.quad_renderer.render_bg(&mut pass);
+                gpu.text_renderer.render(&gpu.atlas, &gpu.viewport, &mut pass)?;
+            }
+            gpu.queue.submit(Some(enc.finish()));
         }
     }
 

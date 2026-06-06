@@ -16,6 +16,9 @@ struct VOut {
     @location(1) local: vec2<f32>,  // pixel offset within the rect
     @location(2) half_size: vec2<f32>,   // half-size of the rect (avoid `half`, reserved in MSL)
     @location(3) radius: f32,
+    // params.y>0 ⇒ arc mode: a circular ring between radius params.x (outer) and
+    // params.y (inner), centered at params.zw (local px), clipped to this rect.
+    @location(4) params: vec4<f32>,
 };
 
 @vertex
@@ -41,11 +44,20 @@ fn vs_main(in: VIn, @builtin(vertex_index) vid: u32) -> VOut {
     out.local = local;
     out.half_size = in.rect.zw * 0.5;
     out.radius = in.params.x;
+    out.params = in.params;
     return out;
 }
 
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {
+    // Arc mode: a 1px-AA circular ring band between inner..outer radius, centered at
+    // params.zw. The rect bounds it (so a quadrant-sized rect yields a quarter arc).
+    if (in.params.y > 0.0) {
+        let dist = length(in.local - in.params.zw);
+        let a_out = clamp(in.params.x - dist + 0.5, 0.0, 1.0);
+        let a_in = clamp(dist - in.params.y + 0.5, 0.0, 1.0);
+        return vec4<f32>(in.color.rgb, in.color.a * min(a_out, a_in));
+    }
     // Sharp rectangles (the common case) skip the SDF entirely so their edges
     // stay crisp and pixel-exact.
     if (in.radius <= 0.0) {

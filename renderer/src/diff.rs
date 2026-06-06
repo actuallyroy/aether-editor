@@ -121,6 +121,23 @@ pub fn compute(root: &Path, path: &str, staged: bool, untracked: bool) -> Diff {
     diff
 }
 
+/// The diff a single commit introduced for one file (`git show <hash> -- path`),
+/// shown as a read-only tab. Full context + collapsible gaps like `compute`.
+pub fn compute_commit(root: &Path, path: &str, hash: &str) -> Diff {
+    let name = file_name(path).to_string();
+    let short: String = hash.chars().take(7).collect();
+    let title = format!("{name} ({short})");
+    // `git show --format=` suppresses the commit header, leaving just the file diff;
+    // works for the root commit too (unlike `<hash>~1 <hash>`).
+    let ctx = format!("-U{FULL_CONTEXT}");
+    let raw = git(root, &["show", "--no-color", "--first-parent", "--format=", &ctx, hash, "--", path]).unwrap_or_default();
+    let mut b = Builder::new(title);
+    b.parse_into(&raw);
+    let mut diff = b.finish();
+    diff.collapse_unchanged();
+    diff
+}
+
 /// Compare two arbitrary files (explorer "Select for Compare" → "Compare with
 /// Selected"): `git diff --no-index` works outside any repository and exits
 /// non-zero when the files differ, which `git()` deliberately ignores.
