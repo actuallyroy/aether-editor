@@ -690,21 +690,34 @@ impl TerminalPanel {
         // one logical line of width `cols`, so the cursor delta spans rows:
         // (line - cursor_line) * cols + (col - cur_col). This makes clicking anywhere
         // in a wrapped command work, not just the row the cursor happens to be on.
+        // The cursor-walk is a bare-shell-prompt convenience (readline). The moment a
+        // foreground program is running — alt-screen (vim) OR inline (Claude Code,
+        // REPLs, whose prompt/box chrome looks like "content") — clicking must not
+        // synthesize arrow keys into it. `focused_term_busy` asks the pty-host whether
+        // the shell has a child process.
+        let busy = self.focused_term_busy();
         if let Some((line, col)) = self.click_cell.take() {
             if let Some(g) = self.groups.get_mut(self.active) {
                 if let Some(p) = g.panes.get_mut(g.focused) {
                     let no_drag = p.sel.map_or(true, |(a, b)| a == b);
-                    if no_drag && !p.term.is_alt() {
-                        let (cur_col, cur_row) = p.term.cursor();
-                        let (cols, rows) = p.term.dims();
-                        let cursor_line = p.term.total_lines().saturating_sub(rows) + cur_row;
-                        let delta = (line as i64 - cursor_line as i64) * cols as i64
-                            + (col as i64 - cur_col as i64);
-                        let one: &[u8] = if delta > 0 { b"\x1b[C" } else { b"\x1b[D" };
-                        let n = delta.unsigned_abs().min(512) as usize;
-                        if n > 0 {
-                            let bytes: Vec<u8> = one.iter().copied().cycle().take(one.len() * n).collect();
-                            p.term.write(&bytes);
+                    // Only walk to a cell that actually holds content, clamped to just
+                    // past the last character so you can't over-walk into blank space.
+                    let chars = p.term.line_chars(line);
+                    let content_end = chars.iter().rposition(|&c| c != ' ' && c != '\0');
+                    if no_drag && !busy && !p.term.is_alt() && !p.term.mouse_reporting() {
+                        if let Some(end) = content_end {
+                            let col = (col).min(end + 1);
+                            let (cur_col, cur_row) = p.term.cursor();
+                            let (cols, rows) = p.term.dims();
+                            let cursor_line = p.term.total_lines().saturating_sub(rows) + cur_row;
+                            let delta = (line as i64 - cursor_line as i64) * cols as i64
+                                + (col as i64 - cur_col as i64);
+                            let one: &[u8] = if delta > 0 { b"\x1b[C" } else { b"\x1b[D" };
+                            let n = delta.unsigned_abs().min(512) as usize;
+                            if n > 0 {
+                                let bytes: Vec<u8> = one.iter().copied().cycle().take(one.len() * n).collect();
+                                p.term.write(&bytes);
+                            }
                         }
                     }
                 }

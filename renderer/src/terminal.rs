@@ -876,6 +876,12 @@ impl Terminal {
         self.grid.alt.is_some()
     }
 
+    /// True when the running app has enabled mouse reporting (DECSET 1000/1002/1003)
+    /// — it wants clicks itself, so we must not synthesize cursor-walk arrow keys.
+    pub fn mouse_reporting(&self) -> bool {
+        self.grid.mouse_enabled
+    }
+
     /// Forward one wheel notch to the running app: an SGR/legacy mouse-wheel event
     /// if it enabled mouse reporting, else an arrow key (so pagers/editors scroll).
     pub fn forward_wheel(&mut self, up: bool, col: u16, row: u16) {
