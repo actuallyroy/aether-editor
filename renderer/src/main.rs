@@ -6531,6 +6531,14 @@ impl App {
             self.redraw();
             return;
         }
+        // Terminal tab-list reorder drag (takes precedence over text selection).
+        if self.mouse_pressed {
+            let layout = self.layout();
+            if self.terminal.tab_drag_to((x, y), &layout) {
+                self.redraw();
+                return;
+            }
+        }
         // Terminal text-selection drag.
         if self.mouse_pressed {
             let layout = self.layout();
@@ -6687,9 +6695,13 @@ impl App {
             }
             // Tab drag-reorder: live-swap once the pointer crosses another tab.
             if let Some((idx, at, active)) = self.tab_drag {
-                let now_active = active || (x - at.0).abs() > 6.0 * theme::ui_zoom();
+                // Activate on movement along EITHER axis — dragging a tab straight
+                // down into the terminal is a vertical gesture (x barely changes).
+                let thresh = 6.0 * theme::ui_zoom();
+                let now_active = active || (x - at.0).abs() > thresh || (y - at.1).abs() > thresh;
                 if now_active != active {
                     self.tab_drag = Some((idx, at, true));
+                    self.redraw();
                 }
                 if now_active {
                     let layout = self.layout();
@@ -6746,7 +6758,22 @@ impl App {
                 self.redraw();
             }
         }
-        self.tab_drag = None;
+        // Editor tab dropped onto the terminal → paste its file path (like the
+        // explorer drag-to-terminal). Reordering already happened live during drag.
+        if let Some((idx, _, active)) = self.tab_drag.take() {
+            if active {
+                let p = (self.mouse_pos.x as f32, self.mouse_pos.y as f32);
+                let over_terminal = self.terminal.visible
+                    && self.layout().terminal_panel.map_or(false, |tp| tp.contains(p));
+                if over_terminal {
+                    if let Some(path) = self.workspace.documents.get(idx).and_then(|d| d.path.clone()) {
+                        self.terminal.write_focused(shell_quoted(&path).as_bytes());
+                        self.terminal.focused = true;
+                        self.redraw();
+                    }
+                }
+            }
+        }
         self.editor.on_release();
         self.text_drag = None;
         self.find_drag = None;
@@ -6765,6 +6792,7 @@ impl App {
         self.terminal.split.release();
         self.terminal.release_scrolls();
         self.terminal.selection_release();
+        self.terminal.end_tab_drag();
         self.detail.ext_detail_scroll.release();
         self.explorer.scroll.release();
         if let Some(scp) = self.source_control.as_mut() {
@@ -8625,7 +8653,17 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_pos = position;
                 self.on_mouse_move(position.x as f32, position.y as f32);
-                self.recompute_hover();
+                // While dragging (tab / explorer entry / terminal tab), the floating
+                // ghost must track the cursor every frame — skip the heavy hover
+                // hit-testing and just redraw so the ghost stays glued to the pointer.
+                let dragging = matches!(self.tab_drag, Some((_, _, true)))
+                    || matches!(self.tree_drag, Some((_, _, true)))
+                    || self.terminal.dragging_tab().is_some();
+                if dragging {
+                    self.redraw();
+                } else {
+                    self.recompute_hover();
+                }
             }
             WindowEvent::CursorLeft { .. } => {
                 self.hovered_tab = None;

@@ -49,6 +49,9 @@ pub struct TerminalPanel {
     /// Orphaned terminals offered at connect time (this workspace's shells from a
     /// closed window), re-attached when the terminal panel first opens.
     reattach: Vec<crate::ptyhost::TermInfo>,
+    /// In-flight tab-list reorder drag: (source group index, press y, activated past
+    /// the move threshold). `None` when no tab is being dragged.
+    tab_drag: Option<(usize, f32, bool)>,
 }
 
 impl TerminalPanel {
@@ -72,6 +75,7 @@ impl TerminalPanel {
             next_tag: 1,
             focus_requested: false,
             reattach: Vec::new(),
+            tab_drag: None,
         }
     }
 
@@ -409,6 +413,65 @@ impl TerminalPanel {
         }
     }
 
+    /// Move tab `from` to position `to`, keeping the dragged tab active (tab-list
+    /// drag-reorder). No-op for out-of-range / equal indices.
+    fn reorder_tab(&mut self, from: usize, to: usize) {
+        let n = self.groups.len();
+        if from == to || from >= n || to >= n {
+            return;
+        }
+        let g = self.groups.remove(from);
+        self.groups.insert(to, g);
+        self.active = to; // the dragged tab was the active one
+        self.mark_dirty();
+    }
+
+    /// Continue a tab-list reorder drag while the mouse is held. Returns true once
+    /// the drag has activated (so the caller treats the move as consumed).
+    pub fn tab_drag_to(&mut self, pt: (f32, f32), layout: &Layout) -> bool {
+        let Some((from, py, active)) = self.tab_drag else { return false };
+        let now_active = active || (pt.1 - py).abs() > 4.0 * theme::ui_zoom();
+        if now_active != active {
+            self.tab_drag = Some((from, py, now_active));
+        }
+        if !now_active {
+            return false;
+        }
+        let Some(panel) = layout.terminal_panel else { return true };
+        let content = terminal_content(panel);
+        if let Some(tl) = terminal_tablist_rect(content, self.groups.len()) {
+            let to = (((pt.1 - tl.y) / theme::TREE_ROW_HEIGHT()).max(0.0) as usize).min(self.groups.len().saturating_sub(1));
+            if to != from {
+                self.reorder_tab(from, to);
+                self.tab_drag = Some((to, py, true));
+            }
+        }
+        true
+    }
+
+    /// End any in-flight tab reorder (mouse release).
+    pub fn end_tab_drag(&mut self) {
+        self.tab_drag = None;
+    }
+
+    /// The group index being drag-reordered once the drag has activated (for the
+    /// floating drag ghost). `None` while not dragging or below the threshold.
+    pub fn dragging_tab(&self) -> Option<usize> {
+        match self.tab_drag {
+            Some((idx, _, true)) => Some(idx),
+            _ => None,
+        }
+    }
+
+    /// Display label for tab `i` (the focused pane's shell title), for the ghost.
+    pub fn tab_label(&self, i: usize) -> String {
+        self.groups
+            .get(i)
+            .and_then(|g| g.panes.get(g.focused))
+            .map(|p| p.term.title.clone())
+            .unwrap_or_else(|| format!("Terminal {}", i + 1))
+    }
+
     /// Tab-list × button: kill an entire tab (all its panes); hide the panel if it
     /// was the last tab.
     pub fn kill_tab(&mut self, i: usize) {
@@ -568,7 +631,10 @@ impl TerminalPanel {
                         if terminal_tab_close_rect(tl, idx).contains(pt) {
                             self.kill_tab(idx);
                         } else {
+                            // Switch immediately; arm a reorder drag (activates only
+                            // once the pointer moves past the threshold).
                             self.switch_tab(idx);
+                            self.tab_drag = Some((idx, pt.1, false));
                         }
                     }
                     return true;

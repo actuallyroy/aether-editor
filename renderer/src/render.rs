@@ -1911,8 +1911,19 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // cursor so the grab is visible and the parent-folder drop highlight reads as
     // "dropping into here". The label's text area is pushed in the areas section.
     let mut drag_ghost_pill: Option<Rect> = None;
-    if let Some((path, _, true)) = app.tree_drag.as_ref() {
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    // The ghost label comes from whichever drag is active: an explorer entry, an
+    // editor tab (incl. dragging it toward the terminal), or a terminal tab.
+    let ghost_name: Option<String> = app
+        .tree_drag
+        .as_ref()
+        .filter(|(_, _, active)| *active)
+        .map(|(path, ..)| path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+        .or_else(|| match app.tab_drag {
+            Some((idx, _, true)) => app.workspace.documents.get(idx).map(|d| d.name.clone()),
+            _ => None,
+        })
+        .or_else(|| app.terminal.dragging_tab().map(|i| app.terminal.tab_label(i)));
+    if let Some(name) = ghost_name {
         gpu.ui.drag_ghost.set(&mut gpu.font_system, &name, theme::UI_FAMILY());
         let mp = (app.mouse_pos.x as f32, app.mouse_pos.y as f32);
         let pill = Rect {
