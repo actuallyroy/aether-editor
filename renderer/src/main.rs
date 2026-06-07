@@ -1123,6 +1123,12 @@ impl App {
             self.terminal.split.cursor()
         } else if over_term_btn {
             CursorIcon::Pointer
+        } else if over_term_content
+            && (self.mods.control_key() || (cfg!(target_os = "macos") && self.mods.super_key()))
+            && self.terminal.url_at(p, &layout, self.terminal_cell_w).is_some()
+        {
+            // Ctrl/Cmd held over a terminal URL → it's clickable.
+            CursorIcon::Pointer
         } else if over_term_content {
             CursorIcon::Text
         } else if new_search {
@@ -2636,6 +2642,25 @@ impl App {
     }
 
     /// Open `path` and place the caret at (1-based `line`, byte `col`).
+    /// Resolve a literal path the user typed/pasted into the quick-open box: `~`
+    /// expands to $HOME, relative paths join the workspace root, and the result
+    /// must exist on disk. Returns None for fuzzy queries (no path separators).
+    fn resolve_literal_path(&self, raw: &str) -> Option<PathBuf> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        let expanded: PathBuf = if let Some(rest) = raw.strip_prefix("~/") {
+            std::env::var_os("HOME").map(PathBuf::from)?.join(rest)
+        } else if raw == "~" {
+            std::env::var_os("HOME").map(PathBuf::from)?
+        } else {
+            PathBuf::from(raw)
+        };
+        let abs = if expanded.is_absolute() { expanded } else { self.cwd.join(expanded) };
+        abs.exists().then_some(abs)
+    }
+
     fn open_file_at(&mut self, path: PathBuf, line: usize, col: usize) {
         // Opening a file reveals the editor: if the terminal is maximized (filling
         // the editor area), hide the whole bottom panel so the file content shows.
@@ -3645,6 +3670,21 @@ impl App {
                 true
             }
             commands::PaletteMode::Files => {
+                // A literal path typed into the box wins over the fuzzy selection so
+                // pasting/typing a full path (absolute, ~, or cwd-relative) opens it.
+                let raw = self
+                    .gpu
+                    .as_ref()
+                    .map(|g| g.ui.palette_input.text().trim().to_string())
+                    .unwrap_or_default();
+                if let Some(path) = self.resolve_literal_path(&raw) {
+                    if path.is_file() {
+                        self.palette.close();
+                        self.nav.mark(&self.workspace);
+                        self.open_file_at(path, 1, 0);
+                        return true;
+                    }
+                }
                 if let Some(rel) = self.palette.selected_item().map(|it| it.label.clone()) {
                     self.palette.close();
                     self.nav.mark(&self.workspace);
@@ -5451,6 +5491,28 @@ impl App {
         // Count consecutive clicks for word/line selection, but only when the press
         // lands in the terminal panel (so it consumes the click — no double-counting
         // with the input/title handlers below).
+        // Ctrl/Cmd+click a URL in the terminal → open it in the browser (don't start
+        // a selection).
+        let link_mod = self.mods.control_key() || (cfg!(target_os = "macos") && self.mods.super_key());
+        if link_mod {
+            if let Some(target) = self.terminal.url_at((x, y), &layout, self.terminal_cell_w) {
+                let low = target.to_lowercase();
+                if low.starts_with("http://") || low.starts_with("https://") || low.starts_with("file://") {
+                    open_url(&target);
+                } else {
+                    // A filesystem path: open files in the editor; for a folder,
+                    // drop the path into the quick-open palette so the user can drill in.
+                    let path = PathBuf::from(&target);
+                    if path.is_dir() {
+                        self.open_palette_with(&target);
+                    } else {
+                        self.nav.mark(&self.workspace);
+                        self.open_file_at(path, 1, 0);
+                    }
+                }
+                return;
+            }
+        }
         let term_clicks = if layout.terminal_panel.map_or(false, |p| p.contains((x, y))) {
             self.register_click(x, y);
             self.click_streak
@@ -8258,6 +8320,11 @@ impl ApplicationHandler for App {
             }
             WindowEvent::ModifiersChanged(m) => {
                 self.mods = m.state();
+                // Ctrl/Cmd toggles the terminal link highlight + cursor under a
+                // stationary pointer — refresh so it appears/clears without moving.
+                if self.terminal.visible {
+                    self.redraw();
+                }
             }
             WindowEvent::Resized(size) => {
                 if let Some(g) = self.gpu.as_mut() {

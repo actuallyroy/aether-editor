@@ -633,6 +633,51 @@ impl TerminalPanel {
 
     /// Map a point inside pane `rect` to a `(line, col)` in that pane's combined
     /// buffer. Mirrors the cell geometry used by the renderer (8px/4px insets).
+    /// The URL under the terminal cell at `pt`, if any (for Ctrl/Cmd+click open).
+    pub fn url_at(&self, pt: (f32, f32), layout: &Layout, cell_w: f32) -> Option<String> {
+        self.url_span_at(pt, layout, cell_w).map(|(_, url)| url)
+    }
+
+    /// The URL under `pt` plus the screen rect of its cells (for the Ctrl-hover
+    /// underline highlight).
+    pub fn url_span_at(&self, pt: (f32, f32), layout: &Layout, cell_w: f32) -> Option<(Rect, String)> {
+        if !self.visible {
+            return None;
+        }
+        let panel = layout.terminal_panel?;
+        let content = terminal_content(panel);
+        if !content.contains(pt) {
+            return None;
+        }
+        let area = terminal_pane_area(content, self.groups.len());
+        let rects = terminal_pane_rects(area, self.active_pane_count());
+        let i = rects.iter().position(|r| r.contains(pt))?;
+        let r = rects[i];
+        let pane = self.groups.get(self.active)?.panes.get(i)?;
+        let (line, col) = Self::cell_at(r, pt, cell_w, pane);
+        let chars = pane.term.line_chars(line);
+        // Prefer the shell's live cwd (OSC 7) for resolving relative paths, falling
+        // back to the workspace root the terminal was opened in.
+        let base = pane.term.cwd().unwrap_or(&self.cwd);
+        let url = url_token_at(&chars, col)
+            .or_else(|| path_token_at(&chars, col).and_then(|p| resolve_against(base, &p)))?;
+        // On-screen cell span: the whitespace-delimited token minus trailing
+        // punctuation (which `url_token_at` also trims).
+        let (s, e) = word_bounds(&chars, col);
+        let mut end = e;
+        while end > s && matches!(chars[end - 1], '.' | ',' | ';' | ':' | ')' | ']' | '}' | '>' | '"' | '\'' | '\0') {
+            end -= 1;
+        }
+        let len = end.saturating_sub(s);
+        let line_h = theme::LINE_HEIGHT();
+        let top_line = (pane.scroll.offset().1 / line_h).round() as usize;
+        let vis_row = line.saturating_sub(top_line);
+        let x0 = r.x + theme::zpx(8.0) + s as f32 * cell_w;
+        let y0 = r.y + theme::zpx(4.0) + vis_row as f32 * line_h;
+        let rect = Rect { x: x0, y: y0, w: len as f32 * cell_w, h: line_h };
+        Some((rect, url))
+    }
+
     fn cell_at(rect: Rect, pt: (f32, f32), cell_w: f32, pane: &terminal::Pane) -> (usize, usize) {
         let line_h = theme::LINE_HEIGHT();
         let x0 = rect.x + theme::zpx(8.0);
@@ -862,6 +907,75 @@ impl TerminalPanel {
 /// Word boundaries (start, end-exclusive) around `col` in `chars`: the run of
 /// non-whitespace under the cursor. On a space (or past the end) selects just that
 /// cell. Treating any non-space as a word keeps paths/URLs/flags selectable whole.
+/// The URL token covering `col`, if the whitespace-delimited run there looks like a
+/// link (http/https/file/www). Trailing punctuation that usually isn't part of a URL
+/// is trimmed.
+fn url_token_at(chars: &[char], col: usize) -> Option<String> {
+    if col >= chars.len() || chars[col].is_whitespace() {
+        return None;
+    }
+    let (s, e) = word_bounds(chars, col);
+    let mut tok: String = chars[s..e].iter().collect::<String>().trim_end_matches('\0').to_string();
+    // Strip wrapping/trailing punctuation common around links in prose/logs.
+    tok = tok.trim_end_matches(|c| matches!(c, '.' | ',' | ';' | ':' | ')' | ']' | '}' | '>' | '"' | '\'')).to_string();
+    let low = tok.to_lowercase();
+    let is_url = low.starts_with("http://")
+        || low.starts_with("https://")
+        || low.starts_with("file://")
+        || low.starts_with("www.");
+    if !is_url || tok.len() < 5 {
+        return None;
+    }
+    if low.starts_with("www.") {
+        tok = format!("https://{tok}");
+    }
+    Some(tok)
+}
+
+/// A filesystem-path-like token under `col` (existence is checked by the caller,
+/// which knows the cwd). Recognizes absolute (`/…`), home (`~/…`), explicit
+/// relative (`./…`, `../…`), and any token containing a `/` separator. Trailing
+/// prose punctuation is trimmed. URLs are intentionally excluded (handled by
+/// `url_token_at`).
+fn path_token_at(chars: &[char], col: usize) -> Option<String> {
+    if col >= chars.len() || chars[col].is_whitespace() {
+        return None;
+    }
+    let (s, e) = word_bounds(chars, col);
+    let mut tok: String = chars[s..e].iter().collect::<String>().trim_end_matches('\0').to_string();
+    tok = tok.trim_end_matches(|c| matches!(c, '.' | ',' | ';' | ':' | ')' | ']' | '}' | '>' | '"' | '\'')).to_string();
+    let low = tok.to_lowercase();
+    if low.starts_with("http://") || low.starts_with("https://") || low.starts_with("file://") || low.starts_with("www.") {
+        return None;
+    }
+    let looks_path = tok.starts_with('/')
+        || tok.starts_with("~/")
+        || tok == "~"
+        || tok.starts_with("./")
+        || tok.starts_with("../")
+        || tok.contains('/');
+    if !looks_path || tok.len() < 2 {
+        return None;
+    }
+    Some(tok)
+}
+
+/// Resolve a path-like token against `base` into an absolute path that exists on
+/// disk (file or folder). `~` expands to $HOME; relative paths join `base`.
+/// Returns the absolute path as a string (no scheme — callers distinguish it from
+/// URLs by the leading `/`).
+fn resolve_against(base: &std::path::Path, tok: &str) -> Option<String> {
+    let expanded: PathBuf = if let Some(rest) = tok.strip_prefix("~/") {
+        std::env::var_os("HOME").map(PathBuf::from)?.join(rest)
+    } else if tok == "~" {
+        std::env::var_os("HOME").map(PathBuf::from)?
+    } else {
+        PathBuf::from(tok)
+    };
+    let abs = if expanded.is_absolute() { expanded } else { base.join(expanded) };
+    abs.exists().then(|| abs.to_string_lossy().into_owned())
+}
+
 fn word_bounds(chars: &[char], col: usize) -> (usize, usize) {
     if col >= chars.len() || chars[col].is_whitespace() {
         return (col, col + 1);

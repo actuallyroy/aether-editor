@@ -605,6 +605,9 @@ pub fn GRAPH_LANE(i: u8) -> [f32; 4] {
 pub fn BADGE_BG() -> [f32; 4] { [0.0, 0.48, 0.80, 1.0] }
 pub fn BADGE_FG() -> Color { Color::rgb(0xFF, 0xFF, 0xFF) }
 pub fn DIFF_HUNK_FG() -> Color { Color::rgb(0x56, 0x9C, 0xD6) }
+/// Hyperlink blue (terminal Ctrl-hover link highlight + underline).
+pub fn LINK() -> [f32; 4] { [0.30, 0.62, 0.98, 1.0] }
+pub fn LINK_BG() -> [f32; 4] { [0.30, 0.62, 0.98, 0.16] }
 pub fn TITLE_BAR_BG() -> [f32; 4] { current().read().unwrap().title_bar_bg }
 pub fn TITLE_FG() -> Color { current().read().unwrap().title_fg }
 pub fn SEARCH_BG() -> [f32; 4] { current().read().unwrap().search_bg }

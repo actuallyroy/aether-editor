@@ -170,9 +170,32 @@ pub struct Grid {
     /// flushes them after each chunk. Apps that query and never hear back
     /// (zle, inline TUIs measuring their viewport) mis-position their redraws.
     replies: Vec<u8>,
+    /// Shell's current working directory, as reported via OSC 7
+    /// (`ESC ] 7 ; file://host/path ST`). Used to resolve relative paths printed
+    /// in the terminal (e.g. `.next/dev/logs/x.log`) when Ctrl-clicking them.
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 const MAX_SCROLLBACK: usize = 5000;
+
+/// Decode `%XX` escapes in an OSC 7 path (spaces etc. arrive percent-encoded).
+fn percent_decode(s: &str) -> Result<String, ()> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16).ok_or(())?;
+            let lo = (bytes[i + 2] as char).to_digit(16).ok_or(())?;
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| ())
+}
 
 impl Grid {
     fn new(rows: usize, cols: usize) -> Self {
@@ -183,6 +206,7 @@ impl Grid {
             scrollback: Vec::new(),
             cur_row: 0,
             cur_col: 0,
+            cwd: None,
             cur_fg: DEFAULT_FG,
             cur_bg: None,
             reverse: false,
@@ -771,7 +795,22 @@ impl Perform for Grid {
     fn hook(&mut self, _: &Params, _: &[u8], _: bool, _: char) {}
     fn put(&mut self, _: u8) {}
     fn unhook(&mut self) {}
-    fn osc_dispatch(&mut self, _: &[&[u8]], _: bool) {}
+    fn osc_dispatch(&mut self, params: &[&[u8]], _: bool) {
+        // OSC 7: working-directory report — `7 ; file://host/path`.
+        if params.len() >= 2 && params[0] == b"7" {
+            if let Ok(s) = std::str::from_utf8(params[1]) {
+                let path = s.strip_prefix("file://").map_or(s, |rest| {
+                    // Drop the host component: file://host/path → /path.
+                    rest.find('/').map_or("", |i| &rest[i..])
+                });
+                if let Ok(decoded) = percent_decode(path) {
+                    if !decoded.is_empty() {
+                        self.cwd = Some(std::path::PathBuf::from(decoded));
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub struct Terminal {
@@ -902,6 +941,11 @@ impl Terminal {
             "\x1b[B".to_string()
         };
         self.write(seq.as_bytes());
+    }
+
+    /// Shell's last-reported working directory (OSC 7), if any.
+    pub fn cwd(&self) -> Option<&std::path::Path> {
+        self.grid.cwd.as_deref()
     }
 
     /// Total scrollable lines (history + live rows). The alternate screen has no
