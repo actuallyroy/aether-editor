@@ -20,7 +20,7 @@ use crate::quad::QuadRenderer;
 use crate::theme;
 use crate::ext_detail::ExtensionDetail;
 use crate::widgets::{
-    make_ui_buffer, Dialog, Gutter, HoverCard, IconButton, IconList, ListView, Menu,
+    make_ui_buffer, make_ui_buffer_mono, Dialog, Gutter, HoverCard, IconButton, IconList, ListView, Menu,
     MenuBar, SearchField, TextInput, TextLabel,
 };
 
@@ -31,6 +31,8 @@ pub struct UiBuffers {
     pub tabs: Buffer,
     pub status: TextLabel,
     pub status_right: TextLabel,
+    pub encoding: TextLabel, // status-bar encoding label (clickable → encoding picker)
+    pub breadcrumbs: crate::ui::breadcrumbs::Breadcrumbs, // path bar below the tab strip
     pub branch_icon: TextLabel, // status-bar git-branch glyph (codicon)
     pub branch: TextLabel,      // status-bar current branch name (clickable)
     pub line_numbers: Gutter,
@@ -65,9 +67,10 @@ pub struct UiBuffers {
     pub diag_hover: HoverCard, // floating tooltip for the diagnostic under the pointer
     pub commit_card: HoverCard, // commit-graph: full message on hover
     pub ext_detail: ExtensionDetail,
+    pub panel_text: Buffer,          // PROBLEMS/OUTPUT/DEBUG CONSOLE text view (non-terminal tabs)
     pub terminal_panes: Vec<Buffer>, // one monospace grid buffer per visible split pane
     pub term_tablist: ListView,      // right-side terminal tab switcher (multi-tab only)
-
+    pub binary_placeholder: crate::ui::binary_placeholder::BinaryPlaceholder, // unsupported-file overlay
 }
 
 pub struct GpuState {
@@ -239,6 +242,8 @@ impl GpuState {
             tabs: make_ui_buffer(&mut font_system, 4000.0, theme::TAB_HEIGHT()),
             status: TextLabel::new(&mut font_system, 4000.0, theme::STATUS_BAR_HEIGHT()),
             status_right: TextLabel::new(&mut font_system, 4000.0, theme::STATUS_BAR_HEIGHT()),
+            encoding: TextLabel::new(&mut font_system, 400.0, theme::STATUS_BAR_HEIGHT()),
+            breadcrumbs: crate::ui::breadcrumbs::Breadcrumbs::new(&mut font_system),
             branch_icon: TextLabel::new(&mut font_system, 32.0, theme::STATUS_BAR_HEIGHT()),
             branch: TextLabel::new(&mut font_system, 600.0, theme::STATUS_BAR_HEIGHT()),
             line_numbers: Gutter::new(&mut font_system, theme::GUTTER_WIDTH()),
@@ -329,6 +334,7 @@ impl GpuState {
             diag_hover: HoverCard::new(&mut font_system),
             commit_card: HoverCard::new(&mut font_system),
             ext_detail: ExtensionDetail::new(&mut font_system),
+            panel_text: make_ui_buffer_mono(&mut font_system, 4000.0, 4000.0),
             terminal_panes: Vec::new(), // grown on demand as panes are split
             term_tablist: ListView::new(
                 &mut font_system,
@@ -337,6 +343,7 @@ impl GpuState {
                 theme::TREE_ROW_HEIGHT(),
                 10.0,
             ),
+            binary_placeholder: crate::ui::binary_placeholder::BinaryPlaceholder::new(&mut font_system),
         };
 
         Ok(Self {

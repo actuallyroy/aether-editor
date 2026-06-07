@@ -1,8 +1,45 @@
 // Minimal git integration: shells out to the `git` CLI to read the current branch
 // and the working-tree status. Read-only for now (staging/commit come later).
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+
+/// Cache of `cwd → repo top-level` so we resolve `git rev-parse --show-toplevel`
+/// only once per directory (it's run on every git command otherwise).
+fn toplevel_cache() -> &'static Mutex<HashMap<PathBuf, PathBuf>> {
+    static C: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The git repository top-level for `cwd`. Falls back to `cwd` itself when not a
+/// repo (or git is missing). Running every git command from the top-level keeps
+/// status paths (repo-root-relative) aligned with diff/stage pathspecs — otherwise
+/// opening a *subdirectory* of a repo breaks diffs ("No changes.").
+pub fn repo_root(cwd: &Path) -> PathBuf {
+    toplevel(cwd)
+}
+
+fn toplevel(cwd: &Path) -> PathBuf {
+    if let Some(hit) = toplevel_cache().lock().unwrap().get(cwd) {
+        return hit.clone();
+    }
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--show-toplevel"])
+        .output();
+    let top = match out {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if s.is_empty() { cwd.to_path_buf() } else { PathBuf::from(s) }
+        }
+        _ => cwd.to_path_buf(),
+    };
+    toplevel_cache().lock().unwrap().insert(cwd.to_path_buf(), top.clone());
+    top
+}
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000; // suppress the console flash on Windows
@@ -34,8 +71,9 @@ impl Change {
 }
 
 fn git(root: &Path, args: &[&str]) -> Option<String> {
+    let root = toplevel(root);
     let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(root).args(args);
+    cmd.arg("-C").arg(&root).args(args);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -85,7 +123,8 @@ pub fn discard(root: &Path, path: &str, untracked: bool) {
     if untracked {
         // An untracked entry can be a file or a whole directory (git reports the
         // latter as "dir/"); try file removal first, then recursive dir removal.
-        let target = root.join(path);
+        // `path` is repo-root-relative, so join the top-level (not cwd).
+        let target = toplevel(root).join(path);
         let _ = std::fs::remove_file(&target).or_else(|_| std::fs::remove_dir_all(&target));
     } else {
         let _ = git(root, &["restore", "--", path]);
@@ -338,6 +377,27 @@ pub fn status(root: &Path) -> Vec<Change> {
             let rest = line[3..].trim();
             let path = unquote(rest.rsplit(" -> ").next().unwrap_or(rest));
             Some(Change { staged, worktree, path })
+        })
+        .collect()
+}
+
+/// Absolute paths of everything git ignores (`!! path` lines from `git status`).
+/// Directories collapse to a single entry (e.g. `target/`), so callers must also
+/// treat a path whose ancestor is in this set as ignored. Empty outside a repo.
+pub fn ignored(root: &Path) -> std::collections::HashSet<PathBuf> {
+    let Some(out) = git(root, &["status", "--porcelain", "--ignored", "-unormal"]) else {
+        return std::collections::HashSet::new();
+    };
+    // `git status` paths are repo-root-relative, so join the top-level (not cwd).
+    let top = toplevel(root);
+    out.lines()
+        .filter_map(|line| {
+            let bytes = line.as_bytes();
+            if bytes.len() < 4 || &line[..2] != "!!" {
+                return None;
+            }
+            let rel = unquote(line[3..].trim()).trim_end_matches('/').to_string();
+            (!rel.is_empty()).then(|| top.join(rel))
         })
         .collect()
 }

@@ -237,7 +237,7 @@ impl SourceControlPanel {
             change_count: 0,
             graph: None,
             graph_buf: glyphon::Buffer::new(fs, glyphon::Metrics::new(theme::FONT_SIZE(), row_h())),
-            graph_open: true,
+            graph_open: false,
             changes_open: true,
             graph_frac: 0.45,
             graph_resizing: false,
@@ -1368,6 +1368,19 @@ impl SourceControlPanel {
     /// Current view mode (true = folder tree). Read to persist the choice.
     pub fn tree_mode(&self) -> bool {
         self.tree_mode
+    }
+
+    /// Whether the GRAPH accordion is expanded. Read to persist the choice.
+    pub fn graph_open(&self) -> bool {
+        self.graph_open
+    }
+
+    /// Restore the persisted GRAPH expanded/collapsed state on launch.
+    pub fn set_graph_open(&mut self, on: bool) {
+        if self.graph_open != on {
+            self.graph_open = on;
+            self.last_w = -1.0;
+        }
     }
 
     /// Restore the persisted view mode on launch.

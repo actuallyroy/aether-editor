@@ -46,6 +46,21 @@ pub enum WorkerMsg {
     LspSemanticRefresh { server: &'static str },                // server asked us to re-pull semantic tokens
     LspLog { server: &'static str, message: String },           // server log / stderr line
     LspExited { server: &'static str },                         // server process ended
+    // ---- Debug adapter (see dap.rs) ----
+    DebugInitialized,                                            // initialize response arrived
+    DebugConfigured,                                             // `initialized` event: send breakpoints + configurationDone
+    DebugStopped { thread_id: i64, reason: String },            // execution paused
+    DebugThreads { ids: Vec<i64> },                             // threads response (for pause)
+    DebugContinued,                                             // execution resumed
+    DebugStackTrace { frames: Vec<crate::dap::StackFrame> },    // stackTrace response
+    DebugScopes { scopes: Vec<crate::dap::Scope> },             // scopes response
+    DebugVariables { var_ref: i64, vars: Vec<crate::dap::Variable> }, // variables response
+    DebugBreakpointsVerified { path: String, lines: Vec<i64> }, // setBreakpoints response
+    DebugOutput { category: String, text: String },             // output event (stdout/stderr/console)
+    DebugRunInTerminal { seq: i64, cwd: String, args: Vec<String> }, // reverse request
+    DebugLog { text: String },                                  // adapter stderr / status
+    DebugTerminated,                                            // terminated/exited event
+    DebugExited,                                                // adapter process ended
 }
 
 /// Where a README image comes from: a remote URL or a local file path.

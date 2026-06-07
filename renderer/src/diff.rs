@@ -79,8 +79,11 @@ pub struct Diff {
 const FILE_HEADER_PAD: &str = "   ";
 
 fn git(root: &Path, args: &[&str]) -> Option<String> {
+    // Run from the repo top-level so repo-root-relative pathspecs (from `git status`)
+    // resolve correctly even when the opened folder is a subdirectory of the repo.
+    let root = crate::git::repo_root(root);
     let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(root).args(args);
+    cmd.arg("-C").arg(&root).args(args);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -170,7 +173,7 @@ pub fn compute_all(root: &Path, entries: &[(String, bool)], staged: bool) -> Dif
         b.cur_file = fidx;
         b.row(RowKind::File, None, None, &format!("{}{}", FILE_HEADER_PAD, name), "");
         if *untracked {
-            let content = std::fs::read_to_string(root.join(path)).unwrap_or_default();
+            let content = std::fs::read_to_string(crate::git::repo_root(root).join(path)).unwrap_or_default();
             let mut n = 1u32;
             for line in content.replace('\r', "").lines() {
                 b.row(RowKind::Add, None, Some(n), "", line);

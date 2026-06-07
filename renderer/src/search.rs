@@ -30,8 +30,16 @@ impl Filters {
     pub fn new(include: &str, exclude: &str) -> Self {
         Self { include: compile_globs(include), exclude: compile_globs(exclude) }
     }
+    /// Exclude-only filter from a list of glob patterns (e.g. VSCode `files.exclude`).
+    pub fn exclude_globs(patterns: &[String]) -> Self {
+        let exclude = patterns
+            .iter()
+            .filter_map(|p| Regex::new(&glob_to_regex(p.trim())).ok())
+            .collect();
+        Self { include: Vec::new(), exclude }
+    }
     /// Does this repo-relative (forward-slash) path pass the filters?
-    fn allows(&self, rel: &str) -> bool {
+    pub fn allows(&self, rel: &str) -> bool {
         if !self.include.is_empty() && !self.include.iter().any(|re| re.is_match(rel).unwrap_or(false)) {
             return false;
         }

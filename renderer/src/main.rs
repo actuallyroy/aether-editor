@@ -10,8 +10,11 @@
 mod ai;
 mod commands;
 mod completion;
+mod dap;
+mod debug_config;
 mod diff;
 mod document;
+mod encoding;
 mod ext_detail;
 mod ext_runtime;
 mod extensions;
@@ -159,6 +162,7 @@ pub(crate) enum SidebarView {
     Explorer,
     Search,
     SourceControl,
+    Debug,
     Extensions,
 }
 
@@ -317,6 +321,12 @@ pub(crate) struct App {
     pub(crate) search: Option<ui::search_panel::SearchPanel>,
     pub(crate) source_control: Option<ui::source_control_panel::SourceControlPanel>,
     pub(crate) settings_editor: ui::settings_editor::SettingsEditor,
+    pub(crate) debug: Option<ui::debug_panel::DebugPanel>,
+    pub(crate) dap: Option<dap::DapClient>,
+    pub(crate) debug_thread: Option<i64>, // thread the session is stopped on
+    pub(crate) debug_config: Option<debug_config::LaunchConfig>, // active config (for the handshake)
+    pub(crate) debug_handshook: bool,         // initialize response seen (adapter is healthy)
+    pub(crate) debug_pending_pause: bool,     // a Pause was requested; pause once threads arrive
     pub(crate) extensions_panel: Option<ui::extensions_panel::ExtensionsPanel>,
     pub(crate) extensions: Vec<Extension>,
     pub(crate) text_drag: Option<InputId>, // active mouse drag-selection in a text input
@@ -400,6 +410,8 @@ pub(crate) struct App {
     pub(crate) file_clipboard: Option<(PathBuf, bool)>, // explorer Cut/Copy: (path, is_cut)
     pub(crate) compare_select: Option<PathBuf>, // explorer "Select for Compare" anchor
     pub(crate) lsp_log: std::collections::VecDeque<String>, // ring buffer for the Output tab
+    pub(crate) debug_console: std::collections::VecDeque<String>, // debug adapter/debuggee output
+    pub(crate) panel_tab: usize, // active bottom-panel tab (index into theme::PANEL_TABS)
     pub(crate) anim_start: Instant, // monotonic clock for GIF playback
     pub(crate) cursor_icon: CursorIcon,
 }
@@ -469,6 +481,12 @@ impl App {
             search: None, // built in `resumed` once the font system exists
             source_control: None, // built in `resumed`
             settings_editor: ui::settings_editor::SettingsEditor::default(),
+            debug: None, // built in `resumed`
+            dap: None,
+            debug_thread: None,
+            debug_config: None,
+            debug_handshook: false,
+            debug_pending_pause: false,
             extensions_panel: None, // built in `resumed`
             extensions: Vec::new(),
             text_drag: None,
@@ -512,6 +530,8 @@ impl App {
             file_clipboard: None,
             compare_select: None,
             lsp_log: std::collections::VecDeque::new(),
+            debug_console: std::collections::VecDeque::new(),
+            panel_tab: theme::PANEL_ACTIVE_TAB, // default to TERMINAL
             anim_start: Instant::now(),
             cursor_icon: CursorIcon::Default,
         }
@@ -717,6 +737,20 @@ impl App {
                 changed = true;
             }
         }
+        // Breadcrumb dropdown row hover.
+        if self.gpu.as_ref().map_or(false, |g| g.ui.breadcrumbs.is_open()) {
+            let win = self.gpu.as_ref().map(|g| (g.config.width as f32, g.config.height as f32)).unwrap_or((1280.0, 800.0));
+            let row = self.gpu.as_ref().and_then(|g| {
+                g.ui.breadcrumbs.dropdown_rect(layout.breadcrumbs, win)
+                    .and_then(|r| g.ui.breadcrumbs.dropdown_item_at(r, p))
+            });
+            if let Some(g) = self.gpu.as_mut() {
+                if g.ui.breadcrumbs.hovered_row != row {
+                    g.ui.breadcrumbs.hovered_row = row;
+                    changed = true;
+                }
+            }
+        }
 
         let new_layout = if layout.palette.is_none() {
             layout.layout_btn_rects().iter().position(|r| r.contains(p))
@@ -899,6 +933,13 @@ impl App {
                 }
             }
         }
+        if self.sidebar_visible && self.sidebar_view == SidebarView::Debug {
+            if let Some(dp) = self.debug.as_mut() {
+                if dp.on_hover(p, layout.panel_region()) {
+                    changed = true;
+                }
+            }
+        }
         let det_inside = self.detail.open_extension.is_some() && layout.editor_text.contains(p);
         if self.detail.ext_detail_scroll.hover(det_inside) {
             changed = true;
@@ -1061,6 +1102,11 @@ impl App {
             self.right_split.cursor()
         } else if over_outline_row {
             CursorIcon::Pointer
+        } else if self.sidebar_visible
+            && self.sidebar_view == SidebarView::Debug
+            && self.debug.as_ref().map_or(false, |dp| dp.over_row(p, layout.panel_region()))
+        {
+            CursorIcon::Pointer
         } else if let Some(c) = chat_cursor {
             c
         } else if let Some(c) = find_cursor {
@@ -1167,6 +1213,16 @@ impl App {
                 CursorIcon::Pointer
             } else if over_md_link {
                 CursorIcon::Pointer
+            } else if self.workspace.active_doc().map_or(false, |d| d.binary)
+                && g.ui.binary_placeholder.hit_button(render::editor_region(&layout), p)
+            {
+                // "Open Anyway" button in the binary-file placeholder: clickable.
+                CursorIcon::Pointer
+            } else if self.workspace.active_doc().is_some()
+                && render::encoding_cell(layout.status_bar, g.ui.encoding.width()).contains(p)
+            {
+                // Status-bar encoding cell: clickable (opens the encoding picker).
+                CursorIcon::Pointer
             } else if layout.status_bar.contains(p) && g.ui.branch.width() > 0.0 && {
                 // Status-bar branch indicator: clickable (geometry matches render.rs).
                 let icon_x = layout.status_bar.x + theme::zpx(10.0);
@@ -1257,6 +1313,7 @@ impl App {
             if self.right_sidebar_visible { self.right_split.size() } else { 0.0 },
             (self.sidebar_visible && self.sidebar_view == SidebarView::Explorer)
                 .then_some(self.outline_open),
+            Layout::breadcrumbs_visible(self.workspace.active_doc()),
         )
     }
 
@@ -2326,7 +2383,216 @@ impl App {
                     self.terminal.maximized = false;
                 }
             }
+            ui::Intent::DebugStart { config_idx } => self.debug_start(config_idx),
+            ui::Intent::DebugStop => self.debug_stop(),
+            ui::Intent::DebugContinue => {
+                if let (Some(d), Some(t)) = (self.dap.as_mut(), self.debug_thread) {
+                    d.continue_(t);
+                    self.clear_execution_lines();
+                    self.redraw();
+                }
+            }
+            ui::Intent::DebugStepOver => {
+                if let (Some(d), Some(t)) = (self.dap.as_mut(), self.debug_thread) { d.next(t); }
+            }
+            ui::Intent::DebugStepIn => {
+                if let (Some(d), Some(t)) = (self.dap.as_mut(), self.debug_thread) { d.step_in(t); }
+            }
+            ui::Intent::DebugStepOut => {
+                if let (Some(d), Some(t)) = (self.dap.as_mut(), self.debug_thread) { d.step_out(t); }
+            }
+            ui::Intent::DebugSelectConfig(i) => {
+                if let Some(p) = self.debug.as_mut() { p.selected = i; }
+                self.redraw();
+            }
+            ui::Intent::DebugSelectFrame(_id) => { /* Phase 2: navigate to a non-top frame */ }
+            ui::Intent::DebugToggleBreakpoint { path, line } => self.debug_toggle_breakpoint(path, line),
+            ui::Intent::DebugExpandVar(var_ref) => {
+                if let Some(d) = self.dap.as_mut() {
+                    d.variables(var_ref);
+                }
+            }
+            ui::Intent::DebugAttachProcess => self.open_attach_picker(),
+            ui::Intent::DebugPause => {
+                // Suspend the running process. We don't have a thread id yet, so ask
+                // for the thread list and pause the first one when it arrives.
+                if let Some(d) = self.dap.as_mut() {
+                    self.debug_pending_pause = true;
+                    d.threads();
+                }
+            }
         }
+    }
+
+    /// List running debuggable (Python) processes and open a quick-pick to attach.
+    fn open_attach_picker(&mut self) {
+        let procs = list_debuggable_processes();
+        if procs.is_empty() {
+            self.show_info_dialog("No attachable Python processes found.\n\nStart one with debugpy, e.g.:\n  python -m debugpy --listen 5678 your_app.py");
+            return;
+        }
+        let items: Vec<commands::PickItem> = procs
+            .into_iter()
+            .map(|(pid, cmd)| commands::PickItem::at_line(cmd, format!("pid {pid}"), pid as usize))
+            .collect();
+        self.palette.open_quick_pick(commands::PickKind::AttachProcess, items);
+        if let Some(g) = self.gpu.as_mut() {
+            g.ui.palette_input.set_text(&mut g.font_system, "");
+            g.ui.palette_input.focus(true);
+        }
+        self.redraw();
+    }
+
+    /// Attach the debugger to a running process by PID (debugpy injection).
+    fn debug_attach_pid(&mut self, pid: i64) {
+        let adapter = debug_config::python_adapter();
+        let client = dap::DapClient::start(&adapter.program, &adapter.args, &self.cwd, self.worker_tx.clone());
+        match client {
+            Some(mut c) => {
+                c.initialize();
+                self.dap = Some(c);
+                self.debug_handshook = false;
+                self.debug_console.clear();
+                self.open_debug_console();
+                self.debug_config = Some(debug_config::LaunchConfig {
+                    name: format!("Attach to pid {pid}"),
+                    request: debug_config::Request::Attach,
+                    adapter,
+                    args: serde_json::json!({ "processId": pid }),
+                });
+                if let (Some(p), Some(g)) = (self.debug.as_mut(), self.gpu.as_mut()) {
+                    p.set_session(&mut g.font_system, ui::debug_panel::Session::Running);
+                }
+                self.redraw();
+            }
+            None => self.show_info_dialog(adapter.install_hint),
+        }
+    }
+
+    /// Reload launch configs for the workspace + active file into the panel.
+    fn refresh_debug_configs(&mut self) {
+        let active = self.workspace.active_doc().and_then(|d| d.path.clone());
+        let configs = debug_config::load(&self.cwd, active.as_deref());
+        if let (Some(p), Some(g)) = (self.debug.as_mut(), self.gpu.as_mut()) {
+            p.set_configs(&mut g.font_system, configs);
+        }
+        self.redraw();
+    }
+
+    /// All (abs-path, sorted 1-based lines) for files that currently have breakpoints.
+    fn debug_breakpoint_map(&self) -> Vec<(String, Vec<i64>)> {
+        self.workspace
+            .documents
+            .iter()
+            .filter_map(|d| {
+                let path = d.path.as_ref()?;
+                if d.breakpoints.is_empty() {
+                    return None;
+                }
+                let mut lines: Vec<i64> = d.breakpoints.iter().map(|&l| l as i64 + 1).collect();
+                lines.sort_unstable();
+                Some((path.to_string_lossy().into_owned(), lines))
+            })
+            .collect()
+    }
+
+    fn clear_execution_lines(&mut self) {
+        for d in self.workspace.documents.iter_mut() {
+            d.execution_line = None;
+        }
+    }
+
+    /// Append debug-adapter / debuggee output to the Debug Console buffer (the bottom
+    /// panel's DEBUG CONSOLE tab renders it live from here).
+    fn run_in_terminal_output(&mut self, text: &str) {
+        for line in text.split_inclusive('\n') {
+            let line = line.trim_end_matches('\n');
+            if !line.is_empty() {
+                self.debug_console.push_back(line.to_string());
+            }
+        }
+        while self.debug_console.len() > 5000 {
+            self.debug_console.pop_front();
+        }
+        self.redraw();
+    }
+
+    /// Show the bottom panel with the DEBUG CONSOLE tab active.
+    fn open_debug_console(&mut self) {
+        self.terminal.visible = true;
+        self.terminal.maximized = false;
+        self.panel_tab = theme::PANEL_DEBUG_CONSOLE_TAB;
+        self.redraw();
+    }
+
+    fn debug_start(&mut self, config_idx: usize) {
+        self.refresh_debug_configs();
+        let cfg = self.debug.as_ref().and_then(|p| p.configs.get(config_idx).cloned());
+        let Some(cfg) = cfg else {
+            self.show_info_dialog("No debug configuration available. Open a file or add a .vscode/launch.json.");
+            return;
+        };
+        let client = dap::DapClient::start(&cfg.adapter.program, &cfg.adapter.args, &self.cwd, self.worker_tx.clone());
+        match client {
+            Some(mut c) => {
+                c.initialize();
+                self.dap = Some(c);
+                self.debug_config = Some(cfg);
+                self.debug_handshook = false;
+                self.debug_console.clear();
+                if let (Some(p), Some(g)) = (self.debug.as_mut(), self.gpu.as_mut()) {
+                    p.set_session(&mut g.font_system, ui::debug_panel::Session::Running);
+                }
+                self.open_debug_console();
+                self.redraw();
+            }
+            None => {
+                self.show_info_dialog(cfg.adapter.install_hint);
+            }
+        }
+    }
+
+    fn debug_stop(&mut self) {
+        if let Some(d) = self.dap.as_mut() {
+            d.disconnect();
+        }
+        self.dap = None;
+        self.debug_thread = None;
+        self.debug_config = None;
+        self.clear_execution_lines();
+        if let (Some(p), Some(g)) = (self.debug.as_mut(), self.gpu.as_mut()) {
+            p.set_session(&mut g.font_system, ui::debug_panel::Session::Idle);
+        }
+        self.redraw();
+    }
+
+    fn debug_toggle_breakpoint(&mut self, path: PathBuf, line: usize) {
+        // Toggle on the matching open document.
+        let mut abs: Option<String> = None;
+        for d in self.workspace.documents.iter_mut() {
+            if d.path.as_deref() == Some(path.as_path()) {
+                d.toggle_breakpoint(line);
+                abs = Some(path.to_string_lossy().into_owned());
+                break;
+            }
+        }
+        // If a session is live, resend this file's breakpoints.
+        if let (Some(abs), Some(d)) = (abs, self.dap.as_mut()) {
+            let lines: Vec<i64> = self
+                .workspace
+                .documents
+                .iter()
+                .find(|doc| doc.path.as_deref() == Some(path.as_path()))
+                .map(|doc| {
+                    let mut v: Vec<i64> = doc.breakpoints.iter().map(|&l| l as i64 + 1).collect();
+                    v.sort_unstable();
+                    v
+                })
+                .unwrap_or_default();
+            d.set_breakpoints(&abs, &lines);
+        }
+        crate::state::save_breakpoints(&self.debug_breakpoint_map());
+        self.redraw();
     }
 
     /// Open `path` and place the caret at (1-based `line`, byte `col`).
@@ -3027,6 +3293,8 @@ impl App {
     /// Commit a quick-pick selection.
     fn exec_pick(&mut self, kind: commands::PickKind, label: &str) {
         match kind {
+            // Handled at the commit site (needs the item's PID), not by label.
+            commands::PickKind::AttachProcess => {}
             commands::PickKind::OpenRecent => {
                 let p = PathBuf::from(label);
                 if p.is_dir() {
@@ -3048,6 +3316,13 @@ impl App {
                 } else {
                     self.show_info_dialog("Couldn't switch branch — commit or stash your changes first.");
                 }
+            }
+            commands::PickKind::ReopenEncoding => {
+                let enc = encoding::static_label(label);
+                if let (Some(g), Some(d)) = (self.gpu.as_mut(), self.workspace.active_doc_mut()) {
+                    d.reopen_with_encoding(enc, &mut g.font_system);
+                }
+                self.redraw();
             }
             commands::PickKind::DeleteBranch => {
                 if git::branch(&self.cwd).as_deref() == Some(label) {
@@ -3310,7 +3585,11 @@ impl App {
                 if let Some((kind, label)) = self.palette.selected_pick() {
                     let item = self.palette.selected_item().cloned();
                     self.palette.close();
-                    if matches!(kind, commands::PickKind::Problem | commands::PickKind::Location) {
+                    if kind == commands::PickKind::AttachProcess {
+                        if let Some(pid) = item.and_then(|it| it.line) {
+                            self.debug_attach_pid(pid as i64);
+                        }
+                    } else if matches!(kind, commands::PickKind::Problem | commands::PickKind::Location) {
                         // detail = "rel/path:line" — jump straight to the diagnostic.
                         if let Some(it) = item {
                             if let Some((rel, _)) = it.detail.rsplit_once(':') {
@@ -3639,6 +3918,27 @@ impl App {
     }
 
     /// Open a branch quick-pick (Checkout / Delete) listing local branches.
+    /// Open the "Reopen with Encoding" quick-pick (status-bar encoding click).
+    fn open_encoding_pick(&mut self) {
+        if self.workspace.active_doc().and_then(|d| d.path.as_ref()).is_none() {
+            return;
+        }
+        let cur = self.workspace.active_doc().map(|d| d.encoding).unwrap_or("UTF-8");
+        let items: Vec<commands::PickItem> = encoding::ENCODINGS
+            .iter()
+            .map(|(label, _)| {
+                let detail = if *label == cur { "current" } else { "" };
+                commands::PickItem::new(*label, detail)
+            })
+            .collect();
+        self.palette.open_quick_pick(commands::PickKind::ReopenEncoding, items);
+        if let Some(g) = self.gpu.as_mut() {
+            g.ui.palette_input.set_text(&mut g.font_system, "");
+            g.ui.palette_input.focus(true);
+        }
+        self.redraw();
+    }
+
     fn open_branch_pick(&mut self, kind: commands::PickKind) {
         let cur = git::branch(&self.cwd);
         let items: Vec<commands::PickItem> = git::branches(&self.cwd)
@@ -3836,7 +4136,9 @@ impl App {
         }
         self.terminal.set_cwd(folder.clone()); // new shells start in the new root
         if let Some(scp) = self.source_control.as_mut() {
-            scp.set_root(folder.clone());
+            // Git operates on the repo top-level so status paths align with diff/stage
+            // pathspecs when the opened folder is a subdirectory of the repo.
+            scp.set_root(git::repo_root(&folder));
         }
         self.workspace.tree = crate::workspace::FileTree::new(folder);
         self.invalidate_file_index(); // new root → rebuild go-to-file index on next open
@@ -4176,6 +4478,9 @@ impl App {
         if let (Some(ep), Some(g)) = (self.extensions_panel.as_mut(), self.gpu.as_mut()) {
             ep.rezoom(&mut g.font_system);
         }
+        if let (Some(dp), Some(g)) = (self.debug.as_mut(), self.gpu.as_mut()) {
+            dp.reshape(&mut g.font_system);
+        }
         // Terminal: re-seed the cell advance and mark panes dirty so their grids
         // re-shape + reflow (cols/rows) at the new font size.
         self.terminal_cell_w = theme::FONT_SIZE() * 0.6;
@@ -4207,6 +4512,8 @@ impl App {
         let s = settings::reload();
         self.sidebar_visible = s.workbench_sidebar_visible;
         self.apply_theme_by_name(&s.workbench_color_theme);
+        // files.exclude / explorer.excludeGitIgnore changes affect tree visibility.
+        self.workspace.tree.refresh();
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.ui.line_numbers.invalidate();
             for d in self.workspace.documents.iter_mut() {
@@ -4696,6 +5003,46 @@ impl App {
             return;
         }
 
+        // Breadcrumb dropdown (folder-contents popup) is a transient overlay: a click
+        // inside it selects an entry (file → open, folder → drill in); a click outside
+        // dismisses it. A click on a breadcrumb segment opens/toggles its dropdown.
+        if self.gpu.as_ref().map_or(false, |g| g.ui.breadcrumbs.is_open()) {
+            let win = self.gpu.as_ref().map(|g| (g.config.width as f32, g.config.height as f32)).unwrap_or((1280.0, 800.0));
+            let hit = self.gpu.as_ref().and_then(|g| {
+                g.ui.breadcrumbs.dropdown_rect(layout.breadcrumbs, win)
+                    .filter(|r| r.contains((x, y)))
+                    .and_then(|r| g.ui.breadcrumbs.dropdown_item_at(r, (x, y)))
+            });
+            if let Some(i) = hit {
+                if let Some((path, is_dir)) = self.gpu.as_ref().and_then(|g| g.ui.breadcrumbs.entry(i)) {
+                    if is_dir {
+                        if let Some(g) = self.gpu.as_mut() {
+                            g.ui.breadcrumbs.drill(&mut g.font_system, path);
+                        }
+                    } else {
+                        if let Some(g) = self.gpu.as_mut() { g.ui.breadcrumbs.close(); }
+                        self.open_file_at(path, 1, 0);
+                    }
+                }
+                self.redraw();
+                return;
+            }
+            // Click outside the dropdown closes it (then falls through so a click on
+            // another segment can re-open).
+            if let Some(g) = self.gpu.as_mut() { g.ui.breadcrumbs.close(); }
+            self.redraw();
+        }
+        if layout.breadcrumbs.h > 0.0 && layout.breadcrumbs.contains((x, y)) {
+            let seg = self.gpu.as_ref().and_then(|g| g.ui.breadcrumbs.segment_at(layout.breadcrumbs, (x, y)));
+            if let Some(i) = seg {
+                if let Some(g) = self.gpu.as_mut() {
+                    g.ui.breadcrumbs.toggle(&mut g.font_system, i);
+                }
+                self.redraw();
+            }
+            return;
+        }
+
         // The Settings editor is modal: handle it before any region handler so a
         // click outside the card dismisses it (rather than landing underneath).
         if self.settings_editor.open {
@@ -4947,6 +5294,27 @@ impl App {
             }
         }
 
+        // Binary / unsupported-file placeholder: "Open Anyway" reloads the file as
+        // lossy UTF-8 text; clicks elsewhere in the overlay are inert.
+        if self.detail.open_extension.is_none()
+            && self.workspace.active_doc().map_or(false, |d| d.binary)
+        {
+            let region = render::editor_region(&layout);
+            if region.contains((x, y)) {
+                let hit = self
+                    .gpu
+                    .as_ref()
+                    .map_or(false, |g| g.ui.binary_placeholder.hit_button(region, (x, y)));
+                if hit {
+                    if let (Some(g), Some(d)) = (self.gpu.as_mut(), self.workspace.active_doc_mut()) {
+                        d.open_anyway(&mut g.font_system);
+                    }
+                    self.redraw();
+                }
+                return;
+            }
+        }
+
         // Terminal panel resize handle (top edge) — let its Splitter claim the
         // press before the focus/scroll handlers. The handle straddles the panel
         // edge, so check it ahead of the in-panel focus test below.
@@ -4955,6 +5323,24 @@ impl App {
                 if self.terminal.split.press((x, y), panel) {
                     self.terminal.maximized = false; // dragging restores from maximized
                     return;
+                }
+            }
+        }
+
+        // Bottom-panel tab bar (PROBLEMS / OUTPUT / DEBUG CONSOLE / TERMINAL / PORTS):
+        // clicking a tab switches the active view.
+        if self.terminal.visible {
+            if let Some(panel) = layout.terminal_panel {
+                let header = Rect { x: panel.x, y: panel.y, w: panel.w, h: theme::TERMINAL_HEADER_H() };
+                if header.contains((x, y)) {
+                    let hit = self.gpu.as_ref().and_then(|g| {
+                        render::panel_tab_rects(header, &g.terminal_tabs).iter().position(|r| r.contains((x, y)))
+                    });
+                    if let Some(i) = hit {
+                        self.panel_tab = i;
+                        self.redraw();
+                        return;
+                    }
                 }
             }
         }
@@ -5128,6 +5514,15 @@ impl App {
                 self.open_branch_pick(commands::PickKind::Checkout);
                 return;
             }
+            // Encoding cell (left of the zoom controls): open the encoding picker.
+            let enc_hit = self.workspace.active_doc().is_some()
+                && self.gpu.as_ref().map_or(false, |g| {
+                    render::encoding_cell(layout.status_bar, g.ui.encoding.width()).contains((x, y))
+                });
+            if enc_hit {
+                self.open_encoding_pick();
+                return;
+            }
             let cells = render::zoom_ctrl_cells(layout.status_bar);
             if cells[0].contains((x, y)) {
                 self.zoom_step(-0.1);
@@ -5146,6 +5541,7 @@ impl App {
                 0 => Some(SidebarView::Explorer),
                 1 => Some(SidebarView::Search),
                 2 => Some(SidebarView::SourceControl),
+                3 => Some(SidebarView::Debug),
                 4 => Some(SidebarView::Extensions),
                 _ => None,
             };
@@ -5162,6 +5558,9 @@ impl App {
                     if let (Some(scp), Some(g)) = (self.source_control.as_mut(), self.gpu.as_mut()) {
                         scp.refresh(&mut g.font_system);
                     }
+                }
+                if v == SidebarView::Debug {
+                    self.refresh_debug_configs();
                 }
                 if self.sidebar_view == v && self.sidebar_visible {
                     self.sidebar_visible = false;
@@ -5270,10 +5669,40 @@ impl App {
             self.register_click(x, y);
             let clicks = self.click_streak;
             let mut intents = Vec::new();
+            let graph_before = self.source_control.as_ref().map(|scp| scp.graph_open());
             let consumed = self
                 .source_control
                 .as_mut()
                 .map_or(false, |scp| scp.on_press((x, y), region, clicks, &mut intents));
+            // The GRAPH accordion toggles inside on_press (no Intent); persist if it changed.
+            if let (Some(before), Some(scp)) = (graph_before, self.source_control.as_ref()) {
+                if before != scp.graph_open() {
+                    let mut st = state::State::load();
+                    st.scm_graph_open = scp.graph_open();
+                    st.save();
+                }
+            }
+            for i in intents {
+                self.apply_intent(i);
+            }
+            if consumed {
+                self.redraw();
+                return;
+            }
+        }
+
+        // Run & Debug: toolbar buttons / config selector / call-stack frames.
+        if self.sidebar_visible
+            && self.sidebar_view == SidebarView::Debug
+            && layout.sidebar.contains((x, y))
+        {
+            let region = layout.panel_region();
+            let mut intents = Vec::new();
+            let consumed = if let (Some(dp), Some(g)) = (self.debug.as_mut(), self.gpu.as_mut()) {
+                dp.on_press((x, y), region, &mut g.font_system, &mut intents)
+            } else {
+                false
+            };
             for i in intents {
                 self.apply_intent(i);
             }
@@ -5329,11 +5758,9 @@ impl App {
                 let is_dir = self.workspace.tree.nodes[idx].is_dir;
                 if is_dir {
                     self.workspace.tree.toggle(idx);
-                } else {
-                    let path = self.workspace.tree.nodes[idx].path.clone();
-                    // Route through open_file_at so images open as image tabs.
-                    self.open_file_at(path, 1, 0);
                 }
+                // Files open on release (a click that never became a drag), so a
+                // drag-and-drop into the terminal isn't pre-empted by opening the file.
                 self.redraw();
             }
             return;
@@ -5410,6 +5837,25 @@ impl App {
                 } else if hit_uninstall {
                     self.uninstall_open();
                 }
+                return;
+            }
+        }
+
+        // Gutter click (left of the fold-chevron zone): toggle a breakpoint on that
+        // line — fold-aware via the same visual-row→line mapping the chevron uses.
+        if layout.gutter.contains((x, y))
+            && x < layout.gutter.x + layout.gutter.w - theme::zpx(18.0)
+            && self.workspace.active_doc().map_or(false, |d| d.diff.is_none() && d.info.is_none() && d.path.is_some())
+        {
+            let lh = theme::LINE_HEIGHT();
+            let hit = self.workspace.active_doc_mut().and_then(|d| {
+                let vy = y - (layout.editor_text.y + theme::EDITOR_PAD()) + d.scroll_y();
+                let vidx = (vy / lh).max(0.0) as usize;
+                let line = d.visible_index_to_line(vidx);
+                d.path.clone().map(|p| (p, line))
+            });
+            if let Some((path, line)) = hit {
+                self.debug_toggle_breakpoint(path, line);
                 return;
             }
         }
@@ -5893,6 +6339,11 @@ impl App {
                     self.move_tree_entry(&src, &dir);
                 }
                 self.redraw();
+            } else if src.is_file() {
+                // A plain click on a file (no drag) → open it now, deferred from press
+                // so a drag-and-drop into the terminal isn't pre-empted.
+                self.open_file_at(src, 1, 0);
+                self.redraw();
             }
         }
         self.tab_drag = None;
@@ -6064,6 +6515,16 @@ impl App {
             let region = layout.panel_region();
             if let Some(scp) = self.source_control.as_mut() {
                 if scp.on_wheel(p, region, dy) {
+                    self.redraw();
+                    return;
+                }
+            }
+        }
+        // Run & Debug: the call-stack/variables body scrolls.
+        if self.sidebar_visible && self.sidebar_view == SidebarView::Debug {
+            let region = layout.panel_region();
+            if let Some(dp) = self.debug.as_mut() {
+                if dp.on_wheel(p, region, dy) {
                     self.redraw();
                     return;
                 }
@@ -6828,7 +7289,16 @@ impl App {
                 d.delete_forward(&mut gpu.font_system);
             }
             Key::Named(NamedKey::Enter) => {
-                d.insert_str("\n", &mut gpu.font_system);
+                // Auto-indent: carry the current line's leading whitespace onto the
+                // new line so the cursor lands at the same indentation level.
+                let (line, _) = d.head_line_col();
+                let indent: String = d
+                    .rope
+                    .line(line)
+                    .chars()
+                    .take_while(|&c| c == ' ' || c == '\t')
+                    .collect();
+                d.insert_str(&format!("\n{indent}"), &mut gpu.font_system);
             }
             Key::Named(NamedKey::Tab) => {
                 let s = settings::current();
@@ -7328,6 +7798,123 @@ impl ApplicationHandler for App {
                     }
                     self.redraw();
                 }
+                // ---- Debug adapter events ----
+                WorkerMsg::DebugInitialized => {
+                    self.debug_handshook = true;
+                    // Adapter is up: send the launch/attach request now (per DAP order;
+                    // setBreakpoints + configurationDone wait for the `initialized` event).
+                    if let (Some(d), Some(cfg)) = (self.dap.as_mut(), self.debug_config.as_ref()) {
+                        match cfg.request {
+                            debug_config::Request::Launch => d.launch(cfg.args.clone()),
+                            debug_config::Request::Attach => d.attach(cfg.args.clone()),
+                        }
+                    }
+                }
+                WorkerMsg::DebugConfigured => {
+                    // `initialized` event: register breakpoints, then configurationDone.
+                    let bps = self.debug_breakpoint_map();
+                    if let Some(d) = self.dap.as_mut() {
+                        for (path, lines) in &bps {
+                            d.set_breakpoints(path, lines);
+                        }
+                        d.configuration_done();
+                    }
+                }
+                WorkerMsg::DebugStopped { thread_id, .. } => {
+                    self.debug_thread = Some(thread_id);
+                    if let Some(d) = self.dap.as_mut() {
+                        d.stack_trace(thread_id);
+                    }
+                }
+                WorkerMsg::DebugThreads { ids } => {
+                    // Pause was requested: suspend the first thread (debugpy stops the
+                    // whole process and reports its current frame's source).
+                    if self.debug_pending_pause {
+                        self.debug_pending_pause = false;
+                        if let (Some(d), Some(&tid)) = (self.dap.as_mut(), ids.first()) {
+                            d.pause(tid);
+                        }
+                    }
+                }
+                WorkerMsg::DebugContinued => {
+                    self.clear_execution_lines();
+                    self.redraw();
+                }
+                WorkerMsg::DebugStackTrace { frames } => {
+                    // Highlight + open the top frame's source.
+                    self.clear_execution_lines();
+                    if let Some(top) = frames.first() {
+                        if let Some(path) = top.path.clone() {
+                            self.open_file_at(PathBuf::from(&path), top.line.max(1) as usize, 0);
+                            if let Some(doc) = self.workspace.active_doc_mut() {
+                                doc.execution_line = Some((top.line.max(1) as usize).saturating_sub(1));
+                            }
+                        }
+                        // Pull variables for the top frame.
+                        if let Some(d) = self.dap.as_mut() {
+                            d.scopes(top.id);
+                        }
+                    }
+                    if let (Some(p), Some(g)) = (self.debug.as_mut(), self.gpu.as_mut()) {
+                        p.set_stopped(&mut g.font_system, frames);
+                    }
+                    self.redraw();
+                }
+                WorkerMsg::DebugScopes { scopes } => {
+                    // Hand the scopes to the panel, then fetch the variables of any it
+                    // wants open by default (Locals).
+                    let refs = if let (Some(p), Some(g)) = (self.debug.as_mut(), self.gpu.as_mut()) {
+                        p.set_scopes(&mut g.font_system, scopes);
+                        p.pending_scope_refs()
+                    } else {
+                        Vec::new()
+                    };
+                    if let Some(d) = self.dap.as_mut() {
+                        for r in refs {
+                            d.variables(r);
+                        }
+                    }
+                    self.redraw();
+                }
+                WorkerMsg::DebugVariables { var_ref, vars } => {
+                    if let (Some(p), Some(g)) = (self.debug.as_mut(), self.gpu.as_mut()) {
+                        p.set_children(&mut g.font_system, var_ref, vars);
+                    }
+                    self.redraw();
+                }
+                WorkerMsg::DebugBreakpointsVerified { .. } => {}
+                WorkerMsg::DebugOutput { text, .. } | WorkerMsg::DebugLog { text } => {
+                    self.run_in_terminal_output(&text);
+                }
+                WorkerMsg::DebugRunInTerminal { seq, cwd, args } => {
+                    // Adapter asked us to run the debuggee in a terminal.
+                    let cmd = args.join(" ");
+                    let _ = cwd;
+                    self.run_in_terminal(&cmd);
+                    if let Some(d) = self.dap.as_mut() {
+                        d.reply(seq, "runInTerminal", true, serde_json::json!({ "processId": std::process::id() }));
+                    }
+                }
+                WorkerMsg::DebugTerminated | WorkerMsg::DebugExited => {
+                    // If the adapter died before completing the handshake, it almost
+                    // certainly isn't installed — surface its install hint.
+                    let hint = if !self.debug_handshook {
+                        self.debug_config.as_ref().map(|c| c.adapter.install_hint)
+                    } else {
+                        None
+                    };
+                    self.dap = None;
+                    self.debug_thread = None;
+                    self.debug_config = None;
+                    self.clear_execution_lines();
+                    if let (Some(p), Some(g)) = (self.debug.as_mut(), self.gpu.as_mut()) {
+                        p.set_session(&mut g.font_system, ui::debug_panel::Session::Idle);
+                    }
+                    if let Some(h) = hint {
+                        self.show_info_dialog(h);
+                    }
+                    self.redraw();
+                }
             }
         }
 
@@ -7517,14 +8104,19 @@ impl ApplicationHandler for App {
                 self.gpu = Some(gpu);
                 if let Some(g) = self.gpu.as_mut() {
                     self.search = Some(ui::search_panel::SearchPanel::new(&mut g.font_system));
+                    self.debug = Some(ui::debug_panel::DebugPanel::new(&mut g.font_system));
                     self.extensions_panel =
                         Some(ui::extensions_panel::ExtensionsPanel::new(&mut g.font_system));
+                    // Use the git top-level (not the opened cwd) so status paths and
+                    // diff/stage pathspecs align when a subdirectory of a repo is open.
                     let mut scp = ui::source_control_panel::SourceControlPanel::new(
                         &mut g.font_system,
-                        self.cwd.clone(),
+                        git::repo_root(&self.cwd),
                     );
-                    // Restore the persisted tree/list view choice.
-                    scp.set_tree_mode(state::State::load().scm_tree_view);
+                    // Restore the persisted tree/list view choice + GRAPH state.
+                    let st = state::State::load();
+                    scp.set_tree_mode(st.scm_tree_view);
+                    scp.set_graph_open(st.scm_graph_open);
                     self.source_control = Some(scp);
                 }
                 self.open_initial();
@@ -7660,6 +8252,34 @@ fn reveal_in_os(path: &Path) {
 /// repeated drops form an argument list).
 fn shell_quoted(path: &Path) -> String {
     format!("'{}' ", path.to_string_lossy().replace('\'', r"'\''"))
+}
+
+/// Running processes that can be attached with debugpy (Python interpreters).
+/// Returns (pid, command-line) pairs, newest-listed first. Unix-only `ps`; empty
+/// elsewhere (the picker then shows a hint).
+fn list_debuggable_processes() -> Vec<(i64, String)> {
+    let out = match std::process::Command::new("ps").args(["-axww", "-o", "pid=,command="]).output() {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return Vec::new(),
+    };
+    let me = std::process::id() as i64;
+    let text = String::from_utf8_lossy(&out);
+    let mut v: Vec<(i64, String)> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_start();
+        let Some((pid_str, cmd)) = line.split_once(char::is_whitespace) else { continue };
+        let Ok(pid) = pid_str.trim().parse::<i64>() else { continue };
+        let cmd = cmd.trim();
+        // Only CPython processes are debugpy-attachable; skip ourselves and the picker's ps.
+        let low = cmd.to_lowercase();
+        let is_python = low.contains("python") && !low.contains("debugpy.adapter");
+        if pid == me || !is_python {
+            continue;
+        }
+        let label = if cmd.len() > 90 { format!("{}…", &cmd[..90]) } else { cmd.to_string() };
+        v.push((pid, label));
+    }
+    v
 }
 
 /// First non-existing "name copy[ N]" sibling of `dest` (Finder-style collision

@@ -97,6 +97,8 @@ pub enum PickKind {
     CreateBranch, // palette-as-input: the typed text is the new branch name
     RenameBranch, // palette-as-input: rename the current branch
     DeleteBranch, // git: delete the picked branch
+    AttachProcess, // debug: attach to the picked running process (by PID)
+    ReopenEncoding, // reopen the active file decoded with the picked text encoding
 }
 
 /// One row in a quick-pick list (dynamic, unlike the fixed `COMMANDS`).

@@ -379,7 +379,7 @@ pub fn server_for_language(lang: &str) -> bool {
 /// (CREATE_NO_WINDOW). A no-op on other platforms. ALL process spawns in this module
 /// must go through this — otherwise a probe like `node --version`, run every sync,
 /// pops a console window each time ("dancing terminals").
-fn quiet_command(program: &str) -> Command {
+pub(crate) fn quiet_command(program: &str) -> Command {
     let mut c = Command::new(program);
     #[cfg(windows)]
     {
@@ -1283,16 +1283,17 @@ fn parse_completion(result: &Value) -> Vec<CompletionItem> {
         .collect()
 }
 
-/// Frame a JSON value as a Content-Length delimited LSP message.
-fn frame(msg: &Value) -> Vec<u8> {
+/// Frame a JSON value as a Content-Length delimited message (LSP and DAP share
+/// this framing).
+pub(crate) fn frame(msg: &Value) -> Vec<u8> {
     let body = serde_json::to_vec(msg).unwrap_or_default();
     let mut out = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
     out.extend_from_slice(&body);
     out
 }
 
-/// Read one Content-Length framed message; None on EOF/error.
-fn read_message<R: BufRead>(reader: &mut R) -> Option<Value> {
+/// Read one Content-Length framed message; None on EOF/error. Shared by LSP + DAP.
+pub(crate) fn read_message<R: BufRead>(reader: &mut R) -> Option<Value> {
     let mut content_len = 0usize;
     loop {
         let mut line = String::new();

@@ -31,6 +31,12 @@ pub struct Settings {
     pub workbench_font_family: String,
     pub workbench_activitybar_visible: bool,
     pub workbench_sidebar_visible: bool,
+    /// Explorer glob patterns to hide (VSCode `files.exclude`), e.g. `**/bin`.
+    /// Only keys mapped to `true` are kept.
+    pub files_exclude: Vec<String>,
+    /// Hide anything matched by `.gitignore` from the Explorer (VSCode
+    /// `explorer.excludeGitIgnore` / `files.excludeGitIgnore`).
+    pub files_exclude_gitignore: bool,
 }
 
 impl Default for Settings {
@@ -53,6 +59,8 @@ impl Default for Settings {
             workbench_font_family: "Segoe UI".into(),
             workbench_activitybar_visible: true,
             workbench_sidebar_visible: true,
+            files_exclude: Vec::new(),
+            files_exclude_gitignore: false,
         }
     }
 }
@@ -115,6 +123,18 @@ impl Settings {
         if let Some(b) = v["workbench.sideBar.visible"].as_bool() {
             self.workbench_sidebar_visible = b;
         }
+        // files.exclude: { "**/bin": true, "**/obj": true, … } — keep keys set true.
+        if let Some(obj) = v["files.exclude"].as_object() {
+            self.files_exclude = obj
+                .iter()
+                .filter(|(_, val)| val.as_bool() == Some(true))
+                .map(|(k, _)| k.clone())
+                .collect();
+        }
+        // Accept both the explorer.* and files.* spellings VSCode has used.
+        if let Some(b) = v["explorer.excludeGitIgnore"].as_bool().or_else(|| v["files.excludeGitIgnore"].as_bool()) {
+            self.files_exclude_gitignore = b;
+        }
     }
 }
 
@@ -175,6 +195,12 @@ fn set_ui_family(name: &str) {
 pub fn word_wrap() -> bool {
     store().read().unwrap().editor_word_wrap
 }
+pub fn files_exclude() -> Vec<String> {
+    store().read().unwrap().files_exclude.clone()
+}
+pub fn files_exclude_gitignore() -> bool {
+    store().read().unwrap().files_exclude_gitignore
+}
 pub fn line_numbers() -> bool {
     store().read().unwrap().editor_line_numbers
 }
@@ -227,7 +253,7 @@ pub fn is_user_settings(path: &std::path::Path) -> bool {
 }
 
 /// Strip `//` line and `/* */` block comments from JSONC (string-aware).
-fn strip_jsonc(src: &str) -> String {
+pub(crate) fn strip_jsonc(src: &str) -> String {
     let b = src.as_bytes();
     let mut out = String::with_capacity(src.len());
     let mut i = 0;

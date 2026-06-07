@@ -8,18 +8,52 @@ use glyphon::FontSystem;
 
 use crate::document::Document;
 
+/// Heuristic for "can't be shown as text" (so we open the binary placeholder
+/// instead of garbled glyphs that break cursor movement). Mirrors git/VSCode:
+/// a NUL byte, invalid UTF-8, or a high ratio of non-text control characters
+/// (anything outside the printable range plus \t \n \r) in the leading sample.
+fn is_binary(bytes: &[u8]) -> bool {
+    let sample = &bytes[..bytes.len().min(8192)];
+    if sample.contains(&0) {
+        return true;
+    }
+    let Ok(text) = std::str::from_utf8(sample) else {
+        // Invalid UTF-8 mid-multibyte at the 8KB cut is a false positive; only
+        // bail if the whole file fails to decode.
+        return std::str::from_utf8(bytes).is_err();
+    };
+    if text.is_empty() {
+        return false;
+    }
+    let control = text
+        .chars()
+        .filter(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
+        .count();
+    control * 100 / text.chars().count().max(1) > 10
+}
+
 pub struct FileNode {
     pub path: PathBuf,
     pub name: String,
     pub is_dir: bool,
     pub depth: usize,
     pub expanded: bool,
+    /// True if git ignores this entry (or an ancestor of it). Rendered dimmed.
+    pub ignored: bool,
 }
 
 pub struct FileTree {
     pub root: PathBuf,
     pub nodes: Vec<FileNode>,
     expanded_set: HashSet<PathBuf>,
+    /// Git-ignored paths (directories collapsed). Recomputed on each rebuild.
+    ignored_set: HashSet<PathBuf>,
+}
+
+/// Should `rel` (forward-slash workspace-relative path) be hidden from the tree?
+/// Combines VSCode's `files.exclude` globs and `explorer.excludeGitIgnore`.
+fn should_hide(rel: &str, excludes: &crate::search::Filters, gitignored: bool, hide_gitignored: bool) -> bool {
+    (hide_gitignored && gitignored) || !excludes.allows(rel)
 }
 
 impl FileTree {
@@ -28,7 +62,9 @@ impl FileTree {
             root,
             nodes: Vec::new(),
             expanded_set: HashSet::new(),
+            ignored_set: HashSet::new(),
         };
+        t.refresh_ignored();
         t.rebuild();
         t
     }
@@ -36,6 +72,18 @@ impl FileTree {
     pub fn rebuild(&mut self) {
         self.nodes.clear();
         self.add_children(&self.root.clone(), 0);
+    }
+
+    /// Recompute the git-ignored set (shells out to git, so call only on real
+    /// changes — initial load, refresh, git ops — not on every folder toggle).
+    pub fn refresh_ignored(&mut self) {
+        self.ignored_set = crate::git::ignored(&self.root);
+    }
+
+    /// Whether `path` is git-ignored (directly, or via an ignored ancestor dir).
+    fn is_ignored(&self, path: &Path) -> bool {
+        self.ignored_set.contains(path)
+            || self.ignored_set.iter().any(|ig| path.starts_with(ig))
     }
 
     fn add_children(&mut self, dir: &Path, depth: usize) {
@@ -59,7 +107,15 @@ impl FileTree {
             (false, true) => std::cmp::Ordering::Greater,
             _ => a.1.to_lowercase().cmp(&b.1.to_lowercase()),
         });
+        // VSCode-style hiding: `files.exclude` globs + `explorer.excludeGitIgnore`.
+        let excludes = crate::search::Filters::exclude_globs(&crate::settings::files_exclude());
+        let hide_gitignored = crate::settings::files_exclude_gitignore();
         for (path, name, is_dir) in children {
+            let ignored = self.is_ignored(&path);
+            let rel = path.strip_prefix(&self.root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+            if should_hide(&rel, &excludes, ignored, hide_gitignored) {
+                continue;
+            }
             let expanded = is_dir && self.expanded_set.contains(&path);
             self.nodes.push(FileNode {
                 path: path.clone(),
@@ -67,6 +123,7 @@ impl FileTree {
                 is_dir,
                 depth,
                 expanded,
+                ignored,
             });
             if expanded {
                 self.add_children(&path, depth + 1);
@@ -76,6 +133,7 @@ impl FileTree {
 
     /// Re-read the tree from disk (preserving which folders are expanded).
     pub fn refresh(&mut self) {
+        self.refresh_ignored();
         self.rebuild();
     }
 
@@ -159,8 +217,23 @@ impl Workspace {
                 return Ok(());
             }
         }
-        let contents = std::fs::read_to_string(path)?;
-        let doc = Document::new(Some(path.to_path_buf()), contents, fs);
+        // Read bytes first: a binary file (NUL byte) or non-UTF-8 content can't be
+        // shown as text, so open a placeholder tab ("Open Anyway" reloads it lossily).
+        let bytes = std::fs::read(path)?;
+        if is_binary(&bytes) {
+            self.documents.push(Document::new_binary(path.to_path_buf(), fs));
+            self.active = Some(self.documents.len() - 1);
+            return Ok(());
+        }
+        let contents = String::from_utf8_lossy(&bytes).into_owned();
+        let mut doc = Document::new(Some(path.to_path_buf()), contents, fs);
+        // Restore persisted debug breakpoints for this file (stored as 1-based lines).
+        let key = path.to_string_lossy();
+        for (p, lines) in crate::state::load_breakpoints() {
+            if p == key {
+                doc.breakpoints = lines.iter().map(|&l| (l.max(1) as usize).saturating_sub(1)).collect();
+            }
+        }
         self.documents.push(doc);
         self.active = Some(self.documents.len() - 1);
         Ok(())

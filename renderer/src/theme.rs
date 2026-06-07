@@ -235,6 +235,12 @@ fn blend(fg: (u8, u8, u8, f32), bg: (u8, u8, u8, f32), t: f32) -> Color {
     Color::rgb(mix(fg.0, bg.0), mix(fg.1, bg.1), mix(fg.2, bg.2))
 }
 
+/// Fade a color `t` of the way toward the editor background (0 = unchanged,
+/// 1 = fully background). Used to dim git-ignored explorer entries.
+pub fn dim(c: Color, t: f32) -> Color {
+    blend(rgb_tuple(c), quad_tuple(SIDEBAR_BG()), t)
+}
+
 fn rgb_tuple(c: Color) -> (u8, u8, u8, f32) {
     (c.r(), c.g(), c.b(), 1.0)
 }
@@ -735,19 +741,11 @@ pub fn symbol_icon(kind: &str) -> (char, Color) {
 pub fn folder_icon(name: &str, open: bool) -> (char, Color) {
     // A twistie chevron (▾ open / ▸ collapsed) rather than a folder glyph — the
     // expand/collapse affordance reads more clearly than open/closed folder art.
+    let _ = name;
     let g = if open { ICON_CHEVRON_DOWN } else { ICON_CHEVRON_RIGHT };
-    let base = current().read().unwrap().icon_folder_color;
-    let c = |r, gg, b| Color::rgb(r, gg, b);
-    let col = match name.to_ascii_lowercase().as_str() {
-        ".git" => c(0xE0, 0x6C, 0x4E),
-        "node_modules" | "vendor" | "target" | "dist" | "build" | "out" | ".next" | "bin" | "obj" => {
-            c(0x7A, 0x7E, 0x86)
-        }
-        ".github" | ".vscode" | ".idea" | ".cargo" => c(0x6B, 0x8A, 0xB0),
-        "assets" | "images" | "img" | "media" | "public" | "static" => c(0xA0, 0x74, 0xC4),
-        "test" | "tests" | "__tests__" | "spec" | "specs" => c(0x89, 0xD1, 0x85),
-        _ => base,
-    };
+    // The twistie chevron is a pure expand/collapse affordance — keep it one
+    // uniform color for every folder rather than tinting by folder name.
+    let col = current().read().unwrap().icon_folder_color;
     (g, col)
 }
 
@@ -832,6 +830,20 @@ pub const ICON_CLOSE: char = '\u{ea76}';
 pub const ICON_ACCOUNT: char = '\u{eb99}';
 pub const ICON_SETTINGS: char = '\u{eb51}';
 pub const ICON_CHECK: char = '\u{eab2}';
+// Run & Debug toolbar (codicon).
+pub const ICON_DEBUG_START: char = '\u{ead3}';
+pub const ICON_DEBUG_CONTINUE: char = '\u{eacf}';
+pub const ICON_DEBUG_PAUSE: char = '\u{ead1}';
+pub const ICON_DEBUG_STOP: char = '\u{ead7}';
+pub const ICON_DEBUG_STEP_OVER: char = '\u{ead6}';
+pub const ICON_DEBUG_STEP_INTO: char = '\u{ead4}';
+pub const ICON_DEBUG_STEP_OUT: char = '\u{ead5}';
+pub const ICON_DEBUG_RESTART: char = '\u{ead2}';
+pub const ICON_DEBUG_STACKFRAME: char = '\u{eb89}'; // active-frame arrow (execution line)
+pub const ICON_DEBUG_ATTACH: char = '\u{eb7b}'; // vm-running (attach to a running process)
+// Breakpoint / execution-line colors.
+pub fn BREAKPOINT() -> [f32; 4] { [0.86, 0.27, 0.24, 1.0] } // red dot
+pub fn EXECUTION_LINE_BG() -> [f32; 4] { [0.93, 0.78, 0.26, 0.18] } // amber line band
 pub const ICON_CHEVRON_DOWN: char = '\u{eab4}';
 pub const ICON_CHEVRON_RIGHT: char = '\u{eab6}';
 pub const ICON_CHEVRON_UP: char = '\u{eab7}';
@@ -917,6 +929,7 @@ pub fn SIDEBAR_MIN_WIDTH() -> f32 { 120.0 * ui_zoom() }
 pub fn SIDEBAR_MAX_WIDTH() -> f32 { 600.0 * ui_zoom() }
 pub fn SIDEBAR_RESIZE_HANDLE() -> f32 { 6.0 * ui_zoom() }
 pub fn TAB_HEIGHT() -> f32 { 34.0 * ui_zoom() }
+pub fn BREADCRUMB_HEIGHT() -> f32 { 22.0 * ui_zoom() }
 pub fn STATUS_BAR_HEIGHT() -> f32 { 22.0 * ui_zoom() }
 pub fn GUTTER_WIDTH() -> f32 { 56.0 * ui_zoom() }
 pub fn EDITOR_PAD() -> f32 { 12.0 * ui_zoom() }
@@ -933,7 +946,10 @@ pub fn TERMINAL_HEADER_H() -> f32 { 32.0 * ui_zoom() } // panel header (tabs + b
 
 /// Bottom-panel tabs (VSCode layout). Index 3 (TERMINAL) is the active stub.
 pub const PANEL_TABS: &[&str] = &["PROBLEMS", "OUTPUT", "DEBUG CONSOLE", "TERMINAL", "PORTS"];
-pub const PANEL_ACTIVE_TAB: usize = 3;
+pub const PANEL_ACTIVE_TAB: usize = 3; // default tab (TERMINAL)
+pub const PANEL_OUTPUT_TAB: usize = 1;
+pub const PANEL_DEBUG_CONSOLE_TAB: usize = 2;
+pub const PANEL_TERMINAL_TAB: usize = 3;
 pub fn PALETTE_WIDTH() -> f32 { 620.0 * ui_zoom() }
 // Row height matches the UI line height so the selection pill aligns with the text.
 pub fn PALETTE_ROW_HEIGHT() -> f32 { UI_LINE_HEIGHT() }

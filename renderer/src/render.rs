@@ -25,7 +25,7 @@ use crate::{
 
 /// Left-to-right rects for the panel-header tab labels, sized to each label's
 /// measured width. Shared by the underline (quad phase) and the text (areas phase).
-fn panel_tab_rects(header: Rect, tabs: &[crate::widgets::TextLabel]) -> Vec<Rect> {
+pub(crate) fn panel_tab_rects(header: Rect, tabs: &[crate::widgets::TextLabel]) -> Vec<Rect> {
     let pad_l = theme::zpx(12.0);
     let gap = theme::zpx(18.0);
     let mut x = header.x + pad_l;
@@ -159,6 +159,17 @@ pub(crate) fn zoom_ctrl_cells(status: Rect) -> [Rect; 3] {
     [minus, pct, plus]
 }
 
+/// Clickable status-bar encoding cell, placed just left of the zoom controls.
+/// `label_w` is the shaped width of the encoding label. Single source of truth
+/// shared by render (background + label), hover, and the click handler.
+pub(crate) fn encoding_cell(status: Rect, label_w: f32) -> Rect {
+    let z = theme::ui_zoom();
+    let zoom_left = zoom_ctrl_cells(status)[0].x;
+    let pad = 8.0 * z;
+    let w = label_w + 12.0 * z;
+    Rect { x: zoom_left - pad - w, y: status.y, w, h: status.h }
+}
+
 /// Zoom-control overlay cells [zoom_out, percent, zoom_in, fit], a pill at the
 /// bottom-centre of the image region.
 pub(crate) fn image_ctrl_cells(region: Rect) -> [Rect; 4] {
@@ -201,6 +212,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         if app.right_sidebar_visible { app.right_split.size() } else { 0.0 },
         (app.sidebar_visible && app.sidebar_view == SidebarView::Explorer)
             .then_some(app.outline_open),
+        Layout::breadcrumbs_visible(app.workspace.active_doc()),
     );
 
     // editor.wordWrap — wrap the active document to the editor width (or disable).
@@ -263,6 +275,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     if app.sidebar_visible && app.sidebar_view == SidebarView::SourceControl {
         if let Some(scp) = app.source_control.as_mut() {
             scp.update(&mut gpu.font_system, layout.panel_region());
+        }
+    }
+    if app.sidebar_visible && app.sidebar_view == SidebarView::Debug {
+        if let Some(dp) = app.debug.as_mut() {
+            dp.update(&mut gpu.font_system, layout.panel_region());
         }
     }
     // Explorer OUTLINE section: created on first use, rows rebuilt from the
@@ -353,6 +370,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             SidebarView::Extensions => "EXTENSIONS",
             SidebarView::Search => "SEARCH",
             SidebarView::SourceControl => "SOURCE CONTROL",
+            SidebarView::Debug => "RUN AND DEBUG",
             SidebarView::Explorer => "EXPLORER",
         };
         gpu.ui.sidebar_header.set(fs, header, theme::UI_FAMILY());
@@ -406,11 +424,17 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                         let (g, c) = theme::file_icon(&node.name);
                         (g, c, 1.0)
                     };
-                    sidebar_key.push_str(&format!("{}{}{}\n", node.depth, glyph, node.name));
+                    // Git-ignored entries render dimmed (icon + label).
+                    let (color, label_c) = if node.ignored {
+                        (theme::dim(color, 0.25), theme::dim(name_c, 0.15))
+                    } else {
+                        (color, name_c)
+                    };
+                    sidebar_key.push_str(&format!("{}{}{}{}\n", node.depth, node.ignored as u8, glyph, node.name));
                     crate::widgets::IconRow {
                         depth: node.depth,
                         icon: Some((glyph, color, scale)),
-                        label: vec![(node.name.clone(), name_c)],
+                        label: vec![(node.name.clone(), label_c)],
                     }
                 })
                 .collect();
@@ -504,7 +528,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             (
                 format!(" {}{}", path, dirty),
                 format!(
-                    "Ln {}, Col {}    {}    UTF-8    {}    {}{}    ",
+                    "Ln {}, Col {}    {}    {}    {}{}    ",
                     line + 1,
                     col + 1,
                     indent,
@@ -516,6 +540,16 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         } else {
             ("Aether".to_string(), String::new())
         };
+        // The encoding sits in its own clickable cell (see the status-bar draw pass).
+        let encoding_label = app.workspace.active_doc().map(|d| d.encoding).unwrap_or("UTF-8");
+        gpu.ui.encoding.set(fs, encoding_label, theme::UI_FAMILY());
+        // Breadcrumbs: shape the active file's path segments (the component owns its
+        // per-segment layout + the click dropdown).
+        if layout.breadcrumbs.h > 0.0 {
+            if let Some(path) = app.workspace.active_doc().and_then(|d| d.path.clone()) {
+                gpu.ui.breadcrumbs.set_path(fs, &app.cwd, &path);
+            }
+        }
         // Diagnostic hover is shown as a floating card (see the overlay pass below),
         // not in the status bar — the status bar keeps showing the file path.
         gpu.ui.status.set(fs, &status_text, theme::UI_FAMILY());
@@ -530,6 +564,23 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         gpu.ui.branch_icon.set(fs, &theme::ICON_SOURCE_CONTROL.to_string(), theme::ICON_FAMILY);
         gpu.ui.branch.set(fs, &branch_name, theme::UI_FAMILY());
         gpu.ui.zoom_pct.set(fs, &format!("{}%", (theme::ui_zoom() * 100.0).round() as i32), theme::UI_FAMILY());
+
+        // Bottom-panel text view (PROBLEMS / OUTPUT / DEBUG CONSOLE) — shaped here
+        // while the font system is mutable; drawn in the panel block below.
+        if app.terminal.visible && app.panel_tab != theme::PANEL_TERMINAL_TAB {
+            let join = |q: &std::collections::VecDeque<String>, empty: &str| {
+                if q.is_empty() { empty.to_string() } else { q.iter().cloned().collect::<Vec<_>>().join("\n") }
+            };
+            let text = match app.panel_tab {
+                t if t == theme::PANEL_DEBUG_CONSOLE_TAB => join(&app.debug_console, "(waiting for debug output…)"),
+                t if t == theme::PANEL_OUTPUT_TAB => join(&app.lsp_log, "(no output yet)"),
+                0 => "No problems have been detected in the workspace.".to_string(),
+                _ => String::new(),
+            };
+            gpu.ui.panel_text.set_metrics(fs, glyphon::Metrics::new(theme::FONT_SIZE(), theme::LINE_HEIGHT()));
+            gpu.ui.panel_text.set_text(fs, &text, Attrs::new().family(Family::Name(theme::MONO_FAMILY())), Shaping::Advanced);
+            gpu.ui.panel_text.shape_until_scroll(fs, false);
+        }
 
         // Source Control change-count badge text (capped at 99+).
         let scm_count = app.source_control.as_ref().map_or(0, |s| s.change_count());
@@ -873,6 +924,10 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             if let Some(scp) = app.source_control.as_ref() {
                 scp.draw_quads(layout.panel_region(), app.cursor_blink_on, now, &mut bg_quads, &mut fg_quads);
             }
+        } else if app.sidebar_view == SidebarView::Debug {
+            if let Some(dp) = app.debug.as_ref() {
+                dp.draw_quads(layout.panel_region(), now, &mut bg_quads, &mut fg_quads);
+            }
         }
     }
     // Explorer OUTLINE section chrome: header divider, hover row, scrollbar.
@@ -912,6 +967,13 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     }
     // Tab strip bg
     bg_quads.push(layout.tab_strip.quad(theme::TAB_BAR_BG()));
+    // Breadcrumb bar bg + bottom seam (drawn between the tab strip and editor).
+    if layout.breadcrumbs.h > 0.0 {
+        let bc = layout.breadcrumbs;
+        let be = theme::BG_EDITOR();
+        bg_quads.push(bc.quad([be.r as f32, be.g as f32, be.b as f32, be.a as f32]));
+        bg_quads.push(Quad::new(bc.x, bc.y + bc.h - 1.0, bc.w, 1.0, theme::PANEL_BORDER()));
+    }
     // Per-tab styling — geometry from the single-source tab rects. (Inline rather
     // than App::tab_count/active_tab so we don't borrow all of `app` while `gpu` is
     // mutably held; the fields here are disjoint from `app.gpu`.)
@@ -969,6 +1031,15 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         theme::BG_EDITOR().b as f32,
         theme::BG_EDITOR().a as f32,
     ]));
+
+    // Binary / unsupported-file placeholder button — drawn AFTER the editor bg fill
+    // so its solid background isn't painted over.
+    if app.detail.open_extension.is_none() && app.workspace.active_doc().map_or(false, |d| d.binary) {
+        let pt = (app.mouse_pos.x as f32, app.mouse_pos.y as f32);
+        gpu.ui.binary_placeholder.prepare(&mut gpu.font_system);
+        let hovered = gpu.ui.binary_placeholder.hit_button(editor_full, pt);
+        gpu.ui.binary_placeholder.draw_quads(editor_full, hovered, &mut bg_quads);
+    }
 
     // Extension detail page chrome (icon tile, Install, tabs, sidebar separator).
     if app.detail.open_extension.is_some() {
@@ -1426,6 +1497,30 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             }
         }
 
+        // Debug: breakpoint dots in the gutter + the current execution-line band.
+        if d.diff.is_none() && d.info.is_none() && (!d.breakpoints.is_empty() || d.execution_line.is_some()) {
+            let g = layout.gutter;
+            let dot = theme::zpx(9.0);
+            for run in d.buffer.layout_runs() {
+                let line = run.line_i;
+                if d.is_line_hidden(line) {
+                    continue;
+                }
+                let line_y = layout.editor_text.y + theme::EDITOR_PAD() + run.line_top - d.scroll_y() - foff(line);
+                if d.execution_line == Some(line) {
+                    if let Some((qy, qh)) = clip_v(line_y, run.line_height) {
+                        bg_quads.push(Quad::new(layout.editor_text.x, qy, layout.editor_text.w, qh, theme::EXECUTION_LINE_BG()));
+                    }
+                }
+                if d.breakpoints.contains(&line) {
+                    let cy = line_y + (run.line_height - dot) * 0.5;
+                    if let Some((qy, qh)) = clip_v(cy, dot) {
+                        bg_quads.push(Rect { x: g.x + theme::zpx(6.0), y: qy, w: dot, h: qh }.rounded_quad(theme::BREAKPOINT(), dot * 0.5));
+                    }
+                }
+            }
+        }
+
         // Cursor (foreground so it sits over glyphs) — gated by blink. Read-only
         // tabs (images, diffs) have nothing to edit, so they show no caret. Also
         // suppressed when a modal (palette/dialog) owns the screen or the find
@@ -1567,7 +1662,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         bg_quads.push(Quad::new(content.x, content.y - 1.0, content.w, 1.0, theme::PANEL_BORDER()));
         // Active panel tab underline (text + buttons are drawn in the areas phase).
         let header = Rect { x: panel.x, y: panel.y, w: panel.w, h: theme::TERMINAL_HEADER_H() };
-        if let Some(r) = panel_tab_rects(header, &gpu.terminal_tabs).get(theme::PANEL_ACTIVE_TAB) {
+        if let Some(r) = panel_tab_rects(header, &gpu.terminal_tabs).get(app.panel_tab) {
             bg_quads.push(Quad::new(r.x, header.y + header.h - theme::zpx(2.0), r.w, theme::zpx(2.0), theme::ACCENT()));
         }
         let char_w = app.terminal_cell_w;
@@ -1871,6 +1966,10 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             if let Some(scp) = app.source_control.as_ref() {
                 scp.draw_text(layout.panel_region(), &mut areas);
             }
+        } else if app.sidebar_view == SidebarView::Debug {
+            if let Some(dp) = app.debug.as_ref() {
+                dp.draw_text(layout.panel_region(), &mut areas);
+            }
         }
     }
     // Explorer OUTLINE section text: chevron header + symbol rows.
@@ -1947,6 +2046,13 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             .draw(Layout::tab_close_rect(*tab), close_color, &mut areas);
     }
 
+    // Breadcrumb path bar (per-segment labels; the component owns its layout).
+    if layout.breadcrumbs.h > 0.0 {
+        let pt = (app.mouse_pos.x as f32, app.mouse_pos.y as f32);
+        let hov = ui.breadcrumbs.segment_at(layout.breadcrumbs, pt);
+        ui.breadcrumbs.draw(layout.breadcrumbs, hov, &mut areas);
+    }
+
     // Editor area: either the extension detail page or the document.
     if app.detail.open_extension.is_some() {
         let size_of = |k: &str| gpu.media.size(k);
@@ -1988,6 +2094,10 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             // reading column (its quads are added in the quad-build phase above).
             let body = crate::ui::info_page::InfoPage::body(editor_region(&layout));
             page.draw(body, d.scroll_y(), &mut areas);
+        } else if d.binary {
+            // Binary / unsupported-encoding placeholder (its button quad was added
+            // in the quad phase above). The widget owns its centered layout.
+            ui.binary_placeholder.draw(editor_region(&layout), &mut areas);
         } else if let Some(right) = d.diff_right.as_ref() {
             // Side-by-side diff: two gutters + two text panes over the full region.
             // Geometry (incl. the reserved per-block action column) comes from the
@@ -2188,9 +2298,23 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         .draw_left(layout.status_bar, branch_block_w.max(theme::zpx(12.0)), theme::STATUS_BAR_FG(), &mut areas);
     // Window-zoom control (− % +) pinned to the right; status info is padded left of it.
     let zoom_cells = zoom_ctrl_cells(layout.status_bar);
-    ui.status_right
-        .draw_right(layout.status_bar, 8.0 + (layout.status_bar.x + layout.status_bar.w - zoom_cells[0].x), theme::STATUS_BAR_FG(), &mut areas);
     let sfg = theme::STATUS_BAR_FG();
+    // Encoding cell (clickable) sits just left of the zoom controls; the rest of the
+    // right-hand status info is padded to end left of the encoding cell.
+    let enc_cell = if app.workspace.active_doc().is_some() {
+        let cell = encoding_cell(layout.status_bar, ui.encoding.width());
+        let pt = (app.mouse_pos.x as f32, app.mouse_pos.y as f32);
+        if cell.contains(pt) {
+            bg_quads.push(cell.quad(theme::MENU_HOVER()));
+        }
+        ui.encoding.push(cell.x + (cell.w - ui.encoding.width()) * 0.5, cell, sfg, &mut areas);
+        Some(cell)
+    } else {
+        None
+    };
+    let right_anchor = enc_cell.map(|c| c.x).unwrap_or(zoom_cells[0].x);
+    ui.status_right
+        .draw_right(layout.status_bar, 8.0 + (layout.status_bar.x + layout.status_bar.w - right_anchor), sfg, &mut areas);
     for (lbl, c) in [
         (&ui.zoom_minus, zoom_cells[0]),
         (&ui.zoom_pct, zoom_cells[1]),
@@ -2206,13 +2330,10 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         if let Some(panel) = layout.terminal_panel {
             let content = crate::terminal_content(panel);
             let header = Rect { x: panel.x, y: panel.y, w: panel.w, h: theme::TERMINAL_HEADER_H() };
-            // Tab labels (active = bright, others dimmed).
+            // Tab labels (active = bright, others dimmed) + accent underline on active.
             for (i, r) in panel_tab_rects(header, &gpu.terminal_tabs).into_iter().enumerate() {
-                let color = if i == theme::PANEL_ACTIVE_TAB {
-                    theme::FG_ACTIVE()
-                } else {
-                    theme::FG_DIM()
-                };
+                let active = i == app.panel_tab;
+                let color = if active { theme::FG_ACTIVE() } else { theme::FG_DIM() };
                 gpu.terminal_tabs[i].push(r.x, r, color, &mut areas);
             }
             // Right-side icon buttons.
@@ -2221,6 +2342,28 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     b.draw(r, theme::FG_TEXT(), &mut areas);
                 }
             }
+            // Non-terminal tabs render a scrollable text view (shaped above), tailed to
+            // the bottom so the latest output is visible.
+            if app.panel_tab != theme::PANEL_TERMINAL_TAB {
+                let lh = theme::LINE_HEIGHT();
+                let view_h = (content.h - theme::zpx(8.0)).max(lh);
+                let total = gpu.ui.panel_text.layout_runs().count() as f32 * lh;
+                let scroll = (total - view_h).max(0.0); // pin to bottom
+                areas.push(TextArea {
+                    buffer: &gpu.ui.panel_text,
+                    left: content.x + theme::zpx(8.0),
+                    top: content.y + theme::zpx(4.0) - scroll,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: content.x as i32,
+                        top: content.y as i32,
+                        right: (content.x + content.w) as i32,
+                        bottom: (content.y + content.h) as i32,
+                    },
+                    default_color: theme::FG_TEXT(),
+                    custom_glyphs: &[],
+                });
+            } else {
             // Each split pane's grid text in the active tab, clipped to its column.
             let area = crate::terminal_pane_area(content, app.terminal.groups.len());
             let n = app.terminal.groups.get(app.terminal.active).map_or(0, |g| g.panes.len());
@@ -2253,6 +2396,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     );
                 }
             }
+            } // end: terminal-tab content (else branch)
         }
     }
     } // end: background text
@@ -2666,6 +2810,44 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             }
             gpu.queue.submit(Some(encm.finish()));
         }
+    }
+
+    // ---- Breadcrumb dropdown overlay (folder contents popup) ----
+    if let Some(menu) = gpu.ui.breadcrumbs.dropdown_rect(layout.breadcrumbs, (cfg_w as f32, cfg_h as f32)) {
+        let mut mq: Vec<Quad> = Vec::new();
+        gpu.ui.breadcrumbs.draw_dropdown_quads(menu, &mut mq);
+        gpu.quad_renderer
+            .prepare(&gpu.device, &gpu.queue, &mq, &[], (cfg_w, cfg_h));
+        let mut mareas: Vec<TextArea> = Vec::new();
+        gpu.ui.breadcrumbs.draw_dropdown(menu, &mut mareas);
+        gpu.text_renderer.prepare(
+            &gpu.device,
+            &gpu.queue,
+            &mut gpu.font_system,
+            &mut gpu.atlas,
+            &gpu.viewport,
+            mareas,
+            &mut gpu.swash_cache,
+        )?;
+        let mut encm = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("aether-breadcrumb-pass"),
+        });
+        {
+            let mut pass = encm.begin_render_pass(&RenderPassDescriptor {
+                label: Some("aether-breadcrumb"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            gpu.quad_renderer.render_bg(&mut pass);
+            gpu.text_renderer.render(&gpu.atlas, &gpu.viewport, &mut pass)?;
+        }
+        gpu.queue.submit(Some(encm.finish()));
     }
 
     // ---- Command palette overlay ----

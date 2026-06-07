@@ -11,6 +11,8 @@
 
 use std::path::PathBuf;
 
+pub mod binary_placeholder;
+pub mod breadcrumbs;
 pub mod editor_view;
 pub mod explorer_panel;
 pub mod find_widget;
@@ -19,6 +21,7 @@ pub mod info_page;
 pub mod outline_panel;
 pub mod ext_detail_view;
 pub mod extensions_panel;
+pub mod debug_panel;
 pub mod search_panel;
 pub mod settings_editor;
 pub mod source_control_panel;
@@ -89,4 +92,17 @@ pub enum Intent {
     GitOpenRenameBranch,
     /// Open the branch quick-pick to delete a branch.
     GitOpenDeleteBranch,
+    /// ---- Run & Debug ----
+    DebugStart { config_idx: usize }, // start the selected launch config
+    DebugStop,
+    DebugContinue,
+    DebugStepOver,
+    DebugStepIn,
+    DebugStepOut,
+    DebugSelectConfig(usize),         // change the active launch config
+    DebugSelectFrame(i64),            // jump to a stack frame's source
+    DebugToggleBreakpoint { path: PathBuf, line: usize }, // gutter click
+    DebugAttachProcess,               // open the running-process picker (attach by PID)
+    DebugPause,                       // suspend a running process to reveal where it is
+    DebugExpandVar(i64),              // lazily fetch a variable/scope's children
 }

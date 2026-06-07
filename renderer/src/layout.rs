@@ -32,6 +32,7 @@ pub struct Layout {
     pub activity_bar: Rect,
     pub sidebar: Rect,
     pub tab_strip: Rect,
+    pub breadcrumbs: Rect, // path bar below the tab strip (h == 0 when hidden)
     pub gutter: Rect,
     pub editor_text: Rect,
     pub status_bar: Rect,
@@ -51,6 +52,20 @@ pub struct PaletteLayout {
 }
 
 impl Layout {
+    /// Whether the breadcrumb path bar should show for `doc`: a regular file tab
+    /// (has a path, not a diff/image/info/graph/binary view). Single source of
+    /// truth shared by both `Layout::compute` call sites.
+    pub fn breadcrumbs_visible(doc: Option<&crate::document::Document>) -> bool {
+        doc.map_or(false, |d| {
+            d.path.is_some()
+                && d.diff.is_none()
+                && d.image.is_none()
+                && d.info.is_none()
+                && d.graph.is_none()
+                && !d.binary
+        })
+    }
+
     pub fn compute(
         w: f32,
         h: f32,
@@ -69,6 +84,8 @@ impl Layout {
         // Explorer OUTLINE section: None = not showing (other sidebar view),
         // Some(open) = header visible, body expanded when `open`.
         explorer_outline: Option<bool>,
+        // True when the active tab is a regular file → show the breadcrumb path bar.
+        show_breadcrumbs: bool,
     ) -> Self {
         let tb = theme::TITLE_BAR_H();
         let title_bar = Rect { x: 0.0, y: 0.0, w, h: tb };
@@ -109,7 +126,15 @@ impl Layout {
         // The find/replace widget floats over the editor's top-right (it doesn't
         // push the editor down), so no vertical reservation here.
         let _ = find_active;
-        let editor_y = tb + tab_strip.h;
+        // Breadcrumb path bar sits between the tab strip and the editor; it pushes
+        // the editor down by its height (0 when hidden).
+        let breadcrumbs = Rect {
+            x: editor_left,
+            y: tb + tab_strip.h,
+            w: (content_right - editor_left).max(0.0),
+            h: if show_breadcrumbs { theme::BREADCRUMB_HEIGHT() } else { 0.0 },
+        };
+        let editor_y = tb + tab_strip.h + breadcrumbs.h;
         // Terminal panel sits above the status bar; the editor shrinks to fit. A
         // maximize request (huge height) is clamped here to fill the whole content
         // area (editor_h → 0); normal drag is bounded by the splitter's own max.
@@ -201,6 +226,7 @@ impl Layout {
             activity_bar,
             sidebar,
             tab_strip,
+            breadcrumbs,
             gutter,
             editor_text,
             status_bar,
@@ -440,6 +466,7 @@ pub(crate) fn active_activity_idx(sidebar_visible: bool, view: SidebarView) -> O
         SidebarView::Explorer => Some(0),
         SidebarView::Search => Some(1),
         SidebarView::SourceControl => Some(2),
+        SidebarView::Debug => Some(3),
         SidebarView::Extensions => Some(4),
     }
 }

@@ -22,10 +22,38 @@ pub struct State {
     pub recent: Vec<PathBuf>,
     /// Source Control tree (true) vs flat-list (false) view, restored on launch.
     pub scm_tree_view: bool,
+    /// Source Control GRAPH accordion expanded (true) vs collapsed (false). Defaults
+    /// to collapsed so the CHANGES list isn't pushed up on launch.
+    pub scm_graph_open: bool,
 }
 
 fn state_path() -> Option<PathBuf> {
     config_dir().map(|d| d.join("state.json"))
+}
+
+fn breakpoints_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("breakpoints.json"))
+}
+
+/// Persist debug breakpoints as `{ "<abs path>": [1-based lines] }` (best-effort).
+pub fn save_breakpoints(map: &[(String, Vec<i64>)]) {
+    let Some(path) = breakpoints_path() else { return };
+    let obj: serde_json::Map<String, Value> =
+        map.iter().map(|(p, lines)| (p.clone(), json!(lines))).collect();
+    let _ = std::fs::write(&path, serde_json::to_string_pretty(&Value::Object(obj)).unwrap_or_default());
+}
+
+/// Load persisted breakpoints (abs path → 1-based lines). Empty on any error.
+pub fn load_breakpoints() -> Vec<(String, Vec<i64>)> {
+    let Some(path) = breakpoints_path() else { return Vec::new() };
+    let Ok(text) = std::fs::read_to_string(&path) else { return Vec::new() };
+    let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(&text) else { return Vec::new() };
+    obj.into_iter()
+        .map(|(k, v)| {
+            let lines = v.as_array().map(|a| a.iter().filter_map(|x| x.as_i64()).collect()).unwrap_or_default();
+            (k, lines)
+        })
+        .collect()
 }
 
 impl State {
@@ -46,6 +74,9 @@ impl State {
         }
         if let Some(t) = v.get("scmTreeView").and_then(|t| t.as_bool()) {
             s.scm_tree_view = t;
+        }
+        if let Some(g) = v.get("scmGraphOpen").and_then(|g| g.as_bool()) {
+            s.scm_graph_open = g;
         }
         if let Some(arr) = v.get("recentFolders").and_then(|r| r.as_array()) {
             s.recent = arr
@@ -79,6 +110,7 @@ impl State {
                 .map(|p| p.to_string_lossy().to_string())
                 .collect::<Vec<_>>(),
             "scmTreeView": self.scm_tree_view,
+            "scmGraphOpen": self.scm_graph_open,
         });
         if let Ok(text) = serde_json::to_string_pretty(&doc) {
             let _ = std::fs::write(&path, text);

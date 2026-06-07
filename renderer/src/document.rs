@@ -94,8 +94,15 @@ pub struct Document {
     pub image_scale: Option<f32>,        // None = fit-to-window; Some(s) = absolute scale
     pub image_pan: (f32, f32),           // pan offset (px) from centered position
     pub feedback: bool,                  // Some => Ctrl+Enter submits it as a GitHub issue
+    /// True ⇒ binary / unsupported-encoding file: the editor shows a placeholder
+    /// ("not displayed … Open Anyway") instead of garbled text. Cleared by `open_anyway`.
+    pub binary: bool,
+    /// Display label of the text encoding this doc was decoded with (status bar).
+    pub encoding: &'static str,
     pub version: i32,                    // LSP document version (bumped on every edit)
     pub diagnostics: Vec<crate::lsp::Diagnostic>, // current LSP diagnostics for this doc
+    pub breakpoints: std::collections::HashSet<usize>, // debug breakpoints (0-based lines)
+    pub execution_line: Option<usize>,   // current debug execution line (0-based), if stopped here
     pub lsp_dirty: bool,                 // text changed since the last didChange was sent
     pub lsp_servers: Vec<&'static str>,  // servers a didOpen has been sent to (open-state is per-server)
     hl: Option<crate::highlight::LineCache>, // syntect incremental highlighter (None = no grammar)
@@ -124,6 +131,20 @@ pub struct Document {
 pub const LARGE_FILE_LINES: usize = 50_000;
 pub const LARGE_FILE_BYTES: usize = 8 * 1024 * 1024;
 const LARGE_WINDOW_LINES: usize = 1_500;
+
+/// Replace C0/C1 control characters (except tab and newline) with the Unicode
+/// replacement char so the shaper never sees a NUL or other unshapeable control
+/// byte — cosmic-text panics (`shape.rs` assertion) on those. Used when force-
+/// opening binary / unknown-encoding content as editable text.
+fn sanitize_for_display(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\t' | '\n' | '\r' => c,
+            c if c.is_control() => '\u{FFFD}',
+            c => c,
+        })
+        .collect()
+}
 
 /// The window's lines as one string (CR stripped — cosmic-text renders a stray
 /// `\r` as an extra line break).
@@ -351,8 +372,12 @@ impl Document {
             image_scale: None,
             image_pan: (0.0, 0.0),
             feedback: false,
+            binary: false,
+            encoding: "UTF-8",
             version: 0,
             diagnostics: Vec::new(),
+            breakpoints: std::collections::HashSet::new(),
+            execution_line: None,
             lsp_dirty: false,
             lsp_servers: Vec::new(),
             hl,
@@ -377,6 +402,35 @@ impl Document {
         d.read_only = true;
         d.info = Some(page);
         d
+    }
+
+    /// A placeholder tab for a binary / unsupported-encoding file: no text is shaped,
+    /// the editor draws the "not displayed … Open Anyway" overlay. `open_anyway`
+    /// reloads it as lossy UTF-8 text.
+    pub fn new_binary(path: PathBuf, fs: &mut FontSystem) -> Self {
+        let mut d = Document::new(Some(path), String::new(), fs);
+        d.read_only = true;
+        d.binary = true;
+        d
+    }
+
+    /// Force-load a binary placeholder's bytes as lossy UTF-8 text (VSCode's "Open
+    /// Anyway"). Turns the tab into a normal editable document.
+    pub fn open_anyway(&mut self, fs: &mut FontSystem) {
+        let Some(path) = self.path.clone() else { return };
+        let Ok(bytes) = std::fs::read(&path) else { return };
+        let text = sanitize_for_display(&String::from_utf8_lossy(&bytes));
+        *self = Document::new(Some(path), text, fs);
+    }
+
+    /// Re-read the file from disk and decode it with `encoding` (VSCode's "Reopen
+    /// with Encoding"). Replaces content; records the label for the status bar.
+    pub fn reopen_with_encoding(&mut self, encoding: &'static str, fs: &mut FontSystem) {
+        let Some(path) = self.path.clone() else { return };
+        let Ok(bytes) = std::fs::read(&path) else { return };
+        let text = sanitize_for_display(&crate::encoding::decode(encoding, &bytes));
+        *self = Document::new(Some(path), text, fs);
+        self.encoding = encoding;
     }
 
     /// A read-only commit-graph tab (Visualize Repository History). The buffer holds
@@ -455,8 +509,12 @@ impl Document {
             image_scale: None,
             image_pan: (0.0, 0.0),
             feedback: false,
+            binary: false,
+            encoding: "UTF-8",
             version: 0,
             diagnostics: Vec::new(),
+            breakpoints: std::collections::HashSet::new(),
+            execution_line: None,
             lsp_dirty: false,
             lsp_servers: Vec::new(),
             hl: None,
@@ -556,8 +614,12 @@ impl Document {
             image_scale: None,
             image_pan: (0.0, 0.0),
             feedback: false,
+            binary: false,
+            encoding: "UTF-8",
             version: 0,
             diagnostics: Vec::new(),
+            breakpoints: std::collections::HashSet::new(),
+            execution_line: None,
             lsp_dirty: false,
             lsp_servers: Vec::new(),
             hl: None,
@@ -1367,6 +1429,7 @@ impl Document {
         // against the PRE-edit rope. Undo/redo also pass through here with inverse
         // ops, so the shifts cancel correctly.
         self.shift_diagnostics(op, at_byte);
+        self.shift_breakpoints(op, at_byte);
         let at_char = self.rope.byte_to_char(at_byte);
         match op {
             EditOp::Insert(s) => {
@@ -1377,6 +1440,41 @@ impl Document {
                 self.rope.remove(at_char..end_char);
             }
         }
+    }
+
+    /// Toggle a breakpoint on a 0-based line.
+    pub fn toggle_breakpoint(&mut self, line: usize) {
+        if !self.breakpoints.remove(&line) {
+            self.breakpoints.insert(line);
+        }
+    }
+
+    /// Shift breakpoint + execution lines when an edit adds/removes newlines before
+    /// them, so they stay glued to their code (line-granular; columns don't matter).
+    fn shift_breakpoints(&mut self, op: &EditOp, at_byte: usize) {
+        if self.breakpoints.is_empty() && self.execution_line.is_none() {
+            return;
+        }
+        let at = at_byte.min(self.rope.len_bytes());
+        let edit_line = self.rope.byte_to_line(at);
+        let (s, deleting) = match op {
+            EditOp::Insert(s) => (s, false),
+            EditOp::Delete(s) => (s, true),
+        };
+        let nl = s.matches('\n').count() as i64;
+        if nl == 0 {
+            return; // single-line edit: no line numbers move
+        }
+        let delta = if deleting { -nl } else { nl };
+        let shift = |line: usize| -> usize {
+            if line > edit_line {
+                (line as i64 + delta).max(edit_line as i64) as usize
+            } else {
+                line
+            }
+        };
+        self.breakpoints = self.breakpoints.iter().map(|&l| shift(l)).collect();
+        self.execution_line = self.execution_line.map(shift);
     }
 
     /// Shift stored diagnostic positions for an edit at `at_byte` (VSCode keeps
