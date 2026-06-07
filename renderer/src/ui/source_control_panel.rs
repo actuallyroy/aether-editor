@@ -460,13 +460,23 @@ impl SourceControlPanel {
         // Rebuild the visible-item lists (flat or tree) for the current collapse state.
         self.staged_vis = self.build_vis(&self.staged_rows, true);
         self.unstaged_vis = self.build_vis(&self.unstaged_rows, false);
-        let sw = theme::SIDEBAR_WIDTH();
+        // Shape at the actual panel width (matches the ellipsis budget); wrapping is
+        // disabled in the buffer, so this just sizes the x-extent correctly when the
+        // panel is resized away from the default SIDEBAR_WIDTH.
+        let sw = w.max(20.0);
         let s_hover = match self.hovered { Some((true, i)) => Some(i), _ => None };
         let u_hover = match self.hovered { Some((false, i)) => Some(i), _ => None };
         let (sk, ss) = self.vis_rows(&self.staged_vis, &self.staged_rows, avail, s_hover);
         let (uk, us) = self.vis_rows(&self.unstaged_vis, &self.unstaged_rows, avail, u_hover);
-        self.staged.set_rows(fs, &sk, &ss, sw, 4000.0);
-        self.unstaged.set_rows(fs, &uk, &us, sw, 4000.0);
+        // Buffer height must cover EVERY row's line: `shape_until_scroll` only lays
+        // out lines that fit the buffer's set height, so a fixed cap silently drops
+        // the tail once the list is tall (many changes × high zoom) — leaving blank
+        // rows below the last shaped line. Size to the actual row count.
+        let lh = theme::UI_LINE_HEIGHT().max(row_h());
+        let sh = ss.len() as f32 * lh + 200.0;
+        let uh = us.len() as f32 * lh + 200.0;
+        self.staged.set_rows(fs, &sk, &ss, sw, sh);
+        self.unstaged.set_rows(fs, &uk, &us, sw, uh);
     }
 
     /// Build the visible-item list for one group. Flat in list mode; a compacted

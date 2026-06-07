@@ -352,6 +352,133 @@ impl LineCache {
     }
 }
 
+/// Same shape as one line's cached spans for two `(text, color)` rows.
+fn line_eq(a: &[(String, Color)], b: &[(String, Color)]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|((sa, ca), (sb, cb))| {
+            sa == sb && ca.r() == cb.r() && ca.g() == cb.g() && ca.b() == cb.b() && ca.a() == cb.a()
+        })
+}
+
+/// Tree-sitter–backed line cache for JS/TS — a drop-in alternative to the syntect
+/// [`LineCache`] for languages whose TextMate grammar misbehaves (template
+/// literals, regex). Tree-sitter parses the whole document each refresh (cheap for
+/// the non-huge files we highlight) and we diff against the cache to report the
+/// minimal changed line range, so the editor still reshapes only what moved.
+pub struct TsCache {
+    lang: crate::syntax::Lang,
+    spans: Vec<Vec<(String, Color)>>,
+    last_end: usize,
+}
+
+impl TsCache {
+    pub fn new(ext: &str) -> Option<TsCache> {
+        let lang = crate::syntax::Lang::from_ext(ext);
+        matches!(lang, crate::syntax::Lang::TypeScript | crate::syntax::Lang::Tsx)
+            .then(|| TsCache { lang, spans: Vec::new(), last_end: 0 })
+    }
+
+    pub fn refresh(&mut self, text: &str, _dirty: usize) -> (usize, usize) {
+        let new = crate::syntax::highlight_lines(self.lang, text).unwrap_or_default();
+        // Minimal changed range: skip the matching prefix + suffix vs the old cache.
+        let mut start = 0;
+        while start < self.spans.len() && start < new.len() && line_eq(&self.spans[start], &new[start]) {
+            start += 1;
+        }
+        let (mut eo, mut en) = (self.spans.len(), new.len());
+        while eo > start && en > start && line_eq(&self.spans[eo - 1], &new[en - 1]) {
+            eo -= 1;
+            en -= 1;
+        }
+        self.spans = new;
+        let start = start.min(self.spans.len());
+        self.last_end = en.max(start).min(self.spans.len());
+        (start, self.last_end)
+    }
+
+    pub fn highlight(&mut self, text: &str, dirty: usize) -> Vec<(String, Color)> {
+        self.refresh(text, dirty);
+        self.flatten()
+    }
+
+    pub fn flatten(&self) -> Vec<(String, Color)> {
+        self.spans.iter().flatten().cloned().collect()
+    }
+
+    pub fn line_count(&self) -> usize {
+        self.spans.len()
+    }
+
+    pub fn line_spans(&self, line: usize) -> Option<&[(String, Color)]> {
+        self.spans.get(line).map(|v| v.as_slice())
+    }
+
+    pub fn last_changed_end(&self) -> usize {
+        self.last_end
+    }
+}
+
+/// The active highlighter for a document: tree-sitter for JS/TS (robust template
+/// literal / regex handling), syntect for everything else. Both expose the same
+/// per-line span API the editor consumes.
+pub enum Highlighter {
+    Syntect(LineCache),
+    Tree(TsCache),
+}
+
+impl Highlighter {
+    /// Tree-sitter for JS/TS-family extensions; otherwise the syntect grammar (if
+    /// one is bundled for `ext`). `None` ⇒ no highlighter (plain text).
+    pub fn new(ext: &str) -> Option<Highlighter> {
+        if let Some(ts) = TsCache::new(ext) {
+            return Some(Highlighter::Tree(ts));
+        }
+        LineCache::new(ext).map(Highlighter::Syntect)
+    }
+
+    pub fn refresh(&mut self, text: &str, dirty: usize) -> (usize, usize) {
+        match self {
+            Highlighter::Syntect(c) => c.refresh(text, dirty),
+            Highlighter::Tree(c) => c.refresh(text, dirty),
+        }
+    }
+
+    pub fn highlight(&mut self, text: &str, dirty: usize) -> Vec<(String, Color)> {
+        match self {
+            Highlighter::Syntect(c) => c.highlight(text, dirty),
+            Highlighter::Tree(c) => c.highlight(text, dirty),
+        }
+    }
+
+    pub fn flatten(&self) -> Vec<(String, Color)> {
+        match self {
+            Highlighter::Syntect(c) => c.flatten(),
+            Highlighter::Tree(c) => c.flatten(),
+        }
+    }
+
+    pub fn line_count(&self) -> usize {
+        match self {
+            Highlighter::Syntect(c) => c.line_count(),
+            Highlighter::Tree(c) => c.line_count(),
+        }
+    }
+
+    pub fn line_spans(&self, line: usize) -> Option<&[(String, Color)]> {
+        match self {
+            Highlighter::Syntect(c) => c.line_spans(line),
+            Highlighter::Tree(c) => c.line_spans(line),
+        }
+    }
+
+    pub fn last_changed_end(&self) -> usize {
+        match self {
+            Highlighter::Syntect(c) => c.last_changed_end(),
+            Highlighter::Tree(c) => c.last_changed_end(),
+        }
+    }
+}
+
 /// Iterate lines keeping their trailing `\n` (syntect tokenizes with line endings).
 struct LinesWithEndingsIter<'a> {
     text: &'a str,
@@ -447,3 +574,13 @@ mod tests {
         );
     }
 }
+
+
+
+
+
+
+
+
+
+

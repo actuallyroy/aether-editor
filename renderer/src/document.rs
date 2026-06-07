@@ -105,7 +105,7 @@ pub struct Document {
     pub execution_line: Option<usize>,   // current debug execution line (0-based), if stopped here
     pub lsp_dirty: bool,                 // text changed since the last didChange was sent
     pub lsp_servers: Vec<&'static str>,  // servers a didOpen has been sent to (open-state is per-server)
-    hl: Option<crate::highlight::LineCache>, // syntect incremental highlighter (None = no grammar)
+    hl: Option<crate::highlight::Highlighter>, // tree-sitter (JS/TS) or syntect incremental highlighter (None = no grammar)
     hl_dirty_from: usize,                // lowest line changed since the last highlight (usize::MAX = none)
     semantic: Vec<(usize, usize, Color)>, // Layer-2 LSP semantic tokens (byte range → color)
     expand_stack: Vec<(usize, usize)>, // prior ranges for Expand/Shrink Selection
@@ -326,7 +326,7 @@ impl Document {
         let large = line_count > LARGE_FILE_LINES || display.len() > LARGE_FILE_BYTES;
         let rope = Rope::from_str(&contents);
         // Layer-1 highlighter: a syntect grammar for this file type (None → plain/markdown).
-        let mut hl = if large { None } else { crate::highlight::LineCache::new(&ext) };
+        let mut hl = if large { None } else { crate::highlight::Highlighter::new(&ext) };
         let buf_count = if large { LARGE_WINDOW_LINES.min(rope.len_lines()) } else { 0 };
         if large {
             shape_window(&mut buffer, fs, &window_string(&rope, 0, buf_count), buf_count);
@@ -1929,7 +1929,7 @@ impl Document {
             .map(|f| f.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Untitled".into());
         self.lang = Lang::from_ext(&ext);
-        self.hl = crate::highlight::LineCache::new(&ext);
+        self.hl = crate::highlight::Highlighter::new(&ext);
         self.ext = ext;
         self.path = Some(path);
         self.hl_dirty_from = 0;

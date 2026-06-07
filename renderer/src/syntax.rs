@@ -14,6 +14,8 @@ pub enum Lang {
     Rust,
     Json,
     Markdown,
+    TypeScript,
+    Tsx,
     PlainText,
 }
 
@@ -23,6 +25,10 @@ impl Lang {
             "rs" => Lang::Rust,
             "json" | "mcp" => Lang::Json,
             "md" | "markdown" => Lang::Markdown,
+            // The TypeScript grammar is a superset of JS, so plain JS files parse
+            // cleanly under it; TSX/JSX use the JSX-aware variant.
+            "ts" | "mts" | "cts" | "js" | "mjs" | "cjs" => Lang::TypeScript,
+            "tsx" | "jsx" => Lang::Tsx,
             _ => Lang::PlainText,
         }
     }
@@ -77,6 +83,20 @@ fn color_for(idx: usize) -> Color {
     }
 }
 
+/// The TypeScript highlights query is only the TS-specific delta; it must be
+/// layered on top of the JavaScript base query (same approach as Helix/nvim), or
+/// core tokens — keywords, comments, strings, calls — go uncolored. Built once.
+fn ts_highlights_query() -> &'static str {
+    static Q: OnceLock<String> = OnceLock::new();
+    Q.get_or_init(|| {
+        format!(
+            "{}\n{}",
+            tree_sitter_javascript::HIGHLIGHT_QUERY,
+            tree_sitter_typescript::HIGHLIGHTS_QUERY
+        )
+    })
+}
+
 fn config_for(lang: Lang) -> Option<&'static HighlightConfiguration> {
     match lang {
         Lang::Rust => {
@@ -109,8 +129,82 @@ fn config_for(lang: Lang) -> Option<&'static HighlightConfiguration> {
                 c
             }))
         }
+        Lang::TypeScript => {
+            static C: OnceLock<HighlightConfiguration> = OnceLock::new();
+            Some(C.get_or_init(|| {
+                let mut c = HighlightConfiguration::new(
+                    tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                    "typescript",
+                    &ts_highlights_query(),
+                    "",
+                    tree_sitter_typescript::LOCALS_QUERY,
+                )
+                .expect("typescript highlight config");
+                c.configure(HIGHLIGHT_NAMES);
+                c
+            }))
+        }
+        Lang::Tsx => {
+            static C: OnceLock<HighlightConfiguration> = OnceLock::new();
+            Some(C.get_or_init(|| {
+                let mut c = HighlightConfiguration::new(
+                    tree_sitter_typescript::LANGUAGE_TSX.into(),
+                    "tsx",
+                    &ts_highlights_query(),
+                    "",
+                    tree_sitter_typescript::LOCALS_QUERY,
+                )
+                .expect("tsx highlight config");
+                c.configure(HIGHLIGHT_NAMES);
+                c
+            }))
+        }
         _ => None,
     }
+}
+
+/// Tree-sitter highlight `text` for `lang`, returning per-LINE colored spans
+/// `(substring, color)` — the shape the incremental `LineCache` consumes. A
+/// trailing '\n' produces a span ending the line (cosmic-text counts no extra
+/// empty line). `None` for languages without a tree-sitter config.
+pub fn highlight_lines(lang: Lang, text: &str) -> Option<Vec<Vec<(String, Color)>>> {
+    let config = config_for(lang)?;
+    let mut hl = Highlighter::new();
+    let events = hl.highlight(config, text.as_bytes(), None, |_| None).ok()?;
+    let mut lines: Vec<Vec<(String, Color)>> = vec![Vec::new()];
+    let mut stack: Vec<usize> = Vec::new();
+    for ev in events {
+        match ev.ok()? {
+            HighlightEvent::HighlightStart(Highlight(i)) => stack.push(i),
+            HighlightEvent::HighlightEnd => {
+                stack.pop();
+            }
+            HighlightEvent::Source { start, end } => {
+                if start >= end {
+                    continue;
+                }
+                let color = stack.last().map(|&i| color_for(i)).unwrap_or_else(theme::FG_TEXT);
+                // Split the source slice across line boundaries so each output row
+                // holds only its own text (including the trailing '\n').
+                let chunk = &text[start..end];
+                let mut rest = chunk;
+                while let Some(nl) = rest.find('\n') {
+                    let (head, tail) = rest.split_at(nl + 1);
+                    lines.last_mut().unwrap().push((head.to_string(), color));
+                    lines.push(Vec::new());
+                    rest = tail;
+                }
+                if !rest.is_empty() {
+                    lines.last_mut().unwrap().push((rest.to_string(), color));
+                }
+            }
+        }
+    }
+    // A trailing '\n' pushed an empty final row; cosmic-text doesn't count it.
+    if lines.len() > 1 && lines.last().map_or(false, |l| l.is_empty()) {
+        lines.pop();
+    }
+    Some(lines)
 }
 
 /// Highlight `text` for `lang`, returning per-span (text, attrs). Returns None
