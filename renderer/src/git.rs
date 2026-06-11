@@ -198,10 +198,14 @@ pub fn unstage_all(root: &Path) {
     let _ = git(root, &["restore", "--staged", "."]);
 }
 
-/// Discard all tracked working-tree changes (`git restore .`). Leaves untracked
-/// files alone (deleting those is destructive and needs explicit confirmation).
+/// Discard ALL working-tree changes: reverts tracked files (`git restore .`)
+/// AND removes untracked files/dirs (`git clean -fd`). The caller gates this
+/// behind an explicit "irreversible" confirmation, so wiping untracked content
+/// here matches what the user was warned about — without `clean`, "Discard All"
+/// silently does nothing in a tree where every change is untracked.
 pub fn discard_all(root: &Path) {
     let _ = git(root, &["restore", "."]);
+    let _ = git(root, &["clean", "-fd"]);
 }
 
 /// Stash all working-tree changes, including untracked files

@@ -284,8 +284,14 @@ fn join_path(base: &str, seg: &str) -> String {
     }
 }
 
-/// Directories never worth searching, and a per-file size ceiling.
-const SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".aether", "dist", "build", "out"];
+/// Directories never worth indexing or searching — VCS metadata plus the usual
+/// generated/build/dependency output. Shared by project search and the command
+/// palette's file picker so both exclude the same garbage (single source of truth).
+pub const SKIP_DIRS: &[&str] = &[
+    ".git", ".svn", ".hg", "target", "node_modules", ".aether", "dist", "build", "out",
+    ".next", ".nuxt", ".svelte-kit", ".venv", "venv", "bin", "obj", "Pods", ".expo",
+    "__pycache__", ".gradle", "DerivedData", "coverage", ".cache",
+];
 const MAX_FILE_BYTES: u64 = 2_000_000;
 const MAX_TOTAL_MATCHES: usize = 5000;
 const BATCH_FILES: usize = 12;

@@ -3719,10 +3719,7 @@ impl App {
     }
 
     fn build_file_items(&self) -> Vec<commands::PickItem> {
-        const SKIP: &[&str] = &[
-            ".git", "target", "node_modules", ".aether", "dist", "build", "out", ".next", ".venv",
-            "bin", "obj", "Pods", ".expo", "__pycache__", ".gradle", "DerivedData", "coverage",
-        ];
+        const SKIP: &[&str] = crate::search::SKIP_DIRS;
         let root = self.cwd.clone();
         let mut out = Vec::new();
         let mut stack = vec![root.clone()];
