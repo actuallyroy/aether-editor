@@ -36,6 +36,9 @@ pub enum WorkerMsg {
     CommitMessage { result: Result<String, String> },
     // Inline git blame (GitLens-style): per-line authorship for `path`.
     Blame { path: std::path::PathBuf, lines: Vec<crate::git::BlameLine> },
+    // HEAD baseline for the editor gutter change indicators. `base` is None when the
+    // file isn't committed yet (every line then shows as added).
+    DiffBase { path: std::path::PathBuf, base: Option<String> },
     // Filesystem watcher: paths under the workspace changed on disk (debounced in
     // the UI). Drives Source Control refresh + external-edit reload of open docs.
     FsChanged { paths: Vec<std::path::PathBuf> },

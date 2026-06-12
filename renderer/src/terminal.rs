@@ -406,6 +406,12 @@ impl Grid {
     fn erase_in_display(&mut self, mode: u16) {
         match mode {
             2 | 3 => {
+                // Mode 3 (ESC[3J) also erases the scrollback — this is the `E3`
+                // capability `clear` uses, so the history is gone (a true clear)
+                // instead of just being pushed out of view.
+                if mode == 3 && self.alt.is_none() {
+                    self.scrollback.clear();
+                }
                 for row in &mut self.cells {
                     for c in row.iter_mut() {
                         *c = Cell::blank();

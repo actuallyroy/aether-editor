@@ -21,6 +21,7 @@ mod extensions;
 mod feedback_upload;
 mod gpu;
 mod graph;
+mod gutter_diff;
 mod icon;
 mod git;
 mod highlight;
@@ -257,6 +258,68 @@ pub(crate) enum CtxAction {
     TermNew,                   // terminal: new tab
 }
 
+/// An open inline gutter-diff peek (VSCode-style "Peek Changes"): a scrollable,
+/// embedded unified-diff of the whole file, hanging under the clicked line.
+pub(crate) struct GutterPeek {
+    pub anchor_line: usize, // editor line the zone hangs under
+    pub doc_version: i32,   // doc version when opened (an edit dismisses it)
+    pub title: String,      // header: "<file> · Working Tree"
+    pub text: String,       // the unified-diff body (one line per row)
+    pub kinds: Vec<diff::RowKind>, // per body row, for +/- background coloring
+    pub hunk_rows: Vec<usize>,     // body-row index of each change run (nav + count)
+    pub change_idx: usize,  // which hunk the click landed in (for "N of M")
+    pub scroll: f32,        // vertical scroll within the zone (px)
+}
+
+/// Build the scrollable peek body from a single-file working-tree `Diff`. Renders a
+/// unified view — `<old> <new> <±> <content>` per row — and records each change run
+/// (hunk) so the zone can show "N of M" and scroll to the clicked one.
+fn build_file_peek(df: &diff::Diff, fname: String, clicked_line: usize, doc_version: i32) -> GutterPeek {
+    use diff::RowKind;
+    let lefts: Vec<&str> = df.left_text.split('\n').collect();
+    let rights: Vec<&str> = df.right_text.split('\n').collect();
+    let clicked_new = (clicked_line + 1) as u32;
+    let num = |n: Option<u32>| n.map(|v| v.to_string()).unwrap_or_default();
+    let mut text = String::new();
+    let mut kinds: Vec<RowKind> = Vec::new();
+    let mut hunk_rows: Vec<usize> = Vec::new();
+    let mut prev_changed = false;
+    let mut change_idx = 0;
+    for (i, row) in df.rows.iter().enumerate() {
+        let (sign, content) = match row.kind {
+            RowKind::Add => ('+', rights.get(i).copied().unwrap_or("")),
+            RowKind::Del => ('-', lefts.get(i).copied().unwrap_or("")),
+            RowKind::Context => (' ', lefts.get(i).copied().unwrap_or("")),
+            _ => continue, // skip Hunk/Gap/File separators
+        };
+        let changed = matches!(row.kind, RowKind::Add | RowKind::Del);
+        if changed && !prev_changed {
+            hunk_rows.push(kinds.len());
+        }
+        // The hunk owning the clicked new-side line becomes the focused one.
+        if changed && row.right == Some(clicked_new) {
+            change_idx = hunk_rows.len().saturating_sub(1);
+        }
+        text.push_str(&format!("{:>5} {:>5} {} {}\n", num(row.left), num(row.right), sign, content));
+        kinds.push(row.kind);
+        prev_changed = changed;
+    }
+    // Scroll so the focused hunk sits a couple of rows from the top.
+    let lh = theme::LINE_HEIGHT();
+    let target = hunk_rows.get(change_idx).copied().unwrap_or(0);
+    let scroll = ((target as f32 - 2.0) * lh).max(0.0);
+    GutterPeek {
+        anchor_line: clicked_line,
+        doc_version,
+        title: format!("{fname} · Working Tree"),
+        text,
+        kinds,
+        hunk_rows,
+        change_idx,
+        scroll,
+    }
+}
+
 pub(crate) struct App {
     pub(crate) cwd: PathBuf,
     pub(crate) initial_file: Option<PathBuf>,
@@ -322,6 +385,15 @@ pub(crate) struct App {
     pub(crate) blame_pending: Option<(String, f32, f32, Instant)>,
     // Editor tab hover: full file name + anchor (x, y) — tabs truncate to fit.
     pub(crate) tab_tip: Option<(String, f32, f32)>,
+    /// Hover tooltip for an unlabeled icon button (Source Control toolbar / row
+    /// actions, etc.) — (label, anchor x, y). Makes the icons discoverable.
+    pub(crate) icon_tip: Option<(String, f32, f32)>,
+    /// Inline gutter-diff peek (VSCode-style): the change-bar that was clicked opens
+    /// a panel showing the hunk's original (HEAD) lines below that line.
+    pub(crate) gutter_peek: Option<GutterPeek>,
+    /// Identity of the peek body last shaped into the GPU buffer, so we re-shape the
+    /// (potentially huge) whole-file diff only when it changes — not every frame.
+    pub(crate) peek_shaped_key: Option<(usize, usize, u64)>,
     // Explorer / Source Control row hover: full path when the label is ellipsized.
     pub(crate) row_tip: Option<(String, f32, f32)>,
     pub(crate) sidebar_view: SidebarView,
@@ -499,7 +571,10 @@ impl App {
             block_tip: None,
             commit_tip: None,
             blame_pending: None,
+            gutter_peek: None,
+            peek_shaped_key: None,
             tab_tip: None,
+            icon_tip: None,
             row_tip: None,
             sidebar_view: SidebarView::Explorer,
             search: None, // built in `resumed` once the font system exists
@@ -739,6 +814,19 @@ impl App {
         };
         if row_tip != self.row_tip {
             self.row_tip = row_tip;
+            changed = true;
+        }
+        // Tooltip for a hovered (unlabeled) Source Control icon button.
+        let icon_tip = if self.sidebar_visible && self.sidebar_view == SidebarView::SourceControl {
+            self.source_control
+                .as_ref()
+                .and_then(|scp| scp.tooltip_at(p, layout.panel_region()))
+                .map(|label| (label.to_string(), p.0 + theme::zpx(12.0), p.1 + theme::zpx(20.0)))
+        } else {
+            None
+        };
+        if icon_tip != self.icon_tip {
+            self.icon_tip = icon_tip;
             changed = true;
         }
         if new_close != self.hovered_tab_close {
@@ -1147,10 +1235,41 @@ impl App {
                 None
             }
         };
+        // Inline gutter-diff peek: its header buttons are pointer; the rest of the
+        // zone claims the default cursor so the editor I-beam can't bleed through.
+        let (over_peek_btn, over_peek_zone) = if self.gutter_peek.is_some() {
+            let rows = self.gpu.as_ref().map_or(0, |g| g.ui.peek.layout_runs().count());
+            self.workspace
+                .active_doc()
+                .map(|d| render::peek_geom(d, self.gutter_peek.as_ref().unwrap().anchor_line, &layout, rows))
+                .map_or((false, false), |gm| {
+                    let btn = gm.close.contains(p) || gm.prev.contains(p) || gm.next.contains(p);
+                    (btn, gm.zone.contains(p))
+                })
+        } else {
+            (false, false)
+        };
+        // Pointer over a gutter change bar (the clickable strip on a changed line).
+        let over_gutter_change = layout.gutter.contains(p)
+            && p.0 >= layout.gutter.x + layout.gutter.w - theme::zpx(8.0)
+            && self.workspace.active_doc().map_or(false, |d| {
+                if d.diff.is_some() || d.info.is_some() || d.gutter_changes.is_empty() {
+                    return false;
+                }
+                let vy = p.1 - (layout.editor_text.y + theme::EDITOR_PAD()) + d.scroll_y();
+                let line = d.visible_index_to_line((vy / theme::LINE_HEIGHT()).max(0.0) as usize);
+                d.gutter_changes.iter().any(|(l, _)| *l == line)
+            });
         let new_cursor = if self.settings_editor.open {
             // The Settings modal owns the whole screen — resolve its cursor here so
             // background regions (editor I-beam, etc.) can't bleed through.
             self.settings_cursor(p)
+        } else if over_peek_btn {
+            CursorIcon::Pointer
+        } else if over_peek_zone {
+            CursorIcon::Default
+        } else if over_gutter_change {
+            CursorIcon::Pointer
         } else if let Some(c) = over_overlay {
             c
         } else if self.sidebar_split.is_dragging() || over_handle {
@@ -1239,9 +1358,9 @@ impl App {
             && self
                 .source_control
                 .as_ref()
-                .map_or(false, |scp| scp.over_row(p, layout.panel_region()))
+                .map_or(false, |scp| scp.over_clickable(p, layout.panel_region()))
         {
-            // A changed-file row or collapsible folder header is clickable.
+            // Any interactive SCM element: icon buttons, rows, commit button, headers.
             CursorIcon::Pointer
         } else if self.focused_input_at(&layout, p).is_some() {
             CursorIcon::Text
@@ -2435,6 +2554,53 @@ impl App {
         }
     }
 
+    /// Fetch the HEAD baseline (off-thread) for the active doc's gutter change bars,
+    /// once per file, and recompute the marks each tick if the buffer changed. Mirrors
+    /// `maybe_request_blame`'s gating (plain editable tracked file).
+    fn maybe_request_diff_base(&mut self) {
+        let need = matches!(self.workspace.active_doc(), Some(d)
+            if !d.diff_base_requested
+                && d.path.is_some()
+                && !d.read_only
+                && d.diff.is_none()
+                && d.image.is_none()
+                && d.graph.is_none()
+                && d.info.is_none()
+                && d.markdown_preview.is_none());
+        if need {
+            let path = self.workspace.active_doc().and_then(|d| d.path.clone());
+            if let Some(d) = self.workspace.active_doc_mut() {
+                d.diff_base_requested = true;
+            }
+            if let Some(p) = path {
+                self.request_diff_base(p);
+            }
+        }
+        // Recompute marks from the (already-fetched) baseline when the text changed.
+        if let Some(d) = self.workspace.active_doc_mut() {
+            d.refresh_gutter_marks();
+        }
+        // An edit (or switching docs) invalidates an open peek — its line shifted.
+        if let Some(pk) = self.gutter_peek.as_ref() {
+            let stale = self.workspace.active_doc().map_or(true, |d| d.version != pk.doc_version);
+            if stale {
+                self.gutter_peek = None;
+            }
+        }
+    }
+
+    /// Off-thread: read HEAD's version of `path` and post it back as the gutter
+    /// baseline (None when the file isn't committed → all lines read as added).
+    fn request_diff_base(&self, path: PathBuf) {
+        let root = git::repo_root(&self.cwd);
+        let tx = self.worker_tx.clone();
+        std::thread::spawn(move || {
+            let rel = path.strip_prefix(&root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+            let base = git::head_blob(&root, &rel);
+            let _ = tx.send(WorkerMsg::DiffBase { path, base });
+        });
+    }
+
     /// Start (or restart) the workspace filesystem watcher. Debounced fs events
     /// post `WorkerMsg::FsChanged`; the UI flushes them into a Source Control
     /// refresh + external-edit reload of open documents.
@@ -2488,6 +2654,11 @@ impl App {
                     }
                 }
             }
+        }
+        // A commit/checkout moves HEAD, so the gutter baselines are stale — refetch
+        // them (keeps the old marks until the new baseline arrives, so no flicker).
+        for d in self.workspace.documents.iter_mut() {
+            d.diff_base_requested = false;
         }
         // Any change (working tree or .git) can move the git status.
         self.refresh_source_control();
@@ -2578,6 +2749,15 @@ impl App {
             }
             ui::Intent::GitStash => {
                 self.confirm_stash();
+            }
+            ui::Intent::GitStashPath(path) => {
+                // Stash a single file or folder (no confirm — stash is recoverable
+                // via `git stash pop`, unlike Discard).
+                if git::stash_path(&self.cwd, &path) {
+                    self.refresh_source_control();
+                } else {
+                    self.show_info_dialog(&format!("Couldn't stash '{path}'."));
+                }
             }
             ui::Intent::GitGenerateCommitMessage => {
                 // Summarize the staged (or, if nothing staged, working-tree) diff
@@ -6303,6 +6483,79 @@ impl App {
             }
         }
 
+        // Inline gutter-diff peek interactions: close / prev / next buttons, or a
+        // click outside the zone dismisses it (before any editor handling).
+        if self.gutter_peek.is_some() {
+            let rows = self.gpu.as_ref().map_or(0, |g| g.ui.peek.layout_runs().count());
+            let gm = self
+                .workspace
+                .active_doc()
+                .map(|d| render::peek_geom(d, self.gutter_peek.as_ref().unwrap().anchor_line, &layout, rows));
+            if let Some(gm) = gm {
+                if gm.close.contains((x, y)) {
+                    self.gutter_peek = None;
+                    self.redraw();
+                    return;
+                }
+                if gm.prev.contains((x, y)) || gm.next.contains((x, y)) {
+                    let fwd = gm.next.contains((x, y));
+                    if let Some(pk) = self.gutter_peek.as_mut() {
+                        let n = pk.hunk_rows.len();
+                        if n > 0 {
+                            pk.change_idx = if fwd {
+                                (pk.change_idx + 1) % n
+                            } else {
+                                (pk.change_idx + n - 1) % n
+                            };
+                            let target = pk.hunk_rows[pk.change_idx];
+                            pk.scroll = ((target as f32 - 2.0) * gm.lh).clamp(0.0, gm.max_scroll);
+                        }
+                    }
+                    self.redraw();
+                    return;
+                }
+                if gm.zone.contains((x, y)) {
+                    return; // swallow clicks inside the zone body
+                }
+                // Click outside the zone: dismiss and let the click fall through.
+                self.gutter_peek = None;
+                self.redraw();
+            }
+        }
+
+        // Gutter change-bar click (right edge): open this file's working-tree diff,
+        // scrolled to the clicked hunk. Takes the rightmost strip when the line has a
+        // change mark, so it wins over the fold chevron only on changed lines.
+        if layout.gutter.contains((x, y))
+            && x >= layout.gutter.x + layout.gutter.w - theme::zpx(8.0)
+            && self.workspace.active_doc().map_or(false, |d| d.diff.is_none() && d.info.is_none() && d.path.is_some())
+        {
+            let lh = theme::LINE_HEIGHT();
+            let hit = self.workspace.active_doc().and_then(|d| {
+                let vy = y - (layout.editor_text.y + theme::EDITOR_PAD()) + d.scroll_y();
+                let vidx = (vy / lh).max(0.0) as usize;
+                let line = d.visible_index_to_line(vidx);
+                let changed = d.gutter_changes.iter().any(|(l, _)| *l == line);
+                (changed && d.path.is_some()).then(|| (d.path.clone().unwrap(), line, d.version))
+            });
+            if let Some((abs, line, ver)) = hit {
+                // Toggle off if re-clicking while a peek is already open.
+                if self.gutter_peek.is_some() {
+                    self.gutter_peek = None;
+                    self.redraw();
+                    return;
+                }
+                let root = git::repo_root(&self.cwd);
+                let rel = abs.strip_prefix(&root).unwrap_or(&abs).to_string_lossy().replace('\\', "/");
+                let untracked = git::head_blob(&root, &rel).is_none();
+                let df = diff::compute(&self.cwd, &rel, false, untracked);
+                let fname = rel.rsplit('/').next().unwrap_or(&rel).to_string();
+                self.gutter_peek = Some(build_file_peek(&df, fname, line, ver));
+                self.redraw();
+                return;
+            }
+        }
+
         // Gutter click (left of the fold-chevron zone): toggle a breakpoint on that
         // line — fold-aware via the same visual-row→line mapping the chevron uses.
         if layout.gutter.contains((x, y))
@@ -6381,6 +6634,7 @@ impl App {
         }
 
         if layout.editor_text.contains((x, y)) {
+            self.gutter_peek = None; // clicking into the code closes an open diff peek
             self.set_ext_filter_focus(false); // editor takes keyboard focus
             // Clicking the editor moves focus off the find widget (it stays open, but
             // typing now goes to the editor — like VSCode).
@@ -6927,6 +7181,20 @@ impl App {
     fn on_scroll(&mut self, dy: f32) {
         let layout = self.layout();
         let p = (self.mouse_pos.x as f32, self.mouse_pos.y as f32);
+        // Inline gutter-diff peek: wheel over the zone scrolls its diff body.
+        if self.gutter_peek.is_some() {
+            let rows = self.gpu.as_ref().map_or(0, |g| g.ui.peek.layout_runs().count());
+            if let Some(d) = self.workspace.active_doc() {
+                let gm = render::peek_geom(d, self.gutter_peek.as_ref().unwrap().anchor_line, &layout, rows);
+                if gm.zone.contains(p) {
+                    if let Some(pk) = self.gutter_peek.as_mut() {
+                        pk.scroll = (pk.scroll - dy).clamp(0.0, gm.max_scroll);
+                    }
+                    self.redraw();
+                    return;
+                }
+            }
+        }
         // Settings editor: modal. Wheel over the search box or the focused field
         // scrolls that text horizontally; elsewhere it scrolls the settings viewport.
         if self.settings_editor.open {
@@ -7220,6 +7488,12 @@ impl App {
             return;
         }
 
+        // Escape closes an open inline gutter-diff peek first.
+        if self.gutter_peek.is_some() && matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape)) {
+            self.gutter_peek = None;
+            self.redraw();
+            return;
+        }
         // Escape closes an open context menu first.
         if self.ctx_menu.is_some() && matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape)) {
             self.close_ctx_menu();
@@ -8108,6 +8382,7 @@ impl ApplicationHandler for App {
         // Lazily fetch inline git blame for the active document (open / tab switch /
         // session restore all land here).
         self.maybe_request_blame();
+        self.maybe_request_diff_base();
         // Native macOS menu clicks → commands.
         #[cfg(target_os = "macos")]
         {
@@ -8346,6 +8621,15 @@ impl ApplicationHandler for App {
                     // closed or its content changed enough that blame is stale-on-arrival.
                     if let Some(d) = self.workspace.documents.iter_mut().find(|d| d.path.as_deref() == Some(path.as_path())) {
                         d.blame = lines;
+                        self.redraw();
+                    }
+                }
+                WorkerMsg::DiffBase { path, base } => {
+                    if let Some(d) = self.workspace.documents.iter_mut().find(|d| d.path.as_deref() == Some(path.as_path())) {
+                        // Empty baseline for an uncommitted file → every line is "added".
+                        d.diff_base = Some(base.unwrap_or_default().lines().map(|l| l.to_string()).collect());
+                        d.gutter_version = -1; // force a recompute against the new baseline
+                        d.refresh_gutter_marks();
                         self.redraw();
                     }
                 }

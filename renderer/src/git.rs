@@ -250,6 +250,20 @@ pub fn stash(root: &Path) -> bool {
     git(root, &["stash", "push", "--include-untracked"]).is_some()
 }
 
+/// The committed (HEAD) contents of a file, as the baseline for the editor's gutter
+/// change indicators. `None` when the file isn't in HEAD (new/untracked) — the caller
+/// treats that as an empty baseline (every line shows as added). `path` is repo-relative.
+pub fn head_blob(root: &Path, path: &str) -> Option<String> {
+    git(root, &["show", &format!("HEAD:{path}")])
+}
+
+/// Stash a single pathspec — one file or a whole folder — including any untracked
+/// files under it (`git stash push --include-untracked -- <path>`). Returns true on
+/// success. `path` is repo-relative (git resolves it as a pathspec).
+pub fn stash_path(root: &Path, path: &str) -> bool {
+    git(root, &["stash", "push", "--include-untracked", "--", path]).is_some()
+}
+
 /// The diff that a commit would capture: staged changes (`git diff --cached`)
 /// when anything is staged, otherwise the whole working tree (`git diff` plus
 /// untracked file contents). Used to feed AI commit-message generation.

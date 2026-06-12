@@ -584,6 +584,10 @@ pub fn ICON_FILE_COLOR() -> Color { current().read().unwrap().icon_file_color }
 pub fn DIFF_ADD_BG() -> [f32; 4] { [0.18, 0.43, 0.24, 0.30] }
 pub fn DIFF_DEL_BG() -> [f32; 4] { [0.50, 0.18, 0.18, 0.30] }
 pub fn DIFF_HUNK_BG() -> [f32; 4] { [0.20, 0.30, 0.42, 0.28] }
+// Gutter change indicators (VSCode-style bars left of the line numbers).
+pub fn GUTTER_ADD() -> [f32; 4] { [0.34, 0.65, 0.40, 1.0] }  // green
+pub fn GUTTER_MOD() -> [f32; 4] { [0.32, 0.55, 0.86, 1.0] }  // blue
+pub fn GUTTER_DEL() -> [f32; 4] { [0.82, 0.34, 0.32, 1.0] }  // red
 pub fn DIFF_FILLER_BG() -> [f32; 4] { [0.0, 0.0, 0.0, 0.22] } // "no line here" on a side
 pub fn DIFF_GAP_BG() -> [f32; 4] { [0.40, 0.44, 0.56, 0.20] } // collapsed-unchanged separator band
 

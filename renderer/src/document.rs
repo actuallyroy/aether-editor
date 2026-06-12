@@ -104,6 +104,10 @@ pub struct Document {
     pub breakpoints: std::collections::HashSet<usize>, // debug breakpoints (0-based lines)
     pub blame: Vec<crate::git::BlameLine>, // inline git blame, indexed by 0-based line (empty = none/pending)
     pub blame_requested: bool, // a blame fetch has been kicked off for the current content
+    pub diff_base: Option<Vec<String>>, // HEAD baseline lines for gutter change bars (None = not fetched)
+    pub diff_base_requested: bool,      // a baseline fetch is in flight / done for this file
+    pub gutter_changes: Vec<(usize, crate::gutter_diff::Change)>, // per-line change marks
+    pub gutter_version: i32,            // `version` the marks were computed for (-1 = stale)
     pub execution_line: Option<usize>,   // current debug execution line (0-based), if stopped here
     pub lsp_dirty: bool,                 // text changed since the last didChange was sent
     pub lsp_servers: Vec<&'static str>,  // servers a didOpen has been sent to (open-state is per-server)
@@ -382,6 +386,10 @@ impl Document {
             breakpoints: std::collections::HashSet::new(),
             blame: Vec::new(),
             blame_requested: false,
+            diff_base: None,
+            diff_base_requested: false,
+            gutter_changes: Vec::new(),
+            gutter_version: -1,
             execution_line: None,
             lsp_dirty: false,
             lsp_servers: Vec::new(),
@@ -453,17 +461,29 @@ impl Document {
     /// one line per commit (inline refs + subject + author/date); the renderer draws
     /// the lane graph to the left and offsets this text past it.
     pub fn new_graph(graph: crate::graph::Graph, fs: &mut FontSystem) -> Self {
+        // Render as aligned, monospace columns so the view reads like a table:
+        //   <hash>  <refs + subject>            <author>          <date>
+        // Each column is padded/truncated to a fixed character width (the lane graph
+        // is drawn to the left and the text offset past it, so columns line up).
+        const MSG_W: usize = 78; // refs + subject column
+        const AUTHOR_W: usize = 18;
+        // Pad-or-truncate to exactly `w` display chars (… on overflow), counting chars
+        // (every glyph here is single-width in the mono font).
+        fn col(s: &str, w: usize) -> String {
+            let n = s.chars().count();
+            if n > w {
+                let kept: String = s.chars().take(w.saturating_sub(1)).collect();
+                format!("{kept}…")
+            } else {
+                format!("{s}{}", " ".repeat(w - n))
+            }
+        }
         let mut text = String::new();
         for r in &graph.rows {
             let refs: String = r.refs.iter().map(|rf| format!("‹{}› ", rf.label)).collect();
-            // Truncate the subject so rows don't run long; full message shows on hover.
-            let subject: String = if r.subject.chars().count() > 72 {
-                let s: String = r.subject.chars().take(71).collect();
-                format!("{s}…")
-            } else {
-                r.subject.clone()
-            };
-            text.push_str(&format!("{}  {}{}    {} · {}\n", r.short, refs, subject, r.author, r.when));
+            let msg = col(&format!("{refs}{}", r.subject), MSG_W);
+            let author = col(&r.author, AUTHOR_W);
+            text.push_str(&format!("{}  {}  {}  {}\n", r.short, msg, author, r.when));
         }
         let mut d = Document::new(None, text, fs);
         d.name = graph.title.clone();
@@ -532,6 +552,10 @@ impl Document {
             breakpoints: std::collections::HashSet::new(),
             blame: Vec::new(),
             blame_requested: false,
+            diff_base: None,
+            diff_base_requested: false,
+            gutter_changes: Vec::new(),
+            gutter_version: -1,
             execution_line: None,
             lsp_dirty: false,
             lsp_servers: Vec::new(),
@@ -640,6 +664,10 @@ impl Document {
             breakpoints: std::collections::HashSet::new(),
             blame: Vec::new(),
             blame_requested: false,
+            diff_base: None,
+            diff_base_requested: false,
+            gutter_changes: Vec::new(),
+            gutter_version: -1,
             execution_line: None,
             lsp_dirty: false,
             lsp_servers: Vec::new(),
@@ -1652,6 +1680,20 @@ impl Document {
     /// Full document text (for LSP full-text sync).
     pub fn text(&self) -> String {
         self.rope.to_string()
+    }
+
+    /// Recompute the gutter change marks against the HEAD baseline, but only if the
+    /// buffer changed since the last computation (keyed by `version`). No-op until the
+    /// baseline blob has been fetched. Cheap for local edits (prefix/suffix trim).
+    pub fn refresh_gutter_marks(&mut self) {
+        if self.gutter_version == self.version {
+            return;
+        }
+        let Some(base) = self.diff_base.as_ref() else { return };
+        let text = self.rope.to_string();
+        let cur: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+        self.gutter_changes = crate::gutter_diff::compute(base, &cur);
+        self.gutter_version = self.version;
     }
 
     /// Absolute byte offset for an LSP position `(line, utf16_char)`. LSP characters

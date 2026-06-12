@@ -69,6 +69,11 @@ pub struct UiBuffers {
     pub commit_card: HoverCard, // commit-graph: full message on hover
     pub ext_detail: ExtensionDetail,
     pub panel_text: Buffer,          // PROBLEMS/OUTPUT/DEBUG CONSOLE text view (non-terminal tabs)
+    pub peek: Buffer,                // inline gutter-diff peek: the scrollable unified-diff body
+    pub peek_title: TextLabel,       // peek header label ("file · Working Tree — N of M")
+    pub peek_close: TextLabel,       // peek header close (×) glyph
+    pub peek_prev: TextLabel,        // peek header previous-change (↑) glyph
+    pub peek_next: TextLabel,        // peek header next-change (↓) glyph
     pub terminal_panes: Vec<Buffer>, // one monospace grid buffer per visible split pane
     pub term_tablist: ListView,      // right-side terminal tab switcher (multi-tab only)
     pub binary_placeholder: crate::ui::binary_placeholder::BinaryPlaceholder, // unsupported-file overlay
@@ -337,6 +342,23 @@ impl GpuState {
             commit_card: HoverCard::new(&mut font_system),
             ext_detail: ExtensionDetail::new(&mut font_system),
             panel_text: make_ui_buffer_mono(&mut font_system, 4000.0, 4000.0),
+            peek: make_ui_buffer_mono(&mut font_system, 4000.0, 4000.0),
+            peek_title: TextLabel::new(&mut font_system, 600.0, theme::UI_LINE_HEIGHT()),
+            peek_close: {
+                let mut l = TextLabel::new(&mut font_system, 28.0, 28.0);
+                l.set(&mut font_system, &theme::ICON_CLOSE.to_string(), theme::ICON_FAMILY);
+                l
+            },
+            peek_prev: {
+                let mut l = TextLabel::new(&mut font_system, 28.0, 28.0);
+                l.set(&mut font_system, &theme::ICON_ARROW_UP.to_string(), theme::ICON_FAMILY);
+                l
+            },
+            peek_next: {
+                let mut l = TextLabel::new(&mut font_system, 28.0, 28.0);
+                l.set(&mut font_system, &theme::ICON_ARROW_DOWN.to_string(), theme::ICON_FAMILY);
+                l
+            },
             terminal_panes: Vec::new(), // grown on demand as panes are split
             term_tablist: ListView::new(
                 &mut font_system,

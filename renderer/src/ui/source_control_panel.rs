@@ -377,10 +377,21 @@ impl SourceControlPanel {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
+        // Remember which commit (by hash) was expanded so a refresh — now fired by
+        // the fs-watcher on every working-tree/.git change — doesn't snap it shut.
+        let expanded_hash = self
+            .graph_expanded
+            .and_then(|i| self.graph.as_ref().and_then(|g| g.rows.get(i)))
+            .map(|r| r.short.clone());
         let entries = git::commit_log(&self.root, 200);
         self.graph = Some(crate::graph::build(String::new(), entries, now));
-        self.graph_expanded = None;
-        self.graph_files.clear();
+        // Re-resolve the expanded commit's new row index (indices shift when commits
+        // are added/removed). Keep its already-fetched file list if it's still present.
+        self.graph_expanded = expanded_hash
+            .and_then(|h| self.graph.as_ref().and_then(|g| g.rows.iter().position(|r| r.short == h)));
+        if self.graph_expanded.is_none() {
+            self.graph_files.clear();
+        }
         self.rebuild_graph_text(fs);
         self.last_w = -1.0; // force re-ellipsize on the next `update`
         // Shape immediately at the last known width so a refresh isn't blank for a frame.
@@ -576,8 +587,8 @@ impl SourceControlPanel {
         let z = theme::ui_zoom();
         // The hovered row's action icons appear at the right, so that one row reserves
         // the action column too (others keep the full width). Reserve the widest case
-        // (3 actions) so the icons never sit over the name.
-        let hover_reserve = 3.0 * action_w() + 4.0 * z;
+        // (4 actions: Open · Discard · Stash · Stage) so the icons never sit over the name.
+        let hover_reserve = 4.0 * action_w() + 4.0 * z;
         let row_avail = |i: usize| if Some(i) == hovered { (avail - hover_reserve).max(20.0) } else { avail };
         // Width an indented tree row's name may use: its base avail minus the indent
         // steps and the icon column. Ellipsized (not hard-clipped) past this.
@@ -895,17 +906,17 @@ impl SourceControlPanel {
     /// Hover-action icon rects for a row, right-to-left ending before the status.
     fn action_rects(region: Rect, y: f32, staged: bool) -> Vec<(Act, Rect)> {
         let acts: &[Act] = if staged {
-            &[Act::Open, Act::Unstage]
+            &[Act::Open, Act::Stash, Act::Unstage]
         } else {
-            &[Act::Open, Act::Discard, Act::Stage]
+            &[Act::Open, Act::Discard, Act::Stash, Act::Stage]
         };
         Self::rects_for(acts, region, y)
     }
 
-    /// Hover actions on a tree-mode FOLDER row: stage/unstage every file under it
-    /// (#34). Discard is deliberately absent — it confirms per file.
+    /// Hover actions on a tree-mode FOLDER row: stash + stage/unstage every file
+    /// under it (#34). Discard is deliberately absent — it confirms per file.
     fn folder_action_rects(region: Rect, y: f32, staged: bool) -> Vec<(Act, Rect)> {
-        let acts: &[Act] = if staged { &[Act::Unstage] } else { &[Act::Stage] };
+        let acts: &[Act] = if staged { &[Act::Stash, Act::Unstage] } else { &[Act::Stash, Act::Stage] };
         Self::rects_for(acts, region, y)
     }
 
@@ -1534,6 +1545,110 @@ impl SourceControlPanel {
         None
     }
 
+    /// True when `pt` is over ANY clickable element — the single seam the cursor
+    /// logic asks so every icon/button/row reads as a pointer (no more "added a
+    /// button, forgot the cursor"). Covers toolbar + header + row-action icons (via
+    /// `tooltip_at`), file/folder rows, the commit split button, and graph rows.
+    pub fn over_clickable(&self, pt: (f32, f32), region: Rect) -> bool {
+        if self.tooltip_at(pt, region).is_some() || self.over_row(pt, region) {
+            return true;
+        }
+        if self.changes_open
+            && (Self::commit_main(region).contains(pt) || Self::commit_chevron(region).contains(pt))
+        {
+            return true;
+        }
+        // CHANGES / GRAPH section headers and graph commit rows are clickable too.
+        if Self::changes_hdr(region).contains(pt) {
+            return true;
+        }
+        if self.graph.is_some()
+            && (self.graph_hdr(region).contains(pt) || self.graph_viewport(region).contains(pt))
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Hover label for whichever icon button sits under `pt` — the toolbar, the
+    /// commit dropdown, group-header actions, or a row's action icons. Drives the
+    /// tooltip so the (otherwise unlabeled) icons are discoverable.
+    pub fn tooltip_at(&self, pt: (f32, f32), region: Rect) -> Option<&'static str> {
+        let act_label = |a: Act| match a {
+            Act::Diff => "Open Changes",
+            Act::Open => "Open File",
+            Act::Discard => "Discard Changes",
+            Act::Stage => "Stage Changes",
+            Act::Unstage => "Unstage Changes",
+            Act::Stash => "Stash Changes",
+        };
+        // Top toolbar.
+        let [sparkle, stash, tree, refresh, more] = Self::toolbar_rects(region);
+        if sparkle.contains(pt) {
+            return Some("Generate Commit Message (AI)");
+        }
+        if stash.contains(pt) {
+            return Some("Stash All Changes");
+        }
+        if tree.contains(pt) {
+            return Some(if self.tree_mode { "View as List" } else { "View as Tree" });
+        }
+        if refresh.contains(pt) {
+            return Some("Refresh");
+        }
+        if more.contains(pt) {
+            return Some("Views and More Actions…");
+        }
+        if self.changes_open && Self::commit_chevron(region).contains(pt) {
+            return Some("More Commit Actions…");
+        }
+        // Group-header composite actions (Stage/Discard/Stash/Unstage All, Open All).
+        for staged in [true, false] {
+            if (staged && !self.has_staged()) || (!staged && self.unstaged_vis.is_empty()) {
+                continue;
+            }
+            for (act, r) in self.header_actions(region, staged) {
+                if r.contains(pt) {
+                    return Some(match act {
+                        Act::Diff => "Open All Changes",
+                        Act::Stage => "Stage All Changes",
+                        Act::Unstage => "Unstage All Changes",
+                        Act::Discard => "Discard All Changes",
+                        Act::Stash => "Stash All Changes",
+                        Act::Open => "Open File",
+                    });
+                }
+            }
+        }
+        // Per-row file / folder action icons (only the hovered row shows them).
+        if !self.groups_viewport(region).contains(pt) {
+            return None;
+        }
+        for staged in [true, false] {
+            let (lr, vis, list): (Rect, &[Vis], &IconList) = if staged {
+                (self.staged_list(region), &self.staged_vis, &self.staged)
+            } else {
+                (self.unstaged_list(region), &self.unstaged_vis, &self.unstaged)
+            };
+            if !lr.contains(pt) {
+                continue;
+            }
+            let Some(i) = list.row_at(lr, pt, vis.len()) else { return None };
+            let y = lr.y + i as f32 * row_h();
+            let rects = match &vis[i] {
+                Vis::Folder { .. } => Self::folder_action_rects(lr, y, staged),
+                Vis::File { .. } => Self::action_rects(lr, y, staged),
+            };
+            for (act, r) in rects {
+                if r.contains(pt) {
+                    return Some(act_label(act));
+                }
+            }
+            return None;
+        }
+        None
+    }
+
     pub fn row_at_point(&self, pt: (f32, f32), region: Rect) -> Option<(String, bool, bool)> {
         if !self.groups_viewport(region).contains(pt) {
             return None;
@@ -1780,6 +1895,12 @@ impl SourceControlPanel {
                         let mut acted = false;
                         for (act, ar) in Self::folder_action_rects(lr, y, staged) {
                             if ar.contains(pt) {
+                                if act == Act::Stash {
+                                    // One stash for the whole folder (pathspec), not per file.
+                                    out.push(Intent::GitStashPath(Self::folder_path(key).to_string()));
+                                    acted = true;
+                                    break;
+                                }
                                 let dir = format!("{}/", Self::folder_path(key));
                                 for r in rows.iter().filter(|r| r.path.starts_with(&dir)) {
                                     match act {
@@ -1812,7 +1933,7 @@ impl SourceControlPanel {
                                     Act::Stage => out.push(Intent::GitStage(p)),
                                     Act::Unstage => out.push(Intent::GitUnstage(p)),
                                     Act::Discard => out.push(Intent::GitDiscard { path: p, untracked: r.untracked }),
-                                    Act::Stash => {} // not a per-file action
+                                    Act::Stash => out.push(Intent::GitStashPath(p)),
                                 }
                                 acted = true;
                                 break;

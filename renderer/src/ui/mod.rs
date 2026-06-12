@@ -61,6 +61,8 @@ pub enum Intent {
     GitDiscardAll,
     /// Stash all working-tree changes (including untracked).
     GitStash,
+    /// Stash only one pathspec — a single file or a whole folder (incl. untracked).
+    GitStashPath(String),
     GitRefresh,
     /// Generate a commit message from the current diff via Azure OpenAI (✨).
     GitGenerateCommitMessage,

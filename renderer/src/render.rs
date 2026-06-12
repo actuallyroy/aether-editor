@@ -59,6 +59,72 @@ fn rel_time(secs_ago: i64) -> String {
     format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
 }
 
+/// Geometry of the inline gutter-diff peek zone (shared by the renderer and input
+/// hit-testing so the close/nav buttons, scrollbar, and wheel all use one layout).
+pub(crate) struct PeekGeom {
+    pub zone: Rect,
+    pub header: Rect,
+    pub content: Rect,
+    pub close: Rect,
+    pub prev: Rect,
+    pub next: Rect,
+    pub max_scroll: f32,
+    pub lh: f32,
+}
+
+/// Compute the peek zone under `anchor_line` of `d`. `content_rows` is the body's
+/// shaped line count (`gpu.ui.peek.layout_runs().count()`).
+pub(crate) fn peek_geom(
+    d: &crate::document::Document,
+    anchor_line: usize,
+    layout: &Layout,
+    content_rows: usize,
+) -> PeekGeom {
+    let et = layout.editor_text;
+    let g = layout.gutter;
+    let lh = theme::LINE_HEIGHT();
+    let total = d.rope.len_lines();
+    let anchor = anchor_line.min(total.saturating_sub(1));
+    let (ltop, _) = d.line_visual_bounds(anchor);
+    let off = lh * d.hidden_above(anchor) as f32;
+    let line_bot = et.y + theme::EDITOR_PAD() + ltop + lh - d.scroll_y() - off;
+    let header_h = theme::UI_LINE_HEIGHT() + theme::zpx(6.0);
+    let px = g.x;
+    let pw = g.w + et.w;
+    let region_bot = et.y + et.h;
+    // Up to 14 body rows; clamp to space below the clicked line.
+    let want_h = header_h + 14.0 * lh;
+    let py = line_bot.max(et.y).min((region_bot - lh * 3.0).max(et.y));
+    let zone_h = want_h.min(region_bot - py).max(header_h + lh);
+    let zone = Rect { x: px, y: py, w: pw, h: zone_h };
+    let header = Rect { x: px, y: py, w: pw, h: header_h };
+    let content = Rect { x: px, y: py + header_h, w: pw, h: zone_h - header_h };
+    let bw = header_h; // square buttons
+    let close = Rect { x: px + pw - bw, y: py, w: bw, h: header_h };
+    let next = Rect { x: close.x - bw, y: py, w: bw, h: header_h };
+    let prev = Rect { x: next.x - bw, y: py, w: bw, h: header_h };
+    let max_scroll = (content_rows as f32 * lh - content.h).max(0.0);
+    PeekGeom { zone, header, content, close, prev, next, max_scroll, lh }
+}
+
+/// Tab icon for a document: a git-branch glyph for the read-only Commit Graph view,
+/// otherwise the file-type icon by name. Used both to register the icon overlay and
+/// to draw it, so they stay in sync.
+fn doc_tab_icon(d: &crate::document::Document) -> (char, glyphon::Color) {
+    if d.graph.is_some() {
+        // Reuse the file-type icon's color, just swap in the git-branch glyph.
+        (theme::ICON_SOURCE_CONTROL, theme::file_icon(&d.name).1)
+    } else if d.diff.is_some() {
+        // Diff-tab titles are "<file> (Working Tree)" / "<file> (abc1234)" / "<a> ↔ <b>";
+        // pick the type icon from the leading filename so a diff looks like its file.
+        let fname = d.name.split(" (").next().unwrap_or(&d.name);
+        let fname = fname.split(" ↔ ").next().unwrap_or(fname);
+        theme::file_icon(fname.trim())
+    } else {
+        theme::file_icon(&d.name)
+    }
+}
+
 /// The inline git-blame annotation for the caret line, if any — only for plain
 /// editable text docs (not diffs/images/previews). "You" replaces the user's own
 /// name; uncommitted edits read "You · Uncommitted changes".
@@ -332,8 +398,13 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     pane.term.resize(rows, cols);
                     pane.dirty = true;
                 }
+                // The scroll range must be measured in GRID ROWS, not raw pixels: the
+                // pane renders exactly `grid_rows` lines, but `rect.h` is usually a
+                // fraction of a row taller, which made max-scroll ~1 line short so the
+                // bottom (live) line could never be reached. Use a row-aligned viewport.
                 let content_h = pane.term.total_lines() as f32 * theme::LINE_HEIGHT();
-                pane.scroll.set_metrics(rect, (rect.w, content_h));
+                let vp = Rect { h: rows as f32 * theme::LINE_HEIGHT(), ..rect };
+                pane.scroll.set_metrics(vp, (rect.w, content_h));
             }
         }
     }
@@ -578,7 +649,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             cache.tabs = tab_text;
             // Ensure a cached icon overlay exists for each tab's file type.
             for d in &app.workspace.documents {
-                let g = theme::file_icon(&d.name).0;
+                let g = doc_tab_icon(d).0;
                 gpu.ui
                     .tab_icons
                     .entry(g)
@@ -695,6 +766,32 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             gpu.ui.panel_text.shape_until_scroll(fs, false);
         }
 
+        // Inline gutter-diff peek: shape the whole-file unified diff body + header.
+        // Re-shaping a multi-thousand-line diff every frame is what made the popup
+        // feel laggy — only do it when the body actually changes (keyed by content +
+        // zoom epoch); the header label is cheap and change-detects on its own.
+        if let Some(pk) = app.gutter_peek.as_ref() {
+            let key = (pk.text.len(), pk.anchor_line, theme::shape_epoch() as u64);
+            if app.peek_shaped_key != Some(key) {
+                let attrs = Attrs::new().family(Family::Name(theme::MONO_FAMILY()));
+                gpu.ui.peek.set_metrics(fs, glyphon::Metrics::new(theme::FONT_SIZE(), theme::LINE_HEIGHT()));
+                // Size the buffer tall enough to shape EVERY row — `shape_until_scroll`
+                // only lays out lines that fit the buffer height, so a short buffer would
+                // silently truncate a long diff (the "only ~100 lines" bug).
+                let n = pk.text.lines().count().max(1) as f32;
+                gpu.ui.peek.set_size(fs, Some(8000.0), Some(n * theme::LINE_HEIGHT() + 200.0));
+                gpu.ui.peek.set_text(fs, &pk.text, attrs, Shaping::Advanced);
+                gpu.ui.peek.shape_until_scroll(fs, false);
+                gpu.ui.peek_close.reshape(fs);
+                gpu.ui.peek_prev.reshape(fs);
+                gpu.ui.peek_next.reshape(fs);
+                app.peek_shaped_key = Some(key);
+            }
+            let n = pk.hunk_rows.len().max(1);
+            let header = format!("{}   {} of {} change{}", pk.title, pk.change_idx + 1, n, if n == 1 { "" } else { "s" });
+            gpu.ui.peek_title.set(fs, &header, theme::UI_FAMILY());
+        }
+
         // Source Control change-count badge text (capped at 99+).
         let scm_count = app.source_control.as_ref().map_or(0, |s| s.change_count());
         if scm_count > 0 {
@@ -766,7 +863,12 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                         continue;
                     }
                     let rect = rects[i];
-                    let top_line = (pane.scroll.offset().1 / theme::LINE_HEIGHT()).round() as usize;
+                    // Clamp to the same max the caret uses (`total - grid_rows`) so the
+                    // text window never starts past the point where the bottom line fits
+                    // — otherwise a fractional row height drops the last line (the prompt).
+                    let grid_rows = pane.term.dims().1;
+                    let back = pane.term.total_lines().saturating_sub(grid_rows);
+                    let top_line = ((pane.scroll.offset().1 / theme::LINE_HEIGHT()).round() as usize).min(back);
                     let owned: Vec<(String, Attrs)> = pane
                         .term
                         .visual_spans(top_line)
@@ -1615,6 +1717,35 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             }
         }
 
+        // Git gutter change indicators (vs HEAD): a colored bar at the gutter's left
+        // edge — green added, blue modified, red wedge where lines were deleted.
+        if d.diff.is_none() && d.info.is_none() && d.graph.is_none() && !d.gutter_changes.is_empty() {
+            use crate::gutter_diff::Change;
+            let g = layout.gutter;
+            let bw = theme::zpx(2.5);
+            // Right edge of the line-number column (between numbers and text), VSCode-style.
+            let bx = g.x + g.w - bw;
+            for run in d.buffer.layout_runs() {
+                let line = run.line_i;
+                if d.is_line_hidden(line) {
+                    continue;
+                }
+                let Some(&(_, kind)) = d.gutter_changes.iter().find(|(l, _)| *l == line) else {
+                    continue;
+                };
+                let line_y = layout.editor_text.y + theme::EDITOR_PAD() + run.line_top - d.scroll_y() - foff(line);
+                let (color, top, h) = match kind {
+                    Change::Added => (theme::GUTTER_ADD(), line_y, run.line_height),
+                    Change::Modified => (theme::GUTTER_MOD(), line_y, run.line_height),
+                    // Deletion sits between lines: a short wedge at this line's top edge.
+                    Change::Deleted => (theme::GUTTER_DEL(), line_y - theme::zpx(3.0), theme::zpx(6.0)),
+                };
+                if let Some((qy, qh)) = clip_v(top, h) {
+                    bg_quads.push(Quad::new(bx, qy, bw, qh, color));
+                }
+            }
+        }
+
         // Debug: breakpoint dots in the gutter + the current execution-line band.
         if d.diff.is_none() && d.info.is_none() && (!d.breakpoints.is_empty() || d.execution_line.is_some()) {
             let g = layout.gutter;
@@ -1733,6 +1864,23 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 }
             }
         }
+        // Gutter-change overview ruler: a colored tick on the scrollbar track for each
+        // changed line (vs HEAD), so the spread of edits across the file is visible at a
+        // glance — mirrors the in-gutter bars (VSCode's overview ruler).
+        if d.diff.is_none() && !d.read_only && !d.gutter_changes.is_empty() && !modal_open {
+            let track = d.scroll.vtrack_rect();
+            let total = d.rope.len_lines().max(1) as f32;
+            let mh = theme::zpx(3.0).max(2.0);
+            for &(line, kind) in &d.gutter_changes {
+                let color = match kind {
+                    crate::gutter_diff::Change::Added => theme::GUTTER_ADD(),
+                    crate::gutter_diff::Change::Modified => theme::GUTTER_MOD(),
+                    crate::gutter_diff::Change::Deleted => theme::GUTTER_DEL(),
+                };
+                let y = track.y + (line as f32 / total) * track.h - mh * 0.5;
+                fg_quads.push(Quad::new(track.x, y, track.w, mh, color));
+            }
+        }
         // Overview markers: a tick on the scrollbar track per match — find results
         // (current one brighter) or selection occurrences — so you can see where
         // they sit in the whole file (VSCode's overview ruler).
@@ -1795,7 +1943,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     bg_quads.push(Quad::new(rect.x - 1.0, rect.y, 1.0, rect.h, theme::PANEL_BORDER()));
                 }
                 let right = rect.x + rect.w;
-                let top_line = (pane.scroll.offset().1 / line_h).round() as usize;
+                // Clamp to `total - grid_rows` so the bottom line is never windowed out
+                // (matches the text-prep + caret math; fixes the intermittently missing
+                // last line at a fractional row height).
+                let back = pane.term.total_lines().saturating_sub(pane.term.dims().1);
+                let top_line = ((pane.scroll.offset().1 / line_h).round() as usize).min(back);
                 let at_bottom = pane.scroll.at_end();
                 // Per-cell background fills (reverse-video cursor, colored TUIs), clipped to the pane.
                 for (row, c0, c1, bg) in pane.term.bg_cells(top_line) {
@@ -1836,35 +1988,34 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 // the window starts exactly at scrollback.len() drifts one row off
                 // whenever the scroll offset isn't a perfect line multiple, painting
                 // the caret beside the wrong line while the grid is fully correct.
+                // Caret: a thin blinking bar in the focused pane; a hollow block in
+                // unfocused panes so the cursor position is still visible (VSCode-style)
+                // — otherwise clicking into the editor makes the terminal cursor vanish.
                 let focused = app.terminal.focused && i == g.focused;
-                if focused && pane.term.cursor_visible() && at_bottom && app.term_blink_on {
+                if pane.term.cursor_visible() && at_bottom && (!focused || app.term_blink_on) {
                     let (cc, cr) = pane.term.cursor();
                     let (_, grid_rows) = pane.term.dims();
                     let back = pane.term.total_lines().saturating_sub(grid_rows);
                     // Same clamp as window_from: the text never starts past `back`.
                     let eff_top = top_line.min(back);
                     let visual = (back + cr) as isize - eff_top as isize;
-                    // Debug builds: dump the caret-draw inputs (overwrite, tiny) so a
-                    // misplaced caret report can be matched against a grid replay.
-                    #[cfg(debug_assertions)]
-                    {
-                        let _ = std::fs::write(
-                            "/tmp/aether_caret_dbg.txt",
-                            format!(
-                                "cc={cc} cr={cr} grid_rows={grid_rows} total={} back={back} top_line={top_line} eff_top={eff_top} visual={visual} scroll={:.2} rect.y={:.1} rect.h={:.1} line_h={line_h:.2}\n",
-                                pane.term.total_lines(),
-                                pane.scroll.offset().1,
-                                rect.y,
-                                rect.h,
-                            ),
-                        );
-                    }
                     if visual >= 0 {
                         let cx = rect.x + theme::zpx(8.0) + cc as f32 * char_w;
                         let cy = rect.y + theme::zpx(4.0) + visual as f32 * line_h;
-                        let caret_w = theme::zpx(2.0).max(1.0);
+                        let col = theme::CURSOR();
                         if cx < right && cy + line_h <= rect.y + rect.h {
-                            bg_quads.push(Quad::new(cx, cy, caret_w, line_h, theme::CURSOR()));
+                            if focused {
+                                let caret_w = theme::zpx(2.0).max(1.0);
+                                bg_quads.push(Quad::new(cx, cy, caret_w, line_h, col));
+                            } else {
+                                // Hollow one-cell block (four thin edges).
+                                let bw = char_w.min((right - cx).max(0.0));
+                                let t = theme::zpx(1.0).max(1.0);
+                                bg_quads.push(Quad::new(cx, cy, bw, t, col)); // top
+                                bg_quads.push(Quad::new(cx, cy + line_h - t, bw, t, col)); // bottom
+                                bg_quads.push(Quad::new(cx, cy, t, line_h, col)); // left
+                                bg_quads.push(Quad::new(cx + bw - t, cy, t, line_h, col)); // right
+                            }
                         }
                     }
                 }
@@ -2140,7 +2291,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         };
         // File-type icon overlay at the tab's left (Seti brand glyph), centered.
         let icon = if i < app.workspace.documents.len() {
-            Some(theme::file_icon(&app.workspace.documents[i].name))
+            Some(doc_tab_icon(&app.workspace.documents[i]))
         } else if app.detail.open_extension.is_some() {
             Some((theme::ICON_EXTENSIONS, theme::FG_DIM()))
         } else {
@@ -3175,7 +3326,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // tab full-name on hover (tabs truncate to fit). Only one is set at a time.
     if app.dialog.is_none() && app.feedback_form.is_none() {
         if let Some((text, ax, ay)) =
-            app.block_tip.clone().or_else(|| app.tab_tip.clone()).or_else(|| app.row_tip.clone())
+            app.block_tip.clone().or_else(|| app.tab_tip.clone()).or_else(|| app.row_tip.clone()).or_else(|| app.icon_tip.clone())
         {
             gpu.ui.block_tip.set(&mut gpu.font_system, &text, theme::UI_FAMILY());
             let padx = theme::zpx(7.0);
@@ -3375,6 +3526,104 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             gpu.quad_renderer.render_fg(&mut pass);
         }
         gpu.queue.submit(Some(encf.finish()));
+    }
+
+    // ---- Inline gutter-diff peek (own pass so it draws OPAQUELY over the code) ----
+    // The main pass draws all editor text in one batch, so an inline panel can't hide
+    // the lines beneath it. Drawing here, after the main pass, occludes them properly.
+    if let Some(pk) = app.gutter_peek.as_ref() {
+        if let Some(d) = app.workspace.active_doc() {
+            let rows = gpu.ui.peek.layout_runs().count();
+            let gm = peek_geom(d, pk.anchor_line, &layout, rows);
+            let lh = gm.lh;
+            let scroll = pk.scroll.clamp(0.0, gm.max_scroll);
+            let z = gm.zone;
+            let c = gm.content;
+            let mut pq: Vec<Quad> = Vec::new();
+            pq.push(Quad::new(z.x, z.y, z.w, z.h, theme::PANEL_BG())); // opaque base
+            pq.push(Quad::new(gm.header.x, gm.header.y, gm.header.w, gm.header.h, theme::SIDEBAR_BG())); // header strip
+            // Per-row +/- backgrounds within the scrolled content viewport.
+            let first = (scroll / lh).floor() as usize;
+            let vis = (c.h / lh).ceil() as usize + 1;
+            for ri in first..(first + vis).min(pk.kinds.len()) {
+                let col = match pk.kinds[ri] {
+                    crate::diff::RowKind::Add => theme::DIFF_ADD_BG(),
+                    crate::diff::RowKind::Del => theme::DIFF_DEL_BG(),
+                    _ => continue,
+                };
+                let ry = c.y + ri as f32 * lh - scroll;
+                let top = ry.max(c.y);
+                let bot = (ry + lh).min(c.y + c.h);
+                if bot > top {
+                    pq.push(Quad::new(c.x, top, c.w, bot - top, col));
+                }
+            }
+            // Vertical scrollbar thumb.
+            if gm.max_scroll > 0.0 {
+                let track_h = c.h;
+                let thumb_h = (track_h * (c.h / (c.h + gm.max_scroll))).max(theme::zpx(24.0));
+                let ty = c.y + (track_h - thumb_h) * (scroll / gm.max_scroll);
+                pq.push(Rect { x: z.x + z.w - theme::zpx(6.0), y: ty, w: theme::zpx(4.0), h: thumb_h }
+                    .rounded_quad(theme::SCROLLBAR_THUMB(), theme::zpx(2.0)));
+            }
+            let border = theme::SEARCH_BORDER();
+            let fq = vec![
+                Quad::new(z.x, z.y, z.w, 1.0, border),
+                Quad::new(z.x, z.y + gm.header.h - 1.0, z.w, 1.0, border),
+                Quad::new(z.x, z.y + z.h - 1.0, z.w, 1.0, border),
+            ];
+            gpu.quad_renderer.prepare(&gpu.device, &gpu.queue, &pq, &fq, (cfg_w, cfg_h));
+            let mut pareas: Vec<TextArea> = Vec::new();
+            // Header label + nav/close glyphs.
+            gpu.ui.peek_title.push(z.x + theme::zpx(10.0), gm.header, theme::FG_TEXT(), &mut pareas);
+            gpu.ui.peek_prev.draw_center(gm.prev, theme::FG_DIM(), &mut pareas);
+            gpu.ui.peek_next.draw_center(gm.next, theme::FG_DIM(), &mut pareas);
+            gpu.ui.peek_close.draw_center(gm.close, theme::FG_DIM(), &mut pareas);
+            // Scrolled diff body, clipped to the content viewport.
+            pareas.push(TextArea {
+                buffer: &gpu.ui.peek,
+                left: c.x + theme::zpx(8.0),
+                top: c.y - scroll,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: c.x as i32,
+                    top: c.y as i32,
+                    right: (c.x + c.w) as i32,
+                    bottom: (c.y + c.h) as i32,
+                },
+                default_color: theme::FG_TEXT(),
+                custom_glyphs: &[],
+            });
+            gpu.text_renderer.prepare(
+                &gpu.device,
+                &gpu.queue,
+                &mut gpu.font_system,
+                &mut gpu.atlas,
+                &gpu.viewport,
+                pareas,
+                &mut gpu.swash_cache,
+            )?;
+            let mut encp = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("aether-peek-pass"),
+            });
+            {
+                let mut pass = encp.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("aether-peek"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                gpu.quad_renderer.render_bg(&mut pass);
+                gpu.text_renderer.render(&gpu.atlas, &gpu.viewport, &mut pass)?;
+                gpu.quad_renderer.render_fg(&mut pass);
+            }
+            gpu.queue.submit(Some(encp.finish()));
+        }
     }
 
     // ---- Generic right-click context menu (editor / tabs / SCM / settings dropdowns) ----
