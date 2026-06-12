@@ -58,8 +58,20 @@ impl Change {
     pub fn is_staged(&self) -> bool {
         self.staged != ' ' && self.staged != '?'
     }
+    /// True when this path is in an unmerged (conflicted) state. Git's porcelain
+    /// reports conflicts as `UU`/`AA`/`DD` or any pairing with a `U` side
+    /// (`AU UA DU UD`). Treating these as a normal "modified" row is dangerous —
+    /// the file still has `<<<<<<<` markers and won't run.
+    pub fn is_conflicted(&self) -> bool {
+        self.staged == 'U'
+            || self.worktree == 'U'
+            || (self.staged == self.worktree && (self.staged == 'A' || self.staged == 'D'))
+    }
     /// A short human label for the dominant state (for the UI badge).
     pub fn label(&self) -> &'static str {
+        if self.is_conflicted() {
+            return "!";
+        }
         match (self.staged, self.worktree) {
             ('?', _) => "U", // untracked
             ('A', _) => "A", // added
@@ -161,6 +173,30 @@ pub fn branch(root: &Path) -> Option<String> {
         None
     } else {
         Some(s.to_string())
+    }
+}
+
+/// An in-progress multi-step git operation, detected from the marker files git
+/// drops in the git-dir. `None` in a clean repo. The label is shown in the status
+/// bar so the user can't unknowingly sit mid-merge with conflicted files.
+pub fn merge_state(root: &Path) -> Option<&'static str> {
+    // `git rev-parse --git-dir` resolves the real git-dir (handles subdirs,
+    // worktrees, and `.git`-file submodules — joining `root/.git` does not).
+    let gd = git(root, &["rev-parse", "--git-dir"])?;
+    let gd = PathBuf::from(gd.trim());
+    let gd = if gd.is_absolute() { gd } else { toplevel(root).join(gd) };
+    if gd.join("MERGE_HEAD").exists() {
+        Some("MERGING")
+    } else if gd.join("rebase-merge").exists() || gd.join("rebase-apply").exists() {
+        Some("REBASING")
+    } else if gd.join("CHERRY_PICK_HEAD").exists() {
+        Some("CHERRY-PICKING")
+    } else if gd.join("REVERT_HEAD").exists() {
+        Some("REVERTING")
+    } else if gd.join("BISECT_LOG").exists() {
+        Some("BISECTING")
+    } else {
+        None
     }
 }
 

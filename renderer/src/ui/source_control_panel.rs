@@ -73,13 +73,14 @@ enum Act {
     Stash, // group header: stash all working changes
 }
 
-const BADGE_LETTERS: [&str; 5] = ["M", "A", "D", "R", "U"];
-const BADGE_RGB: [(u8, u8, u8); 5] = [
+const BADGE_LETTERS: [&str; 6] = ["M", "A", "D", "R", "U", "!"];
+const BADGE_RGB: [(u8, u8, u8); 6] = [
     (224, 168, 61),
     (102, 199, 117),
     (219, 84, 84),
     (115, 158, 230),
     (102, 199, 117),
+    (231, 76, 60), // conflict — strong red so it stands apart from green untracked
 ];
 /// Vertical intersection of `r` with viewport `vp` (None when fully outside).
 fn vclip(r: Rect, vp: Rect) -> Option<Rect> {
@@ -118,13 +119,15 @@ pub struct SourceControlPanel {
     selected: Option<(bool, usize)>, // clicked/highlighted row (persists; opens diff too)
     hover_reflowed: Option<(bool, usize)>, // hovered row the buffer was last re-truncated for
     branch: Option<String>,
+    merge_state: Option<&'static str>, // in-progress merge/rebase/etc. (status-bar warning)
+    conflict_count: usize,             // unmerged files (red "!" badge)
     l_changes: TextLabel,
     l_staged: TextLabel,
     l_unstaged: TextLabel,
     l_commit: TextLabel,
     count_staged: TextLabel,
     count_unstaged: TextLabel,
-    badges: [TextLabel; 5],
+    badges: [TextLabel; 6],
     ic_diff: TextLabel,
     ic_open: TextLabel,
     ic_discard: TextLabel,
@@ -235,6 +238,8 @@ impl SourceControlPanel {
             scroll: ScrollView::new(ScrollOpts { vertical: true, horizontal: false, stick_to_end: false }),
             root,
             change_count: 0,
+            merge_state: None,
+            conflict_count: 0,
             graph: None,
             graph_buf: glyphon::Buffer::new(fs, glyphon::Metrics::new(theme::FONT_SIZE(), row_h())),
             graph_open: false,
@@ -345,7 +350,17 @@ impl SourceControlPanel {
         self.change_count = changes.len();
         self.staged_rows.clear();
         self.unstaged_rows.clear();
+        self.merge_state = git::merge_state(&self.root);
+        self.conflict_count = 0;
         for c in &changes {
+            // Conflicted files are unmerged on BOTH index and worktree sides; routing
+            // them through the normal staged/unstaged logic would double-list them and
+            // show a misleading green "U". Surface them once, in Changes, with a red "!".
+            if c.is_conflicted() {
+                self.conflict_count += 1;
+                self.unstaged_rows.push(Self::conflict_row(&c.path));
+                continue;
+            }
             if c.staged != ' ' && c.staged != '?' {
                 self.staged_rows.push(Self::row(&c.path, c.staged));
             }
@@ -389,6 +404,26 @@ impl SourceControlPanel {
             untracked: code == '?',
             new_file: code == '?' || code == 'A',
         }
+    }
+
+    /// A row for an unmerged/conflicted file: red "!" badge, treated as an existing
+    /// file (it has a prior version, so Open Changes / Discard behave normally).
+    fn conflict_row(path: &str) -> Row {
+        let mut r = Self::row(path, 'M');
+        r.badge = 5;
+        r
+    }
+
+    /// In-progress merge/rebase warning for the status bar, e.g. "MERGING · 2 conflicts"
+    /// or just "MERGING" once conflicts are resolved. `None` when the repo is clean.
+    pub fn merge_banner(&self) -> Option<String> {
+        let state = self.merge_state?;
+        Some(if self.conflict_count > 0 {
+            let s = if self.conflict_count == 1 { "" } else { "s" };
+            format!("{state} · {} conflict{s}", self.conflict_count)
+        } else {
+            state.to_string()
+        })
     }
 
     /// Scroll the groups area by a wheel delta when the cursor is over it. Returns

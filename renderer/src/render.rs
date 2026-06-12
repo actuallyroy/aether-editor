@@ -656,12 +656,24 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         gpu.ui.status.set(fs, &status_text, theme::UI_FAMILY());
         gpu.ui.status_right.set(fs, &status_right_text, theme::UI_FAMILY());
         // Git-branch indicator (far left of the status bar). Empty when not a repo.
-        let branch_name = app
-            .source_control
-            .as_ref()
-            .and_then(|s| s.branch_name())
-            .unwrap_or("")
-            .to_string();
+        let branch_name = {
+            let mut s = app
+                .source_control
+                .as_ref()
+                .and_then(|sc| sc.branch_name())
+                .unwrap_or("")
+                .to_string();
+            // Surface an in-progress merge/rebase (+ conflict count) right next to the
+            // branch so it's visible from any panel — not just Source Control.
+            if let Some(banner) = app.source_control.as_ref().and_then(|sc| sc.merge_banner()) {
+                if s.is_empty() {
+                    s = banner;
+                } else {
+                    s = format!("{s}  ⚠ {banner}");
+                }
+            }
+            s
+        };
         gpu.ui.branch_icon.set(fs, &theme::ICON_SOURCE_CONTROL.to_string(), theme::ICON_FAMILY);
         gpu.ui.branch.set(fs, &branch_name, theme::UI_FAMILY());
         gpu.ui.zoom_pct.set(fs, &format!("{}%", (theme::ui_zoom() * 100.0).round() as i32), theme::UI_FAMILY());

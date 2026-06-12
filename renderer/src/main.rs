@@ -391,6 +391,10 @@ pub(crate) struct App {
     pub(crate) ext_remote: Vec<marketplace::RemoteExt>, // current marketplace search results
     pub(crate) worker_tx: Sender<WorkerMsg>,
     pub(crate) worker_rx: Receiver<WorkerMsg>,
+    /// Wakes a parked event loop when a background thread (fs-watcher, debug
+    /// adapter, …) posts a `WorkerMsg`. Without it, `about_to_wait` only drains
+    /// the channel on the next OS/input event, so changes don't auto-apply while idle.
+    pub(crate) proxy: Option<winit::event_loop::EventLoopProxy<()>>,
     /// Language servers (ESLint diagnostics, TS semantic tokens) — the manager owns
     /// the clients, the sync loop, and response routing (see lsp.rs).
     pub(crate) lsp: lsp::LspManager,
@@ -536,6 +540,7 @@ impl App {
             ext_remote: Vec::new(),
             worker_tx,
             worker_rx,
+            proxy: None, // set in main() once the event loop exists
             lsp: lsp::LspManager::new(),
             installing: None,
             detail: ui::ext_detail_view::ExtDetailView::new(),
@@ -2436,10 +2441,16 @@ impl App {
     fn start_fs_watcher(&mut self) {
         use notify::{RecursiveMode, Watcher};
         let tx = self.worker_tx.clone();
+        let proxy = self.proxy.clone();
         let mut watcher = match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             if let Ok(ev) = res {
                 if !ev.paths.is_empty() {
                     let _ = tx.send(WorkerMsg::FsChanged { paths: ev.paths });
+                    // Wake the event loop so the change is picked up even while idle
+                    // (no mouse/keyboard activity to drain the channel otherwise).
+                    if let Some(p) = &proxy {
+                        let _ = p.send_event(());
+                    }
                 }
             }
         }) {
@@ -8079,6 +8090,11 @@ fn min_instant(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
 // ---------- winit glue ----------
 
 impl ApplicationHandler for App {
+    /// A background thread (fs-watcher, debug adapter, …) posted a `WorkerMsg` and
+    /// woke the loop via the proxy. No work needed here — receiving the event is
+    /// enough; `about_to_wait` runs right after and drains `worker_rx`.
+    fn user_event(&mut self, _el: &ActiveEventLoop, _event: ()) {}
+
     /// The event loop is shutting down (Cmd/Ctrl+Q, menu Quit, or a `CloseRequested`
     /// that reached `el.exit()`): persist the window/layout one last time. Idempotent
     /// with the `CloseRequested` save above.
@@ -8948,6 +8964,7 @@ fn main() -> Result<()> {
     };
     let event_loop = EventLoop::new()?;
     let mut app = App::new(root, initial_file);
+    app.proxy = Some(event_loop.create_proxy());
     event_loop.run_app(&mut app)?;
     Ok(())
 }
