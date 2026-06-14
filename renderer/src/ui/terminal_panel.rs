@@ -138,12 +138,19 @@ impl TerminalPanel {
         for inc in incoming {
             match inc {
                 Incoming::Created { id, title } => {
-                    let bound = self
-                        .pending
-                        .pop_front()
-                        .and_then(|tag| self.term_by_tag(tag))
-                        .map(|p| p.term.bind(id, title))
-                        .is_some();
+                    let pane = self.pending.pop_front().and_then(|tag| self.term_by_tag(tag));
+                    let bound = if let Some(p) = pane {
+                        p.term.bind(id, title);
+                        // A restored session carries a command (e.g. `claude --resume …`)
+                        // to type once the shell is live.
+                        if let Some(cmd) = p.pending_cmd.take() {
+                            p.term.write(cmd.as_bytes());
+                            p.term.write(b"\r");
+                        }
+                        true
+                    } else {
+                        false
+                    };
                     if !bound {
                         // Its pane is gone (e.g. folder switched mid-create) — release
                         // the shell instead of leaking an owned, invisible terminal.
@@ -331,6 +338,21 @@ impl TerminalPanel {
     /// Spawn a pane sized to fit when the active tab shows `count` side-by-side
     /// panes, with the shell starting in `cwd` (the workspace root).
     fn spawn_pane(&mut self, count: usize, panel: Option<Rect>, cell_w: f32) -> Option<terminal::Pane> {
+        let cwd = self.cwd.to_string_lossy().to_string();
+        self.spawn_pane_in(count, panel, cell_w, &cwd, None)
+    }
+
+    /// Spawn a pane whose shell starts in `cwd` and (optionally) auto-runs `cmd`
+    /// once bound — the seam used by both new tabs (`cwd` = workspace, no command)
+    /// and Claude-session restore (`cwd` = the session's dir, `cmd` = the resume).
+    fn spawn_pane_in(
+        &mut self,
+        count: usize,
+        panel: Option<Rect>,
+        cell_w: f32,
+        cwd: &str,
+        cmd: Option<String>,
+    ) -> Option<terminal::Pane> {
         self.ensure_connected();
         let client = self.client.as_ref()?;
         let panel = panel?;
@@ -343,10 +365,44 @@ impl TerminalPanel {
         // Ask the daemon to spawn a shell; bind its id when `Created` arrives (poll).
         let tag = self.next_tag;
         self.next_tag += 1;
-        client.create(&self.cwd.to_string_lossy(), rows as u16, cols as u16);
+        client.create(cwd, rows as u16, cols as u16);
         self.pending.push_back(tag);
         let conn = client.conn();
-        Some(terminal::Pane::wrap(terminal::Terminal::new_unbound(conn, tag, rows, cols)))
+        let mut pane = terminal::Pane::wrap(terminal::Terminal::new_unbound(conn, tag, rows, cols));
+        pane.pending_cmd = cmd;
+        Some(pane)
+    }
+
+    /// Restore a Claude session as a new terminal tab: a shell in `cwd` that
+    /// auto-runs `command` (e.g. `claude --resume <id>`).
+    pub fn restore_terminal_tab(&mut self, panel: Option<Rect>, cell_w: f32, cwd: &str, command: String) {
+        if let Some(p) = self.spawn_pane_in(1, panel, cell_w, cwd, Some(command)) {
+            self.groups.push(terminal::Group::new(p));
+            self.active = self.groups.len() - 1;
+            self.visible = true;
+            self.focused = true;
+            self.mark_dirty();
+        }
+    }
+
+    /// Which currently-bound panes have a `claude` process running (daemon query).
+    pub fn claude_live_ids(&mut self) -> Vec<crate::ptyhost::TermId> {
+        self.client.as_mut().map(|c| c.claude_live()).unwrap_or_default()
+    }
+
+    /// `(id, cwd)` for every bound pane, so the watcher can map a running Claude to
+    /// the directory it should be resumed in (falls back to the workspace root).
+    pub fn live_terms(&self) -> Vec<(crate::ptyhost::TermId, PathBuf)> {
+        let mut out = Vec::new();
+        for g in &self.groups {
+            for p in &g.panes {
+                if p.term.id != 0 {
+                    let cwd = p.term.cwd().map(|c| c.to_path_buf()).unwrap_or_else(|| self.cwd.clone());
+                    out.push((p.term.id, cwd));
+                }
+            }
+        }
+        out
     }
 
     /// Header `+`: open a new terminal tab (a fresh group). The previous tab keeps

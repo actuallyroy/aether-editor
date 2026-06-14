@@ -22,6 +22,9 @@ pub struct Pane {
     /// coordinates (`scrollback ++ live`). `None` when there's no selection.
     pub sel: Option<(TermPos, TermPos)>,
     pub sel_dragging: bool,
+    /// A command to type into this shell once its daemon id is bound (used to
+    /// auto-run `claude --resume …` in a restored session). Cleared after sending.
+    pub pending_cmd: Option<String>,
 }
 
 /// A `(line, col)` position in the terminal's combined buffer. `col` may equal the
@@ -41,6 +44,7 @@ impl Pane {
             dirty: true,
             sel: None,
             sel_dragging: false,
+            pending_cmd: None,
         }
     }
 

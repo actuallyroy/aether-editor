@@ -8,6 +8,7 @@
 // status bar, command palette (Ctrl+Shift+P), find bar (Ctrl+F).
 
 mod ai;
+mod claude_sessions;
 mod commands;
 mod completion;
 mod dap;
@@ -182,6 +183,9 @@ pub(crate) enum DialogAction {
     /// Closing the window while terminals have running processes: kill them, keep
     /// them running in the background (daemon), or cancel the close.
     CloseWindowBusy,
+    /// Restore Claude sessions that were live when the window was lost (one-click
+    /// launch toast). Carries the candidates to relaunch via `claude --resume`.
+    RestoreClaude(Vec<claude_sessions::RestoreItem>),
     Dismiss, // info-only dialog; any button just closes it
 }
 
@@ -483,6 +487,16 @@ pub(crate) struct App {
     /// Integrated terminal state — see `ui::terminal_panel::TerminalPanel`. Accessed
     /// as `self.terminal.{groups,active,visible,focused,split,maximized}`.
     pub(crate) terminal: ui::terminal_panel::TerminalPanel,
+    /// Tracks which terminals run `claude` so live sessions can be restored after an
+    /// unexpected loss (see `claude_sessions`). Polled on a slow cadence.
+    pub(crate) claude_watcher: claude_sessions::ClaudeWatcher,
+    /// Restore candidates loaded on launch, offered via a one-click toast once the
+    /// daemon link has settled. Empty once handled.
+    pub(crate) claude_restore: Vec<claude_sessions::RestoreItem>,
+    /// When to make the restore decision (after the reattach has had time to bind).
+    pub(crate) claude_restore_at: Option<Instant>,
+    /// Next due time for the periodic Claude-liveness poll.
+    pub(crate) claude_poll_at: Instant,
     // Real monospace cell advance (px), measured from the shaped terminal buffer.
     // The cursor and grid sizing use this instead of an estimate so the block
     // cursor lands exactly on the glyph cell (no per-column drift).
@@ -621,6 +635,12 @@ impl App {
             detail: ui::ext_detail_view::ExtDetailView::new(),
             pending_close: false,
             terminal: ui::terminal_panel::TerminalPanel::new(root.clone()),
+            claude_watcher: claude_sessions::ClaudeWatcher::new(root.clone()),
+            // Sessions that were running when the window was last lost; offered for
+            // one-click restore ~3s in, once any surviving daemon has reattached.
+            claude_restore: claude_sessions::load_candidates(&root),
+            claude_restore_at: Some(Instant::now() + Duration::from_secs(3)),
+            claude_poll_at: Instant::now() + Duration::from_secs(2),
             terminal_cell_w: theme::FONT_SIZE() * 0.6, // refined after first shape
             cursor_blink_on: true,
             last_blink: Instant::now(),
@@ -3706,8 +3726,48 @@ impl App {
                     _ => {}
                 }
             }
+            DialogAction::RestoreClaude(items) => {
+                // 0 = Restore, 1 = Dismiss
+                if i == 0 {
+                    self.terminal.visible = true;
+                    self.terminal.maximized = false;
+                    self.panel_tab = 0;
+                    let panel = self.layout().terminal_panel;
+                    for it in items {
+                        self.terminal.restore_terminal_tab(
+                            panel,
+                            self.terminal_cell_w,
+                            &it.cwd.to_string_lossy(),
+                            it.command(),
+                        );
+                    }
+                }
+            }
             DialogAction::Dismiss => {}
         }
+        self.redraw();
+    }
+
+    /// One-click toast offering to restore Claude sessions that were live when the
+    /// window was lost (daemon died without a reboot).
+    fn offer_claude_restore(&mut self, items: Vec<claude_sessions::RestoreItem>) {
+        let msg = if items.len() == 1 {
+            "A Claude session was running when Aether last closed unexpectedly. Restore it?".to_string()
+        } else {
+            format!(
+                "{} Claude sessions were running when Aether last closed unexpectedly. Restore them?",
+                items.len()
+            )
+        };
+        if let Some(g) = self.gpu.as_mut() {
+            g.ui.dialog.set(&mut g.font_system, &msg, &["Restore", "Dismiss"], None);
+        }
+        self.dialog = Some(DialogState {
+            action: DialogAction::RestoreClaude(items),
+            has_check: false,
+            checked: false,
+            hovered: None,
+        });
         self.redraw();
     }
 
@@ -4706,6 +4766,11 @@ impl App {
             g.window.set_title(&window_title(&folder)); // Dock window-list / title bar
         }
         self.terminal.set_cwd(folder.clone()); // new shells start in the new root
+        // Re-scope Claude-session tracking to the new workspace (no cross-folder
+        // restore — the daemon reattaches this folder's orphaned shells itself).
+        self.claude_watcher.set_workspace(folder.clone());
+        self.claude_restore.clear();
+        self.claude_restore_at = None;
         if let Some(scp) = self.source_control.as_mut() {
             // Git operates on the repo top-level so status paths align with diff/stage
             // pathspecs when the opened folder is a subdirectory of the repo.
@@ -8853,6 +8918,44 @@ impl ApplicationHandler for App {
             self.redraw();
         }
 
+        // Claude-session liveness: on a slow cadence, ask the daemon which shells run
+        // `claude`, reconcile the watcher, and persist the running-set when it changes.
+        // Once the launch reattach has settled, offer to restore any session that the
+        // surviving daemon did NOT bring back on its own.
+        if now >= self.claude_poll_at && self.terminal.connected() {
+            self.claude_poll_at = now + Duration::from_secs(2);
+            let terms = self.terminal.live_terms();
+            // The process-tree query is a daemon round-trip; skip it when there are no
+            // shells to inspect and no restore decision pending (an empty `live` still
+            // lets the watcher retire any sessions whose panes vanished).
+            let live = if !terms.is_empty() || self.claude_restore_at.is_some() {
+                self.terminal.claude_live_ids()
+            } else {
+                Vec::new()
+            };
+            if self.claude_watcher.observe(&live, &terms) {
+                let snap = self.claude_watcher.snapshot();
+                claude_sessions::save(self.claude_watcher.workspace(), &snap);
+            }
+            if let Some(at) = self.claude_restore_at {
+                if now >= at {
+                    self.claude_restore_at = None;
+                    let live_cwds: std::collections::HashSet<PathBuf> = terms
+                        .iter()
+                        .filter(|(id, _)| live.contains(id))
+                        .map(|(_, c)| c.clone())
+                        .collect();
+                    let pending: Vec<_> = std::mem::take(&mut self.claude_restore)
+                        .into_iter()
+                        .filter(|r| !live_cwds.contains(&r.cwd))
+                        .collect();
+                    if !pending.is_empty() {
+                        self.offer_claude_restore(pending);
+                    }
+                }
+            }
+        }
+
         // Integrated terminal: keep ticking while open so new output appears promptly.
         if self.terminal.visible {
             let mut changed = polled;
@@ -8911,15 +9014,20 @@ impl ApplicationHandler for App {
             // While connected to the pty-host, keep a slow heartbeat so cross-window
             // focus requests are drained even when this window is otherwise idle.
             let daemon_wake = self.terminal.connected().then(|| now + Duration::from_millis(500));
+            // While a restore decision is pending, keep waking until it's made.
+            let claude_wake = self.claude_restore_at.map(|_| self.claude_poll_at);
             let wake = min_instant(
                 min_instant(
                     min_instant(
-                        min_instant(min_instant(min_instant(scroll_wake, autosave_wake), hover_wake), search_wake),
-                        blame_wake,
+                        min_instant(
+                            min_instant(min_instant(min_instant(scroll_wake, autosave_wake), hover_wake), search_wake),
+                            blame_wake,
+                        ),
+                        fs_wake,
                     ),
-                    fs_wake,
+                    daemon_wake,
                 ),
-                daemon_wake,
+                claude_wake,
             );
             el.set_control_flow(match wake {
                 Some(w) => ControlFlow::WaitUntil(w),

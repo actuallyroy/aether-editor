@@ -63,6 +63,11 @@ pub enum Msg {
     /// clears the input line.) Replies `TermBusyResult`.
     QueryTermBusy { id: TermId },
     TermBusyResult { id: TermId, busy: bool },
+    /// Which of this window's shells currently have a `claude` process running in
+    /// their subtree? Drives Claude-session liveness tracking (restore-on-launch).
+    /// Replies `ClaudeLive`.
+    QueryClaude,
+    ClaudeLive { ids: Vec<TermId> },
     FocusResult { found: bool },
     /// Daemon→GUI: another instance asked for this window — raise it.
     Focus,

@@ -118,6 +118,21 @@ impl Client {
         true
     }
 
+    /// Which of this window's shells currently have a `claude` process running.
+    /// Blocking round-trip (bounded); unrelated frames are stashed for `poll`.
+    pub fn claude_live(&mut self) -> Vec<TermId> {
+        send(&self.conn, Frame::Control(Msg::QueryClaude));
+        let deadline = std::time::Instant::now() + Duration::from_millis(400);
+        while std::time::Instant::now() < deadline {
+            match self.rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(Frame::Control(Msg::ClaudeLive { ids })) => return ids,
+                Ok(other) => self.stash.push_back(other),
+                Err(_) => {}
+            }
+        }
+        Vec::new() // no reply — treat as none running
+    }
+
     /// Ask the daemon to focus another live window that already has `workspace`
     /// open. Returns true if one was found (so the caller should NOT open the folder
     /// here). Waits briefly for the reply; unrelated frames are stashed for `poll`.

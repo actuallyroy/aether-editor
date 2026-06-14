@@ -248,6 +248,20 @@ pub fn run() -> io::Result<()> {
                         let busy = terms.get(&id).map_or(false, shell_busy);
                         send(&mut conns, cid, Frame::Control(Msg::TermBusyResult { id, busy }));
                     }
+                    Frame::Control(Msg::QueryClaude) => {
+                        // One process snapshot, then walk each owned shell's subtree
+                        // for a `claude` process (cheap vs forking ps per terminal).
+                        let snap = proc_snapshot();
+                        let ids = terms
+                            .iter()
+                            .filter(|(_, t)| t.owner == Some(cid))
+                            .filter(|(_, t)| {
+                                t.child.process_id().map_or(false, |pid| claude_in_subtree(pid, &snap))
+                            })
+                            .map(|(id, _)| *id)
+                            .collect();
+                        send(&mut conns, cid, Frame::Control(Msg::ClaudeLive { ids }));
+                    }
                     Frame::Control(Msg::FocusWindow { workspace }) => {
                         // Single-window-per-folder: find another live window that has
                         // this workspace open and ask it to raise itself. Empty
@@ -371,6 +385,60 @@ fn shell_busy(t: &Term) -> bool {
         let _ = t;
         false
     }
+}
+
+/// A snapshot of the process table: `pid → (ppid, command)`. One `ps` fork on
+/// Unix; empty elsewhere (Claude-session tracking is Unix-only for now).
+#[cfg(unix)]
+fn proc_snapshot() -> std::collections::HashMap<u32, (u32, String)> {
+    let mut map = std::collections::HashMap::new();
+    let out = match std::process::Command::new("ps").args(["-axo", "pid=,ppid=,command="]).output() {
+        Ok(o) => o,
+        Err(_) => return map,
+    };
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let mut it = line.trim_start().splitn(3, char::is_whitespace);
+        let (Some(pid), Some(ppid), Some(cmd)) = (it.next(), it.next(), it.next()) else {
+            continue;
+        };
+        if let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>()) {
+            map.insert(pid, (ppid, cmd.to_string()));
+        }
+    }
+    map
+}
+#[cfg(not(unix))]
+fn proc_snapshot() -> std::collections::HashMap<u32, (u32, String)> {
+    std::collections::HashMap::new()
+}
+
+/// Does any descendant of `root` (the pane's shell) look like a `claude` process?
+/// Matches a whitespace token whose basename starts with "claude" so it catches
+/// both a `claude` binary and `node …/claude` launches, but not `cd claude-foo`.
+fn claude_in_subtree(root: u32, snap: &std::collections::HashMap<u32, (u32, String)>) -> bool {
+    let is_claude = |cmd: &str| {
+        cmd.split_whitespace().any(|tok| {
+            tok.rsplit('/').next().map_or(false, |base| base.starts_with("claude"))
+        })
+    };
+    // BFS over the descendants of `root`.
+    let mut stack = vec![root];
+    let mut seen = 0;
+    while let Some(pid) = stack.pop() {
+        seen += 1;
+        if seen > 4096 {
+            break; // pathological cycle guard
+        }
+        for (&child, (ppid, cmd)) in snap.iter() {
+            if *ppid == pid {
+                if is_claude(cmd) {
+                    return true;
+                }
+                stack.push(child);
+            }
+        }
+    }
+    false
 }
 
 /// The user's login shell (COMSPEC on Windows, else $SHELL → bash → sh).
