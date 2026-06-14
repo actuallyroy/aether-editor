@@ -192,21 +192,18 @@ pub fn save(workspace: &Path, sessions: &[LiveSession]) {
     }
 }
 
-/// Load the restore candidates for `workspace`. Returns empty when the machine has
-/// rebooted since the set was saved (per the user's "not on reboot" rule) or when
-/// nothing was persisted.
+/// Load the restore candidates for `workspace`, or empty if nothing was persisted.
+///
+/// Unlike a generic terminal process — which is unrecoverable once killed — a Claude
+/// session lives in its on-disk transcript (`~/.claude/projects/…`), so `--resume`
+/// reconstructs it even across a reboot. We therefore restore regardless of boot
+/// time; the launch flow still drops any session the surviving daemon already
+/// reattached, so a clean quit doesn't produce duplicates.
 pub fn load_candidates(workspace: &Path) -> Vec<RestoreItem> {
     let Some(path) = store_path() else { return Vec::new() };
     let Ok(text) = std::fs::read_to_string(&path) else { return Vec::new() };
     let Ok(root) = serde_json::from_str::<Value>(&text) else { return Vec::new() };
     let Some(entry) = root.get(workspace.to_string_lossy().as_ref()) else { return Vec::new() };
-    // Reboot gate: if the system booted after we saved, the loss was a reboot/
-    // shutdown — don't restore.
-    if let (Some(saved), Some(now)) = (entry.get("boot").and_then(|b| b.as_u64()), boot_time()) {
-        if now > saved {
-            return Vec::new();
-        }
-    }
     entry
         .get("sessions")
         .and_then(|s| s.as_array())
