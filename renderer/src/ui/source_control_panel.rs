@@ -2031,6 +2031,42 @@ mod tests {
         (p, fs)
     }
 
+    // A file that is staged AND then further modified ("MM"/"AM") must appear in BOTH
+    // the Staged Changes and Changes lists, not just one.
+    #[test]
+    fn staged_then_modified_shows_in_both() {
+        fn git(dir: &std::path::Path, args: &[&str]) {
+            assert!(std::process::Command::new("git").args(args).current_dir(dir).output().is_ok());
+        }
+        let dir = std::env::temp_dir().join(format!("aether_scm_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        git(&dir, &["config", "user.email", "t@t.com"]);
+        git(&dir, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("f.txt"), "line1\n").unwrap();
+        git(&dir, &["add", "f.txt"]);
+        git(&dir, &["commit", "-qm", "init"]);
+        // Stage a change, then modify again so the worktree differs from the index.
+        std::fs::write(dir.join("f.txt"), "line1\nstaged\n").unwrap();
+        git(&dir, &["add", "f.txt"]);
+        std::fs::write(dir.join("f.txt"), "line1\nstaged\nmore\n").unwrap();
+        // Also a brand-new file staged then modified ("AM").
+        std::fs::write(dir.join("g.txt"), "new\n").unwrap();
+        git(&dir, &["add", "g.txt"]);
+        std::fs::write(dir.join("g.txt"), "new\nmore\n").unwrap();
+
+        let mut fs = FontSystem::new();
+        let mut p = SourceControlPanel::new(&mut fs, dir.clone());
+        p.refresh(&mut fs);
+        let staged = |path: &str| p.staged_rows.iter().any(|r| r.path == path);
+        let unstaged = |path: &str| p.unstaged_rows.iter().any(|r| r.path == path);
+        let (fs_s, fu, gs, gu) = (staged("f.txt"), unstaged("f.txt"), staged("g.txt"), unstaged("g.txt"));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(fs_s && fu, "tracked MM: staged={fs_s} unstaged={fu}");
+        assert!(gs && gu, "new-file AM: staged={gs} unstaged={gu}");
+    }
+
     // Clicking the per-row Stage (+) icon on an unstaged file must emit GitStage for
     // THAT file — not fall through to the row-body OpenDiff.
     #[test]

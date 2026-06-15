@@ -88,6 +88,19 @@ pub fn list() -> Value {
                 "enter":{"type":"boolean","description":"Append Enter to run (default true)"}
             },"required":["text"]}),
         ),
+        tool(
+            "listTerminals",
+            "List the terminal tabs (index, title, active)",
+            json!({"type":"object","properties":{}}),
+        ),
+        tool(
+            "renameTerminal",
+            "Rename a terminal tab",
+            json!({"type":"object","properties":{
+                "name":{"type":"string","description":"New tab title"},
+                "index":{"type":"number","description":"Tab index; omits to the active tab"}
+            },"required":["name"]}),
+        ),
     ])
 }
 
@@ -296,6 +309,27 @@ pub fn execute(app: &mut crate::App, name: &str, args: &Value) -> Result<Value, 
                 bytes.push(b'\r');
             }
             app.terminal.write_focused(&bytes);
+            Ok(json!({ "ok": true }))
+        }
+
+        "listTerminals" => {
+            let mut tabs = Vec::new();
+            let mut i = 0;
+            while let Some(title) = app.terminal.tab_title(i) {
+                tabs.push(json!({ "index": i, "title": title, "active": i == app.terminal.active }));
+                i += 1;
+            }
+            Ok(json!({ "terminals": tabs }))
+        }
+
+        "renameTerminal" => {
+            let name = args.get("name").and_then(|n| n.as_str()).ok_or("renameTerminal requires name")?;
+            let idx = args
+                .get("index")
+                .and_then(|i| i.as_u64())
+                .map(|i| i as usize)
+                .unwrap_or(app.terminal.active);
+            app.terminal.rename_tab(idx, name);
             Ok(json!({ "ok": true }))
         }
 

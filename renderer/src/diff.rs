@@ -99,7 +99,9 @@ fn file_name(path: &str) -> &str {
 
 /// Build the diff for one repo-relative `path`.
 /// - `staged`: diff the index against HEAD (`git diff --cached`).
-/// - else tracked: diff the working tree against HEAD (`git diff HEAD`).
+/// - else tracked: diff the working tree against the INDEX (`git diff`) — so a file
+///   that's staged and then further modified shows only its unstaged changes here,
+///   not the staged ones too (those belong to the Staged Changes entry).
 /// - `untracked`: no git side — show the whole working file as additions.
 pub fn compute(root: &Path, path: &str, staged: bool, untracked: bool) -> Diff {
     let name = file_name(path).to_string();
@@ -114,7 +116,9 @@ pub fn compute(root: &Path, path: &str, staged: bool, untracked: bool) -> Diff {
     let args: Vec<&str> = if staged {
         vec!["diff", "--no-color", &ctx, "--cached", "--", path]
     } else {
-        vec!["diff", "--no-color", &ctx, "HEAD", "--", path]
+        // Working tree vs INDEX (no `HEAD`): the Changes entry shows only what's not
+        // yet staged, even when the file also has staged changes.
+        vec!["diff", "--no-color", &ctx, "--", path]
     };
     let raw = git(root, &args).unwrap_or_default();
     let mut b = Builder::new(title);
@@ -183,7 +187,8 @@ pub fn compute_all(root: &Path, entries: &[(String, bool)], staged: bool) -> Dif
             let args: Vec<&str> = if staged {
                 vec!["diff", "--no-color", "--cached", "--", path]
             } else {
-                vec!["diff", "--no-color", "HEAD", "--", path]
+                // Working tree vs index — only the unstaged changes (see `compute`).
+                vec!["diff", "--no-color", "--", path]
             };
             let raw = git(root, &args).unwrap_or_default();
             b.parse_into(&raw);
