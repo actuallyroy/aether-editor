@@ -30,6 +30,7 @@ mod layout;
 mod lsp;
 mod markdown;
 mod marketplace;
+mod mcp;
 mod menus;
 mod nav;
 #[cfg(target_os = "macos")]
@@ -497,6 +498,13 @@ pub(crate) struct App {
     pub(crate) claude_restore_at: Option<Instant>,
     /// Next due time for the periodic Claude-liveness poll.
     pub(crate) claude_poll_at: Instant,
+    /// IDE-integration MCP server (started in `resumed`). `None` until then / if bind
+    /// failed. Holds the bound port for terminal env injection; drops the lockfile.
+    pub(crate) mcp: Option<mcp::McpServer>,
+    /// Tool calls from MCP connection threads → drained on the UI thread in
+    /// `about_to_wait`. `mcp_req_tx` is cloned into the server when it starts.
+    pub(crate) mcp_req_tx: Sender<mcp::McpRequest>,
+    pub(crate) mcp_rx: Receiver<mcp::McpRequest>,
     // Real monospace cell advance (px), measured from the shaped terminal buffer.
     // The cursor and grid sizing use this instead of an estimate so the block
     // cursor lands exactly on the glyph cell (no per-column drift).
@@ -527,6 +535,7 @@ pub(crate) struct App {
 impl App {
     fn new(root: PathBuf, initial_file: Option<PathBuf>) -> Self {
         let (worker_tx, worker_rx) = std::sync::mpsc::channel();
+        let (mcp_tx, mcp_rx) = std::sync::mpsc::channel();
         Self {
             cwd: root.clone(),
             initial_file,
@@ -641,6 +650,9 @@ impl App {
             claude_restore: claude_sessions::load_candidates(&root),
             claude_restore_at: Some(Instant::now() + Duration::from_secs(3)),
             claude_poll_at: Instant::now() + Duration::from_secs(2),
+            mcp: None,
+            mcp_req_tx: mcp_tx,
+            mcp_rx,
             terminal_cell_w: theme::FONT_SIZE() * 0.6, // refined after first shape
             cursor_blink_on: true,
             last_blink: Instant::now(),
@@ -8472,6 +8484,14 @@ impl ApplicationHandler for App {
                 self.exec_menu_cmd(c);
             }
         }
+        // Drain IDE-MCP tool calls forwarded from WS connection threads, run each on
+        // this (UI) thread against `App`, and reply to the waiting connection.
+        while let Ok(req) = self.mcp_rx.try_recv() {
+            let mcp::McpRequest { tool, args, reply } = req;
+            let res = mcp::tools::execute(self, &tool, &args);
+            let _ = reply.send(res);
+            self.redraw();
+        }
         // Drain background worker results (marketplace search/install).
         while let Ok(msg) = self.worker_rx.try_recv() {
             match msg {
@@ -9119,6 +9139,19 @@ impl ApplicationHandler for App {
                 // a long-running window still learns about new releases.
                 update::check_async(self.worker_tx.clone(), false);
                 update::check_periodic(self.worker_tx.clone(), std::time::Duration::from_secs(6 * 3600));
+                // Start the IDE-integration MCP server so `claude` (and other agents)
+                // launched in Aether's terminal can auto-connect and drive the editor.
+                if self.mcp.is_none() {
+                    if let Some(proxy) = self.proxy.clone() {
+                        self.mcp = mcp::start(self.cwd.clone(), self.mcp_req_tx.clone(), proxy);
+                        if let Some(s) = &self.mcp {
+                            self.terminal.set_ide_port(s.port);
+                            // Auto-register the `aether --mcp` bridge so agents started
+                            // in our terminal get the full tool surface with no setup.
+                            mcp::agents::register_claude(&self.cwd);
+                        }
+                    }
+                }
                 // Register this window with the pty-host (single-window-per-folder):
                 // if another live window already has this workspace open, it raises
                 // itself and this duplicate instance closes.
@@ -9340,6 +9373,13 @@ fn main() -> Result<()> {
     // they survive GUI restarts. It never opens a window — just runs the event loop.
     if std::env::args().any(|a| a == "--pty-host") {
         ptyhost::client::run_daemon()?;
+        return Ok(());
+    }
+    // MCP bridge mode: a stdio↔WebSocket proxy that exposes the running Aether GUI's
+    // full tool surface to an agent (e.g. registered via `claude mcp add`). Unlike the
+    // IDE channel, a regular MCP server's tools aren't filtered by the client.
+    if std::env::args().any(|a| a == "--mcp") {
+        mcp::proxy::run_stdio()?;
         return Ok(());
     }
     // Move a legacy ~/.nova config dir to ~/.aether before anything reads config.

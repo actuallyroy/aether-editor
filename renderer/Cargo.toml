@@ -1,6 +1,6 @@
 [package]
 name = "aether-renderer"
-version = "0.3.13"
+version = "0.3.14"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -38,6 +38,9 @@ tree-sitter-highlight = "0.24"
 tree-sitter-json = "0.23"
 tree-sitter-rust = "0.23"
 ureq = { version = "2", features = ["tls"] }
+# Blocking WebSocket server for the Claude Code IDE-integration MCP channel
+# (localhost ws://, no TLS) — sync, fits the std-threads model (no async runtime).
+tungstenite = "0.24"
 wgpu = "22"
 winit = "0.30"
 zip = { version = "2", default-features = false, features = ["deflate"] }

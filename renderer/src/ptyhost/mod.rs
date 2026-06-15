@@ -31,7 +31,15 @@ pub enum Msg {
     /// another live window are never offered, so windows don't leak into each other.
     Welcome { terminals: Vec<TermInfo> },
     /// Spawn a new shell. Daemon replies with `Created`.
-    Create { cwd: String, rows: u16, cols: u16 },
+    Create {
+        cwd: String,
+        rows: u16,
+        cols: u16,
+        /// Extra environment for the spawned shell (e.g. `CLAUDE_CODE_SSE_PORT` for IDE
+        /// auto-detect). `default` so a `Create` from an older client still parses.
+        #[serde(default)]
+        env: Vec<(String, String)>,
+    },
     Created { id: TermId, title: String },
     /// Subscribe to a terminal's output; daemon first sends `Backlog`, then live
     /// `Output` frames.
@@ -366,11 +374,11 @@ mod tests {
     #[test]
     fn control_roundtrips_via_frame() {
         let mut buf = Vec::new();
-        Frame::Control(Msg::Create { cwd: "/tmp".into(), rows: 24, cols: 80 })
+        Frame::Control(Msg::Create { cwd: "/tmp".into(), rows: 24, cols: 80, env: Vec::new() })
             .write_to(&mut buf)
             .unwrap();
         match Frame::read_from(&mut &buf[..]).unwrap() {
-            Frame::Control(Msg::Create { cwd, rows, cols }) => {
+            Frame::Control(Msg::Create { cwd, rows, cols, .. }) => {
                 assert_eq!((cwd.as_str(), rows, cols), ("/tmp", 24, 80));
             }
             other => panic!("wrong frame: {other:?}"),

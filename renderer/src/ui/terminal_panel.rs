@@ -52,6 +52,9 @@ pub struct TerminalPanel {
     /// In-flight tab-list reorder drag: (source group index, press y, activated past
     /// the move threshold). `None` when no tab is being dragged.
     tab_drag: Option<(usize, f32, bool)>,
+    /// IDE-integration MCP port (set once the GUI's MCP server starts). Injected as
+    /// `CLAUDE_CODE_SSE_PORT` into shells we spawn so `claude` auto-connects.
+    ide_port: Option<u16>,
 }
 
 impl TerminalPanel {
@@ -76,6 +79,21 @@ impl TerminalPanel {
             focus_requested: false,
             reattach: Vec::new(),
             tab_drag: None,
+            ide_port: None,
+        }
+    }
+
+    /// Record the IDE-MCP port; subsequently-spawned shells get `CLAUDE_CODE_SSE_PORT`
+    /// so `claude` auto-connects to this window.
+    pub fn set_ide_port(&mut self, port: u16) {
+        self.ide_port = Some(port);
+    }
+
+    /// Env vars injected into shells we spawn (IDE auto-detect).
+    fn shell_env(&self) -> Vec<(String, String)> {
+        match self.ide_port {
+            Some(p) => vec![("CLAUDE_CODE_SSE_PORT".to_string(), p.to_string())],
+            None => Vec::new(),
         }
     }
 
@@ -354,6 +372,7 @@ impl TerminalPanel {
         cmd: Option<String>,
     ) -> Option<terminal::Pane> {
         self.ensure_connected();
+        let env = self.shell_env();
         let client = self.client.as_ref()?;
         let panel = panel?;
         let area = terminal_pane_area(terminal_content(panel), self.groups.len().max(1));
@@ -365,7 +384,7 @@ impl TerminalPanel {
         // Ask the daemon to spawn a shell; bind its id when `Created` arrives (poll).
         let tag = self.next_tag;
         self.next_tag += 1;
-        client.create(cwd, rows as u16, cols as u16);
+        client.create(cwd, rows as u16, cols as u16, env);
         self.pending.push_back(tag);
         let conn = client.conn();
         let mut pane = terminal::Pane::wrap(terminal::Terminal::new_unbound(conn, tag, rows, cols));

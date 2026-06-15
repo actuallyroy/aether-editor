@@ -66,8 +66,8 @@ impl Client {
         self.conn.clone()
     }
 
-    pub fn create(&self, cwd: &str, rows: u16, cols: u16) {
-        send(&self.conn, Frame::Control(Msg::Create { cwd: cwd.to_string(), rows, cols }));
+    pub fn create(&self, cwd: &str, rows: u16, cols: u16, env: Vec<(String, String)>) {
+        send(&self.conn, Frame::Control(Msg::Create { cwd: cwd.to_string(), rows, cols, env }));
     }
     pub fn attach(&self, id: TermId) {
         send(&self.conn, Frame::Control(Msg::Attach { id }));
@@ -301,7 +301,7 @@ mod tests {
         let (mut a, token) = connect(150).expect("daemon up");
         Frame::Control(Msg::Hello { token: token.clone(), workspace: "/tmp".into() }).write_to(&mut a).unwrap();
         assert!(matches!(Frame::read_from(&mut a), Ok(Frame::Control(Msg::Welcome { .. }))));
-        Frame::Control(Msg::Create { cwd: "/tmp".into(), rows: 24, cols: 80 }).write_to(&mut a).unwrap();
+        Frame::Control(Msg::Create { cwd: "/tmp".into(), rows: 24, cols: 80, env: Vec::new() }).write_to(&mut a).unwrap();
 
         let mut id = None;
         let mut acc: Vec<u8> = Vec::new();

@@ -179,9 +179,9 @@ pub fn run() -> io::Result<()> {
                     continue;
                 }
                 match frame {
-                    Frame::Control(Msg::Create { cwd, rows, cols }) => {
+                    Frame::Control(Msg::Create { cwd, rows, cols, env }) => {
                         let workspace = workspaces.get(&cid).cloned().unwrap_or_else(|| cwd.clone());
-                        if let Some(term) = spawn_term(&cwd, &workspace, cid, rows, cols, next_id, tx.clone()) {
+                        if let Some(term) = spawn_term(&cwd, &workspace, cid, rows, cols, next_id, tx.clone(), &env) {
                             let id = next_id;
                             next_id += 1;
                             let title = term.title.clone();
@@ -313,7 +313,7 @@ fn send(conns: &mut HashMap<u64, TcpStream>, cid: u64, frame: Frame) {
 
 /// Spawn the platform shell on a fresh PTY plus a reader thread that pumps its
 /// output into the event loop. Returns the owned `Term` on success.
-fn spawn_term(cwd: &str, workspace: &str, owner: u64, rows: u16, cols: u16, id: TermId, tx: Sender<Event>) -> Option<Term> {
+fn spawn_term(cwd: &str, workspace: &str, owner: u64, rows: u16, cols: u16, id: TermId, tx: Sender<Event>, env: &[(String, String)]) -> Option<Term> {
     let pty = native_pty_system();
     let pair = pty
         .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
@@ -331,6 +331,10 @@ fn spawn_term(cwd: &str, workspace: &str, owner: u64, rows: u16, cols: u16, id: 
     }
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    // Extra env from the GUI (e.g. CLAUDE_CODE_SSE_PORT for IDE auto-detect).
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
     let child = pair.slave.spawn_command(cmd).ok()?;
     drop(pair.slave);
     let mut reader = pair.master.try_clone_reader().ok()?;
