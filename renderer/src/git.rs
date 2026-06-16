@@ -210,6 +210,14 @@ pub fn unstage(root: &Path, path: &str) {
     let _ = git(root, &["restore", "--staged", "--", path]);
 }
 
+/// Resolve a merge conflict by taking one side wholesale, then mark it resolved
+/// (`git add`). `ours` = the current branch's version (`--ours`); else theirs.
+pub fn resolve_conflict(root: &Path, path: &str, ours: bool) {
+    let side = if ours { "--ours" } else { "--theirs" };
+    let _ = git(root, &["checkout", side, "--", path]);
+    let _ = git(root, &["add", "--", path]);
+}
+
 /// Discard working-tree changes to a path: delete it if untracked, else revert it
 /// to the index/HEAD (`git restore`).
 pub fn discard(root: &Path, path: &str, untracked: bool) {
@@ -227,6 +235,14 @@ pub fn discard(root: &Path, path: &str, untracked: bool) {
 /// Stage every change (`git add -A`).
 pub fn stage_all(root: &Path) {
     let _ = git(root, &["add", "-A"]);
+}
+
+/// Resolve EVERY conflicted path to one side (`--ours`/`--theirs`) and stage them —
+/// the Merge Changes group's batch "Discard All" (keep ours).
+pub fn resolve_all_conflicts(root: &Path, ours: bool) {
+    let side = if ours { "--ours" } else { "--theirs" };
+    let _ = git(root, &["checkout", side, "--", "."]);
+    let _ = git(root, &["add", "-u"]);
 }
 
 /// Unstage everything (`git restore --staged .`).

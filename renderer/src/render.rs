@@ -290,6 +290,24 @@ pub(crate) fn fold_segments(d: &crate::document::Document, total: usize) -> Vec<
     segs
 }
 
+/// Visible runs split further at each conflict marker line, so a blank "ghost" row
+/// can be reserved above each `<<<<<<<` (for the inline merge CodeLens). Each returned
+/// segment has a uniform ghost offset (`d.ghost_above(seg.start)`).
+pub(crate) fn render_segments(d: &crate::document::Document, total: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for (a, b) in fold_segments(d, total) {
+        let mut s = a;
+        for &c in &d.conflict_lines {
+            if c > s && c <= b {
+                out.push((s, c - 1));
+                s = c;
+            }
+        }
+        out.push((s, b));
+    }
+    out
+}
+
 /// Scale that fits a `iw`x`ih` image inside `region` (16px padding), never upscaling.
 pub(crate) fn image_fit_scale(iw: f32, ih: f32, region: Rect) -> f32 {
     let pad = 16.0;
@@ -502,7 +520,8 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         // position from these metrics). Content height uses logical lines + padding.
         // Collapsed fold regions remove their hidden lines from the scrollable height.
         let hidden = d.hidden_above(d.rope.len_lines());
-        let content_h = (d.rope.len_lines().saturating_sub(hidden)) as f32 * theme::LINE_HEIGHT() + theme::EDITOR_PAD() * 2.0;
+        let content_h = (d.rope.len_lines().saturating_sub(hidden) + d.ghost_rows()) as f32 * theme::LINE_HEIGHT()
+            + theme::EDITOR_PAD() * 2.0;
         // Side-by-side diffs scroll each pane horizontally on its own (two scrollbars,
         // see `diff_h*` on Document), so the document ScrollView only owns vertical
         // here — content width 0 keeps its horizontal thumb hidden; the full-width
@@ -842,6 +861,20 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             // areas phase). Set here so it doesn't conflict with `areas` borrows.
             if let Some(txt) = blame_text(d, app.git_user.as_deref(), now_unix()) {
                 gpu.ui.blame.set(fs, &txt, theme::MONO_FAMILY());
+            }
+            // Inline merge-conflict actions (CodeLens) — set once when the buffer has
+            // conflict markers; drawn on each visible `<<<<<<<` line in the areas phase.
+            if d.diff.is_none() && !d.conflicts().is_empty() {
+                gpu.ui.merge_lens.set(
+                    fs,
+                    &[
+                        ("current", "Accept Current Change"),
+                        ("incoming", "Accept Incoming Change"),
+                        ("both", "Accept Both Changes"),
+                    ],
+                );
+                gpu.ui.merge_hint_cur.set(fs, " (Current Change)", theme::MONO_FAMILY());
+                gpu.ui.merge_hint_inc.set(fs, " (Incoming Change)", theme::MONO_FAMILY());
             }
         }
 
@@ -1307,7 +1340,12 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         // it; `foff(line)` is that pixel offset (0 when nothing is folded). Hidden
         // lines (`d.is_line_hidden`) are skipped entirely by the per-line loops below.
         let fold_lh = theme::LINE_HEIGHT();
-        let foff = |line: usize| -> f32 { fold_lh * d.hidden_above(line) as f32 };
+        // Net vertical shift for `line`: folds pull it UP (hidden rows above), inline
+        // merge ghost rows push it DOWN (a blank row above each conflict marker for the
+        // resolve CodeLens). Subtracting `foff` from a line's Y applies both.
+        let foff = |line: usize| -> f32 {
+            fold_lh * d.hidden_above(line) as f32 - fold_lh * d.ghost_above(line) as f32
+        };
 
         let (cur_line, _) = d.head_line_col();
         // `@`-symbol preview: tint the whole previewed block (declaration → end of
@@ -1778,6 +1816,43 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             }
         }
 
+        // Merge-conflict region tints (VSCode-style): the current/ours side green, the
+        // incoming/theirs side blue. The `=======` separator line stays untinted.
+        if d.diff.is_none() && !d.conflict_lines.is_empty() {
+            let blocks = d.conflicts();
+            // Marker ("origin") lines get a brighter tint than the change content, like
+            // VSCode (green = current/ours, blue = incoming/theirs).
+            let cur_bg = [0.18, 0.49, 0.33, 0.16]; // green, content
+            let cur_hi = [0.18, 0.49, 0.33, 0.34]; // green, the <<<<<<< line
+            let inc_bg = [0.20, 0.42, 0.74, 0.16]; // blue, content
+            let inc_hi = [0.20, 0.42, 0.74, 0.34]; // blue, the >>>>>>> line
+            for run in d.buffer.layout_runs() {
+                let line = run.line_i;
+                if d.is_line_hidden(line) {
+                    continue;
+                }
+                let tint = blocks.iter().find_map(|&(s, m, e)| {
+                    if line == s {
+                        Some(cur_hi)
+                    } else if line == e {
+                        Some(inc_hi)
+                    } else if line > s && line < m {
+                        Some(cur_bg)
+                    } else if line > m && line < e {
+                        Some(inc_bg)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(col) = tint {
+                    let line_y = layout.editor_text.y + theme::EDITOR_PAD() + run.line_top - d.scroll_y() - foff(line);
+                    if let Some((qy, qh)) = clip_v(line_y, run.line_height) {
+                        bg_quads.push(Quad::new(layout.editor_text.x, qy, layout.editor_text.w, qh, col));
+                    }
+                }
+            }
+        }
+
         // Cursor (foreground so it sits over glyphs) — gated by blink. Read-only
         // tabs (images, diffs) have nothing to edit, so they show no caret. Also
         // suppressed when a modal (palette/dialog) owns the screen or the find
@@ -2111,7 +2186,15 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             Some((idx, _, true)) => app.workspace.documents.get(idx).map(|d| d.name.clone()),
             _ => None,
         })
-        .or_else(|| app.terminal.dragging_tab().map(|i| app.terminal.tab_label(i)));
+        .or_else(|| app.terminal.dragging_tab().map(|i| app.terminal.tab_label(i)))
+        .or_else(|| match &app.graph_file_drag {
+            Some((_, path, _, true)) => Some(path.rsplit('/').next().unwrap_or(path).to_string()),
+            _ => None,
+        })
+        .or_else(|| match &app.diff_file_drag {
+            Some((path, _, _, true)) => Some(path.rsplit('/').next().unwrap_or(path).to_string()),
+            _ => None,
+        });
     if let Some(name) = ghost_name {
         gpu.ui.drag_ghost.set(&mut gpu.font_system, &name, theme::UI_FAMILY());
         let mp = (app.mouse_pos.x as f32, app.mouse_pos.y as f32);
@@ -2538,8 +2621,8 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             let lh = theme::LINE_HEIGHT();
             let total = d.rope.len_lines();
             let (etop, ebot) = (et.y, et.y + et.h);
-            for (a, b) in fold_segments(d, total) {
-                let off = lh * d.hidden_above(a) as f32;
+            for (a, b) in render_segments(d, total) {
+                let off = lh * d.hidden_above(a) as f32 - lh * d.ghost_above(a) as f32;
                 let seg_top = et.y + theme::EDITOR_PAD() + a as f32 * lh - d.scroll_y() - off;
                 let seg_bot = seg_top + (b - a + 1) as f32 * lh;
                 let cy0 = seg_top.max(etop);
@@ -2569,11 +2652,17 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             }
             // Inline git blame at the caret line's end (GitLens-style), dimmed and
             // clipped to the editor text area.
-            if blame_text(d, app.git_user.as_deref(), now_unix()).is_some() {
+            // Suppress blame on conflict marker lines — the "(Current/Incoming Change)"
+            // hint already occupies that line's end.
+            let on_marker = d.conflicts().iter().any(|&(s, _, e)| {
+                let cur = d.head_line_col().0;
+                cur == s || cur == e
+            });
+            if !on_marker && blame_text(d, app.git_user.as_deref(), now_unix()).is_some() {
                 let cur = d.head_line_col().0;
                 let line_w = d.buffer.layout_runs().find(|r| r.line_i == cur).map(|r| r.line_w).unwrap_or(0.0);
                 let (ltop, lh2) = d.line_visual_bounds(cur);
-                let off2 = lh * d.hidden_above(cur) as f32;
+                let off2 = lh * d.hidden_above(cur) as f32 - lh * d.ghost_above(cur) as f32;
                 let line_y = et.y + theme::EDITOR_PAD() + ltop - d.scroll_y() - off2;
                 if line_y >= et.y && line_y + lh2 <= et.y + et.h {
                     let bx = et.x + theme::EDITOR_PAD() - d.scroll_x() + line_w + theme::zpx(28.0);
@@ -2581,13 +2670,47 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     ui.blame.push_in(bx, rect, et, theme::FG_DIM(), &mut areas);
                 }
             }
+            // Inline merge-conflict actions, drawn in the blank "ghost" row reserved
+            // ABOVE each `<<<<<<<` marker (VSCode-style — its own row, no line number).
+            // The hit-test in main.rs mirrors this geometry.
+            if d.diff.is_none() && !ui.merge_lens.is_empty() {
+                // y of a logical line's row, accounting for folds + ghost rows.
+                let row_y = |line: usize| {
+                    let (ltop, _) = d.line_visual_bounds(line);
+                    let off = lh * d.hidden_above(line) as f32 - lh * d.ghost_above(line) as f32;
+                    et.y + theme::EDITOR_PAD() + ltop - d.scroll_y() - off
+                };
+                // dim text after a marker line's content (e.g. the "(Current Change)" hint).
+                let line_w = |line: usize| d.buffer.layout_runs().find(|r| r.line_i == line).map(|r| r.line_w).unwrap_or(0.0);
+                for (st, _, en) in d.conflicts() {
+                    let ghost_y = row_y(st) - lh; // reserved row above the marker
+                    if ghost_y >= et.y && ghost_y + lh <= et.y + et.h {
+                        let lx = et.x + theme::EDITOR_PAD() - d.scroll_x();
+                        // Gray, dim — a subtle affordance like VSCode's CodeLens.
+                        ui.merge_lens.draw(lx, ghost_y, et, theme::FG_DIM(), theme::FG_GUTTER(), &mut areas);
+                    }
+                    // "(Current Change)" after `<<<<<<<`, "(Incoming Change)" after `>>>>>>>`.
+                    let cy = row_y(st);
+                    if cy >= et.y && cy + lh <= et.y + et.h {
+                        let hx = et.x + theme::EDITOR_PAD() - d.scroll_x() + line_w(st);
+                        let r = Rect { x: hx, y: cy, w: ui.merge_hint_cur.width(), h: lh };
+                        ui.merge_hint_cur.push_in(hx, r, et, theme::FG_GUTTER(), &mut areas);
+                    }
+                    let ey = row_y(en);
+                    if ey >= et.y && ey + lh <= et.y + et.h {
+                        let hx = et.x + theme::EDITOR_PAD() - d.scroll_x() + line_w(en);
+                        let r = Rect { x: hx, y: ey, w: ui.merge_hint_inc.width(), h: lh };
+                        ui.merge_hint_inc.push_in(hx, r, et, theme::FG_GUTTER(), &mut areas);
+                    }
+                }
+            }
             // Fold chevrons in the gutter: ▸ for folded headers, ▾ for foldable ones.
             // Walk the SAME visible segments the text is drawn in — folded lines take
             // no screen space but DO consume raw line numbers, so a fixed raw-line
             // window stops short of the bottom and drops every chevron below a fold.
             if d.diff.is_none() {
-                for (a, b) in fold_segments(d, total) {
-                    let off = lh * d.hidden_above(a) as f32;
+                for (a, b) in render_segments(d, total) {
+                    let off = lh * d.hidden_above(a) as f32 - lh * d.ghost_above(a) as f32;
                     let seg_top = et.y + theme::EDITOR_PAD() + a as f32 * lh - d.scroll_y() - off;
                     let seg_bot = seg_top + (b - a + 1) as f32 * lh;
                     if seg_bot < etop || seg_top > ebot {

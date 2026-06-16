@@ -177,6 +177,7 @@ pub(crate) enum DialogAction {
     CloseDoc(usize),
     GitDiscard { path: String, untracked: bool },
     GitDiscardAll,
+    GitDiscardAllMerge,
     GitStash,
     /// Revert a single change block in the working tree (reverse-apply its patch).
     RevertDiffBlock { patch: String },
@@ -440,6 +441,14 @@ pub(crate) struct App {
     // activation threshold), the folder it would drop into, and a tab drag-reorder.
     pub(crate) tree_drag: Option<(PathBuf, (f32, f32), bool)>,
     pub(crate) tree_drop_target: Option<PathBuf>,
+    /// A commit-history file being dragged (short hash, repo-relative path, press pos,
+    /// past the activation threshold). Dropping on the terminal inserts `<hash>:<path>`;
+    /// a plain click opens that commit's diff for the file.
+    pub(crate) graph_file_drag: Option<(String, String, (f32, f32), bool)>,
+    /// A combined-diff file header being dragged (repo-relative path, file index, press
+    /// pos, active). Drop on the terminal → the file's path; a plain click toggles the
+    /// file section.
+    pub(crate) diff_file_drag: Option<(String, usize, (f32, f32), bool)>,
     pub(crate) tab_drag: Option<(usize, (f32, f32), bool)>,
     /// Caret byte to restore if the palette's symbol preview is dismissed (Esc).
     pub(crate) palette_preview_return: Option<usize>,
@@ -620,6 +629,8 @@ impl App {
             completion: completion::Completion::default(),
             completion_req: None,
             tree_drag: None,
+            graph_file_drag: None,
+            diff_file_drag: None,
             tree_drop_target: None,
             tab_drag: None,
             palette_preview_return: None,
@@ -1453,6 +1464,9 @@ impl App {
                 let block_w = (name_x + g.ui.branch.width() + theme::zpx(12.0)) - layout.status_bar.x;
                 p.0 < layout.status_bar.x + block_w
             } {
+                CursorIcon::Pointer
+            } else if layout.editor_text.contains(p) && self.over_merge_lens(p, &layout) {
+                // Inline merge-conflict CodeLens actions are clickable.
                 CursorIcon::Pointer
             } else if layout.editor_text.contains(p)
                 && self.workspace.active_doc().map_or(false, |d| d.info.is_some())
@@ -2768,8 +2782,16 @@ impl App {
                 self.redraw();
             }
             ui::Intent::GitStage(path) => {
-                git::stage(&self.cwd, &path);
-                self.refresh_source_control();
+                // Warn (and don't stage) if the file still has conflict markers — staging
+                // now would commit the `<<<<<<< / ======= / >>>>>>>` lines.
+                if file_has_conflict_markers(&git::repo_root(&self.cwd).join(&path)) {
+                    self.show_info_dialog(&format!(
+                        "“{path}” still has unresolved conflict markers (<<<<<<< / >>>>>>>).\n\nResolve them in the editor and save, then stage it."
+                    ));
+                } else {
+                    git::stage(&self.cwd, &path);
+                    self.refresh_source_control();
+                }
             }
             ui::Intent::GitUnstage(path) => {
                 git::unstage(&self.cwd, &path);
@@ -2837,6 +2859,12 @@ impl App {
                     let d = diff::compute_commit(&self.cwd, &path, &hash);
                     self.workspace.open_diff(d, &mut g.font_system);
                     self.detail.open_extension = None;
+                    // Record the path + commit so dragging the diff tab into the terminal
+                    // drops both sides' refs (`<hash>^:<path>` and `<hash>:<path>`).
+                    if let Some(doc) = self.workspace.active_doc_mut() {
+                        doc.diff_path = Some(path.clone());
+                        doc.diff_commit = Some(hash.clone());
+                    }
                 }
                 self.ensure_cursor_visible();
                 self.redraw();
@@ -2919,6 +2947,33 @@ impl App {
                 self.refresh_source_control();
                 self.apply_intent(ui::Intent::ReloadOpenDocs);
             }
+            ui::Intent::GitResolveConflict { path, ours } => {
+                git::resolve_conflict(&self.cwd, &path, ours);
+                self.refresh_source_control();
+                self.apply_intent(ui::Intent::ReloadOpenDocs);
+            }
+            ui::Intent::GitStageAllMerge => {
+                // Stage every resolved conflict; warn (and stage none) if any still has
+                // markers, so we never commit `<<<<<<< / >>>>>>>`.
+                let root = git::repo_root(&self.cwd);
+                let conflicted: Vec<String> =
+                    git::status(&self.cwd).into_iter().filter(|c| c.is_conflicted()).map(|c| c.path).collect();
+                let unresolved: Vec<String> =
+                    conflicted.iter().filter(|p| file_has_conflict_markers(&root.join(p))).cloned().collect();
+                if !unresolved.is_empty() {
+                    self.show_info_dialog(&format!(
+                        "{} file(s) still have unresolved conflict markers:\n\n{}\n\nResolve and save them first.",
+                        unresolved.len(),
+                        unresolved.join("\n")
+                    ));
+                } else {
+                    for p in &conflicted {
+                        git::stage(&self.cwd, p);
+                    }
+                    self.refresh_source_control();
+                }
+            }
+            ui::Intent::GitDiscardAllMerge => self.confirm_discard_all_merge(),
             ui::Intent::GitOpenCheckout => self.open_branch_pick(commands::PickKind::Checkout),
             ui::Intent::GitOpenDeleteBranch => self.open_branch_pick(commands::PickKind::DeleteBranch),
             ui::Intent::GitOpenCreateBranch => {
@@ -3528,6 +3583,22 @@ impl App {
         self.redraw();
     }
 
+    fn confirm_discard_all_merge(&mut self) {
+        let msg = "Discard ALL merge conflicts, keeping the current branch's version of each file? The incoming changes for these files will be dropped.";
+        if let Some(g) = self.gpu.as_mut() {
+            g.ui
+                .dialog
+                .set(&mut g.font_system, msg, &["Discard Conflicts", "Cancel"], None);
+        }
+        self.dialog = Some(DialogState {
+            action: DialogAction::GitDiscardAllMerge,
+            has_check: false,
+            checked: false,
+            hovered: None,
+        });
+        self.redraw();
+    }
+
     /// Apply a per-block diff action. `staged` diffs offer Unstage (idx 0); working-
     /// tree diffs offer Revert (idx 0, destructive → confirm) and Stage (idx 1).
     fn apply_diff_block(&mut self, vbs: usize, staged: bool, idx: usize) {
@@ -3709,6 +3780,14 @@ impl App {
                 if i == 0 {
                     git::discard_all(&self.cwd);
                     self.refresh_source_control();
+                }
+            }
+            DialogAction::GitDiscardAllMerge => {
+                // 0 = Discard Conflicts (keep ours), 1 = Cancel
+                if i == 0 {
+                    git::resolve_all_conflicts(&self.cwd, true);
+                    self.refresh_source_control();
+                    self.apply_intent(ui::Intent::ReloadOpenDocs);
                 }
             }
             DialogAction::GitStash => {
@@ -5662,6 +5741,26 @@ impl App {
         layout.title_btn_rects().iter().position(|r| r.contains((x, y)))
     }
 
+    /// True when `p` is over an inline merge-conflict CodeLens action (mirrors the
+    /// render + click geometry) — drives the pointer cursor.
+    fn over_merge_lens(&self, p: (f32, f32), layout: &Layout) -> bool {
+        let Some((d, g)) = self.workspace.active_doc().zip(self.gpu.as_ref()) else {
+            return false;
+        };
+        if d.diff.is_some() || g.ui.merge_lens.is_empty() {
+            return false;
+        }
+        let et = layout.editor_text;
+        let lh = theme::LINE_HEIGHT();
+        let lens_x = et.x + theme::EDITOR_PAD() - d.scroll_x();
+        d.conflicts().into_iter().any(|(st, _, _)| {
+            let (ltop, _) = d.line_visual_bounds(st);
+            let off = lh * d.hidden_above(st) as f32 - lh * d.ghost_above(st) as f32;
+            let ghost_y = et.y + theme::EDITOR_PAD() + ltop - d.scroll_y() - off - lh;
+            p.1 >= ghost_y && p.1 < ghost_y + lh && g.ui.merge_lens.hit(p.0, lens_x).is_some()
+        })
+    }
+
     fn on_mouse_press(&mut self, x: f32, y: f32) {
         let layout = self.layout();
 
@@ -6399,6 +6498,12 @@ impl App {
             && layout.sidebar.contains((x, y))
         {
             let region = layout.panel_region();
+            // A commit-history file row arms a drag (drop on terminal → `<hash>:<path>`),
+            // deferring the open-diff to release so the drag isn't pre-empted.
+            if let Some((hash, path)) = self.source_control.as_ref().and_then(|scp| scp.graph_file_at((x, y), region)) {
+                self.graph_file_drag = Some((hash, path, (x, y), false));
+                return;
+            }
             // Count consecutive clicks so the commit box gets double/triple-click
             // word + select-all selection.
             self.register_click(x, y);
@@ -6752,16 +6857,50 @@ impl App {
                 self.exec_command(Command::NewFile);
                 return;
             }
-            // Combined diff: a click on a file header collapses/expands that file.
-            let toggle = self.workspace.active_doc().and_then(|d| {
+            // Combined diff: a file header arms a drag (drop on terminal → its path),
+            // deferring the collapse/expand toggle to release so the drag isn't pre-empted.
+            let hdr = self.workspace.active_doc().and_then(|d| {
                 d.diff_full.as_ref()?;
                 let line = ui::editor_view::EditorView::line_at(d, &layout, x, y)?;
-                d.diff_file_at_line(line)
+                let fidx = d.diff_file_at_line(line)?;
+                Some((d.diff_file_path(fidx).unwrap_or_default(), fidx))
             });
-            if let Some(fidx) = toggle {
+            if let Some((path, fidx)) = hdr {
+                self.diff_file_drag = Some((path, fidx, (x, y), false));
+                return;
+            }
+            // Inline merge-conflict CodeLens: a click on the Accept actions in the
+            // ghost row above a `<<<<<<<` marker resolves that block. Mirrors render.rs.
+            let resolve = self
+                .workspace
+                .active_doc()
+                .zip(self.gpu.as_ref())
+                .and_then(|(d, g)| {
+                    if d.diff.is_some() {
+                        return None;
+                    }
+                    let et = layout.editor_text;
+                    let lh = theme::LINE_HEIGHT();
+                    let lens_x = et.x + theme::EDITOR_PAD() - d.scroll_x();
+                    let block = d.conflicts().into_iter().find(|(st, _, _)| {
+                        let (ltop, _) = d.line_visual_bounds(*st);
+                        let off = lh * d.hidden_above(*st) as f32 - lh * d.ghost_above(*st) as f32;
+                        let ghost_y = et.y + theme::EDITOR_PAD() + ltop - d.scroll_y() - off - lh;
+                        y >= ghost_y && y < ghost_y + lh
+                    })?;
+                    let choice = match g.ui.merge_lens.hit(x, lens_x)? {
+                        "current" => 0u8,
+                        "incoming" => 1,
+                        "both" => 2,
+                        _ => return None,
+                    };
+                    Some((block, choice))
+                });
+            if let Some((block, choice)) = resolve {
                 if let (Some(d), Some(g)) = (self.workspace.active_doc_mut(), self.gpu.as_mut()) {
-                    d.toggle_diff_file(fidx, &mut g.font_system);
+                    d.resolve_conflict(block, choice, &mut g.font_system);
                 }
+                self.refresh_source_control(); // the file may have left the Merge group
                 self.redraw();
                 return;
             }
@@ -6774,6 +6913,31 @@ impl App {
     }
 
     fn on_mouse_move(&mut self, x: f32, y: f32) {
+        // Commit-history file drag: handle first and return, so the per-move hover/
+        // cursor/graph recompute below doesn't run each event (that was the drag lag).
+        // Only the drag-ghost needs to follow, which a plain redraw covers.
+        if self.mouse_pressed {
+            if let Some((h, p, at, active)) = self.graph_file_drag.clone() {
+                let now_active = active || ((x - at.0).powi(2) + (y - at.1).powi(2)).sqrt() > 5.0 * theme::ui_zoom();
+                if now_active {
+                    if !active {
+                        self.graph_file_drag = Some((h, p, at, true));
+                    }
+                    self.redraw(); // move the ghost
+                    return;
+                }
+            }
+            if let Some((path, fidx, at, active)) = self.diff_file_drag.clone() {
+                let now_active = active || ((x - at.0).powi(2) + (y - at.1).powi(2)).sqrt() > 5.0 * theme::ui_zoom();
+                if now_active {
+                    if !active {
+                        self.diff_file_drag = Some((path, fidx, at, true));
+                    }
+                    self.redraw();
+                    return;
+                }
+            }
+        }
         // Settings editor: drag inside the focused field extends its selection. The
         // TextInput component applies its own drag dead-zone, so a double-click's
         // word selection survives the trailing move event.
@@ -7181,6 +7345,41 @@ impl App {
                 self.redraw();
             }
         }
+        // Commit-history file: dropped on the terminal → insert `<hash>:<path>` (a git
+        // object reference usable with `git show`); a plain click opens the commit diff.
+        if let Some((hash, path, _, active)) = self.graph_file_drag.take() {
+            if active {
+                let p = (self.mouse_pos.x as f32, self.mouse_pos.y as f32);
+                let over_terminal = self.terminal.visible
+                    && self.layout().terminal_panel.map_or(false, |tp| tp.contains(p));
+                if over_terminal {
+                    let reference = format!("{hash}:{path}");
+                    self.terminal.write_focused(format!("'{}' ", reference.replace('\'', r"'\''")).as_bytes());
+                    self.terminal.focused = true;
+                    self.redraw();
+                }
+            } else {
+                self.apply_intent(ui::Intent::OpenCommitDiff { hash, path });
+            }
+        }
+        // Combined-diff file header: dropped on the terminal → its working-tree path;
+        // a plain click toggles the file's collapse.
+        if let Some((path, fidx, _, active)) = self.diff_file_drag.take() {
+            if active {
+                let p = (self.mouse_pos.x as f32, self.mouse_pos.y as f32);
+                let over_terminal = self.terminal.visible
+                    && self.layout().terminal_panel.map_or(false, |tp| tp.contains(p));
+                if over_terminal && !path.is_empty() {
+                    let abs = git::repo_root(&self.cwd).join(&path);
+                    self.terminal.write_focused(shell_quoted(&abs).as_bytes());
+                    self.terminal.focused = true;
+                    self.redraw();
+                }
+            } else if let (Some(d), Some(g)) = (self.workspace.active_doc_mut(), self.gpu.as_mut()) {
+                d.toggle_diff_file(fidx, &mut g.font_system);
+                self.redraw();
+            }
+        }
         // Editor tab dropped onto the terminal → paste its file path (like the
         // explorer drag-to-terminal). Reordering already happened live during drag.
         if let Some((idx, _, active)) = self.tab_drag.take() {
@@ -7189,8 +7388,22 @@ impl App {
                 let over_terminal = self.terminal.visible
                     && self.layout().terminal_panel.map_or(false, |tp| tp.contains(p));
                 if over_terminal {
-                    if let Some(path) = self.workspace.documents.get(idx).and_then(|d| d.path.clone()) {
-                        self.terminal.write_focused(shell_quoted(&path).as_bytes());
+                    let doc = self.workspace.documents.get(idx);
+                    // A commit diff tab drops BOTH sides' git refs (`<hash>^:<path>` and
+                    // `<hash>:<path>`); a working/staged diff or real file drops its path.
+                    let dropped = doc.and_then(|d| match (&d.diff_commit, &d.diff_path) {
+                        (Some(hash), Some(path)) => {
+                            let q = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
+                            Some(format!("{} {} ", q(&format!("{hash}^:{path}")), q(&format!("{hash}:{path}"))))
+                        }
+                        _ => d
+                            .path
+                            .clone()
+                            .or_else(|| d.diff_path.as_ref().map(|p| git::repo_root(&self.cwd).join(p)))
+                            .map(|p| shell_quoted(&p)),
+                    });
+                    if let Some(text) = dropped {
+                        self.terminal.write_focused(text.as_bytes());
                         self.terminal.focused = true;
                         self.redraw();
                     }
@@ -8404,6 +8617,13 @@ pub(crate) fn gh_program() -> String {
 }
 
 /// Percent-encode a string for use in a URL query value.
+/// True if the on-disk file still has git conflict markers (a line starting with
+/// `<<<<<<<` or `>>>>>>>`). Used to warn before staging an unresolved merge.
+fn file_has_conflict_markers(path: &std::path::Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else { return false };
+    text.lines().any(|l| l.starts_with("<<<<<<<") || l.starts_with(">>>>>>>"))
+}
+
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 2);
     for b in s.bytes() {

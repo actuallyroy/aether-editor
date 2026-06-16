@@ -45,6 +45,9 @@ pub struct UiBuffers {
     pub diff_revert: TextLabel, // per-block revert button (discard)
     pub block_tip: TextLabel, // hover tooltip for the per-block buttons
     pub blame: TextLabel,     // inline git-blame annotation at the caret line's end
+    pub merge_lens: crate::widgets::CodeLens, // inline "Accept Current | Incoming | Both" on conflict markers
+    pub merge_hint_cur: TextLabel, // "(Current Change)" after the <<<<<<< marker
+    pub merge_hint_inc: TextLabel, // "(Incoming Change)" after the >>>>>>> marker
     pub tab_icons: std::collections::HashMap<char, crate::widgets::IconButton>, // per-tab file-type icon overlays
     pub menu_dropdown: Menu,   // top menu-bar dropdown (File/Edit/…)
     pub scm_badge: TextLabel,  // change-count badge on the Source Control icon
@@ -286,6 +289,9 @@ impl GpuState {
             },
             block_tip: TextLabel::new(&mut font_system, 240.0, theme::UI_LINE_HEIGHT()),
             blame: TextLabel::new(&mut font_system, 1200.0, theme::UI_LINE_HEIGHT()),
+            merge_lens: crate::widgets::CodeLens::new(&mut font_system),
+            merge_hint_cur: TextLabel::new(&mut font_system, 300.0, theme::UI_LINE_HEIGHT()),
+            merge_hint_inc: TextLabel::new(&mut font_system, 300.0, theme::UI_LINE_HEIGHT()),
             tab_icons: std::collections::HashMap::new(),
             palette_input: TextInput::new(&mut font_system, 600.0, theme::PALETTE_INPUT_HEIGHT()),
             settings_search: TextInput::new(&mut font_system, 900.0, theme::zpx(34.0)),

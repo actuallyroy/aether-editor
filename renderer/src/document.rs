@@ -86,6 +86,9 @@ pub struct Document {
     // Stage/Unstage/Revert can build and apply a patch. None ⇒ not a file diff.
     pub diff_path: Option<String>,
     pub diff_staged: bool,
+    /// For a commit diff: the commit's short hash (the diff is `<hash>^` vs `<hash>`),
+    /// so dragging the tab can drop both sides' git refs. `None` for working/staged diffs.
+    pub diff_commit: Option<String>,
     /// Commit-graph view (Visualize Repository History). Some ⇒ this read-only tab
     /// renders the laid-out graph instead of file text.
     pub graph: Option<crate::graph::Graph>,
@@ -108,6 +111,9 @@ pub struct Document {
     pub diff_base_requested: bool,      // a baseline fetch is in flight / done for this file
     pub gutter_changes: Vec<(usize, crate::gutter_diff::Change)>, // per-line change marks
     pub gutter_version: i32,            // `version` the marks were computed for (-1 = stale)
+    /// 0-based line indices of `<<<<<<<` conflict markers, recomputed on reshape. Each
+    /// reserves a "ghost" row above it for the inline merge-resolve CodeLens.
+    pub conflict_lines: Vec<usize>,
     pub execution_line: Option<usize>,   // current debug execution line (0-based), if stopped here
     pub lsp_dirty: bool,                 // text changed since the last didChange was sent
     pub lsp_servers: Vec<&'static str>,  // servers a didOpen has been sent to (open-state is per-server)
@@ -347,7 +353,7 @@ impl Document {
                 .unwrap_or_else(|| "Untitled".into()),
             None => "Untitled".into(),
         };
-        Self {
+        let mut doc = Self {
             path,
             name,
             rope,
@@ -372,6 +378,7 @@ impl Document {
             diff_hscroll: [std::cell::Cell::new(0.0), std::cell::Cell::new(0.0)],
             diff_hbar: [Scrollbar::new(Axis::Horizontal), Scrollbar::new(Axis::Horizontal)],
             diff_path: None,
+            diff_commit: None,
             diff_staged: false,
             graph: None,
             folds: std::collections::BTreeMap::new(),
@@ -390,6 +397,7 @@ impl Document {
             diff_base_requested: false,
             gutter_changes: Vec::new(),
             gutter_version: -1,
+            conflict_lines: Vec::new(),
             execution_line: None,
             lsp_dirty: false,
             lsp_servers: Vec::new(),
@@ -405,7 +413,12 @@ impl Document {
             large,
             buf_first: 0,
             buf_count,
-        }
+        };
+        // `new` shapes the buffer directly (no `reshape`), so seed the conflict-marker
+        // cache here too — otherwise the inline merge ghost rows don't reserve space
+        // until the first edit.
+        doc.conflict_lines = doc.conflicts().into_iter().map(|(s, _, _)| s).collect();
+        doc
     }
 
     /// A read-only tab that renders a hand-designed info page (Welcome / Tips /
@@ -538,6 +551,7 @@ impl Document {
             diff_hscroll: [std::cell::Cell::new(0.0), std::cell::Cell::new(0.0)],
             diff_hbar: [Scrollbar::new(Axis::Horizontal), Scrollbar::new(Axis::Horizontal)],
             diff_path: None,
+            diff_commit: None,
             diff_staged: false,
             graph: None,
             folds: std::collections::BTreeMap::new(),
@@ -556,6 +570,7 @@ impl Document {
             diff_base_requested: false,
             gutter_changes: Vec::new(),
             gutter_version: -1,
+            conflict_lines: Vec::new(),
             execution_line: None,
             lsp_dirty: false,
             lsp_servers: Vec::new(),
@@ -650,6 +665,7 @@ impl Document {
             diff_hscroll: [std::cell::Cell::new(0.0), std::cell::Cell::new(0.0)],
             diff_hbar: [Scrollbar::new(Axis::Horizontal), Scrollbar::new(Axis::Horizontal)],
             diff_path: None,
+            diff_commit: None,
             diff_staged: false,
             graph: None,
             folds: std::collections::BTreeMap::new(),
@@ -668,6 +684,7 @@ impl Document {
             diff_base_requested: false,
             gutter_changes: Vec::new(),
             gutter_version: -1,
+            conflict_lines: Vec::new(),
             execution_line: None,
             lsp_dirty: false,
             lsp_servers: Vec::new(),
@@ -694,6 +711,11 @@ impl Document {
         }
         let row = d.rows.get(line)?;
         (row.kind == crate::diff::RowKind::File).then_some(row.file)
+    }
+
+    /// Repo-relative path of file `file_idx` in this (combined) diff, for drag-to-terminal.
+    pub fn diff_file_path(&self, file_idx: usize) -> Option<String> {
+        self.diff.as_ref()?.file_paths.get(file_idx).cloned()
     }
 
     /// Collapse/expand one file in a combined diff and rebuild the side-by-side
@@ -1147,6 +1169,17 @@ impl Document {
         (0..cap).filter(|&l| self.is_line_hidden(l)).count()
     }
 
+    /// Number of inline-merge ghost rows above `line` (one per conflict marker at or
+    /// before it). Each adds a blank editor row that the resolve CodeLens sits in, so
+    /// line `line` is pushed down by `ghost_above(line) * line_height` pixels.
+    pub fn ghost_above(&self, line: usize) -> usize {
+        self.conflict_lines.partition_point(|&s| s <= line)
+    }
+    /// Total ghost rows in the buffer (for the scroll content height).
+    pub fn ghost_rows(&self) -> usize {
+        self.conflict_lines.len()
+    }
+
     /// Expand any folds that hide `line` (e.g. when navigating to a search match
     /// inside a collapsed region) so it becomes visible.
     pub fn reveal_line(&mut self, line: usize) {
@@ -1203,10 +1236,19 @@ impl Document {
     /// Convert a click's compressed y (px, fold-collapsed space) to the real buffer
     /// y, so hit-testing lands on the right line when folds are present.
     pub fn expand_visual_y(&self, vy: f32) -> f32 {
+        let lh = theme::LINE_HEIGHT();
+        // Inline-merge ghost rows are blank rows inserted above conflict markers, so a
+        // visual Y sits LOWER than its buffer line. Subtract the ghost rows above the
+        // clicked position first (one fixed-point step; exact when nothing is folded).
+        let vy = if !self.conflict_lines.is_empty() && vy > 0.0 {
+            let approx = (vy / lh).floor() as usize;
+            (vy - self.ghost_above(approx) as f32 * lh).max(0.0)
+        } else {
+            vy
+        };
         if self.folds.is_empty() || vy <= 0.0 {
             return vy;
         }
-        let lh = theme::LINE_HEIGHT();
         let vidx = (vy / lh).floor() as usize;
         let frac = vy - vidx as f32 * lh;
         self.visible_index_to_line(vidx) as f32 * lh + frac
@@ -1232,6 +1274,9 @@ impl Document {
     }
 
     pub fn reshape(&mut self, fs: &mut FontSystem) {
+        // Cache conflict marker lines (ghost-row positions for the inline merge lens).
+        let starts: Vec<usize> = self.conflicts().into_iter().map(|(s, _, _)| s).collect();
+        self.conflict_lines = starts;
         if self.large {
             // Large-file mode: reshape only the shaped window (an edit can't change
             // styling — there is none — so rebuilding the window is enough).
@@ -1264,6 +1309,25 @@ impl Document {
         let spans = self.hl.as_ref().map(|h| h.flatten());
         apply_buffer_text(&mut self.buffer, fs, &text, lines, self.lang, &self.ext, self.wrap_width, spans, &self.semantic);
         crate::perf::log(&format!("reshape({lines} lines): to_string {:?}, highlight+shape {:?}", t_str, t1.elapsed()));
+    }
+
+    /// Re-tokenize the whole file and rebuild the entire buffer, bypassing the
+    /// incremental partial-reshape (which mis-splices multi-line structural edits like
+    /// a merge-conflict resolution, leaving stale lines). Use after such edits.
+    pub fn reshape_full(&mut self, fs: &mut FontSystem) {
+        let starts: Vec<usize> = self.conflicts().into_iter().map(|(s, _, _)| s).collect();
+        self.conflict_lines = starts;
+        if self.large {
+            self.hl_dirty_from = usize::MAX;
+            return self.reshape_window(fs);
+        }
+        let text = self.rope.to_string().replace('\r', "");
+        let lines = self.rope.len_lines();
+        // Rebuild from the raw text (no syntax spans) so buffer content always matches
+        // the rope exactly — passing stale highlight spans here rebuilds the OLD text
+        // (set_rich_text takes content from the span strings). Re-highlight next pass.
+        apply_buffer_text(&mut self.buffer, fs, &text, lines, self.lang, &self.ext, self.wrap_width, None, &self.semantic);
+        self.hl_dirty_from = 0; // next reshape re-tokenizes + recolors from the top
     }
 
     /// Rebuild buffer lines `[start, end)` in place from the highlight cache,
@@ -1471,6 +1535,79 @@ impl Document {
         self.sel.head = self.sel.head.min(max);
         self.dirty = false;
         self.reshape(fs);
+    }
+
+    /// Git conflict marker blocks in the buffer: each `(start, mid, end)` holds the
+    /// 0-based line indices of the `<<<<<<<`, `=======`, `>>>>>>>` lines. Current
+    /// (ours) is `start+1..mid`; incoming (theirs) is `mid+1..end`.
+    pub fn conflicts(&self) -> Vec<(usize, usize, usize)> {
+        let mut out = Vec::new();
+        let (mut start, mut mid) = (None, None);
+        for (i, line) in self.rope.lines().enumerate() {
+            let head: String = line.chars().take(7).collect();
+            if head == "<<<<<<<" {
+                start = Some(i);
+                mid = None;
+            } else if head == "=======" && start.is_some() {
+                mid = Some(i);
+            } else if head == ">>>>>>>" {
+                if let (Some(s), Some(m)) = (start, mid) {
+                    out.push((s, m, i));
+                }
+                start = None;
+                mid = None;
+            }
+        }
+        out
+    }
+
+    /// Resolve the conflict `block` by keeping one (or both) sides and dropping the
+    /// markers. Leaves the buffer dirty (the user still saves/stages). `choice`:
+    /// 0 = current/ours, 1 = incoming/theirs, 2 = both.
+    pub fn resolve_conflict(&mut self, block: (usize, usize, usize), choice: u8, fs: &mut FontSystem) {
+        let (st, md, en) = block;
+        let total = self.rope.len_lines();
+        if self.read_only || en >= total || !(st < md && md < en) {
+            return;
+        }
+        // The chosen side's text (kept lines, with their newlines).
+        let line_str = |rope: &Rope, i: usize| -> String { rope.line(i).chars().collect() };
+        let mut repl = String::new();
+        let push = |repl: &mut String, rope: &Rope, a: usize, b: usize| {
+            for i in a..b {
+                repl.push_str(&line_str(rope, i));
+            }
+        };
+        match choice {
+            0 => push(&mut repl, &self.rope, st + 1, md),                 // current (ours)
+            1 => push(&mut repl, &self.rope, md + 1, en),                 // incoming (theirs)
+            _ => {
+                push(&mut repl, &self.rope, st + 1, md);
+                push(&mut repl, &self.rope, md + 1, en);
+            }
+        }
+        // Replace the whole block [st .. en] (markers + both sides) with `repl`, as a
+        // single undoable edit (delete + insert joined into one undo group).
+        let start_byte = self.rope.line_to_byte(st);
+        let end_byte = if en + 1 >= total {
+            self.rope.len_bytes()
+        } else {
+            self.rope.line_to_byte(en + 1)
+        };
+        self.sel = Selection { anchor: start_byte, head: end_byte, desired_col: None };
+        self.delete_selection_no_reshape();
+        if !repl.is_empty() {
+            self.force_join = true; // delete + insert = one undo step
+            self.push_and_apply(
+                EditOp::Insert(repl.clone()),
+                start_byte,
+                Selection::caret(start_byte + repl.len()),
+            );
+        }
+        // Removing the conflict block changes the line count; the incremental
+        // partial-reshape mis-splices that, leaving stale marker lines in the displayed
+        // buffer. Force a full rebuild.
+        self.reshape_full(fs);
     }
 
     fn apply_op(&mut self, op: &EditOp, at_byte: usize) {
@@ -2886,6 +3023,44 @@ mod tests {
             code: None,
             code_href: None,
         }
+    }
+
+    #[test]
+    fn resolve_conflict_keeps_chosen_side() {
+        let mut fs = FontSystem::new();
+        let text = "a\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> branch\nz\n";
+        let mut d = Document::new(None, text.to_string(), &mut fs);
+        // The cache is seeded in `new`.
+        assert_eq!(d.conflict_lines, vec![1], "marker cached at line 1");
+        let block = d.conflicts()[0];
+        assert_eq!(block, (1, 3, 5), "(<<<, ===, >>>) line indices");
+        // Accept current (ours).
+        d.resolve_conflict(block, 0, &mut fs);
+        assert_eq!(d.rope.to_string(), "a\nours\nz\n", "current kept, markers+incoming gone");
+        assert!(d.conflict_lines.is_empty(), "no conflicts after resolve");
+        assert!(d.dirty, "buffer dirty after resolve");
+
+        // Accept incoming (theirs).
+        let mut d = Document::new(None, text.to_string(), &mut fs);
+        d.resolve_conflict(d.conflicts()[0], 1, &mut fs);
+        assert_eq!(d.rope.to_string(), "a\ntheirs\nz\n");
+
+        // Accept both.
+        let mut d = Document::new(None, text.to_string(), &mut fs);
+        d.resolve_conflict(d.conflicts()[0], 2, &mut fs);
+        assert_eq!(d.rope.to_string(), "a\nours\ntheirs\nz\n");
+
+        // Exactly the client.json shape, WITH a JSON highlighter active (the real
+        // case — a syntax-highlighted file takes the incremental-reshape path that was
+        // leaving the stale `>>>>>>>` in the displayed BUFFER). Check the buffer, not
+        // just the rope.
+        let json = "{\n  \"version\": \"1.0.0\",\n<<<<<<< HEAD\n  \"buildNumber\": \"3\",\n=======\n  \"buildNumber\": \"2\",\n>>>>>>> branch\n  \"buildLabel\": \"X\",\n}\n";
+        let mut d = Document::new(Some(PathBuf::from("x.json")), json.to_string(), &mut fs);
+        d.resolve_conflict(d.conflicts()[0], 2, &mut fs);
+        let out = d.rope.to_string();
+        assert!(!out.contains("<<<<<<<") && !out.contains("=======") && !out.contains(">>>>>>>"), "rope markers left: {out:?}");
+        let buf: String = d.buffer.lines.iter().map(|l| l.text()).collect::<Vec<_>>().join("\n");
+        assert!(!buf.contains(">>>>>>>") && !buf.contains("<<<<<<<") && !buf.contains("======="), "BUFFER markers left (stale display): {buf:?}");
     }
 
     // Squiggles must stay glued to their text between server publishes: inserting

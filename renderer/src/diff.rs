@@ -68,7 +68,8 @@ pub struct Diff {
     pub right_text: String, // new side, one line per row (blank for filler/del)
     pub rows: Vec<DiffRow>,
     pub combined: bool,     // true = multi-file view (has RowKind::File headers)
-    pub files: Vec<String>, // display names per file index (combined view)
+    pub files: Vec<String>,      // display names per file index (combined view)
+    pub file_paths: Vec<String>, // repo-relative paths per file index (for drag-to-terminal)
     /// Collapsed unchanged regions (single-file view). Empty ⇒ nothing to expand;
     /// this is the FULL diff, projected to the visible one via `project_gaps`.
     pub gaps: Vec<Gap>,
@@ -174,6 +175,7 @@ pub fn compute_all(root: &Path, entries: &[(String, bool)], staged: bool) -> Dif
         let name = file_name(path).to_string();
         let fidx = b.files.len();
         b.files.push(name.clone());
+        b.file_paths.push(path.clone());
         b.cur_file = fidx;
         b.row(RowKind::File, None, None, &format!("{}{}", FILE_HEADER_PAD, name), "");
         if *untracked {
@@ -235,6 +237,7 @@ pub fn project(full: &Diff, collapsed: &std::collections::HashSet<usize>) -> Dif
         rows,
         combined: true,
         files: full.files.clone(),
+        file_paths: full.file_paths.clone(),
         gaps: Vec::new(),
     }
 }
@@ -260,6 +263,7 @@ struct Builder {
     rows: Vec<DiffRow>,
     combined: bool,
     files: Vec<String>,
+    file_paths: Vec<String>,
     cur_file: usize,
     // Pending deletions/additions within the current change block, paired on flush.
     dels: Vec<(u32, String)>,
@@ -275,6 +279,7 @@ impl Builder {
             rows: Vec::new(),
             combined: false,
             files: Vec::new(),
+            file_paths: Vec::new(),
             cur_file: 0,
             dels: Vec::new(),
             adds: Vec::new(),
@@ -359,6 +364,7 @@ impl Builder {
             rows: self.rows,
             combined: self.combined,
             files: self.files,
+            file_paths: self.file_paths,
             gaps: Vec::new(),
         }
     }
@@ -452,6 +458,7 @@ pub fn project_gaps(full: &Diff) -> Diff {
         rows,
         combined: false,
         files: full.files.clone(),
+        file_paths: full.file_paths.clone(),
         gaps: full.gaps.clone(),
     }
 }

@@ -308,6 +308,103 @@ impl TextLabel {
     }
 }
 
+/// A reusable inline action row — VS Code "CodeLens" style: a left-to-right run of
+/// clickable text actions separated by " | " (e.g. `Accept Current Change | Accept
+/// Incoming Change | Accept Both`). Generic over what the actions mean: each carries
+/// an opaque string id returned by [`CodeLens::hit`]. Drawn at an absolute (x, y) and
+/// hit-tested back to an id, so the same widget drives merge-conflict resolution and
+/// (later) the `.mcp.json` `Start | More…` actions.
+pub struct CodeLens {
+    actions: Vec<(String, TextLabel)>, // (id, rendered label)
+    sep: TextLabel,                    // " | " drawn between actions
+}
+
+impl CodeLens {
+    pub fn new(fs: &mut FontSystem) -> Self {
+        let lh = theme::UI_LINE_HEIGHT().max(16.0);
+        let mut sep = TextLabel::new(fs, 60.0, lh);
+        sep.set(fs, " | ", theme::UI_FAMILY());
+        Self { actions: Vec::new(), sep }
+    }
+
+    /// Set the action row. `items` is `(id, label)` pairs in display order. Re-shapes
+    /// the separator too so it tracks the current UI zoom alongside the labels.
+    pub fn set(&mut self, fs: &mut FontSystem, items: &[(&str, &str)]) {
+        let lh = theme::UI_LINE_HEIGHT().max(16.0);
+        self.sep.set(fs, " | ", theme::UI_FAMILY());
+        self.actions = items
+            .iter()
+            .map(|(id, label)| {
+                let mut l = TextLabel::new(fs, 400.0, lh);
+                l.set(fs, label, theme::UI_FAMILY());
+                (id.to_string(), l)
+            })
+            .collect();
+    }
+
+    pub fn reshape(&mut self, fs: &mut FontSystem) {
+        for (_, l) in &mut self.actions {
+            l.reshape(fs);
+        }
+        self.sep.reshape(fs);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.actions.is_empty()
+    }
+
+    /// Total pixel width of the rendered row.
+    pub fn width(&self) -> f32 {
+        if self.actions.is_empty() {
+            return 0.0;
+        }
+        let labels: f32 = self.actions.iter().map(|(_, l)| l.width()).sum();
+        labels + self.sep.width() * (self.actions.len() - 1) as f32
+    }
+
+    /// Draw the row left-to-right starting at `x`, baseline row at `y`, clipped to
+    /// `clip`. `color` tints the action text; the separators are drawn dimmer.
+    pub fn draw<'a>(
+        &'a self,
+        x: f32,
+        y: f32,
+        clip: Rect,
+        color: glyphon::Color,
+        sep_color: glyphon::Color,
+        areas: &mut Vec<TextArea<'a>>,
+    ) {
+        let lh = theme::UI_LINE_HEIGHT().max(16.0);
+        let mut cx = x;
+        for (i, (_, l)) in self.actions.iter().enumerate() {
+            if i > 0 {
+                let sw = self.sep.width();
+                self.sep.push_in(cx, Rect { x: cx, y, w: sw, h: lh }, clip, sep_color, areas);
+                cx += sw;
+            }
+            let w = l.width();
+            l.push_in(cx, Rect { x: cx, y, w, h: lh }, clip, color, areas);
+            cx += w;
+        }
+    }
+
+    /// The action id whose label contains horizontal position `px`, for a row drawn
+    /// starting at `x`. `None` when the point is between/outside actions.
+    pub fn hit(&self, px: f32, x: f32) -> Option<&str> {
+        let mut cx = x;
+        for (i, (id, l)) in self.actions.iter().enumerate() {
+            if i > 0 {
+                cx += self.sep.width();
+            }
+            let w = l.width();
+            if px >= cx && px < cx + w {
+                return Some(id);
+            }
+            cx += w;
+        }
+        None
+    }
+}
+
 /// Caret bar width in physical px, scaled with UI zoom so the hairline stays
 /// visible at high zoom (a fixed 1.5px caret all but vanishes next to 2×-scaled
 /// glyphs).

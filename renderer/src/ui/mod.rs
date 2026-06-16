@@ -86,6 +86,13 @@ pub enum Intent {
     GitToggleView,
     GitStashPop,
     GitStashApply,
+    /// Resolve a conflicted file by taking one whole side: `ours` (current) when true,
+    /// else theirs (incoming). Stages the file as resolved.
+    GitResolveConflict { path: String, ours: bool },
+    /// Merge Changes group batch actions: stage all resolved conflicts (warns if any
+    /// still have markers); discard all conflicts (keep ours, confirm first).
+    GitStageAllMerge,
+    GitDiscardAllMerge,
     /// Open the branch quick-pick (Checkout to…).
     GitOpenCheckout,
     /// Open the palette-as-input to create a new branch.

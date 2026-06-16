@@ -46,6 +46,7 @@ struct Row {
     badge: usize,     // index into BADGE_*
     untracked: bool,  // for Discard (delete vs revert)
     new_file: bool,   // untracked or staged-added: no prior version, so no diff
+    conflict: bool,   // unmerged: row offers Accept Current/Incoming instead of stage
 }
 
 /// One visible line in a group: either a folder (tree mode only) or a file row.
@@ -71,6 +72,8 @@ enum Act {
     Stage,
     Unstage,
     Stash, // group header: stash all working changes
+    AcceptCurrent,  // merge conflict: keep our (current branch) version
+    AcceptIncoming, // merge conflict: take their (incoming) version
 }
 
 const BADGE_LETTERS: [&str; 6] = ["M", "A", "D", "R", "U", "!"];
@@ -104,13 +107,18 @@ pub struct SourceControlPanel {
     msg_active: bool,
     staged: IconList,
     unstaged: IconList,
+    merge: IconList, // conflicted/unmerged files ("Merge Changes" group)
     staged_rows: Vec<Row>,
     unstaged_rows: Vec<Row>,
+    merge_rows: Vec<Row>,
     staged_vis: Vec<Vis>,
     unstaged_vis: Vec<Vis>,
+    merge_vis: Vec<Vis>,
+    merge_hover: Option<usize>, // hovered merge row (separate from staged/unstaged)
     tree_mode: bool,
     staged_open: bool,   // "Staged Changes" group expanded
     unstaged_open: bool, // "Changes" group expanded
+    merge_open: bool,    // "Merge Changes" group expanded
     chev_down: IconButton,
     chev_right: IconButton,
     collapsed: HashSet<String>, // keyed folders (per group, see `walk`)
@@ -124,15 +132,19 @@ pub struct SourceControlPanel {
     l_changes: TextLabel,
     l_staged: TextLabel,
     l_unstaged: TextLabel,
+    l_merge: TextLabel,
     l_commit: TextLabel,
     count_staged: TextLabel,
     count_unstaged: TextLabel,
+    count_merge: TextLabel,
     badges: [TextLabel; 6],
     ic_diff: TextLabel,
     ic_open: TextLabel,
     ic_discard: TextLabel,
     ic_stage: TextLabel,
     ic_unstage: TextLabel,
+    ic_accept_cur: TextLabel,
+    ic_accept_inc: TextLabel,
     ic_refresh: TextLabel,
     ic_more: TextLabel,
     ic_stash: TextLabel,
@@ -148,6 +160,7 @@ pub struct SourceControlPanel {
     /// A drag-select inside the commit message box is in progress.
     msg_dragging: bool,
     hovered_header: Option<bool>, // Some(true)=Staged header, Some(false)=Changes header
+    merge_header_hover: bool,     // pointer over the Merge Changes header (batch actions)
     /// Scroll state of the groups area (headers + file lists) — the shared
     /// ScrollView owns the offset, clamping, and the auto-hiding scrollbar.
     pub scroll: ScrollView,
@@ -197,15 +210,20 @@ impl SourceControlPanel {
             // guide lines drawn in tree mode (2 spaces left icons spilling over them).
             staged: IconList::new(fs, theme::SIDEBAR_WIDTH(), 4000.0, row_h(), pad_x()).with_indent(4),
             unstaged: IconList::new(fs, theme::SIDEBAR_WIDTH(), 4000.0, row_h(), pad_x()).with_indent(4),
+            merge: IconList::new(fs, theme::SIDEBAR_WIDTH(), 4000.0, row_h(), pad_x()).with_indent(4),
             staged_rows: Vec::new(),
             unstaged_rows: Vec::new(),
+            merge_rows: Vec::new(),
             staged_vis: Vec::new(),
             unstaged_vis: Vec::new(),
+            merge_vis: Vec::new(),
+            merge_hover: None,
             selected: None,
             hover_reflowed: None,
             tree_mode: false,
             staged_open: true,
             unstaged_open: true,
+            merge_open: true,
             chev_down: IconButton::new(fs, theme::ICON_CHEVRON_DOWN, theme::ICON_FAMILY, theme::UI_FONT_SIZE()),
             chev_right: IconButton::new(fs, theme::ICON_CHEVRON_RIGHT, theme::ICON_FAMILY, theme::UI_FONT_SIZE()),
             collapsed: HashSet::new(),
@@ -215,15 +233,19 @@ impl SourceControlPanel {
             l_changes: mk(fs, "CHANGES"),
             l_staged: mk(fs, "Staged Changes"),
             l_unstaged: mk(fs, "Changes"),
+            l_merge: mk(fs, "Merge Changes"),
             l_commit: mk(fs, "✓ Commit"),
             count_staged: mk(fs, "0"),
             count_unstaged: mk(fs, "0"),
+            count_merge: mk(fs, "0"),
             badges,
             ic_diff: icon(fs, theme::ICON_OPEN_CHANGES),
             ic_open: icon(fs, theme::ICON_FILE),
             ic_discard: icon(fs, theme::ICON_DISCARD),
             ic_stage: icon(fs, theme::ICON_ADD),
             ic_unstage: icon(fs, theme::ICON_REMOVE),
+            ic_accept_cur: icon(fs, theme::ICON_CHECK),
+            ic_accept_inc: icon(fs, theme::ICON_ARROW_DOWN),
             ic_refresh: icon(fs, theme::ICON_REFRESH),
             ic_more: icon(fs, theme::ICON_ELLIPSIS),
             ic_stash: icon(fs, theme::ICON_STASH),
@@ -235,6 +257,7 @@ impl SourceControlPanel {
             gen_since: None,
             msg_dragging: false,
             hovered_header: None,
+            merge_header_hover: false,
             scroll: ScrollView::new(ScrollOpts { vertical: true, horizontal: false, stick_to_end: false }),
             root,
             change_count: 0,
@@ -269,14 +292,18 @@ impl SourceControlPanel {
             &mut self.l_changes,
             &mut self.l_staged,
             &mut self.l_unstaged,
+            &mut self.l_merge,
             &mut self.l_commit,
             &mut self.count_staged,
             &mut self.count_unstaged,
+            &mut self.count_merge,
             &mut self.ic_diff,
             &mut self.ic_open,
             &mut self.ic_discard,
             &mut self.ic_stage,
             &mut self.ic_unstage,
+            &mut self.ic_accept_cur,
+            &mut self.ic_accept_inc,
             &mut self.ic_refresh,
             &mut self.ic_more,
             &mut self.ic_stash,
@@ -293,6 +320,7 @@ impl SourceControlPanel {
         }
         self.staged.reshape_icons(fs);
         self.unstaged.reshape_icons(fs);
+        self.merge.reshape_icons(fs);
         self.chev_down.reshape(fs);
         self.chev_right.reshape(fs);
         // Re-shape the commit-subjects buffer at the new zoom (metrics scale with it);
@@ -350,6 +378,7 @@ impl SourceControlPanel {
         self.change_count = changes.len();
         self.staged_rows.clear();
         self.unstaged_rows.clear();
+        self.merge_rows.clear();
         self.merge_state = git::merge_state(&self.root);
         self.conflict_count = 0;
         for c in &changes {
@@ -358,7 +387,7 @@ impl SourceControlPanel {
             // show a misleading green "U". Surface them once, in Changes, with a red "!".
             if c.is_conflicted() {
                 self.conflict_count += 1;
-                self.unstaged_rows.push(Self::conflict_row(&c.path));
+                self.merge_rows.push(Self::conflict_row(&c.path));
                 continue;
             }
             if c.staged != ' ' && c.staged != '?' {
@@ -370,6 +399,7 @@ impl SourceControlPanel {
         }
         self.count_staged.set(fs, &self.staged_rows.len().to_string(), theme::UI_FAMILY());
         self.count_unstaged.set(fs, &self.unstaged_rows.len().to_string(), theme::UI_FAMILY());
+        self.count_merge.set(fs, &self.merge_rows.len().to_string(), theme::UI_FAMILY());
         self.hovered = None;
         self.set_selected(None); // vis indices change on refresh; drop the highlight
         // Rebuild the GRAPH accordion's commit data (recent commits across all refs).
@@ -414,6 +444,7 @@ impl SourceControlPanel {
             badge: badge_for(code),
             untracked: code == '?',
             new_file: code == '?' || code == 'A',
+            conflict: false,
         }
     }
 
@@ -422,6 +453,7 @@ impl SourceControlPanel {
     fn conflict_row(path: &str) -> Row {
         let mut r = Self::row(path, 'M');
         r.badge = 5;
+        r.conflict = true;
         r
     }
 
@@ -498,7 +530,7 @@ impl SourceControlPanel {
         // they're shown in full and ellipsized only when they actually overflow the
         // panel (not pre-truncated to make room for the on-hover action icons).
         let avail = (w - pad_x() - status_w() - 8.0 * theme::ui_zoom()).max(20.0);
-        for rows in [&mut self.staged_rows, &mut self.unstaged_rows] {
+        for rows in [&mut self.staged_rows, &mut self.unstaged_rows, &mut self.merge_rows] {
             for r in rows.iter_mut() {
                 r.fname_len = Self::display(&r.fname, &r.dir, avail).1;
             }
@@ -506,6 +538,7 @@ impl SourceControlPanel {
         // Rebuild the visible-item lists (flat or tree) for the current collapse state.
         self.staged_vis = self.build_vis(&self.staged_rows, true);
         self.unstaged_vis = self.build_vis(&self.unstaged_rows, false);
+        self.merge_vis = self.build_vis(&self.merge_rows, false);
         // Shape at the actual panel width (matches the ellipsis budget); wrapping is
         // disabled in the buffer, so this just sizes the x-extent correctly when the
         // panel is resized away from the default SIDEBAR_WIDTH.
@@ -514,6 +547,7 @@ impl SourceControlPanel {
         let u_hover = match self.hovered { Some((false, i)) => Some(i), _ => None };
         let (sk, ss) = self.vis_rows(&self.staged_vis, &self.staged_rows, avail, s_hover);
         let (uk, us) = self.vis_rows(&self.unstaged_vis, &self.unstaged_rows, avail, u_hover);
+        let (mk_, ms) = self.vis_rows(&self.merge_vis, &self.merge_rows, avail, self.merge_hover);
         // Buffer height must cover EVERY row's line: `shape_until_scroll` only lays
         // out lines that fit the buffer's set height, so a fixed cap silently drops
         // the tail once the list is tall (many changes × high zoom) — leaving blank
@@ -521,8 +555,10 @@ impl SourceControlPanel {
         let lh = theme::UI_LINE_HEIGHT().max(row_h());
         let sh = ss.len() as f32 * lh + 200.0;
         let uh = us.len() as f32 * lh + 200.0;
+        let mh = ms.len() as f32 * lh + 200.0;
         self.staged.set_rows(fs, &sk, &ss, sw, sh);
         self.unstaged.set_rows(fs, &uk, &us, sw, uh);
+        self.merge.set_rows(fs, &mk_, &ms, sw, mh);
     }
 
     /// Build the visible-item list for one group. Flat in list mode; a compacted
@@ -722,9 +758,39 @@ impl SourceControlPanel {
         let top = self.graph_section_top(r) + Self::graph_header_h();
         Rect { x: r.x, y: top, w: r.w, h: (r.y + r.h - top).max(0.0) }
     }
-    fn staged_hdr(&self, r: Rect) -> Rect {
+    /// Whether the "Merge Changes" group is shown (any unmerged/conflicted files).
+    fn has_merge(&self) -> bool {
+        !self.merge_rows.is_empty()
+    }
+    /// Total height of the merge section (header + open list); 0 when nothing conflicts.
+    fn merge_section_h(&self) -> f32 {
+        if !self.has_merge() {
+            return 0.0;
+        }
+        row_h() + if self.merge_open { self.merge_vis.len() as f32 * row_h() } else { 0.0 }
+    }
+    /// The "Merge Changes" header sits at the very top of the groups area.
+    fn merge_hdr(&self, r: Rect) -> Rect {
         let z = theme::ui_zoom();
         Rect { x: r.x + 8.0 * z, y: self.groups_top(r) - self.scroll.offset().1, w: r.w - 16.0 * z, h: row_h() }
+    }
+    fn merge_list(&self, r: Rect) -> Rect {
+        let h = self.merge_hdr(r);
+        let n = if self.merge_open { self.merge_vis.len() } else { 0 };
+        Rect { x: r.x, y: h.y + row_h(), w: r.w, h: n as f32 * row_h() }
+    }
+    /// Y-offset every section below Merge inherits (its height + a gap when present).
+    fn merge_offset(&self) -> f32 {
+        if self.has_merge() {
+            self.merge_section_h() + 8.0 * theme::ui_zoom()
+        } else {
+            0.0
+        }
+    }
+    fn staged_hdr(&self, r: Rect) -> Rect {
+        let z = theme::ui_zoom();
+        let y = self.groups_top(r) - self.scroll.offset().1 + self.merge_offset();
+        Rect { x: r.x + 8.0 * z, y, w: r.w - 16.0 * z, h: row_h() }
     }
     fn staged_list(&self, r: Rect) -> Rect {
         let h = self.staged_hdr(r);
@@ -748,7 +814,10 @@ impl SourceControlPanel {
     fn unstaged_hdr(&self, r: Rect) -> Rect {
         let z = theme::ui_zoom();
         let gap = if self.has_staged() { 8.0 * z } else { 0.0 };
-        let y = self.groups_top(r) - self.scroll.offset().1 + self.staged_section_h() + gap;
+        let y = self.groups_top(r) - self.scroll.offset().1
+            + self.merge_offset()
+            + self.staged_section_h()
+            + gap;
         Rect { x: r.x + 8.0 * z, y, w: r.w - 16.0 * z, h: row_h() }
     }
     fn unstaged_list(&self, r: Rect) -> Rect {
@@ -863,29 +932,38 @@ impl SourceControlPanel {
     fn graph_pad() -> f32 {
         4.0 * theme::ui_zoom()
     }
-    /// X where the expanded commit's file rows start: just past the lanes that
-    /// continue down through them (the commit's outgoing verticals), so the file list
-    /// also hugs the graph contour.
+    /// The `(short_hash, repo-relative path)` of the commit-history file row under
+    /// `pt`, if any — for drag-to-terminal / deferred open-on-click.
+    pub fn graph_file_at(&self, pt: (f32, f32), region: Rect) -> Option<(String, String)> {
+        if !self.graph_open {
+            return None;
+        }
+        let g = self.graph.as_ref()?;
+        let e = self.graph_expanded?;
+        let gv = self.graph_viewport(region);
+        if !gv.contains(pt) {
+            return None;
+        }
+        let vr = ((pt.1 - gv.y + self.graph_scroll.offset().1) / row_h()) as usize;
+        match self.graph_view_item(vr)? {
+            GView::File(fi) => {
+                let (_, path) = self.graph_files.get(fi)?;
+                Some((g.rows.get(e)?.short.clone(), path.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    /// X where the expanded commit's file rows start: just past the lanes present at
+    /// that commit's row (which are what the continuation draws straight down through
+    /// the file rows), so the file list clears them without a huge gap.
     fn graph_files_x(&self, r: Rect) -> f32 {
-        use crate::graph::{Half, Seg};
-        let mc = self
-            .graph
+        self.graph
             .as_ref()
             .zip(self.graph_expanded)
             .and_then(|(g, e)| g.rows.get(e))
-            .map(|row| {
-                let mut mc = 0u16;
-                for seg in &row.segs {
-                    if let Seg::V { col, half, .. } = seg {
-                        if matches!(half, Half::Full | Half::Bottom) {
-                            mc = mc.max(*col);
-                        }
-                    }
-                }
-                mc
-            })
-            .unwrap_or(0);
-        r.x + Self::graph_pad() + (mc as f32 + 1.0) * Self::graph_lane_w() + 2.0 * theme::ui_zoom()
+            .map(|row| self.graph_row_text_x(r, row))
+            .unwrap_or_else(|| r.x + Self::graph_pad() + Self::graph_lane_w())
     }
     /// X where ONE commit's subject starts: just past the rightmost lane present in
     /// that row (its node + any lanes passing through / branching), so the text wraps
@@ -904,8 +982,12 @@ impl SourceControlPanel {
     }
 
     /// Hover-action icon rects for a row, right-to-left ending before the status.
-    fn action_rects(region: Rect, y: f32, staged: bool) -> Vec<(Act, Rect)> {
-        let acts: &[Act] = if staged {
+    fn action_rects(region: Rect, y: f32, staged: bool, conflict: bool) -> Vec<(Act, Rect)> {
+        let acts: &[Act] = if conflict {
+            // Unmerged file: open to resolve in the editor, then Discard (keep ours) or
+            // Stage (+) to mark resolved. Staging warns if markers remain (apply_intent).
+            &[Act::Open, Act::Discard, Act::Stage]
+        } else if staged {
             &[Act::Open, Act::Stash, Act::Unstage]
         } else {
             &[Act::Open, Act::Discard, Act::Stash, Act::Stage]
@@ -913,10 +995,17 @@ impl SourceControlPanel {
         Self::rects_for(acts, region, y)
     }
 
-    /// Hover actions on a tree-mode FOLDER row: stash + stage/unstage every file
-    /// under it (#34). Discard is deliberately absent — it confirms per file.
-    fn folder_action_rects(region: Rect, y: f32, staged: bool) -> Vec<(Act, Rect)> {
-        let acts: &[Act] = if staged { &[Act::Stash, Act::Unstage] } else { &[Act::Stash, Act::Stage] };
+    /// Hover actions on a tree-mode FOLDER row: stash + stage/unstage every file under
+    /// it (#34). Merge folders get Discard + Stage instead (no stash — not useful for
+    /// conflicts, per the user).
+    fn folder_action_rects(region: Rect, y: f32, staged: bool, merge: bool) -> Vec<(Act, Rect)> {
+        let acts: &[Act] = if merge {
+            &[Act::Discard, Act::Stage]
+        } else if staged {
+            &[Act::Stash, Act::Unstage]
+        } else {
+            &[Act::Stash, Act::Stage]
+        };
         Self::rects_for(acts, region, y)
     }
 
@@ -971,6 +1060,19 @@ impl SourceControlPanel {
             &[Act::Diff, Act::Stash, Act::Discard, Act::Stage]
         };
         let end = hdr.x + hdr.w - (count.width() + theme::zpx(12.0)) - theme::zpx(6.0);
+        let start = end - acts.len() as f32 * action_w();
+        acts.iter()
+            .enumerate()
+            .map(|(i, &a)| (a, Rect { x: start + i as f32 * action_w(), y: hdr.y, w: action_w(), h: row_h() }))
+            .collect()
+    }
+
+    /// Merge Changes header composite actions (on hover): Discard All (keep ours) +
+    /// Stage All (mark resolved).
+    fn merge_header_actions(&self, r: Rect) -> Vec<(Act, Rect)> {
+        let hdr = self.merge_hdr(r);
+        let acts = [Act::Discard, Act::Stage];
+        let end = hdr.x + hdr.w - (self.count_merge.width() + theme::zpx(12.0)) - theme::zpx(6.0);
         let start = end - acts.len() as f32 * action_w();
         acts.iter()
             .enumerate()
@@ -1131,7 +1233,12 @@ impl SourceControlPanel {
                             .segs
                             .iter()
                             .filter_map(|s| match s {
+                                // Lanes leaving the commit downward continue through the
+                                // file rows: full/bottom verticals AND bottom-half bends
+                                // (a branch/merge curving down) — missing the bends left
+                                // those lanes clipped at the file rows.
                                 Seg::V { col, half, color } if matches!(half, Half::Full | Half::Bottom) => Some((*col, *color)),
+                                Seg::Bend { col, top: false, color } => Some((*col, *color)),
                                 _ => None,
                             })
                             .collect();
@@ -1179,6 +1286,22 @@ impl SourceControlPanel {
         self.push_icon(&self.ic_chevron, Self::commit_chevron(region), theme::FG_TEXT(), areas);
 
         let vp = self.groups_viewport(region);
+        // Merge Changes group — conflicted files, shown at the top while a merge is
+        // unresolved (VSCode-style). Rows carry Accept Current/Incoming actions.
+        if self.has_merge() {
+            let mh = self.merge_hdr(region);
+            self.draw_group_chevron(mh, vp, self.merge_open, areas);
+            self.l_merge.push_in(mh.x + hdr_chev_w(), mh, vp, theme::FG_TEXT(), areas);
+            self.push_count(&self.count_merge, mh, vp, areas);
+            if self.merge_header_hover {
+                for (act, ar) in self.merge_header_actions(region) {
+                    self.push_icon_in(self.icon_for(act), ar, vp, theme::FG_TEXT(), areas);
+                }
+            }
+            if self.merge_open {
+                self.draw_rows(&self.merge, &self.merge_vis, &self.merge_rows, self.merge_list(region), vp, false, true, self.merge_hover, areas);
+            }
+        }
         // Staged Changes group — only shown when something is staged.
         if self.has_staged() {
             let sh = self.staged_hdr(region);
@@ -1193,7 +1316,7 @@ impl SourceControlPanel {
                     Some((true, i)) => Some(i),
                     _ => None,
                 };
-                self.draw_rows(&self.staged, &self.staged_vis, &self.staged_rows, self.staged_list(region), vp, true, sh_idx, areas);
+                self.draw_rows(&self.staged, &self.staged_vis, &self.staged_rows, self.staged_list(region), vp, true, false, sh_idx, areas);
             }
         }
 
@@ -1211,7 +1334,7 @@ impl SourceControlPanel {
                 Some((false, i)) => Some(i),
                 _ => None,
             };
-            self.draw_rows(&self.unstaged, &self.unstaged_vis, &self.unstaged_rows, self.unstaged_list(region), vp, false, uh_idx, areas);
+            self.draw_rows(&self.unstaged, &self.unstaged_vis, &self.unstaged_rows, self.unstaged_list(region), vp, false, false, uh_idx, areas);
         }
         } // end changes_open
 
@@ -1320,6 +1443,8 @@ impl SourceControlPanel {
             Act::Stage => &self.ic_stage,
             Act::Unstage => &self.ic_unstage,
             Act::Stash => &self.ic_stash,
+            Act::AcceptCurrent => &self.ic_accept_cur,
+            Act::AcceptIncoming => &self.ic_accept_inc,
         }
     }
 
@@ -1332,6 +1457,7 @@ impl SourceControlPanel {
         region: Rect,
         vp: Rect,
         staged: bool,
+        merge: bool,
         hovered_idx: Option<usize>,
         areas: &mut Vec<TextArea<'b>>,
     ) {
@@ -1351,7 +1477,7 @@ impl SourceControlPanel {
             // Folder rows: stage/unstage-all icons on hover (#34); no badge.
             if matches!(v, Vis::Folder { .. }) {
                 if hovered_idx == Some(i) {
-                    for (act, ar) in Self::folder_action_rects(region, y, staged) {
+                    for (act, ar) in Self::folder_action_rects(region, y, staged, merge) {
                         let lbl = self.icon_for(act);
                         lbl.push_in(ar.x + (ar.w - lbl.width()) * 0.5, ar, vp, theme::FG_TEXT(), areas);
                     }
@@ -1366,7 +1492,7 @@ impl SourceControlPanel {
             self.badges[r.badge].push_in(st.x, st, vp, Color::rgb(rr, gg, bb), areas);
             // Hover actions for this row.
             if hovered_idx == Some(i) {
-                for (act, ar) in Self::action_rects(region, y, staged) {
+                for (act, ar) in Self::action_rects(region, y, staged, r.conflict) {
                     let lbl = self.icon_for(act);
                     lbl.push_in(ar.x + (ar.w - lbl.width()) * 0.5, ar, vp, theme::FG_TEXT(), areas);
                 }
@@ -1379,6 +1505,7 @@ impl SourceControlPanel {
         let in_groups = self.groups_viewport(region).contains(pt);
         let sl = self.staged_list(region);
         let ul = self.unstaged_list(region);
+        let ml = self.merge_list(region);
         let new = if !in_groups {
             None
         } else if sl.contains(pt) {
@@ -1388,6 +1515,15 @@ impl SourceControlPanel {
         } else {
             None
         };
+        // Merge rows hover independently (separate list, own highlight state).
+        let new_merge = if in_groups && ml.contains(pt) {
+            self.merge.row_at(ml, pt, self.merge_vis.len())
+        } else {
+            None
+        };
+        let merge_changed = new_merge != self.merge_hover;
+        self.merge_hover = new_merge;
+        let am = self.merge.set_hover_row(new_merge);
         let new_hdr = if !in_groups {
             None
         } else if self.has_staged() && self.staged_hdr(region).contains(pt) {
@@ -1397,7 +1533,11 @@ impl SourceControlPanel {
         } else {
             None
         };
-        let changed = new != self.hovered || new_hdr != self.hovered_header;
+        let new_merge_hdr = in_groups && self.has_merge() && self.merge_hdr(region).contains(pt);
+        let merge_hdr_changed = new_merge_hdr != self.merge_header_hover;
+        self.merge_header_hover = new_merge_hdr;
+        let changed =
+            new != self.hovered || new_hdr != self.hovered_header || merge_changed || am || merge_hdr_changed;
         self.hovered = new;
         self.hovered_header = new_hdr;
         // Indent guides appear while hovering anywhere in the groups area (eased),
@@ -1480,6 +1620,12 @@ impl SourceControlPanel {
         if !self.groups_viewport(region).contains(pt) {
             return false;
         }
+        let ml = self.merge_list(region);
+        if ml.contains(pt) {
+            if let Some(i) = self.merge.row_at(ml, pt, self.merge_vis.len()) {
+                return matches!(self.merge_vis[i], Vis::File { .. } | Vis::Folder { .. });
+            }
+        }
         for staged in [true, false] {
             let (lr, vis, list): (Rect, &[Vis], &IconList) = if staged {
                 (self.staged_list(region), &self.staged_vis, &self.staged)
@@ -1558,6 +1704,13 @@ impl SourceControlPanel {
         {
             return true;
         }
+        // Group headers (Merge/Staged/Changes) toggle their section on click.
+        if (self.has_merge() && self.merge_hdr(region).contains(pt))
+            || (self.has_staged() && self.staged_hdr(region).contains(pt))
+            || self.unstaged_hdr(region).contains(pt)
+        {
+            return true;
+        }
         // CHANGES / GRAPH section headers and graph commit rows are clickable too.
         if Self::changes_hdr(region).contains(pt) {
             return true;
@@ -1581,6 +1734,8 @@ impl SourceControlPanel {
             Act::Stage => "Stage Changes",
             Act::Unstage => "Unstage Changes",
             Act::Stash => "Stash Changes",
+            Act::AcceptCurrent => "Accept Current Change",
+            Act::AcceptIncoming => "Accept Incoming Change",
         };
         // Top toolbar.
         let [sparkle, stash, tree, refresh, more] = Self::toolbar_rects(region);
@@ -1616,6 +1771,8 @@ impl SourceControlPanel {
                         Act::Discard => "Discard All Changes",
                         Act::Stash => "Stash All Changes",
                         Act::Open => "Open File",
+                        Act::AcceptCurrent => "Accept Current Change",
+                        Act::AcceptIncoming => "Accept Incoming Change",
                     });
                 }
             }
@@ -1624,11 +1781,24 @@ impl SourceControlPanel {
         if !self.groups_viewport(region).contains(pt) {
             return None;
         }
+        // Merge rows (conflict resolution icons) hit-test first.
+        let ml = self.merge_list(region);
+        if ml.contains(pt) {
+            if let Some(i) = self.merge.row_at(ml, pt, self.merge_vis.len()) {
+                let y = ml.y + i as f32 * row_h();
+                for (act, ar) in Self::action_rects(ml, y, false, true) {
+                    if ar.contains(pt) {
+                        return Some(act_label(act));
+                    }
+                }
+            }
+            return None;
+        }
         for staged in [true, false] {
-            let (lr, vis, list): (Rect, &[Vis], &IconList) = if staged {
-                (self.staged_list(region), &self.staged_vis, &self.staged)
+            let (lr, vis, rows, list): (Rect, &[Vis], &[Row], &IconList) = if staged {
+                (self.staged_list(region), &self.staged_vis, &self.staged_rows, &self.staged)
             } else {
-                (self.unstaged_list(region), &self.unstaged_vis, &self.unstaged)
+                (self.unstaged_list(region), &self.unstaged_vis, &self.unstaged_rows, &self.unstaged)
             };
             if !lr.contains(pt) {
                 continue;
@@ -1636,8 +1806,8 @@ impl SourceControlPanel {
             let Some(i) = list.row_at(lr, pt, vis.len()) else { return None };
             let y = lr.y + i as f32 * row_h();
             let rects = match &vis[i] {
-                Vis::Folder { .. } => Self::folder_action_rects(lr, y, staged),
-                Vis::File { .. } => Self::action_rects(lr, y, staged),
+                Vis::Folder { .. } => Self::folder_action_rects(lr, y, staged, false),
+                Vis::File { row, .. } => Self::action_rects(lr, y, staged, rows[*row].conflict),
             };
             for (act, r) in rects {
                 if r.contains(pt) {
@@ -1842,6 +2012,19 @@ impl SourceControlPanel {
         if !self.groups_viewport(region).contains(pt) {
             return false;
         }
+        // Merge Changes header batch actions: Discard All (keep ours) / Stage All.
+        if self.has_merge() {
+            for (act, ar) in self.merge_header_actions(region) {
+                if ar.contains(pt) {
+                    out.push(if act == Act::Stage {
+                        Intent::GitStageAllMerge
+                    } else {
+                        Intent::GitDiscardAllMerge
+                    });
+                    return true;
+                }
+            }
+        }
         // Group-header composite actions (hit-tested by position; they only draw on
         // hover, but a click lands on the pointer, so don't gate on hover state). The
         // staged group is absent when nothing is staged.
@@ -1864,6 +2047,10 @@ impl SourceControlPanel {
         }
         // Group-header body (not an action): toggle the whole group's collapse, like
         // the folder rows and the OUTLINE section.
+        if self.has_merge() && self.merge_hdr(region).contains(pt) {
+            self.merge_open = !self.merge_open;
+            return true;
+        }
         if self.has_staged() && self.staged_hdr(region).contains(pt) {
             self.staged_open = !self.staged_open;
             return true;
@@ -1871,6 +2058,66 @@ impl SourceControlPanel {
         if self.unstaged_hdr(region).contains(pt) {
             self.unstaged_open = !self.unstaged_open;
             return true;
+        }
+        // Merge Changes rows/folders: Open / Discard (keep ours) / Stage (+); folders
+        // toggle or apply the action to every file under them.
+        if self.merge_open {
+            let lr = self.merge_list(region);
+            if lr.contains(pt) {
+                if let Some(i) = self.merge.row_at(lr, pt, self.merge_vis.len()) {
+                    let y = lr.y + i as f32 * row_h();
+                    // Returns Some(folder key) to toggle after the vis borrow is dropped.
+                    let toggle = match &self.merge_vis[i] {
+                        Vis::File { row, .. } => {
+                            let p = self.merge_rows[*row].path.clone();
+                            let mut emitted = false;
+                            for (act, ar) in Self::action_rects(lr, y, false, true) {
+                                if ar.contains(pt) {
+                                    match act {
+                                        // Stage warns if markers remain (apply_intent);
+                                        // Discard keeps ours and marks resolved.
+                                        Act::Stage => out.push(Intent::GitStage(p.clone())),
+                                        Act::Discard => out.push(Intent::GitResolveConflict { path: p.clone(), ours: true }),
+                                        _ => out.push(Intent::OpenFile { path: self.root.join(&p), line: 1, col: 0 }),
+                                    }
+                                    emitted = true;
+                                    break;
+                                }
+                            }
+                            if !emitted {
+                                out.push(Intent::OpenFile { path: self.root.join(&p), line: 1, col: 0 });
+                            }
+                            None
+                        }
+                        Vis::Folder { key, .. } => {
+                            let key = key.clone();
+                            let mut acted = false;
+                            for (act, ar) in Self::folder_action_rects(lr, y, false, true) {
+                                if ar.contains(pt) {
+                                    let dir = format!("{}/", Self::folder_path(&key));
+                                    for r in self.merge_rows.iter().filter(|r| r.path.starts_with(&dir)) {
+                                        match act {
+                                            Act::Stage => out.push(Intent::GitStage(r.path.clone())),
+                                            Act::Discard => out.push(Intent::GitResolveConflict { path: r.path.clone(), ours: true }),
+                                            _ => {}
+                                        }
+                                    }
+                                    acted = true;
+                                    break;
+                                }
+                            }
+                            (!acted).then_some(key)
+                        }
+                    };
+                    if let Some(k) = toggle {
+                        if !self.collapsed.remove(&k) {
+                            self.collapsed.insert(k);
+                        }
+                        self.last_w = -1.0;
+                    }
+                    return true;
+                }
+            }
         }
         // Row hit: resolve into either a folder toggle (deferred so we don't mutate
         // `self` while a `&self` borrow of the vis/rows is live) or file actions.
@@ -1893,7 +2140,7 @@ impl SourceControlPanel {
                         // folder (#34); anywhere else toggles the collapse.
                         let y = lr.y + i as f32 * row_h();
                         let mut acted = false;
-                        for (act, ar) in Self::folder_action_rects(lr, y, staged) {
+                        for (act, ar) in Self::folder_action_rects(lr, y, staged, false) {
                             if ar.contains(pt) {
                                 if act == Act::Stash {
                                     // One stash for the whole folder (pathspec), not per file.
@@ -1924,7 +2171,7 @@ impl SourceControlPanel {
                         let r = &rows[*row];
                         let y = lr.y + i as f32 * row_h();
                         let mut acted = false;
-                        for (act, ar) in Self::action_rects(lr, y, staged) {
+                        for (act, ar) in Self::action_rects(lr, y, staged, r.conflict) {
                             if ar.contains(pt) {
                                 let p = r.path.clone();
                                 match act {
@@ -1934,6 +2181,8 @@ impl SourceControlPanel {
                                     Act::Unstage => out.push(Intent::GitUnstage(p)),
                                     Act::Discard => out.push(Intent::GitDiscard { path: p, untracked: r.untracked }),
                                     Act::Stash => out.push(Intent::GitStashPath(p)),
+                                    Act::AcceptCurrent => out.push(Intent::GitResolveConflict { path: p, ours: true }),
+                                    Act::AcceptIncoming => out.push(Intent::GitResolveConflict { path: p, ours: false }),
                                 }
                                 acted = true;
                                 break;
@@ -1944,7 +2193,9 @@ impl SourceControlPanel {
                             // except a newly created file (untracked or staged-added) has no
                             // prior version, so a diff is pointless: open the file itself. The
                             // per-row "Open Changes" icon still forces a diff if wanted.
-                            if r.new_file {
+                            if r.new_file || r.conflict {
+                                // New file: no prior version. Conflict: open the file so
+                                // the user can edit the conflict markers directly.
                                 out.push(Intent::OpenFile { path: self.root.join(&r.path), line: 1, col: 0 });
                             } else {
                                 out.push(Intent::OpenDiff { path: r.path.clone(), staged, untracked: r.untracked });
@@ -2067,6 +2318,39 @@ mod tests {
         assert!(gs && gu, "new-file AM: staged={gs} unstaged={gu}");
     }
 
+    // A merge conflict routes the file into the Merge Changes group, not Changes.
+    #[test]
+    fn conflict_routes_to_merge_group() {
+        fn git(dir: &std::path::Path, args: &[&str]) {
+            let _ = std::process::Command::new("git").args(args).current_dir(dir).output();
+        }
+        let dir = std::env::temp_dir().join(format!("aether_merge_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        git(&dir, &["config", "user.email", "t@t.com"]);
+        git(&dir, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("c.txt"), "base\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "base"]);
+        git(&dir, &["checkout", "-qb", "feat"]);
+        std::fs::write(dir.join("c.txt"), "feat\n").unwrap();
+        git(&dir, &["commit", "-qam", "feat"]);
+        git(&dir, &["checkout", "-q", "main"]);
+        std::fs::write(dir.join("c.txt"), "main\n").unwrap();
+        git(&dir, &["commit", "-qam", "main"]);
+        git(&dir, &["merge", "feat"]); // conflicts on c.txt
+
+        let mut fs = FontSystem::new();
+        let mut p = SourceControlPanel::new(&mut fs, dir.clone());
+        p.refresh(&mut fs);
+        let in_merge = p.merge_rows.iter().any(|r| r.path == "c.txt");
+        let in_unstaged = p.unstaged_rows.iter().any(|r| r.path == "c.txt");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(in_merge, "conflict should be in Merge Changes");
+        assert!(!in_unstaged, "conflict should NOT be in Changes");
+    }
+
     // Clicking the per-row Stage (+) icon on an unstaged file must emit GitStage for
     // THAT file — not fall through to the row-body OpenDiff.
     #[test]
@@ -2079,7 +2363,7 @@ mod tests {
 
         let lr = p.unstaged_list(region);
         let y = lr.y; // first (only) row
-        let stage = SourceControlPanel::action_rects(lr, y, false)
+        let stage = SourceControlPanel::action_rects(lr, y, false, false)
             .into_iter()
             .find(|(a, _)| matches!(a, Act::Stage))
             .expect("stage action present")
@@ -2107,7 +2391,7 @@ mod tests {
 
         let lr = p.staged_list(region);
         let y = lr.y;
-        let unstage = SourceControlPanel::action_rects(lr, y, true)
+        let unstage = SourceControlPanel::action_rects(lr, y, true, false)
             .into_iter()
             .find(|(a, _)| matches!(a, Act::Unstage))
             .expect("unstage action present")
@@ -2143,7 +2427,7 @@ mod tests {
             .expect("file row present");
         let lr = p.unstaged_list(region);
         let y = lr.y + file_i as f32 * row_h();
-        let stage = SourceControlPanel::action_rects(lr, y, false)
+        let stage = SourceControlPanel::action_rects(lr, y, false, false)
             .into_iter()
             .find(|(a, _)| matches!(a, Act::Stage))
             .expect("stage action present")
@@ -2177,7 +2461,7 @@ mod tests {
         // Target the SECOND file (vis index 1 in flat mode).
         let lr = p.unstaged_list(region);
         let y = lr.y + 1.0 * row_h();
-        let stage = SourceControlPanel::action_rects(lr, y, false)
+        let stage = SourceControlPanel::action_rects(lr, y, false, false)
             .into_iter()
             .find(|(a, _)| matches!(a, Act::Stage))
             .unwrap()
@@ -2230,7 +2514,7 @@ mod tests {
         // Vis order: folder "src" (idx 0), its two files, then README at root.
         let lr = p.unstaged_list(region);
         let y = lr.y; // folder row
-        let stage = SourceControlPanel::folder_action_rects(lr, y, false)
+        let stage = SourceControlPanel::folder_action_rects(lr, y, false, false)
             .into_iter()
             .find(|(a, _)| matches!(a, Act::Stage))
             .expect("folder stage action present")
