@@ -55,6 +55,9 @@ pub enum Intent {
     GitStage(String),
     GitUnstage(String),
     GitDiscard { path: String, untracked: bool },
+    /// Discard every change under one folder (tracked reverts + untracked removed),
+    /// behind a single confirmation.
+    GitDiscardFolder(String),
     /// Group-level (composite) git actions, and toolbar actions.
     GitStageAll,
     GitUnstageAll,

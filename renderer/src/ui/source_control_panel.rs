@@ -1004,7 +1004,7 @@ impl SourceControlPanel {
         } else if staged {
             &[Act::Stash, Act::Unstage]
         } else {
-            &[Act::Stash, Act::Stage]
+            &[Act::Discard, Act::Stash, Act::Stage]
         };
         Self::rects_for(acts, region, y)
     }
@@ -2145,6 +2145,12 @@ impl SourceControlPanel {
                                 if act == Act::Stash {
                                     // One stash for the whole folder (pathspec), not per file.
                                     out.push(Intent::GitStashPath(Self::folder_path(key).to_string()));
+                                    acted = true;
+                                    break;
+                                }
+                                if act == Act::Discard {
+                                    // One pathspec discard + one confirmation, not per file.
+                                    out.push(Intent::GitDiscardFolder(Self::folder_path(key).to_string()));
                                     acted = true;
                                     break;
                                 }

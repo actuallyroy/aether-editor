@@ -35,6 +35,8 @@ mod menus;
 mod nav;
 #[cfg(target_os = "macos")]
 mod macos_menu;
+#[cfg(target_os = "macos")]
+mod macos_launcher;
 mod perf;
 mod update;
 mod media;
@@ -176,6 +178,7 @@ pub(crate) enum DialogAction {
     DeleteNode(usize),
     CloseDoc(usize),
     GitDiscard { path: String, untracked: bool },
+    GitDiscardFolder(String),
     GitDiscardAll,
     GitDiscardAllMerge,
     GitStash,
@@ -2458,7 +2461,13 @@ impl App {
     /// VSCode's File → New Window). The user opens a folder from there; if they pick
     /// one that's already open in a live window, that window is focused instead.
     fn open_new_window(&mut self) {
-        if let Ok(exe) = std::env::current_exe() {
+        // Use the canonical binary, not this process's exe — which may be a per-folder
+        // launcher-bundle hardlink that would re-open that folder (and steal its Dock name).
+        #[cfg(target_os = "macos")]
+        let exe = Ok::<_, std::io::Error>(macos_launcher::canonical_exe());
+        #[cfg(not(target_os = "macos"))]
+        let exe = std::env::current_exe();
+        if let Ok(exe) = exe {
             let mut cmd = std::process::Command::new(exe);
             cmd.arg("--new-window");
             #[cfg(unix)]
@@ -2716,6 +2725,9 @@ impl App {
         for d in self.workspace.documents.iter_mut() {
             d.diff_base_requested = false;
         }
+        // Reflect created/deleted/renamed files in the explorer without a manual refresh
+        // (e.g. when an agent or external tool writes a new file). Preserves expanded state.
+        self.workspace.tree.refresh();
         // Any change (working tree or .git) can move the git status.
         self.refresh_source_control();
         if reloaded {
@@ -2799,6 +2811,9 @@ impl App {
             }
             ui::Intent::GitDiscard { path, untracked } => {
                 self.confirm_discard(path, untracked);
+            }
+            ui::Intent::GitDiscardFolder(dir) => {
+                self.confirm_discard_folder(dir);
             }
             ui::Intent::GitStageAll => {
                 git::stage_all(&self.cwd);
@@ -3566,6 +3581,26 @@ impl App {
         self.redraw();
     }
 
+    /// Confirm before discarding every change under one folder — irreversible.
+    fn confirm_discard_folder(&mut self, dir: String) {
+        let msg = format!(
+            "Are you sure you want to discard all changes in '{}/'? This reverts tracked files and deletes untracked ones. This is irreversible.",
+            dir
+        );
+        if let Some(g) = self.gpu.as_mut() {
+            g.ui
+                .dialog
+                .set(&mut g.font_system, &msg, &["Discard Changes", "Cancel"], None);
+        }
+        self.dialog = Some(DialogState {
+            action: DialogAction::GitDiscardFolder(dir),
+            has_check: false,
+            checked: false,
+            hovered: None,
+        });
+        self.redraw();
+    }
+
     /// Confirm before discarding ALL working-tree changes — irreversible.
     fn confirm_discard_all(&mut self) {
         let msg = "Are you sure you want to discard ALL changes? This is irreversible and cannot be undone.";
@@ -3773,6 +3808,14 @@ impl App {
                 if i == 0 {
                     git::apply_patch(&self.cwd, &patch, false, true); // reverse-apply to worktree
                     self.after_block_action();
+                }
+            }
+            DialogAction::GitDiscardFolder(dir) => {
+                // 0 = Discard Changes, 1 = Cancel
+                if i == 0 {
+                    git::discard_path(&self.cwd, &dir);
+                    self.refresh_source_control();
+                    self.apply_intent(ui::Intent::ReloadOpenDocs);
                 }
             }
             DialogAction::GitDiscardAll => {
@@ -4851,6 +4894,20 @@ impl App {
         // this folder open, it raises itself instead of us opening a duplicate.
         if self.terminal.focus_other_window(&folder.to_string_lossy()) {
             return;
+        }
+        // macOS: each folder runs in its own window launched through a generated bundle so
+        // the Dock/menu-bar show the folder's name. If this is an empty folder-less shell,
+        // close it once the new window is up; otherwise leave it (open in a new window).
+        #[cfg(target_os = "macos")]
+        {
+            if macos_launcher::open_folder_windowed(&folder) {
+                if self.cwd.as_os_str().is_empty() {
+                    self.save_session();
+                    self.pending_close = true;
+                }
+                return;
+            }
+            // Bundle launch failed — fall through to legacy in-place re-scope.
         }
         self.cwd = folder.clone();
         if let Some(g) = self.gpu.as_ref() {
@@ -8692,6 +8749,12 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        // A pending programmatic close (e.g. a folder-less shell handing off to a new
+        // per-folder window) exits the event loop here, not only on the next mouse press.
+        if self.pending_close {
+            el.exit();
+            return;
+        }
         // Lazily fetch inline git blame for the active document (open / tab switch /
         // session restore all land here).
         self.maybe_request_blame();
@@ -9608,8 +9671,23 @@ fn main() -> Result<()> {
     // (and its parent becomes the root). Falls back to the current directory.
     // `--new-window` opens a folder-less window (File → New Window, like VSCode) —
     // no last-workspace restore; the user picks a folder via Open Folder.
+    // macOS: when launched through a per-folder launcher bundle (CrossOver-style Dock
+    // identity), the folder to open is recorded inside the bundle, not on argv. Canonical
+    // launches instead sweep any orphaned bundles left by crashed/force-quit windows.
+    #[cfg(target_os = "macos")]
+    let launcher_workspace = {
+        match macos_launcher::startup_workspace() {
+            Some(ws) => Some(ws),
+            None => {
+                macos_launcher::sweep_stale();
+                None
+            }
+        }
+    };
     let new_window = std::env::args().any(|a| a == "--new-window");
     let arg = std::env::args().nth(1).filter(|a| a != "--new-window").map(PathBuf::from);
+    #[cfg(target_os = "macos")]
+    let arg = launcher_workspace.or(arg);
     let (root, initial_file) = match arg {
         _ if new_window => (PathBuf::new(), None),
         Some(p) if p.is_dir() => (p, None),
@@ -9631,6 +9709,10 @@ fn main() -> Result<()> {
         }
     };
     let event_loop = EventLoop::new()?;
+    // If launched from a per-folder bundle, render its letter-badge icon in the background
+    // (ready for next launch) — never on the Open Folder path.
+    #[cfg(target_os = "macos")]
+    macos_launcher::ensure_icon_async();
     let mut app = App::new(root, initial_file);
     app.proxy = Some(event_loop.create_proxy());
     event_loop.run_app(&mut app)?;

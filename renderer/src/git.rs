@@ -232,6 +232,14 @@ pub fn discard(root: &Path, path: &str, untracked: bool) {
     }
 }
 
+/// Discard every change under one folder pathspec: revert tracked files
+/// (`git restore -- <dir>`) AND remove untracked files/dirs (`git clean -fd -- <dir>`).
+/// One pathspec → one confirmation, instead of stacking a dialog per file.
+pub fn discard_path(root: &Path, dir: &str) {
+    let _ = git(root, &["restore", "--", dir]);
+    let _ = git(root, &["clean", "-fd", "--", dir]);
+}
+
 /// Stage every change (`git add -A`).
 pub fn stage_all(root: &Path) {
     let _ = git(root, &["add", "-A"]);
