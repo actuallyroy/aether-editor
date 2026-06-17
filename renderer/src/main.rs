@@ -2702,6 +2702,21 @@ impl App {
         if paths.is_empty() {
             return;
         }
+        // Classify the batch. The watcher is recursive over the repo root, so it also sees
+        // `.git/` churn — crucially the `.git/index` + `*.lock` writes that our OWN
+        // `git status` (in refresh_source_control) produces. Reacting to those would feed
+        // straight back into the watcher and spin a ~1s refresh loop, so we ignore index/
+        // lock noise and only treat real ref moves (HEAD/refs/MERGE_HEAD) as git-relevant.
+        let under_git = |p: &std::path::Path| p.components().any(|c| c.as_os_str() == ".git");
+        let git_ref_move = |p: &std::path::Path| {
+            let s = p.to_string_lossy();
+            s.contains("/.git/HEAD") || s.contains("/.git/refs/") || s.contains("/.git/MERGE_HEAD")
+        };
+        let workspace_changed = paths.iter().any(|p| !under_git(p));
+        let git_changed = paths.iter().any(|p| git_ref_move(p));
+        if !workspace_changed && !git_changed {
+            return; // only .git/index + lock noise — nothing user-visible changed
+        }
         // Reload externally-changed, non-dirty docs from disk (skip dirty ones so we
         // never clobber unsaved local edits).
         let mut reloaded = false;
@@ -2727,8 +2742,11 @@ impl App {
         }
         // Reflect created/deleted/renamed files in the explorer without a manual refresh
         // (e.g. when an agent or external tool writes a new file). Preserves expanded state.
-        self.workspace.tree.refresh();
-        // Any change (working tree or .git) can move the git status.
+        // Only on real workspace changes — never on `.git/` churn (the explorer hides .git,
+        // and rebuilding on our own git-status writes is what caused the refresh-loop lag).
+        if workspace_changed {
+            self.workspace.tree.refresh();
+        }
         self.refresh_source_control();
         if reloaded {
             self.redraw();
