@@ -973,6 +973,22 @@ impl Terminal {
         (self.grid.cols, self.grid.rows)
     }
 
+    /// The most recent `max_lines` lines of the combined buffer (history + live screen,
+    /// or just the visible screen on the alternate screen) as plain text, trailing
+    /// whitespace trimmed per line and trailing blank lines dropped. Backs the MCP
+    /// `terminalOutput` tool so an agent can read what a terminal is showing.
+    pub fn tail_text(&self, max_lines: usize) -> String {
+        let total = self.total_lines();
+        let start = total.saturating_sub(max_lines.max(1));
+        let mut lines: Vec<String> = (start..total)
+            .map(|l| self.line_chars(l).iter().collect::<String>().trim_end().to_string())
+            .collect();
+        while lines.last().map_or(false, |l| l.is_empty()) {
+            lines.pop();
+        }
+        lines.join("\n")
+    }
+
     /// The characters of combined-buffer line `abs_line` (scrollback then live rows;
     /// just the live screen on the alternate screen). Empty if out of range.
     pub fn line_chars(&self, abs_line: usize) -> Vec<char> {

@@ -302,6 +302,40 @@ impl TerminalPanel {
         }
     }
 
+    /// Send raw bytes to a specific tab's focused pane, even when it isn't the active tab
+    /// (so an agent can drive a background terminal without stealing focus). Returns false
+    /// if `index` is out of range.
+    pub fn write_to(&mut self, index: usize, bytes: &[u8]) -> bool {
+        if let Some(g) = self.groups.get_mut(index) {
+            if let Some(p) = g.panes.get_mut(g.focused) {
+                p.term.write(bytes);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Read the recent text (most recent `max_lines`) of a tab's focused pane — for the
+    /// MCP `terminalOutput` tool, so an agent can read a terminal it isn't focused on.
+    pub fn read_tab(&self, index: usize, max_lines: usize) -> Option<String> {
+        self.groups
+            .get(index)
+            .and_then(|g| g.panes.get(g.focused))
+            .map(|p| p.term.tail_text(max_lines))
+    }
+
+    /// Make tab `index` the active one and show the panel. Returns false if out of range.
+    pub fn focus_tab(&mut self, index: usize) -> bool {
+        if index >= self.groups.len() {
+            return false;
+        }
+        self.active = index;
+        self.visible = true;
+        self.focused = true;
+        self.mark_dirty();
+        true
+    }
+
     /// Requested panel height: huge when maximized (the layout clamps it to leave a
     /// sliver of editor), the splitter size otherwise, None when hidden.
     pub fn panel_height(&self) -> Option<f32> {

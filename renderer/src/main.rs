@@ -1639,7 +1639,7 @@ impl App {
         }
     }
 
-    fn layout(&self) -> Layout {
+    pub(crate) fn layout(&self) -> Layout {
         let (w, h) = match self.gpu.as_ref() {
             Some(g) => (g.config.width as f32, g.config.height as f32),
             None => (1280.0, 800.0),
@@ -2712,10 +2712,15 @@ impl App {
             let s = p.to_string_lossy();
             s.contains("/.git/HEAD") || s.contains("/.git/refs/") || s.contains("/.git/MERGE_HEAD")
         };
-        let workspace_changed = paths.iter().any(|p| !under_git(p));
+        // A real workspace change = outside `.git/` AND not git-ignored. Dropping ignored
+        // paths keeps heavy builds (`dotnet build`/`cargo` thrashing bin/obj/target) from
+        // spinning git-status + tree refreshes on every batch and lagging the window.
+        let workspace_changed = paths
+            .iter()
+            .any(|p| !under_git(p) && !self.workspace.tree.is_path_ignored(p));
         let git_changed = paths.iter().any(|p| git_ref_move(p));
         if !workspace_changed && !git_changed {
-            return; // only .git/index + lock noise — nothing user-visible changed
+            return; // only ignored build output / .git index+lock noise — nothing user-visible
         }
         // Reload externally-changed, non-dirty docs from disk (skip dirty ones so we
         // never clobber unsaved local edits).

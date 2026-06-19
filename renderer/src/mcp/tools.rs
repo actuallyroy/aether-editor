@@ -82,11 +82,51 @@ pub fn list() -> Value {
         ),
         tool(
             "terminalSend",
-            "Type text into the focused terminal (append a newline to run it)",
+            "Type text into a terminal (append a newline to run it). Targets the focused \
+             terminal by default, or a specific tab via `index` — letting you drive a \
+             background terminal without focusing it.",
             json!({"type":"object","properties":{
                 "text":{"type":"string"},
-                "enter":{"type":"boolean","description":"Append Enter to run (default true)"}
+                "enter":{"type":"boolean","description":"Append Enter to run (default true)"},
+                "index":{"type":"number","description":"Tab index to send to; omit for the focused terminal"}
             },"required":["text"]}),
+        ),
+        tool(
+            "terminalSendKey",
+            "Send a control key / keypress to a terminal (use this to stop a process — \
+             `ctrl-c` — not terminalSend, which would type the text literally). Supports: \
+             ctrl-a..ctrl-z, enter, escape, tab, backspace, up, down, left, right.",
+            json!({"type":"object","properties":{
+                "key":{"type":"string","description":"e.g. \"ctrl-c\", \"enter\", \"up\""},
+                "index":{"type":"number","description":"Tab index to send to; omit for the focused terminal"}
+            },"required":["key"]}),
+        ),
+        tool(
+            "terminalOutput",
+            "Read the text a terminal is showing (history + visible screen), so you can see \
+             a command's output or an interactive session's reply. Omit `lines` for the \
+             full buffer, or pass it for just the last N lines. Targets the focused \
+             terminal by default, or a specific tab via `index`.",
+            json!({"type":"object","properties":{
+                "lines":{"type":"number","description":"Last N lines (partial); omit for the full buffer"},
+                "index":{"type":"number","description":"Tab index to read; omit for the focused terminal"}
+            }}),
+        ),
+        tool(
+            "newTerminal",
+            "Create a new terminal tab (starts in the workspace root). Returns its index. \
+             Does not steal focus unless `focus` is true.",
+            json!({"type":"object","properties":{
+                "name":{"type":"string","description":"Optional title for the new tab"},
+                "focus":{"type":"boolean","description":"Make the new tab active (default true)"}
+            }}),
+        ),
+        tool(
+            "focusTerminal",
+            "Focus a terminal tab by index (shows the panel and makes it active)",
+            json!({"type":"object","properties":{
+                "index":{"type":"number","description":"Tab index to focus"}
+            },"required":["index"]}),
         ),
         tool(
             "listTerminals",
@@ -308,7 +348,77 @@ pub fn execute(app: &mut crate::App, name: &str, args: &Value) -> Result<Value, 
             if enter {
                 bytes.push(b'\r');
             }
-            app.terminal.write_focused(&bytes);
+            // With `index`, drive that tab without changing which one is focused; otherwise
+            // the active terminal.
+            match args.get("index").and_then(|i| i.as_u64()) {
+                Some(i) => {
+                    if !app.terminal.write_to(i as usize, &bytes) {
+                        return Err(format!("no terminal at index {i}"));
+                    }
+                }
+                None => app.terminal.write_focused(&bytes),
+            }
+            app.redraw();
+            Ok(json!({ "ok": true }))
+        }
+
+        "terminalSendKey" => {
+            let key = args.get("key").and_then(|k| k.as_str()).ok_or("terminalSendKey requires key")?;
+            let bytes = key_bytes(key).ok_or_else(|| format!("unknown key: {key}"))?;
+            app.terminal.visible = true;
+            match args.get("index").and_then(|i| i.as_u64()) {
+                Some(i) => {
+                    if !app.terminal.write_to(i as usize, &bytes) {
+                        return Err(format!("no terminal at index {i}"));
+                    }
+                }
+                None => app.terminal.write_focused(&bytes),
+            }
+            app.redraw();
+            Ok(json!({ "ok": true }))
+        }
+
+        "terminalOutput" => {
+            let index = args
+                .get("index")
+                .and_then(|i| i.as_u64())
+                .map(|i| i as usize)
+                .unwrap_or(app.terminal.active);
+            // Omit `lines` → full buffer (a large cap; scrollback is bounded anyway).
+            let lines = args.get("lines").and_then(|l| l.as_u64()).map(|l| l as usize).unwrap_or(usize::MAX);
+            let output = app
+                .terminal
+                .read_tab(index, lines)
+                .ok_or_else(|| format!("no terminal at index {index}"))?;
+            Ok(json!({ "index": index, "output": output }))
+        }
+
+        "newTerminal" => {
+            let focus = args.get("focus").and_then(|b| b.as_bool()).unwrap_or(true);
+            let prev_active = app.terminal.active;
+            app.terminal.visible = true;
+            let panel = app.layout().terminal_panel;
+            app.terminal.new_terminal_tab(panel, app.terminal_cell_w);
+            let index = app.terminal.active; // new_terminal_tab makes it active
+            if let Some(name) = args.get("name").and_then(|n| n.as_str()) {
+                app.terminal.rename_tab(index, name);
+            }
+            if !focus {
+                app.terminal.active = prev_active; // created in the background
+            }
+            app.redraw();
+            Ok(json!({ "ok": true, "index": index }))
+        }
+
+        "focusTerminal" => {
+            let index = args
+                .get("index")
+                .and_then(|i| i.as_u64())
+                .ok_or("focusTerminal requires index")? as usize;
+            if !app.terminal.focus_tab(index) {
+                return Err(format!("no terminal at index {index}"));
+            }
+            app.redraw();
             Ok(json!({ "ok": true }))
         }
 
@@ -335,6 +445,33 @@ pub fn execute(app: &mut crate::App, name: &str, args: &Value) -> Result<Value, 
 
         other => Err(format!("unknown tool: {other}")),
     }
+}
+
+/// Map a key name (case-insensitive) to the raw bytes a terminal expects. `ctrl-<letter>`
+/// becomes the corresponding control byte (ctrl-c → 0x03); named keys cover the common
+/// editing/navigation keys. Returns None for anything unrecognized.
+fn key_bytes(key: &str) -> Option<Vec<u8>> {
+    let k = key.trim().to_ascii_lowercase();
+    // ctrl-<letter> / ^<letter> → control byte (letter & 0x1f).
+    let ctrl = k.strip_prefix("ctrl-").or_else(|| k.strip_prefix("ctrl+")).or_else(|| k.strip_prefix('^'));
+    if let Some(rest) = ctrl {
+        let c = rest.chars().next()?;
+        if rest.chars().count() == 1 && c.is_ascii_alphabetic() {
+            return Some(vec![(c.to_ascii_uppercase() as u8) & 0x1f]);
+        }
+    }
+    Some(match k.as_str() {
+        "enter" | "return" | "cr" => vec![b'\r'],
+        "escape" | "esc" => vec![0x1b],
+        "tab" => vec![b'\t'],
+        "backspace" | "bs" => vec![0x7f],
+        "space" => vec![b' '],
+        "up" => vec![0x1b, b'[', b'A'],
+        "down" => vec![0x1b, b'[', b'B'],
+        "right" => vec![0x1b, b'[', b'C'],
+        "left" => vec![0x1b, b'[', b'D'],
+        _ => return None,
+    })
 }
 
 /// LSP severity → the 1–4 numbering MCP/LSP clients expect.

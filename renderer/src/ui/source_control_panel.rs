@@ -134,6 +134,7 @@ pub struct SourceControlPanel {
     l_unstaged: TextLabel,
     l_merge: TextLabel,
     l_commit: TextLabel,
+    l_continue: TextLabel, // commit-button label while mid-rebase (continues the rebase)
     count_staged: TextLabel,
     count_unstaged: TextLabel,
     count_merge: TextLabel,
@@ -235,6 +236,7 @@ impl SourceControlPanel {
             l_unstaged: mk(fs, "Changes"),
             l_merge: mk(fs, "Merge Changes"),
             l_commit: mk(fs, "✓ Commit"),
+            l_continue: mk(fs, "✓ Continue"),
             count_staged: mk(fs, "0"),
             count_unstaged: mk(fs, "0"),
             count_merge: mk(fs, "0"),
@@ -1280,9 +1282,12 @@ impl SourceControlPanel {
         let m = Self::msg_rect(region);
         let mc = if self.msg.text().is_empty() { theme::FG_DIM() } else { theme::FG_TEXT() };
         self.msg.draw(m, theme::zpx(6.0), mc, areas);
-        // Commit split button: label centered in the main part + dropdown chevron.
+        // Commit split button: label centered in the main part + dropdown chevron. While
+        // mid-rebase it reads "Continue" — a plain commit there would strand the rebase, so
+        // the button runs `rebase --continue` instead (see git::commit).
         let cm = Self::commit_main(region);
-        self.l_commit.push(cm.x + (cm.w - self.l_commit.width()) * 0.5, cm, theme::FG_TEXT(), areas);
+        let label = if self.merge_state == Some("REBASING") { &self.l_continue } else { &self.l_commit };
+        label.push(cm.x + (cm.w - label.width()) * 0.5, cm, theme::FG_TEXT(), areas);
         self.push_icon(&self.ic_chevron, Self::commit_chevron(region), theme::FG_TEXT(), areas);
 
         let vp = self.groups_viewport(region);

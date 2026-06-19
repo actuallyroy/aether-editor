@@ -480,11 +480,19 @@ pub fn stash_apply(root: &Path) -> bool {
 /// Commit with `msg`. When `stage_all` is set (nothing was explicitly staged),
 /// stages every change first (`git add -A`). Returns true on success.
 pub fn commit(root: &Path, msg: &str, stage_all: bool) -> bool {
-    if msg.trim().is_empty() {
-        return false;
-    }
     if stage_all {
         let _ = git(root, &["add", "-A"]);
+    }
+    // Mid-rebase, a plain `git commit` makes a stray commit but leaves the rebase in
+    // progress (the user stays stuck in REBASING). The right move is to continue the
+    // rebase, which commits the resolved step reusing its original message. Run it with a
+    // no-op editor so it never blocks on an interactive prompt. (A `merge` is different —
+    // a normal commit correctly finalizes it — so only rebase is special-cased here.)
+    if merge_state(root) == Some("REBASING") {
+        return git(root, &["-c", "core.editor=true", "rebase", "--continue"]).is_some();
+    }
+    if msg.trim().is_empty() {
+        return false;
     }
     git(root, &["commit", "-m", msg]).is_some()
 }

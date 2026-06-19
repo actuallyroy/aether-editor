@@ -86,6 +86,13 @@ impl FileTree {
             || self.ignored_set.iter().any(|ig| path.starts_with(ig))
     }
 
+    /// Public ignore check (uses the cached ignored set). Used to drop git-ignored
+    /// filesystem-watcher churn — e.g. `dotnet build`/`cargo` writing into bin/obj/target —
+    /// so heavy builds don't spin git-status + tree refreshes and lag the window.
+    pub fn is_path_ignored(&self, path: &Path) -> bool {
+        self.is_ignored(path)
+    }
+
     fn add_children(&mut self, dir: &Path, depth: usize) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
