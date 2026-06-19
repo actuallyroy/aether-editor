@@ -82,40 +82,46 @@ pub fn list() -> Value {
         ),
         tool(
             "terminalSend",
-            "Type text into a terminal (append a newline to run it). Targets the focused \
-             terminal by default, or a specific tab via `index` — letting you drive a \
-             background terminal without focusing it.",
+            "Type text into a terminal (append a newline to run it). Targets a terminal by \
+             its stable `id` (from listTerminals/newTerminal — preferred, survives \
+             reordering/closing), or `index`, or the focused terminal if neither is given. \
+             Lets you drive a background terminal without focusing it.",
             json!({"type":"object","properties":{
                 "text":{"type":"string"},
                 "enter":{"type":"boolean","description":"Append Enter to run (default true)"},
-                "index":{"type":"number","description":"Tab index to send to; omit for the focused terminal"}
+                "id":{"type":"number","description":"Stable terminal id (preferred)"},
+                "index":{"type":"number","description":"Tab position index (fallback); omit for the focused terminal"}
             },"required":["text"]}),
         ),
         tool(
             "terminalSendKey",
             "Send a control key / keypress to a terminal (use this to stop a process — \
              `ctrl-c` — not terminalSend, which would type the text literally). Supports: \
-             ctrl-a..ctrl-z, enter, escape, tab, backspace, up, down, left, right.",
+             ctrl-a..ctrl-z, enter, escape, tab, backspace, up, down, left, right. Target \
+             by stable `id` (preferred), `index`, or the focused terminal.",
             json!({"type":"object","properties":{
                 "key":{"type":"string","description":"e.g. \"ctrl-c\", \"enter\", \"up\""},
-                "index":{"type":"number","description":"Tab index to send to; omit for the focused terminal"}
+                "id":{"type":"number","description":"Stable terminal id (preferred)"},
+                "index":{"type":"number","description":"Tab position index (fallback); omit for the focused terminal"}
             },"required":["key"]}),
         ),
         tool(
             "terminalOutput",
             "Read the text a terminal is showing (history + visible screen), so you can see \
              a command's output or an interactive session's reply. Omit `lines` for the \
-             full buffer, or pass it for just the last N lines. Targets the focused \
-             terminal by default, or a specific tab via `index`.",
+             full buffer, or pass it for just the last N lines. Target by stable `id` \
+             (preferred), `index`, or the focused terminal.",
             json!({"type":"object","properties":{
                 "lines":{"type":"number","description":"Last N lines (partial); omit for the full buffer"},
-                "index":{"type":"number","description":"Tab index to read; omit for the focused terminal"}
+                "id":{"type":"number","description":"Stable terminal id (preferred)"},
+                "index":{"type":"number","description":"Tab position index (fallback); omit for the focused terminal"}
             }}),
         ),
         tool(
             "newTerminal",
-            "Create a new terminal tab (starts in the workspace root). Returns its index. \
-             Does not steal focus unless `focus` is true.",
+            "Create a new terminal tab (starts in the workspace root). Returns its stable \
+             `id` (use it for later terminalSend/terminalOutput/etc.) and index. Does not \
+             steal focus unless `focus` is true.",
             json!({"type":"object","properties":{
                 "name":{"type":"string","description":"Optional title for the new tab"},
                 "focus":{"type":"boolean","description":"Make the new tab active (default true)"}
@@ -123,22 +129,27 @@ pub fn list() -> Value {
         ),
         tool(
             "focusTerminal",
-            "Focus a terminal tab by index (shows the panel and makes it active)",
+            "Focus a terminal tab (shows the panel and makes it active). Target by stable \
+             `id` (preferred) or `index`.",
             json!({"type":"object","properties":{
-                "index":{"type":"number","description":"Tab index to focus"}
-            },"required":["index"]}),
+                "id":{"type":"number","description":"Stable terminal id (preferred)"},
+                "index":{"type":"number","description":"Tab position index (fallback)"}
+            }}),
         ),
         tool(
             "listTerminals",
-            "List the terminal tabs (index, title, active)",
+            "List the terminal tabs (stable id, index, title, active). Use `id` for later \
+             calls — it survives reordering/closing other tabs; `index` does not.",
             json!({"type":"object","properties":{}}),
         ),
         tool(
             "renameTerminal",
-            "Rename a terminal tab",
+            "Rename a terminal tab. Target by stable `id` (preferred), `index`, or the \
+             focused tab.",
             json!({"type":"object","properties":{
                 "name":{"type":"string","description":"New tab title"},
-                "index":{"type":"number","description":"Tab index; omits to the active tab"}
+                "id":{"type":"number","description":"Stable terminal id (preferred)"},
+                "index":{"type":"number","description":"Tab position index (fallback); omits to the active tab"}
             },"required":["name"]}),
         ),
     ])
@@ -146,6 +157,19 @@ pub fn list() -> Value {
 
 fn tool(name: &str, desc: &str, schema: Value) -> Value {
     json!({ "name": name, "description": desc, "inputSchema": schema })
+}
+
+/// Resolve which terminal tab a call targets: prefer the stable `id`, fall back to the
+/// position `index`, else the focused tab. Errors if a given id/index doesn't exist.
+fn target_tab(app: &crate::App, args: &Value) -> Result<usize, String> {
+    if let Some(id) = args.get("id").and_then(|v| v.as_u64()) {
+        return app.terminal.tab_index_by_id(id).ok_or_else(|| format!("no terminal with id {id}"));
+    }
+    if let Some(i) = args.get("index").and_then(|v| v.as_u64()) {
+        let i = i as usize;
+        return (i < app.terminal.tab_count()).then_some(i).ok_or_else(|| format!("no terminal at index {i}"));
+    }
+    Ok(app.terminal.active)
 }
 
 /// Run one tool against the editor. Returns the structured JSON payload (the server
@@ -348,16 +372,9 @@ pub fn execute(app: &mut crate::App, name: &str, args: &Value) -> Result<Value, 
             if enter {
                 bytes.push(b'\r');
             }
-            // With `index`, drive that tab without changing which one is focused; otherwise
-            // the active terminal.
-            match args.get("index").and_then(|i| i.as_u64()) {
-                Some(i) => {
-                    if !app.terminal.write_to(i as usize, &bytes) {
-                        return Err(format!("no terminal at index {i}"));
-                    }
-                }
-                None => app.terminal.write_focused(&bytes),
-            }
+            // Targets the tab by stable id/index without changing which one is focused.
+            let idx = target_tab(app, args)?;
+            app.terminal.write_to(idx, &bytes);
             app.redraw();
             Ok(json!({ "ok": true }))
         }
@@ -366,31 +383,18 @@ pub fn execute(app: &mut crate::App, name: &str, args: &Value) -> Result<Value, 
             let key = args.get("key").and_then(|k| k.as_str()).ok_or("terminalSendKey requires key")?;
             let bytes = key_bytes(key).ok_or_else(|| format!("unknown key: {key}"))?;
             app.terminal.visible = true;
-            match args.get("index").and_then(|i| i.as_u64()) {
-                Some(i) => {
-                    if !app.terminal.write_to(i as usize, &bytes) {
-                        return Err(format!("no terminal at index {i}"));
-                    }
-                }
-                None => app.terminal.write_focused(&bytes),
-            }
+            let idx = target_tab(app, args)?;
+            app.terminal.write_to(idx, &bytes);
             app.redraw();
             Ok(json!({ "ok": true }))
         }
 
         "terminalOutput" => {
-            let index = args
-                .get("index")
-                .and_then(|i| i.as_u64())
-                .map(|i| i as usize)
-                .unwrap_or(app.terminal.active);
+            let idx = target_tab(app, args)?;
             // Omit `lines` → full buffer (a large cap; scrollback is bounded anyway).
             let lines = args.get("lines").and_then(|l| l.as_u64()).map(|l| l as usize).unwrap_or(usize::MAX);
-            let output = app
-                .terminal
-                .read_tab(index, lines)
-                .ok_or_else(|| format!("no terminal at index {index}"))?;
-            Ok(json!({ "index": index, "output": output }))
+            let output = app.terminal.read_tab(idx, lines).unwrap_or_default();
+            Ok(json!({ "id": app.terminal.tab_id(idx), "index": idx, "output": output }))
         }
 
         "newTerminal" => {
@@ -400,6 +404,7 @@ pub fn execute(app: &mut crate::App, name: &str, args: &Value) -> Result<Value, 
             let panel = app.layout().terminal_panel;
             app.terminal.new_terminal_tab(panel, app.terminal_cell_w);
             let index = app.terminal.active; // new_terminal_tab makes it active
+            let id = app.terminal.tab_id(index);
             if let Some(name) = args.get("name").and_then(|n| n.as_str()) {
                 app.terminal.rename_tab(index, name);
             }
@@ -407,26 +412,28 @@ pub fn execute(app: &mut crate::App, name: &str, args: &Value) -> Result<Value, 
                 app.terminal.active = prev_active; // created in the background
             }
             app.redraw();
-            Ok(json!({ "ok": true, "index": index }))
+            Ok(json!({ "ok": true, "id": id, "index": index }))
         }
 
         "focusTerminal" => {
-            let index = args
-                .get("index")
-                .and_then(|i| i.as_u64())
-                .ok_or("focusTerminal requires index")? as usize;
-            if !app.terminal.focus_tab(index) {
-                return Err(format!("no terminal at index {index}"));
+            let idx = target_tab(app, args)?;
+            if !app.terminal.focus_tab(idx) {
+                return Err("terminal no longer exists".to_string());
             }
             app.redraw();
-            Ok(json!({ "ok": true }))
+            Ok(json!({ "ok": true, "id": app.terminal.tab_id(idx) }))
         }
 
         "listTerminals" => {
             let mut tabs = Vec::new();
             let mut i = 0;
             while let Some(title) = app.terminal.tab_title(i) {
-                tabs.push(json!({ "index": i, "title": title, "active": i == app.terminal.active }));
+                tabs.push(json!({
+                    "id": app.terminal.tab_id(i),
+                    "index": i,
+                    "title": title,
+                    "active": i == app.terminal.active,
+                }));
                 i += 1;
             }
             Ok(json!({ "terminals": tabs }))
@@ -434,13 +441,9 @@ pub fn execute(app: &mut crate::App, name: &str, args: &Value) -> Result<Value, 
 
         "renameTerminal" => {
             let name = args.get("name").and_then(|n| n.as_str()).ok_or("renameTerminal requires name")?;
-            let idx = args
-                .get("index")
-                .and_then(|i| i.as_u64())
-                .map(|i| i as usize)
-                .unwrap_or(app.terminal.active);
+            let idx = target_tab(app, args)?;
             app.terminal.rename_tab(idx, name);
-            Ok(json!({ "ok": true }))
+            Ok(json!({ "ok": true, "id": app.terminal.tab_id(idx) }))
         }
 
         other => Err(format!("unknown tool: {other}")),

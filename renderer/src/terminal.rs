@@ -68,11 +68,22 @@ impl Pane {
 pub struct Group {
     pub panes: Vec<Pane>,
     pub focused: usize, // focused pane within this group
+    /// Stable identity for this tab, unique for the life of the process and unaffected by
+    /// reordering/closing other tabs — so an agent (MCP) can target a terminal reliably
+    /// instead of by its shifting position index.
+    pub id: u64,
 }
+
+/// Monotonic source of `Group::id`. Process-wide so ids never collide across windows.
+static NEXT_TAB_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Group {
     pub fn new(pane: Pane) -> Self {
-        Self { panes: vec![pane], focused: 0 }
+        Self {
+            panes: vec![pane],
+            focused: 0,
+            id: NEXT_TAB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        }
     }
 
     /// Tab label — the focused pane's shell name (e.g. "cmd"), with a "+N" suffix

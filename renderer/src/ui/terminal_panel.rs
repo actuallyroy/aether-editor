@@ -315,6 +315,21 @@ impl TerminalPanel {
         false
     }
 
+    /// Number of terminal tabs.
+    pub fn tab_count(&self) -> usize {
+        self.groups.len()
+    }
+
+    /// The stable id of the tab at `index` (see `terminal::Group::id`).
+    pub fn tab_id(&self, index: usize) -> Option<u64> {
+        self.groups.get(index).map(|g| g.id)
+    }
+
+    /// The position index of the tab with stable `id`, or None if it's gone.
+    pub fn tab_index_by_id(&self, id: u64) -> Option<usize> {
+        self.groups.iter().position(|g| g.id == id)
+    }
+
     /// Read the recent text (most recent `max_lines`) of a tab's focused pane — for the
     /// MCP `terminalOutput` tool, so an agent can read a terminal it isn't focused on.
     pub fn read_tab(&self, index: usize, max_lines: usize) -> Option<String> {
