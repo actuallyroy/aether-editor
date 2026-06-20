@@ -148,7 +148,11 @@ fn startup_instructions(req_tx: &Sender<McpRequest>, proxy: &EventLoopProxy<()>)
         "Aether IDE (aether-ide). You can drive the editor and its integrated terminals. \
          Terminals are addressed by a STABLE `id` (not position) — pass it to terminalSend / \
          terminalSendKey / terminalOutput / focusTerminal. terminalSend pastes text then \
-         presses Enter by default. Call listTerminals anytime to refresh.\n\n",
+         presses Enter by default; pass `keys` for a custom key sequence after the text \
+         (e.g. [\"enter\"], [\"ctrl-c\"], [\"down\",\"enter\"]) or enter:false for none. \
+         terminalOutput reads a terminal's content (omit `lines` for all, or pass N for the \
+         last N). Call listTerminals anytime to refresh. Report bugs/feedback about Aether \
+         itself with submitFeedback (files a GitHub issue via the user's gh CLI).\n\n",
     );
     let terms = call_tool("listTerminals", Value::Null, req_tx, proxy)
         .ok()

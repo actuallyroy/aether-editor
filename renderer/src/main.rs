@@ -59,6 +59,20 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Temporary perf probe: run `$body`, and if it blocked the UI thread for >= 20ms, log it
+/// to stderr (set AETHER_PERF=0 to silence). Used to hunt the intermittent window freeze.
+macro_rules! time_ui {
+    ($name:expr, $body:expr) => {{
+        let __t = std::time::Instant::now();
+        let __r = $body;
+        let __ms = __t.elapsed().as_millis();
+        if __ms >= 20 && std::env::var("AETHER_PERF").as_deref() != Ok("0") {
+            eprintln!("[perf] {} blocked UI {}ms", $name, __ms);
+        }
+        __r
+    }};
+}
+
 use anyhow::Result;
 use arboard::Clipboard;
 use winit::{
@@ -540,6 +554,11 @@ pub(crate) struct App {
     pub(crate) lsp_log: std::collections::VecDeque<String>, // ring buffer for the Output tab
     pub(crate) debug_console: std::collections::VecDeque<String>, // debug adapter/debuggee output
     pub(crate) panel_tab: usize, // active bottom-panel tab (index into theme::PANEL_TABS)
+    /// Keypresses queued to fire into a terminal slightly after a paste (e.g. the Enter
+    /// after `terminalSend`'s text). Sending them in the same instant as the paste lets a
+    /// TUI like claude code swallow the Enter while still digesting the bracketed paste, so
+    /// we deliver them a tick later. `(fire_at, tab_index, bytes)`.
+    pub(crate) pending_term_keys: Vec<(Instant, usize, Vec<u8>)>,
     pub(crate) anim_start: Instant, // monotonic clock for GIF playback
     pub(crate) cursor_icon: CursorIcon,
 }
@@ -672,6 +691,7 @@ impl App {
             last_blink: Instant::now(),
             term_blink_on: true,
             term_last_blink: Instant::now(),
+            pending_term_keys: Vec::new(),
             last_edit: Instant::now(),
             nav: nav::NavState::default(),
             zen_saved: None,
@@ -8807,10 +8827,30 @@ impl ApplicationHandler for App {
             el.exit();
             return;
         }
+        // Fire any due deferred terminal keys (e.g. the Enter after a terminalSend paste),
+        // and keep waking until they're delivered.
+        if !self.pending_term_keys.is_empty() {
+            let now = Instant::now();
+            let mut i = 0;
+            while i < self.pending_term_keys.len() {
+                if self.pending_term_keys[i].0 <= now {
+                    let (_, idx, bytes) = self.pending_term_keys.remove(i);
+                    self.terminal.write_to(idx, &bytes);
+                } else {
+                    i += 1;
+                }
+            }
+            if let Some(next) = self.pending_term_keys.iter().map(|(t, _, _)| *t).min() {
+                el.set_control_flow(ControlFlow::WaitUntil(next));
+            }
+            self.redraw();
+        }
         // Lazily fetch inline git blame for the active document (open / tab switch /
         // session restore all land here).
-        self.maybe_request_blame();
-        self.maybe_request_diff_base();
+        time_ui!("blame+diff_base", {
+            self.maybe_request_blame();
+            self.maybe_request_diff_base();
+        });
         // Native macOS menu clicks → commands.
         #[cfg(target_os = "macos")]
         {
@@ -8823,7 +8863,7 @@ impl ApplicationHandler for App {
         // this (UI) thread against `App`, and reply to the waiting connection.
         while let Ok(req) = self.mcp_rx.try_recv() {
             let mcp::McpRequest { tool, args, reply } = req;
-            let res = mcp::tools::execute(self, &tool, &args);
+            let res = time_ui!(format!("mcp:{tool}"), mcp::tools::execute(self, &tool, &args));
             let _ = reply.send(res);
             self.redraw();
         }
@@ -9258,7 +9298,7 @@ impl ApplicationHandler for App {
 
         // Drain the pty-host link even with the panel hidden: the daemon may ask this
         // window to raise itself (another instance opened our workspace).
-        let polled = self.terminal.poll();
+        let polled = time_ui!("terminal.poll", self.terminal.poll());
         if self.terminal.focus_requested {
             self.terminal.focus_requested = false;
             if let Some(g) = self.gpu.as_ref() {
@@ -9600,7 +9640,7 @@ impl ApplicationHandler for App {
                 self.redraw();
             }
             WindowEvent::RedrawRequested => {
-                if let Err(e) = render::render(self) {
+                if let Err(e) = time_ui!("render", render::render(self)) {
                     eprintln!("render: {e}");
                 }
             }

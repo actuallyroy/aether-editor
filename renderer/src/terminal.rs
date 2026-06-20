@@ -990,13 +990,22 @@ impl Terminal {
     /// `terminalOutput` tool so an agent can read what a terminal is showing.
     pub fn tail_text(&self, max_lines: usize) -> String {
         let total = self.total_lines();
-        let start = total.saturating_sub(max_lines.max(1));
-        let mut lines: Vec<String> = (start..total)
+        // Anchor on the last line that actually has content — the live screen is mostly
+        // blank padding below the prompt/output, and counting those rows would make
+        // "last N lines" of a fresh/empty terminal return blank padding instead of "".
+        let mut last = 0; // one past the last non-blank line
+        for l in 0..total {
+            if self.line_chars(l).iter().any(|c| !c.is_whitespace()) {
+                last = l + 1;
+            }
+        }
+        if last == 0 {
+            return String::new(); // nothing printed yet
+        }
+        let start = last.saturating_sub(max_lines.max(1));
+        let lines: Vec<String> = (start..last)
             .map(|l| self.line_chars(l).iter().collect::<String>().trim_end().to_string())
             .collect();
-        while lines.last().map_or(false, |l| l.is_empty()) {
-            lines.pop();
-        }
         lines.join("\n")
     }
 

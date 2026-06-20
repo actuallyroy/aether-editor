@@ -146,6 +146,18 @@ pub fn list() -> Value {
             json!({"type":"object","properties":{}}),
         ),
         tool(
+            "submitFeedback",
+            "File feedback about Aether (this IDE / the aether-ide MCP) as a GitHub issue on \
+             actuallyroy/aether-editor, authored under the user's account via their `gh` \
+             CLI. Use for bugs, missing tools, or surprising behavior in Aether itself. \
+             Pass `issue` to comment on an existing issue instead of opening a new one.",
+            json!({"type":"object","properties":{
+                "message":{"type":"string","description":"The feedback — be specific: what you tried, what happened, what you expected."},
+                "title":{"type":"string","description":"Optional issue title (new issues only; auto-derived from the message otherwise)"},
+                "issue":{"type":"number","description":"Comment on this existing issue number instead of opening a new one"}
+            },"required":["message"]}),
+        ),
+        tool(
             "renameTerminal",
             "Rename a terminal tab. Target by stable `id` (preferred), `index`, or the \
              focused tab.",
@@ -388,9 +400,14 @@ pub fn execute(app: &mut crate::App, name: &str, args: &Value) -> Result<Value, 
                 None if enter => vec!["enter".to_string()],
                 None => vec![],
             };
+            // Validate keys up front, then deliver them a tick AFTER the paste — sending
+            // Enter in the same instant lets a TUI (claude code) swallow it while still
+            // digesting the bracketed paste. Staggered a few ms apart to preserve order.
+            let mut fire = std::time::Instant::now() + std::time::Duration::from_millis(60);
             for name in &sent_keys {
                 let b = key_bytes(name).ok_or_else(|| format!("unknown key: {name}"))?;
-                app.terminal.write_to(idx, &b);
+                app.pending_term_keys.push((fire, idx, b));
+                fire += std::time::Duration::from_millis(20);
             }
             app.redraw();
             Ok(json!({ "ok": true, "id": app.terminal.tab_id(idx), "text": text, "keys": sent_keys }))
@@ -439,6 +456,39 @@ pub fn execute(app: &mut crate::App, name: &str, args: &Value) -> Result<Value, 
             }
             app.redraw();
             Ok(json!({ "ok": true, "id": app.terminal.tab_id(idx) }))
+        }
+
+        "submitFeedback" => {
+            let message = args.get("message").and_then(|m| m.as_str()).ok_or("submitFeedback requires message")?;
+            let repo = "actuallyroy/aether-editor";
+            let body = format!(
+                "{message}\n\n---\n_Filed via Aether's submitFeedback MCP tool — aether v{}_",
+                env!("CARGO_PKG_VERSION")
+            );
+            // gh authors under the user's account (blocks briefly — a one-off, user-driven action).
+            let out = if let Some(n) = args.get("issue").and_then(|i| i.as_u64()) {
+                std::process::Command::new("gh")
+                    .args(["issue", "comment", &n.to_string(), "--repo", repo, "--body", &body])
+                    .output()
+            } else {
+                let title = args.get("title").and_then(|t| t.as_str()).map(String::from).unwrap_or_else(|| {
+                    let snippet: String = message.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(80).collect();
+                    format!("[feedback] {snippet}")
+                });
+                std::process::Command::new("gh")
+                    .args(["issue", "create", "--repo", repo, "--title", &title, "--body", &body])
+                    .output()
+            };
+            match out {
+                Ok(o) if o.status.success() => {
+                    let url = String::from_utf8_lossy(&o.stdout).trim().lines().last().unwrap_or("").to_string();
+                    Ok(json!({ "ok": true, "url": url }))
+                }
+                Ok(o) => Err(format!("gh failed: {}", String::from_utf8_lossy(&o.stderr).trim())),
+                Err(e) => Err(format!(
+                    "could not run gh — is the GitHub CLI installed and authenticated (`gh auth login`)? {e}"
+                )),
+            }
         }
 
         "listTerminals" => {
