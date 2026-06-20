@@ -110,6 +110,9 @@ fn serve_conn(stream: TcpStream, token: String, req_tx: Sender<McpRequest>, prox
                     "protocolVersion": PROTOCOL_VERSION,
                     "capabilities": { "tools": { "listChanged": false } },
                     "serverInfo": { "name": "Aether", "version": env!("CARGO_PKG_VERSION") },
+                    // Surfaced to the model on connect: orient it on the terminal tools and
+                    // list the terminals already open (so it knows them without a tool call).
+                    "instructions": startup_instructions(&req_tx, &proxy),
                 }),
             )),
             "notifications/initialized" => None,
@@ -128,17 +131,50 @@ fn serve_conn(stream: TcpStream, token: String, req_tx: Sender<McpRequest>, prox
     }
 }
 
+/// Run one tool on the UI thread (via the bridge) and return its raw result Value.
+fn call_tool(name: &str, args: Value, req_tx: &Sender<McpRequest>, proxy: &EventLoopProxy<()>) -> Result<Value, String> {
+    let (tx, rx) = channel();
+    if req_tx.send(McpRequest { tool: name.to_string(), args, reply: tx }).is_err() {
+        return Err("ide event loop unavailable".into());
+    }
+    let _ = proxy.send_event(()); // wake the UI thread to drain the request
+    rx.recv_timeout(Duration::from_secs(15)).unwrap_or_else(|_| Err("tool timed out".into()))
+}
+
+/// Build the `initialize` instructions: orient the model on the terminal tools and list
+/// the terminals already open, so it starts knowing them without a `listTerminals` call.
+fn startup_instructions(req_tx: &Sender<McpRequest>, proxy: &EventLoopProxy<()>) -> String {
+    let mut s = String::from(
+        "Aether IDE (aether-ide). You can drive the editor and its integrated terminals. \
+         Terminals are addressed by a STABLE `id` (not position) — pass it to terminalSend / \
+         terminalSendKey / terminalOutput / focusTerminal. terminalSend pastes text then \
+         presses Enter by default. Call listTerminals anytime to refresh.\n\n",
+    );
+    let terms = call_tool("listTerminals", Value::Null, req_tx, proxy)
+        .ok()
+        .and_then(|v| v.get("terminals").and_then(|t| t.as_array()).cloned())
+        .unwrap_or_default();
+    if terms.is_empty() {
+        s.push_str("Open terminals: none yet (use newTerminal to create one).");
+    } else {
+        s.push_str("Open terminals:");
+        for t in &terms {
+            let id = t.get("id").and_then(|v| v.as_u64());
+            let title = t.get("title").and_then(|v| v.as_str()).unwrap_or("shell");
+            let active = t.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
+            let id_s = id.map(|i| i.to_string()).unwrap_or_else(|| "?".into());
+            s.push_str(&format!("\n  - id {id_s}: \"{title}\"{}", if active { " (focused)" } else { "" }));
+        }
+    }
+    s
+}
+
 /// Forward a `tools/call` to the UI thread and wrap the result as MCP tool content.
 fn handle_call(id: &Option<Value>, params: &Value, req_tx: &Sender<McpRequest>, proxy: &EventLoopProxy<()>) -> Value {
     let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
     let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-    let (tx, rx) = channel();
-    if req_tx.send(McpRequest { tool: name, args, reply: tx }).is_err() {
-        return err_result(id, -32603, "ide event loop unavailable");
-    }
-    let _ = proxy.send_event(()); // wake the UI thread to drain the request
-    match rx.recv_timeout(Duration::from_secs(15)) {
-        Ok(Ok(value)) => {
+    match call_tool(&name, args, req_tx, proxy) {
+        Ok(value) => {
             // MCP tool result: a single text block carrying the JSON payload (matches
             // how Claude Code's IDE tools return structured data).
             let text = match &value {
@@ -147,11 +183,10 @@ fn handle_call(id: &Option<Value>, params: &Value, req_tx: &Sender<McpRequest>, 
             };
             ok_result(id, json!({ "content": [{ "type": "text", "text": text }], "isError": false }))
         }
-        Ok(Err(msg)) => ok_result(
+        Err(msg) => ok_result(
             id,
             json!({ "content": [{ "type": "text", "text": msg }], "isError": true }),
         ),
-        Err(_) => err_result(id, -32603, "tool timed out"),
     }
 }
 
