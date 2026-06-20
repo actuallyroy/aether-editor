@@ -267,8 +267,20 @@ impl TerminalPanel {
     /// paste markers when the running app enabled mode 2004 (without the wrap, a
     /// multi-line paste into a TUI like claude code submits line by line).
     pub fn paste_focused(&mut self, text: &str) {
+        self.paste_at(self.active, text);
+    }
+
+    /// Paste into a specific tab's focused pane (bracketed-paste aware), for the MCP
+    /// `terminalSend` — so agent-injected text reaches a TUI (e.g. claude code) the same
+    /// way a real paste does, instead of raw bytes the TUI mishandles. Returns false if
+    /// the tab is gone.
+    pub fn paste_to(&mut self, index: usize, text: &str) -> bool {
+        self.paste_at(index, text)
+    }
+
+    fn paste_at(&mut self, index: usize, text: &str) -> bool {
         let norm = text.replace("\r\n", "\n").replace('\n', "\r");
-        if let Some(g) = self.groups.get_mut(self.active) {
+        if let Some(g) = self.groups.get_mut(index) {
             if let Some(p) = g.panes.get_mut(g.focused) {
                 if p.term.bracketed_paste() {
                     let mut b = b"\x1b[200~".to_vec();
@@ -280,8 +292,10 @@ impl TerminalPanel {
                 }
                 p.scroll.scroll_to_end();
                 p.dirty = true;
+                return true;
             }
         }
+        false
     }
 
     /// Is the FOCUSED pane's shell running a foreground process (e.g. claude code)?

@@ -82,13 +82,16 @@ pub fn list() -> Value {
         ),
         tool(
             "terminalSend",
-            "Type text into a terminal (append a newline to run it). Targets a terminal by \
-             its stable `id` (from listTerminals/newTerminal — preferred, survives \
-             reordering/closing), or `index`, or the focused terminal if neither is given. \
-             Lets you drive a background terminal without focusing it.",
+            "Send text to a terminal, then submit it — in one call. The text is pasted (so \
+             TUIs like claude code receive it intact), then a follow-up key is pressed: by \
+             default Enter, or pass `keys` for a custom sequence (e.g. [\"enter\"], \
+             [\"down\",\"enter\"], [\"ctrl-c\"]). Set enter:false to send text with no \
+             keypress. Targets a terminal by stable `id` (preferred), `index`, or the \
+             focused terminal; doesn't change which terminal is focused.",
             json!({"type":"object","properties":{
                 "text":{"type":"string"},
-                "enter":{"type":"boolean","description":"Append Enter to run (default true)"},
+                "keys":{"type":"array","items":{"type":"string"},"description":"Keys pressed after the text, in order (e.g. [\"enter\"]). Overrides `enter`. Names: ctrl-a..ctrl-z, enter, escape, tab, backspace, up, down, left, right."},
+                "enter":{"type":"boolean","description":"Press Enter after the text when `keys` is omitted (default true)"},
                 "id":{"type":"number","description":"Stable terminal id (preferred)"},
                 "index":{"type":"number","description":"Tab position index (fallback); omit for the focused terminal"}
             },"required":["text"]}),
@@ -368,15 +371,29 @@ pub fn execute(app: &mut crate::App, name: &str, args: &Value) -> Result<Value, 
             let text = args.get("text").and_then(|t| t.as_str()).ok_or("terminalSend requires text")?;
             let enter = args.get("enter").and_then(|b| b.as_bool()).unwrap_or(true);
             app.terminal.visible = true;
-            let mut bytes = text.as_bytes().to_vec();
-            if enter {
-                bytes.push(b'\r');
-            }
-            // Targets the tab by stable id/index without changing which one is focused.
             let idx = target_tab(app, args)?;
-            app.terminal.write_to(idx, &bytes);
+            // Paste the text the same way a real paste does (bracketed-paste wrapped when the
+            // running app enabled it) so TUIs like claude code receive it intact. Then send
+            // the follow-up key(s) as separate keypresses *outside* the paste markers, which
+            // is what actually submits — a raw `text\r` write doesn't reliably submit a TUI.
+            app.terminal.paste_to(idx, text);
+            // Resolve the effective key sequence: explicit `keys` (e.g. ["enter"], or
+            // ["down","enter"]); else a single Enter unless enter:false. Reported back so
+            // the agent can see what was actually pressed (not a silent default).
+            let sent_keys: Vec<String> = match args.get("keys").and_then(|k| k.as_array()) {
+                Some(keys) => keys
+                    .iter()
+                    .map(|k| k.as_str().map(str::to_string).ok_or("keys entries must be strings"))
+                    .collect::<Result<_, _>>()?,
+                None if enter => vec!["enter".to_string()],
+                None => vec![],
+            };
+            for name in &sent_keys {
+                let b = key_bytes(name).ok_or_else(|| format!("unknown key: {name}"))?;
+                app.terminal.write_to(idx, &b);
+            }
             app.redraw();
-            Ok(json!({ "ok": true }))
+            Ok(json!({ "ok": true, "id": app.terminal.tab_id(idx), "text": text, "keys": sent_keys }))
         }
 
         "terminalSendKey" => {
@@ -386,7 +403,7 @@ pub fn execute(app: &mut crate::App, name: &str, args: &Value) -> Result<Value, 
             let idx = target_tab(app, args)?;
             app.terminal.write_to(idx, &bytes);
             app.redraw();
-            Ok(json!({ "ok": true }))
+            Ok(json!({ "ok": true, "id": app.terminal.tab_id(idx), "key": key }))
         }
 
         "terminalOutput" => {
