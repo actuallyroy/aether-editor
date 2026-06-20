@@ -2758,6 +2758,35 @@ impl App {
         }
     }
 
+    /// Reconcile the Claude-session watcher with a liveness snapshot (`live` = bound pane
+    /// ids running `claude`), persisting the running-set when it changes and acting on a
+    /// pending restore decision once its settle deadline passes. Called when an async
+    /// `ClaudeLive` reply arrives (or with an empty set when there's nothing to query).
+    fn apply_claude_live(&mut self, live: Vec<crate::ptyhost::TermId>, now: Instant) {
+        let terms = self.terminal.live_terms();
+        if self.claude_watcher.observe(&live, &terms) {
+            let snap = self.claude_watcher.snapshot();
+            claude_sessions::save(self.claude_watcher.workspace(), &snap);
+        }
+        if let Some(at) = self.claude_restore_at {
+            if now >= at {
+                self.claude_restore_at = None;
+                let live_cwds: std::collections::HashSet<PathBuf> = terms
+                    .iter()
+                    .filter(|(id, _)| live.contains(id))
+                    .map(|(_, c)| c.clone())
+                    .collect();
+                let pending: Vec<_> = std::mem::take(&mut self.claude_restore)
+                    .into_iter()
+                    .filter(|r| !live_cwds.contains(&r.cwd))
+                    .collect();
+                if !pending.is_empty() {
+                    self.offer_claude_restore(pending);
+                }
+            }
+        }
+    }
+
     /// Re-read git status into the Source Control panel and redraw.
     fn refresh_source_control(&mut self) {
         if let (Some(scp), Some(g)) = (self.source_control.as_mut(), self.gpu.as_mut()) {
@@ -3888,7 +3917,7 @@ impl App {
                 if i == 0 {
                     self.terminal.visible = true;
                     self.terminal.maximized = false;
-                    self.panel_tab = 0;
+                    self.panel_tab = theme::PANEL_TERMINAL_TAB; // show TERMINAL, not PROBLEMS (tab 0)
                     let panel = self.layout().terminal_panel;
                     for it in items {
                         self.terminal.restore_terminal_tab(
@@ -9251,35 +9280,20 @@ impl ApplicationHandler for App {
         if now >= self.claude_poll_at && self.terminal.connected() {
             self.claude_poll_at = now + Duration::from_secs(2);
             let terms = self.terminal.live_terms();
-            // The process-tree query is a daemon round-trip; skip it when there are no
-            // shells to inspect and no restore decision pending (an empty `live` still
-            // lets the watcher retire any sessions whose panes vanished).
-            let live = if !terms.is_empty() || self.claude_restore_at.is_some() {
-                self.terminal.claude_live_ids()
+            if !terms.is_empty() || self.claude_restore_at.is_some() {
+                // Fire the liveness query (non-blocking); the reply is consumed below when
+                // it arrives via poll(). Blocking here for the reply froze the window during
+                // heavy terminal output.
+                self.terminal.request_claude_live();
             } else {
-                Vec::new()
-            };
-            if self.claude_watcher.observe(&live, &terms) {
-                let snap = self.claude_watcher.snapshot();
-                claude_sessions::save(self.claude_watcher.workspace(), &snap);
+                // No shells to inspect and nothing pending: feed an empty set so the watcher
+                // can retire sessions whose panes vanished — no daemon round-trip needed.
+                self.apply_claude_live(Vec::new(), now);
             }
-            if let Some(at) = self.claude_restore_at {
-                if now >= at {
-                    self.claude_restore_at = None;
-                    let live_cwds: std::collections::HashSet<PathBuf> = terms
-                        .iter()
-                        .filter(|(id, _)| live.contains(id))
-                        .map(|(_, c)| c.clone())
-                        .collect();
-                    let pending: Vec<_> = std::mem::take(&mut self.claude_restore)
-                        .into_iter()
-                        .filter(|r| !live_cwds.contains(&r.cwd))
-                        .collect();
-                    if !pending.is_empty() {
-                        self.offer_claude_restore(pending);
-                    }
-                }
-            }
+        }
+        // Consume an async Claude-liveness reply (arrived via poll — never blocks).
+        if let Some(live) = self.terminal.take_claude_live() {
+            self.apply_claude_live(live, now);
         }
 
         // Integrated terminal: keep ticking while open so new output appears promptly.

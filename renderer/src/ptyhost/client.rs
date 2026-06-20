@@ -33,6 +33,8 @@ pub enum Incoming {
     /// Orphaned shells offered after a workspace switch (`SetWorkspace` reply) —
     /// the just-opened folder's terminals, restorable when the panel opens.
     Offered(Vec<TermInfo>),
+    /// Async reply to `request_claude_live` — which shells are running `claude`.
+    ClaudeLive { ids: Vec<TermId> },
 }
 
 pub struct Client {
@@ -120,17 +122,12 @@ impl Client {
 
     /// Which of this window's shells currently have a `claude` process running.
     /// Blocking round-trip (bounded); unrelated frames are stashed for `poll`.
-    pub fn claude_live(&mut self) -> Vec<TermId> {
+    /// Ask the daemon which shells run `claude` — NON-BLOCKING. The `ClaudeLive` reply
+    /// arrives later through `poll()` as `Incoming::ClaudeLive`. (The old synchronous
+    /// version blocked the UI thread up to 400ms while draining output frames waiting for
+    /// the reply, which froze the window during heavy terminal streaming.)
+    pub fn request_claude_live(&self) {
         send(&self.conn, Frame::Control(Msg::QueryClaude));
-        let deadline = std::time::Instant::now() + Duration::from_millis(400);
-        while std::time::Instant::now() < deadline {
-            match self.rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(Frame::Control(Msg::ClaudeLive { ids })) => return ids,
-                Ok(other) => self.stash.push_back(other),
-                Err(_) => {}
-            }
-        }
-        Vec::new() // no reply — treat as none running
     }
 
     /// Ask the daemon to focus another live window that already has `workspace`
@@ -161,6 +158,7 @@ impl Client {
             // The handshake consumes the initial Welcome, so one seen here is the
             // re-offer that follows a SetWorkspace (Open Folder).
             Frame::Control(Msg::Welcome { terminals }) => out.push(Incoming::Offered(terminals)),
+            Frame::Control(Msg::ClaudeLive { ids }) => out.push(Incoming::ClaudeLive { ids }),
             _ => {}
         };
         while let Some(f) = self.stash.pop_front() {

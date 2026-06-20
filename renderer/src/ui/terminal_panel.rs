@@ -26,6 +26,10 @@ pub struct TerminalPanel {
     pub active: usize,         // active tab (group) index
     pub visible: bool,
     pub focused: bool,
+    /// Latest async Claude-liveness reply (`Incoming::ClaudeLive`) and whether it's
+    /// unconsumed — driven by `request_claude_live`, read via `take_claude_live`.
+    claude_live: Vec<crate::ptyhost::TermId>,
+    claude_live_fresh: bool,
     pub split: Splitter,       // draggable panel height
     pub maximized: bool,       // header maximize toggle (fills the content area)
     /// Workspace root new shells start in (like VSCode). The panel owns this so
@@ -64,6 +68,8 @@ impl TerminalPanel {
             active: 0,
             visible: false,
             focused: false,
+            claude_live: Vec::new(),
+            claude_live_fresh: false,
             split: Splitter::new(
                 theme::TERMINAL_HEIGHT(),
                 theme::TERMINAL_MIN_HEIGHT(),
@@ -222,6 +228,10 @@ impl TerminalPanel {
                     self.pending.clear();
                     self.reattach = terminals;
                     self.active = 0;
+                }
+                Incoming::ClaudeLive { ids } => {
+                    self.claude_live = ids;
+                    self.claude_live_fresh = true;
                 }
             }
         }
@@ -467,9 +477,22 @@ impl TerminalPanel {
         }
     }
 
-    /// Which currently-bound panes have a `claude` process running (daemon query).
-    pub fn claude_live_ids(&mut self) -> Vec<crate::ptyhost::TermId> {
-        self.client.as_mut().map(|c| c.claude_live()).unwrap_or_default()
+    /// Fire the Claude-liveness query (non-blocking). The reply arrives via `poll()` and is
+    /// read with `take_claude_live` — so this never stalls the UI thread.
+    pub fn request_claude_live(&self) {
+        if let Some(c) = self.client.as_ref() {
+            c.request_claude_live();
+        }
+    }
+
+    /// The latest Claude-liveness reply if one arrived since the last call, else None.
+    pub fn take_claude_live(&mut self) -> Option<Vec<crate::ptyhost::TermId>> {
+        if self.claude_live_fresh {
+            self.claude_live_fresh = false;
+            Some(self.claude_live.clone())
+        } else {
+            None
+        }
     }
 
     /// `(id, cwd)` for every bound pane, so the watcher can map a running Claude to

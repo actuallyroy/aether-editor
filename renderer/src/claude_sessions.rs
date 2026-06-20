@@ -77,13 +77,28 @@ impl ClaudeWatcher {
     /// running-set changed (the caller should persist).
     pub fn observe(&mut self, live_ids: &[TermId], terms: &[(TermId, PathBuf)]) -> bool {
         let cwd_of: HashMap<TermId, PathBuf> = terms.iter().cloned().collect();
+        // Session ids already claimed by a still-live pane, per cwd — so multiple Claude
+        // terminals in the SAME directory each map to a DISTINCT transcript (newest
+        // unclaimed first) instead of all resuming the same (newest) session on restore.
+        let mut claimed: HashMap<PathBuf, std::collections::HashSet<String>> = HashMap::new();
+        for (id, s) in &self.live {
+            if live_ids.contains(id) && cwd_of.get(id) == Some(&s.cwd) {
+                if let Some(sid) = &s.session_id {
+                    claimed.entry(s.cwd.clone()).or_default().insert(sid.clone());
+                }
+            }
+        }
         // Add / refresh sessions whose pane currently runs Claude.
         for id in live_ids {
             let Some(cwd) = cwd_of.get(id) else { continue };
             match self.live.get(id) {
                 Some(s) if &s.cwd == cwd => {}
                 _ => {
-                    let session_id = newest_session_id(cwd);
+                    let taken = claimed.entry(cwd.clone()).or_default();
+                    let session_id = session_ids(cwd).into_iter().find(|sid| !taken.contains(sid));
+                    if let Some(sid) = &session_id {
+                        taken.insert(sid.clone());
+                    }
                     self.live.insert(*id, LiveSession { cwd: cwd.clone(), session_id });
                     self.dirty = true;
                 }
@@ -119,23 +134,27 @@ fn encode_cwd(cwd: &Path) -> String {
         .collect()
 }
 
-/// The newest transcript session id for `cwd`, if Claude has one on disk.
-pub fn newest_session_id(cwd: &Path) -> Option<String> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+/// All transcript session ids for `cwd`, newest (most recently modified) first.
+pub fn session_ids(cwd: &Path) -> Vec<String> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Vec::new();
+    };
     let dir = home.join(".claude").join("projects").join(encode_cwd(cwd));
-    let mut best: Option<(std::time::SystemTime, String)> = None;
-    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut items: Vec<(std::time::SystemTime, String)> = Vec::new();
+    for entry in rd.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
-        let mtime = entry.metadata().and_then(|m| m.modified()).ok()?;
-        if best.as_ref().map_or(true, |(t, _)| mtime > *t) {
-            best = Some((mtime, stem.to_string()));
-        }
+        let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else { continue };
+        items.push((mtime, stem.to_string()));
     }
-    best.map(|(_, id)| id)
+    items.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    items.into_iter().map(|(_, id)| id).collect()
 }
 
 /// Seconds-since-epoch of the last system boot (macOS/BSD `kern.boottime`; Linux
