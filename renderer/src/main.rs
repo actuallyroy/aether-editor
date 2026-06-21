@@ -61,6 +61,7 @@ use std::time::{Duration, Instant};
 
 /// Temporary perf probe: run `$body`, and if it blocked the UI thread for >= 20ms, log it
 /// to stderr (set AETHER_PERF=0 to silence). Used to hunt the intermittent window freeze.
+#[macro_export]
 macro_rules! time_ui {
     ($name:expr, $body:expr) => {{
         let __t = std::time::Instant::now();
@@ -524,6 +525,9 @@ pub(crate) struct App {
     pub(crate) claude_restore_at: Option<Instant>,
     /// Next due time for the periodic Claude-liveness poll.
     pub(crate) claude_poll_at: Instant,
+    /// Next time `sync_lsp` may run — throttled off the per-tick path (it could block the
+    /// UI thread for 100s of ms when a language server initializes).
+    pub(crate) lsp_sync_at: Instant,
     /// IDE-integration MCP server (started in `resumed`). `None` until then / if bind
     /// failed. Holds the bound port for terminal env injection; drops the lockfile.
     pub(crate) mcp: Option<mcp::McpServer>,
@@ -683,6 +687,7 @@ impl App {
             claude_restore: claude_sessions::load_candidates(&root),
             claude_restore_at: Some(Instant::now() + Duration::from_secs(3)),
             claude_poll_at: Instant::now() + Duration::from_secs(2),
+            lsp_sync_at: Instant::now(),
             mcp: None,
             mcp_req_tx: mcp_tx,
             mcp_rx,
@@ -9276,8 +9281,13 @@ impl ApplicationHandler for App {
             debounce_wake
         };
 
-        // Language-server document sync (open + debounced didChange).
-        self.sync_lsp();
+        // Language-server document sync (open + debounced didChange). Throttled off the
+        // per-tick path — a sync can block 100s of ms when a server initializes, and the
+        // ~30ms terminal redraw cadence was calling it constantly.
+        if now >= self.lsp_sync_at {
+            self.lsp_sync_at = now + Duration::from_millis(250);
+            self.sync_lsp();
+        }
 
         // Navigation history: record tab switches / edits for Go > Back / Last Edit.
         self.nav.tick(&self.workspace);

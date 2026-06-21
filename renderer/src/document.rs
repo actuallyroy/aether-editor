@@ -140,9 +140,13 @@ pub struct Document {
     buf_count: usize, // how many lines the buffer window holds
 }
 
-/// Large-file thresholds (lines / bytes) and the shaped-window size.
-pub const LARGE_FILE_LINES: usize = 50_000;
-pub const LARGE_FILE_BYTES: usize = 8 * 1024 * 1024;
+/// Large-file thresholds (lines / bytes) and the shaped-window size. Kept modest so
+/// medium-large files viewport-window instead of shaping every line — glyphon's per-frame
+/// `prepare` walks every glyph in a buffer, so a fully-shaped big file spikes the frame
+/// (the ~1s "frame text prepare" stalls). 6k lines still covers virtually all hand-written
+/// source whole; generated/minified/log files window.
+pub const LARGE_FILE_LINES: usize = 6_000;
+pub const LARGE_FILE_BYTES: usize = 2 * 1024 * 1024;
 const LARGE_WINDOW_LINES: usize = 1_500;
 
 /// Replace C0/C1 control characters (except tab and newline) with the Unicode
