@@ -126,8 +126,76 @@ pub fn install_apt_async(tx: Sender<WorkerMsg>) {
     });
 }
 #[cfg(not(target_os = "linux"))]
-pub fn install_apt_async(tx: Sender<WorkerMsg>) {
-    install_async(tx);
+pub fn install_apt_async(_tx: Sender<WorkerMsg>) {}
+
+/// True if installed under Program Files (the Inno Setup installer's target) —
+/// an admin-owned location the in-app self-replace can't overwrite. Such installs
+/// update by re-running the installer (which elevates via UAC). A portable exe
+/// living elsewhere returns false and self-updates normally.
+#[cfg(windows)]
+pub fn is_program_files_install() -> bool {
+    let Ok(exe) = std::env::current_exe() else { return false };
+    let exe = exe.to_string_lossy().to_lowercase();
+    ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"]
+        .iter()
+        .filter_map(|v| std::env::var(v).ok())
+        .filter(|p| !p.is_empty())
+        .any(|pf| exe.starts_with(&pf.to_lowercase()))
+}
+#[cfg(not(windows))]
+pub fn is_program_files_install() -> bool {
+    false
+}
+
+/// Download the latest Windows installer and run it. Inno Setup's admin manifest
+/// triggers the UAC consent prompt; with CloseApplications/RestartApplications
+/// (Inno defaults) the Restart Manager closes this running instance, upgrades in
+/// place, and relaunches it. Sends `UpdateDone { ok:false }` only if the launch
+/// itself fails (on success the installer takes over and restarts us).
+#[cfg(windows)]
+pub fn install_windows_async(tx: Sender<WorkerMsg>) {
+    std::thread::spawn(move || {
+        if download_and_run_installer().is_err() {
+            let _ = tx.send(WorkerMsg::UpdateDone { ok: false });
+        }
+    });
+}
+#[cfg(windows)]
+fn download_and_run_installer() -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!(
+        "https://github.com/{OWNER}/{NAME}/releases/latest/download/aether-windows-setup-x86_64.exe"
+    );
+    let mut reader = ureq::get(&url).call()?.into_reader();
+    let tmp = std::env::temp_dir().join("aether-setup.exe");
+    let mut f = std::fs::File::create(&tmp)?;
+    std::io::copy(&mut reader, &mut f)?;
+    drop(f);
+    // /SILENT: progress bar, no wizard clicks. The installer self-elevates (UAC).
+    std::process::Command::new(&tmp).args(["/SILENT"]).spawn()?;
+    Ok(())
+}
+
+/// True if Aether was installed by a system installer/package manager whose
+/// binary we can't self-replace — update through the manager instead.
+pub fn is_managed_install() -> bool {
+    is_apt_install() || is_program_files_install()
+}
+
+/// Update a managed install the right way for the platform: apt+pkexec on Linux,
+/// re-run the installer (UAC) on Windows. Falls back to self-update elsewhere.
+pub fn install_managed_async(tx: Sender<WorkerMsg>) {
+    #[cfg(target_os = "linux")]
+    {
+        install_apt_async(tx);
+    }
+    #[cfg(windows)]
+    {
+        install_windows_async(tx);
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        install_async(tx);
+    }
 }
 
 fn install() -> Result<(), Box<dyn std::error::Error>> {

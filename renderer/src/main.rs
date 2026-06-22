@@ -3947,11 +3947,13 @@ impl App {
             DialogAction::InstallUpdate => {
                 // 0 = Install & Restart, 1 = Later
                 if i == 0 {
-                    if update::is_apt_install() {
-                        // Package-managed install: upgrade through apt with a polkit
-                        // password prompt (the binary is root-owned; self-replace fails).
-                        update::install_apt_async(self.worker_tx.clone());
-                        self.show_info_dialog("Updating via apt — approve the password prompt. Aether will restart when done.");
+                    if update::is_managed_install() {
+                        // Installer/package-managed: the binary is in an admin/root-owned
+                        // location the self-replace can't touch. Update through the manager
+                        // — apt+pkexec on Linux, re-run the installer (UAC) on Windows —
+                        // both of which prompt the user for consent.
+                        update::install_managed_async(self.worker_tx.clone());
+                        self.show_info_dialog("Updating — approve the system prompt. Aether will restart when done.");
                     } else {
                         update::install_async(self.worker_tx.clone());
                         self.show_info_dialog("Downloading update… the app will restart when it's ready.");
