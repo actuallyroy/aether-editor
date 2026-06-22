@@ -9473,6 +9473,17 @@ impl ApplicationHandler for App {
         {
             attrs = attrs.with_decorations(false);
         }
+        // Linux: advertise the application id (Wayland app_id / X11 WM_CLASS) so
+        // the compositor identifies us as "Aether" — matching StartupWMClass in
+        // aether.desktop for the taskbar name + icon. Without it, GNOME labels the
+        // window "Unknown" (e.g. in the not-responding dialog).
+        #[cfg(target_os = "linux")]
+        {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            use winit::platform::x11::WindowAttributesExtX11;
+            attrs = WindowAttributesExtWayland::with_name(attrs, "aether", "aether");
+            attrs = WindowAttributesExtX11::with_name(attrs, "aether", "aether");
+        }
         let window = Arc::new(el.create_window(attrs).expect("create window"));
         // Install the native macOS menu bar (system menu). Kept alive on `self`.
         #[cfg(target_os = "macos")]
