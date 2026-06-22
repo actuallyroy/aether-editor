@@ -57,6 +57,17 @@
     .card p { margin: 0; color: var(--dim); font-size: 14px; }
     footer { color: var(--dim); font-size: 13px; margin-top: 64px; }
     footer a { color: #8ab4ff; }
+    .install { max-width: 720px; margin: 56px auto 0; text-align: left; }
+    .install h2 { text-align: center; font-size: 24px; margin-bottom: 6px; }
+    .install .sub { margin-bottom: 22px; }
+    .install h4 { margin: 22px 0 6px; font-size: 15px; color: var(--fg); }
+    .install pre {
+      background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+      padding: 14px 16px; overflow-x: auto; margin: 0;
+      font: 13px/1.5 "SFMono-Regular", ui-monospace, Menlo, Consolas, monospace;
+      color: #cdd3dd;
+    }
+    .install pre .c { color: #6b7280; }
   </style>
 </head>
 <body>
@@ -82,6 +93,27 @@
     </div>
     <p class="note">All builds are single self-contained binaries · <a href="https://github.com/actuallyroy/aether-editor/releases">All releases</a> · <a href="https://github.com/actuallyroy/aether-editor">Source on GitHub</a></p>
   </header>
+
+  <section class="install">
+    <h2>Install on Linux</h2>
+    <p class="sub">Pick whichever fits your setup — all stay up to date with each release.</p>
+
+    <h4>APT repository (Debian / Ubuntu)</h4>
+    <pre><span class="c"># add the repo's signing key + source, then install</span>
+curl -fsSL https://actuallyroy.github.io/aether-editor/apt/aether.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/aether.gpg
+echo "deb [signed-by=/usr/share/keyrings/aether.gpg] https://actuallyroy.github.io/aether-editor/apt stable main" | sudo tee /etc/apt/sources.list.d/aether.list
+sudo apt update &amp;&amp; sudo apt install aether</pre>
+
+    <h4>One-line install script (any distro)</h4>
+    <pre>curl -fsSL https://actuallyroy.github.io/aether-editor/install.sh | sh</pre>
+
+    <h4>Standalone packages</h4>
+    <pre><span class="c"># Debian package</span>
+sudo apt install ./aether_*.deb
+<span class="c"># or the portable AppImage — no install needed</span>
+chmod +x Aether-x86_64.AppImage &amp;&amp; ./Aether-x86_64.AppImage</pre>
+    <p class="note" style="margin-top:14px">The <code>.deb</code> and <code>.AppImage</code> are attached to every <a href="https://github.com/actuallyroy/aether-editor/releases/latest">release</a>.</p>
+  </section>
 
   <section class="features">
     <div class="card"><h3>GPU-rendered</h3><p>Every pixel drawn with wgpu — smooth scrolling and crisp text at any zoom.</p></div>

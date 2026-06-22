@@ -77,6 +77,22 @@ jobs:
           mkdir -p dist
           cp "target/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
 
+      # Linux extras: a Debian package (apt/dpkg) and a portable AppImage, both
+      # built from the binary above. The .deb also feeds the hosted APT repo
+      # (see .github/workflows/pages.yml).
+      - name: Build Linux .deb + AppImage
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          # Untagged manual runs have no version; fall back to the crate version.
+          if [ -z "$VERSION" ] || [ "$VERSION" = "$GITHUB_REF_NAME" ]; then
+            VERSION="$(grep -m1 '^version' renderer/Cargo.toml | cut -d'"' -f2)"
+          fi
+          chmod +x packaging/build-deb.sh packaging/build-appimage.sh
+          packaging/build-deb.sh "target/release/aether" "$VERSION" dist
+          packaging/build-appimage.sh "target/release/aether" "$VERSION" dist
+          ls -la dist
+
       # Package an installable Aether.app inside a .dmg (with an Applications drop
       # target). The bare binary above is kept too — the in-app auto-updater
       # downloads `aether-macos-arm64` to self-replace. The .app is unsigned, so
