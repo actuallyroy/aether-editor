@@ -548,6 +548,20 @@ pub fn refresh_scm_async(
     });
 }
 
+/// Compute the git-ignored set on a background thread and post it back as
+/// `WorkerMsg::Ignored`. `git status --ignored` walks the entire ignored tree
+/// (target/, node_modules/, …), which is the ~1s stall on opening a folder.
+pub fn ignored_async(
+    root: PathBuf,
+    gen: u64,
+    tx: std::sync::mpsc::Sender<crate::marketplace::WorkerMsg>,
+) {
+    std::thread::spawn(move || {
+        let set = ignored(&root);
+        let _ = tx.send(crate::marketplace::WorkerMsg::Ignored { gen, set });
+    });
+}
+
 /// Absolute paths of everything git ignores (`!! path` lines from `git status`).
 /// Directories collapse to a single entry (e.g. `target/`), so callers must also
 /// treat a path whose ancestor is in this set as ignored. Empty outside a repo.

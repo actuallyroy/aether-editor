@@ -429,7 +429,9 @@ pub(crate) struct App {
     /// "You" instead of this name. `None` = not a repo / git missing.
     pub(crate) git_user: Option<String>,
     /// Filesystem watcher on the workspace root (kept alive so it keeps firing).
-    pub(crate) fs_watcher: Option<notify::RecommendedWatcher>,
+    // Sends a workspace root to the dedicated fs-watcher thread, which owns the
+    // notify::Watcher and (re)registers recursive watches OFF the UI thread.
+    pub(crate) fs_watch_tx: Option<std::sync::mpsc::Sender<std::path::PathBuf>>,
     /// Debounce for fs-change handling: paths changed since the last flush + when
     /// to flush them (refresh Source Control + reload externally-edited open docs).
     pub(crate) fs_dirty: std::collections::HashSet<PathBuf>,
@@ -638,7 +640,7 @@ impl App {
             search: None, // built in `resumed` once the font system exists
             source_control: None, // built in `resumed`
             git_user: None,       // resolved in `open_initial`
-            fs_watcher: None,     // started in `open_initial`
+            fs_watch_tx: None,    // watcher thread started in `start_fs_watcher`
             fs_dirty: std::collections::HashSet::new(),
             fs_flush_due: None,
             settings_editor: ui::settings_editor::SettingsEditor::default(),
@@ -2695,27 +2697,48 @@ impl App {
     /// post `WorkerMsg::FsChanged`; the UI flushes them into a Source Control
     /// refresh + external-edit reload of open documents.
     fn start_fs_watcher(&mut self) {
-        use notify::{RecursiveMode, Watcher};
-        let tx = self.worker_tx.clone();
-        let proxy = self.proxy.clone();
-        let mut watcher = match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if let Ok(ev) = res {
-                if !ev.paths.is_empty() {
-                    let _ = tx.send(WorkerMsg::FsChanged { paths: ev.paths });
-                    // Wake the event loop so the change is picked up even while idle
-                    // (no mouse/keyboard activity to drain the channel otherwise).
-                    if let Some(p) = &proxy {
-                        let _ = p.send_event(());
+        let root = git::repo_root(&self.cwd);
+        // Lazily spawn ONE long-lived watcher thread. It owns the notify::Watcher
+        // and (re)registers recursive watches off the UI thread — recursive inotify
+        // registration over a large tree (node_modules/, target/) walks every
+        // subdir and blocks for seconds, which froze the window on folder open.
+        if self.fs_watch_tx.is_none() {
+            let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<std::path::PathBuf>();
+            let tx = self.worker_tx.clone();
+            let proxy = self.proxy.clone();
+            std::thread::spawn(move || {
+                use notify::{RecursiveMode, Watcher};
+                let mut watcher = match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                    if let Ok(ev) = res {
+                        if !ev.paths.is_empty() {
+                            let _ = tx.send(WorkerMsg::FsChanged { paths: ev.paths });
+                            // Wake the event loop so the change is picked up even while
+                            // idle (no input to drain the channel otherwise).
+                            if let Some(p) = &proxy {
+                                let _ = p.send_event(());
+                            }
+                        }
+                    }
+                }) {
+                    Ok(w) => w,
+                    Err(_) => return,
+                };
+                // Re-scope to each new workspace root as it arrives (drops the prior
+                // watch first). The blocking watch() call runs here, not on the UI.
+                let mut current: Option<std::path::PathBuf> = None;
+                while let Ok(root) = cmd_rx.recv() {
+                    if let Some(old) = current.take() {
+                        let _ = watcher.unwatch(&old);
+                    }
+                    if watcher.watch(&root, RecursiveMode::Recursive).is_ok() {
+                        current = Some(root);
                     }
                 }
-            }
-        }) {
-            Ok(w) => w,
-            Err(_) => return,
-        };
-        let root = git::repo_root(&self.cwd);
-        if watcher.watch(&root, RecursiveMode::Recursive).is_ok() {
-            self.fs_watcher = Some(watcher);
+            });
+            self.fs_watch_tx = Some(cmd_tx);
+        }
+        if let Some(tx) = &self.fs_watch_tx {
+            let _ = tx.send(root);
         }
     }
 
@@ -2776,6 +2799,10 @@ impl App {
         // and rebuilding on our own git-status writes is what caused the refresh-loop lag).
         if workspace_changed {
             self.workspace.tree.refresh();
+            // Ignore rules may have changed (.gitignore edit, new build dir) — refresh
+            // the ignored set off-thread. `workspace_changed` is already false for pure
+            // ignored-build churn, so this won't fire on every cargo/npm write.
+            self.workspace.tree.request_ignored(&self.worker_tx);
         }
         self.refresh_source_control();
         if reloaded {
@@ -3920,8 +3947,15 @@ impl App {
             DialogAction::InstallUpdate => {
                 // 0 = Install & Restart, 1 = Later
                 if i == 0 {
-                    update::install_async(self.worker_tx.clone());
-                    self.show_info_dialog("Downloading update… the app will restart when it's ready.");
+                    if update::is_apt_install() {
+                        // Package-managed install: upgrade through apt with a polkit
+                        // password prompt (the binary is root-owned; self-replace fails).
+                        update::install_apt_async(self.worker_tx.clone());
+                        self.show_info_dialog("Updating via apt — approve the password prompt. Aether will restart when done.");
+                    } else {
+                        update::install_async(self.worker_tx.clone());
+                        self.show_info_dialog("Downloading update… the app will restart when it's ready.");
+                    }
                 }
             }
             DialogAction::CloseWindowBusy => {
@@ -5002,6 +5036,9 @@ impl App {
             scp.set_root(git::repo_root(&folder));
         }
         self.workspace.tree = crate::workspace::FileTree::new(folder);
+        // git status --ignored is slow on big trees (target/, node_modules/), so
+        // fetch it off-thread; the tree re-hides ignored files when it arrives.
+        self.workspace.tree.request_ignored(&self.worker_tx);
         self.invalidate_file_index(); // new root → rebuild go-to-file index on next open
         self.sidebar_view = SidebarView::Explorer;
         self.sidebar_visible = true;
@@ -8978,6 +9015,8 @@ impl ApplicationHandler for App {
                 WorkerMsg::UpdateDone { ok } => {
                     if ok {
                         self.restart_app();
+                    } else if update::is_apt_install() {
+                        self.show_info_dialog("Update canceled or failed. You can also run: sudo apt update && sudo apt install --only-upgrade aether");
                     } else {
                         self.show_info_dialog("Update failed. Please try again or download from GitHub.");
                     }
@@ -9096,6 +9135,12 @@ impl ApplicationHandler for App {
                     if self.fs_flush_due.is_none() {
                         self.fs_flush_due = Some(Instant::now() + Duration::from_millis(500));
                     }
+                }
+                WorkerMsg::Ignored { gen, set } => {
+                    // Off-thread `git status --ignored` result: hide/dim ignored files
+                    // in the tree (gen-gated against a workspace switch) and redraw.
+                    self.workspace.tree.apply_ignored(gen, set);
+                    self.redraw();
                 }
                 WorkerMsg::ScmData { gen, branch, changes, merge_state, entries } => {
                     // Source Control git data fetched off-thread: apply it to the panel
@@ -9524,6 +9569,9 @@ impl ApplicationHandler for App {
                 self.restore_session();
                 // Populate the Source Control change-count badge at startup.
                 self.refresh_source_control();
+                // Fetch the git-ignored set off-thread (slow on big trees) so the
+                // initial folder open doesn't block ~1s on `git status --ignored`.
+                self.workspace.tree.request_ignored(&self.worker_tx);
                 // Check GitHub for a newer release now, then re-check every 6 hours so
                 // a long-running window still learns about new releases.
                 update::check_async(self.worker_tx.clone(), false);

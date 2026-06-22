@@ -81,6 +81,55 @@ pub fn install_async(tx: Sender<WorkerMsg>) {
     });
 }
 
+/// True if Aether was installed by the system package manager (Linux, dpkg/apt)
+/// — i.e. the running binary is managed by dpkg. Such installs live in a
+/// root-owned location the in-app self-replace can't (and shouldn't) overwrite;
+/// they must upgrade through apt instead. See `install_apt_async`.
+#[cfg(target_os = "linux")]
+pub fn is_apt_install() -> bool {
+    let Ok(exe) = std::env::current_exe() else { return false };
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    // dpkg knows the path iff it was installed from our .deb / APT repo.
+    std::process::Command::new("dpkg")
+        .arg("-S")
+        .arg(&exe)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+#[cfg(not(target_os = "linux"))]
+pub fn is_apt_install() -> bool {
+    false
+}
+
+/// Upgrade an apt-managed install through the package manager, asking the user
+/// for authorization via PolicyKit (`pkexec` shows a graphical password prompt).
+/// Refreshes only Aether's APT source (not every repo) then upgrades the package.
+/// Sends `UpdateDone { ok }`; on success the app re-execs the new binary.
+#[cfg(target_os = "linux")]
+pub fn install_apt_async(tx: Sender<WorkerMsg>) {
+    std::thread::spawn(move || {
+        // Scope `apt-get update` to Aether's own list so we don't refresh (or fail
+        // on) unrelated third-party repos, then upgrade just the aether package.
+        let script = "set -e; \
+            apt-get update \
+              -o Dir::Etc::sourcelist=sources.list.d/aether.list \
+              -o Dir::Etc::sourceparts=/dev/null \
+              -o APT::Get::List-Cleanup=0; \
+            apt-get install -y --only-upgrade aether";
+        let ok = std::process::Command::new("pkexec")
+            .args(["sh", "-c", script])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        let _ = tx.send(WorkerMsg::UpdateDone { ok });
+    });
+}
+#[cfg(not(target_os = "linux"))]
+pub fn install_apt_async(tx: Sender<WorkerMsg>) {
+    install_async(tx);
+}
+
 fn install() -> Result<(), Box<dyn std::error::Error>> {
     self_update::backends::github::Update::configure()
         .repo_owner(OWNER)

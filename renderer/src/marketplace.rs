@@ -52,6 +52,13 @@ pub enum WorkerMsg {
         merge_state: Option<&'static str>,
         entries: Vec<crate::git::LogEntry>,
     },
+    // Git-ignored path set computed off-thread (`git status --ignored` walks the
+    // whole ignored tree — e.g. target/ — which can take ~1s). Applied to the file
+    // tree via FileTree::apply_ignored; gen-gated against a workspace switch.
+    Ignored {
+        gen: u64,
+        set: std::collections::HashSet<std::path::PathBuf>,
+    },
     // ---- Language server (see lsp.rs) ----
     LspInitialized { sem_token_types: Vec<String> },            // initialize response (+ semantic legend)
     LspDiagnostics { server: &'static str, uri: String, diags: Vec<crate::lsp::Diagnostic> }, // push publishDiagnostics

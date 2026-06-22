@@ -46,8 +46,10 @@ pub struct FileTree {
     pub root: PathBuf,
     pub nodes: Vec<FileNode>,
     expanded_set: HashSet<PathBuf>,
-    /// Git-ignored paths (directories collapsed). Recomputed on each rebuild.
+    /// Git-ignored paths (directories collapsed). Fetched off-thread (see
+    /// `request_ignored`) since `git status --ignored` can take ~1s.
     ignored_set: HashSet<PathBuf>,
+    ignored_gen: u64, // bumped per async ignored fetch; apply_ignored drops stale results
 }
 
 /// Should `rel` (forward-slash workspace-relative path) be hidden from the tree?
@@ -63,10 +65,34 @@ impl FileTree {
             nodes: Vec::new(),
             expanded_set: HashSet::new(),
             ignored_set: HashSet::new(),
+            ignored_gen: 0,
         };
-        t.refresh_ignored();
+        // NOTE: the ignored set is fetched asynchronously via `request_ignored`
+        // (git status --ignored is slow). The first rebuild shows everything; the
+        // tree re-builds with ignored files hidden/dimmed when the set arrives.
         t.rebuild();
         t
+    }
+
+    /// Fetch the git-ignored set off-thread; the result arrives as
+    /// `WorkerMsg::Ignored` and is applied via `apply_ignored`. No-op without a
+    /// real root (folder-less window).
+    pub fn request_ignored(&mut self, tx: &std::sync::mpsc::Sender<crate::marketplace::WorkerMsg>) {
+        if self.root.as_os_str().is_empty() {
+            return;
+        }
+        self.ignored_gen = self.ignored_gen.wrapping_add(1);
+        crate::git::ignored_async(self.root.clone(), self.ignored_gen, tx.clone());
+    }
+
+    /// Apply an off-thread ignored set and rebuild. `gen`-gated so a result from a
+    /// previous workspace (after the user switched folders) is dropped.
+    pub fn apply_ignored(&mut self, gen: u64, set: HashSet<PathBuf>) {
+        if gen != self.ignored_gen {
+            return;
+        }
+        self.ignored_set = set;
+        self.rebuild();
     }
 
     pub fn rebuild(&mut self) {
@@ -138,9 +164,10 @@ impl FileTree {
         }
     }
 
-    /// Re-read the tree from disk (preserving which folders are expanded).
+    /// Re-read the tree from disk (preserving which folders are expanded). Uses
+    /// the cached ignored set — call `request_ignored` (async) separately when the
+    /// ignore rules themselves may have changed, so this never blocks on git.
     pub fn refresh(&mut self) {
-        self.refresh_ignored();
         self.rebuild();
     }
 
