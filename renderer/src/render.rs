@@ -2115,11 +2115,19 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                                     .find(|r| r.line_i == visual as usize)
                                     .map(|run| match run.glyphs.get(cc) {
                                         Some(gph) => base + gph.x,
-                                        None => run
-                                            .glyphs
-                                            .last()
-                                            .map(|gph| base + gph.x + gph.w)
-                                            .unwrap_or(base + cc as f32 * char_w),
+                                        // Past the shaped glyphs: the shaper drops trailing
+                                        // whitespace, so extend the last glyph's edge by one
+                                        // grid cell per column beyond it — otherwise the caret
+                                        // stalls on "hello " until the next char is typed.
+                                        None => {
+                                            let n = run.glyphs.len();
+                                            let end = run
+                                                .glyphs
+                                                .last()
+                                                .map(|gph| gph.x + gph.w)
+                                                .unwrap_or(0.0);
+                                            base + end + cc.saturating_sub(n) as f32 * char_w
+                                        }
                                     })
                             })
                             .unwrap_or(base + cc as f32 * char_w);
