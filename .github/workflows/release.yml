@@ -94,6 +94,27 @@ jobs:
           packaging/build-appimage.sh "target/release/aether" "$VERSION" dist
           ls -la dist
 
+      # Windows installer wizard (Inno Setup): Start Menu/desktop shortcuts,
+      # optional PATH entry, and a real Add/Remove Programs uninstaller. The
+      # bare aether.exe staged above is kept too (the in-app updater downloads
+      # it to self-replace, and it doubles as a portable exe).
+      - name: Build Windows installer (Inno Setup)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $version = "$env:GITHUB_REF_NAME" -replace '^v', ''
+          # Untagged manual runs have no version; fall back to the crate version.
+          if (-not $version -or $version -eq "$env:GITHUB_REF_NAME") {
+            $version = (Select-String -Path renderer/Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          }
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          $exe = (Resolve-Path target/release/aether.exe).Path
+          & $iscc "/DMyAppVersion=$version" "/DSourceExe=$exe" packaging/windows/aether.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
+          Copy-Item packaging/windows/installer/aether-windows-setup-x86_64.exe dist/
+          Get-ChildItem dist
+
       # Package an installable Aether.app inside a .dmg (with an Applications drop
       # target). The bare binary above is kept too — the in-app auto-updater
       # downloads `aether-macos-arm64` to self-replace. The .app is unsigned, so
