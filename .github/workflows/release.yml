@@ -13,6 +13,7 @@ on:
 
 permissions:
   contents: write
+  actions: write # lets the release job dispatch the Pages/APT-repo rebuild
 
 jobs:
   build:
@@ -165,3 +166,12 @@ jobs:
           files: artifacts/*
           generate_release_notes: true
           fail_on_unmatched_files: true
+
+      # The `release: published` event above is fired with GITHUB_TOKEN, which
+      # by design does NOT trigger other workflows — so the Pages/APT-repo
+      # rebuild won't start on its own. workflow_dispatch IS exempt from that
+      # rule, so dispatch it explicitly to ingest this release's .deb.
+      - name: Rebuild APT repository (Pages)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run pages.yml --ref main
