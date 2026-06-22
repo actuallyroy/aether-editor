@@ -195,4 +195,6 @@ jobs:
       - name: Rebuild APT repository (Pages)
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run pages.yml --ref main
+        # This job doesn't check out the repo, so gh has no local git context —
+        # name the repo explicitly.
+        run: gh workflow run pages.yml --repo "$GITHUB_REPOSITORY" --ref main
