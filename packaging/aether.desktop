@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Aether
+GenericName=Code Editor
+Comment=A GPU-native, VSCode-compatible code editor
+Exec=aether %F
+Icon=aether
+Terminal=false
+Categories=Development;TextEditor;IDE;
+MimeType=text/plain;inode/directory;
+StartupNotify=true
+StartupWMClass=aether
+Keywords=editor;code;text;development;programming;
