@@ -2098,7 +2098,31 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     let eff_top = top_line.min(back);
                     let visual = (back + cr) as isize - eff_top as isize;
                     if visual >= 0 {
-                        let cx = rect.x + theme::zpx(8.0) + cc as f32 * char_w;
+                        // Caret x from the SHAPED glyphs on the cursor's visual row, not
+                        // `cc * char_w`: wide prompt glyphs (powerline/nerd-font ❯, etc.)
+                        // advance more than the ASCII cell width, so a uniform-grid caret
+                        // drifts left into the last character. Map the grid column to the
+                        // glyph at that index (one glyph per cell for the common case);
+                        // past the last glyph, sit at its trailing edge. Fall back to the
+                        // grid for empty rows / missing buffers.
+                        let base = rect.x + theme::zpx(8.0);
+                        let cx = gpu
+                            .ui
+                            .terminal_panes
+                            .get(i)
+                            .and_then(|buf| {
+                                buf.layout_runs()
+                                    .find(|r| r.line_i == visual as usize)
+                                    .map(|run| match run.glyphs.get(cc) {
+                                        Some(gph) => base + gph.x,
+                                        None => run
+                                            .glyphs
+                                            .last()
+                                            .map(|gph| base + gph.x + gph.w)
+                                            .unwrap_or(base + cc as f32 * char_w),
+                                    })
+                            })
+                            .unwrap_or(base + cc as f32 * char_w);
                         let cy = rect.y + theme::zpx(4.0) + visual as f32 * line_h;
                         let col = theme::CURSOR();
                         if cx < right && cy + line_h <= rect.y + rect.h {
