@@ -101,11 +101,13 @@ jobs:
           fi
           echo "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
           keyid="$(gpg --list-secret-keys --with-colons | awk -F: '/^sec:/{print $5; exit}')"
+          # --pinentry-mode loopback: the runner has no tty, so gpg-agent's
+          # default pinentry fails with "Inappropriate ioctl for device". The
+          # key has no passphrase, so loopback signs without prompting.
+          GPG="gpg --batch --yes --pinentry-mode loopback --default-key $keyid"
           # Detached + inline signatures apt looks for.
-          gpg --batch --yes --default-key "$keyid" -abs \
-            -o dists/stable/Release.gpg dists/stable/Release
-          gpg --batch --yes --default-key "$keyid" --clearsign \
-            -o dists/stable/InRelease dists/stable/Release
+          $GPG -abs -o dists/stable/Release.gpg dists/stable/Release
+          $GPG --clearsign -o dists/stable/InRelease dists/stable/Release
           # Public key for users to trust (ASCII-armored).
           gpg --armor --export "$keyid" > aether.gpg.key
           echo "Signed with key $keyid"
