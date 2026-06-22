@@ -42,6 +42,16 @@ pub enum WorkerMsg {
     // Filesystem watcher: paths under the workspace changed on disk (debounced in
     // the UI). Drives Source Control refresh + external-edit reload of open docs.
     FsChanged { paths: Vec<std::path::PathBuf> },
+    // Source Control data computed off the UI thread (branch/status/merge/log) so
+    // the four git subprocesses never block the event loop. Applied via
+    // `SourceControlPanel::apply_data`; `gen`-gated to drop stale results.
+    ScmData {
+        gen: u64,
+        branch: Option<String>,
+        changes: Vec<crate::git::Change>,
+        merge_state: Option<&'static str>,
+        entries: Vec<crate::git::LogEntry>,
+    },
     // ---- Language server (see lsp.rs) ----
     LspInitialized { sem_token_types: Vec<String> },            // initialize response (+ semantic legend)
     LspDiagnostics { server: &'static str, uri: String, diags: Vec<crate::lsp::Diagnostic> }, // push publishDiagnostics

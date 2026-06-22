@@ -2474,7 +2474,7 @@ impl App {
         }
         if view == SidebarView::SourceControl {
             if let (Some(scp), Some(g)) = (self.source_control.as_mut(), self.gpu.as_mut()) {
-                scp.refresh(&mut g.font_system);
+                scp.refresh(&self.worker_tx);
             }
         }
         self.sidebar_view = view;
@@ -2815,7 +2815,7 @@ impl App {
     /// Re-read git status into the Source Control panel and redraw.
     fn refresh_source_control(&mut self) {
         if let (Some(scp), Some(g)) = (self.source_control.as_mut(), self.gpu.as_mut()) {
-            scp.refresh(&mut g.font_system);
+            scp.refresh(&self.worker_tx);
         }
         self.redraw();
     }
@@ -2865,7 +2865,7 @@ impl App {
                 if git::commit(&self.cwd, &msg, stage_all) {
                     if let (Some(scp), Some(g)) = (self.source_control.as_mut(), self.gpu.as_mut()) {
                         scp.clear_message(&mut g.font_system);
-                        scp.refresh(&mut g.font_system);
+                        scp.refresh(&self.worker_tx);
                     }
                 }
                 self.redraw();
@@ -2967,7 +2967,7 @@ impl App {
                     git::push(&self.cwd);
                     if let (Some(scp), Some(g)) = (self.source_control.as_mut(), self.gpu.as_mut()) {
                         scp.clear_message(&mut g.font_system);
-                        scp.refresh(&mut g.font_system);
+                        scp.refresh(&self.worker_tx);
                     }
                 }
                 self.redraw();
@@ -6524,7 +6524,7 @@ impl App {
                 }
                 if v == SidebarView::SourceControl {
                     if let (Some(scp), Some(g)) = (self.source_control.as_mut(), self.gpu.as_mut()) {
-                        scp.refresh(&mut g.font_system);
+                        scp.refresh(&self.worker_tx);
                     }
                 }
                 if v == SidebarView::Debug {
@@ -9095,6 +9095,14 @@ impl ApplicationHandler for App {
                     self.fs_dirty.extend(paths);
                     if self.fs_flush_due.is_none() {
                         self.fs_flush_due = Some(Instant::now() + Duration::from_millis(500));
+                    }
+                }
+                WorkerMsg::ScmData { gen, branch, changes, merge_state, entries } => {
+                    // Source Control git data fetched off-thread: apply it to the panel
+                    // (gen-gated inside apply_data) and redraw.
+                    if let (Some(scp), Some(g)) = (self.source_control.as_mut(), self.gpu.as_mut()) {
+                        scp.apply_data(&mut g.font_system, gen, branch, changes, merge_state, entries);
+                        self.redraw();
                     }
                 }
                 WorkerMsg::Blame { path, lines } => {

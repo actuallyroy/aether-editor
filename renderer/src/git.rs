@@ -524,6 +524,30 @@ pub fn status(root: &Path) -> Vec<Change> {
         .collect()
 }
 
+/// Compute Source Control panel data (branch, status, merge state, recent log) on
+/// a background thread and post it back as `WorkerMsg::ScmData`. Mirrors the
+/// blame/diff-base async fetches — keeps the four git subprocesses off the UI
+/// thread so a slow repo can't stall (or freeze) the editor.
+pub fn refresh_scm_async(
+    root: PathBuf,
+    gen: u64,
+    tx: std::sync::mpsc::Sender<crate::marketplace::WorkerMsg>,
+) {
+    std::thread::spawn(move || {
+        let branch = branch(&root);
+        let changes = status(&root);
+        let merge_state = merge_state(&root);
+        let entries = commit_log(&root, 200);
+        let _ = tx.send(crate::marketplace::WorkerMsg::ScmData {
+            gen,
+            branch,
+            changes,
+            merge_state,
+            entries,
+        });
+    });
+}
+
 /// Absolute paths of everything git ignores (`!! path` lines from `git status`).
 /// Directories collapse to a single entry (e.g. `target/`), so callers must also
 /// treat a path whose ancestor is in this set as ignored. Empty outside a repo.

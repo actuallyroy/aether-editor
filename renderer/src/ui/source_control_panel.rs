@@ -166,6 +166,7 @@ pub struct SourceControlPanel {
     /// ScrollView owns the offset, clamping, and the auto-hiding scrollbar.
     pub scroll: ScrollView,
     root: PathBuf,
+    refresh_gen: u64, // bumped per async refresh; apply_data ignores stale results
     change_count: usize, // unique changed files (for the activity-bar badge)
     // GRAPH accordion (below the change groups): the commit graph + a buffer holding
     // one truncated subject per row, plus the collapsed state. Built on refresh.
@@ -262,6 +263,7 @@ impl SourceControlPanel {
             merge_header_hover: false,
             scroll: ScrollView::new(ScrollOpts { vertical: true, horizontal: false, stick_to_end: false }),
             root,
+            refresh_gen: 0,
             change_count: 0,
             merge_state: None,
             conflict_count: 0,
@@ -374,14 +376,34 @@ impl SourceControlPanel {
         self.branch.as_deref()
     }
 
-    pub fn refresh(&mut self, fs: &mut FontSystem) {
-        self.branch = git::branch(&self.root);
-        let changes = git::status(&self.root);
+    /// Request a Source Control refresh: spawn the git work (branch/status/merge/
+    /// log) on a background thread. Results arrive as `WorkerMsg::ScmData` and are
+    /// applied via `apply_data`. Bumping the gen makes any in-flight refresh stale.
+    pub fn refresh(&mut self, tx: &std::sync::mpsc::Sender<crate::marketplace::WorkerMsg>) {
+        self.refresh_gen = self.refresh_gen.wrapping_add(1);
+        git::refresh_scm_async(self.root.clone(), self.refresh_gen, tx.clone());
+    }
+
+    /// Apply git data fetched off-thread. `gen`-gated: drops results older than the
+    /// latest requested refresh (out-of-order completions / a workspace switch).
+    pub fn apply_data(
+        &mut self,
+        fs: &mut FontSystem,
+        gen: u64,
+        branch: Option<String>,
+        changes: Vec<git::Change>,
+        merge_state: Option<&'static str>,
+        entries: Vec<git::LogEntry>,
+    ) {
+        if gen != self.refresh_gen {
+            return;
+        }
+        self.branch = branch;
         self.change_count = changes.len();
         self.staged_rows.clear();
         self.unstaged_rows.clear();
         self.merge_rows.clear();
-        self.merge_state = git::merge_state(&self.root);
+        self.merge_state = merge_state;
         self.conflict_count = 0;
         for c in &changes {
             // Conflicted files are unmerged on BOTH index and worktree sides; routing
@@ -415,7 +437,6 @@ impl SourceControlPanel {
             .graph_expanded
             .and_then(|i| self.graph.as_ref().and_then(|g| g.rows.get(i)))
             .map(|r| r.short.clone());
-        let entries = git::commit_log(&self.root, 200);
         self.graph = Some(crate::graph::build(String::new(), entries, now));
         // Re-resolve the expanded commit's new row index (indices shift when commits
         // are added/removed). Keep its already-fetched file list if it's still present.
@@ -2320,7 +2341,8 @@ mod tests {
 
         let mut fs = FontSystem::new();
         let mut p = SourceControlPanel::new(&mut fs, dir.clone());
-        p.refresh(&mut fs);
+        // Synchronous equivalent of refresh() for the test (refresh() is now async).
+        p.apply_data(&mut fs, 0, git::branch(&dir), git::status(&dir), git::merge_state(&dir), git::commit_log(&dir, 200));
         let staged = |path: &str| p.staged_rows.iter().any(|r| r.path == path);
         let unstaged = |path: &str| p.unstaged_rows.iter().any(|r| r.path == path);
         let (fs_s, fu, gs, gu) = (staged("f.txt"), unstaged("f.txt"), staged("g.txt"), unstaged("g.txt"));
@@ -2354,7 +2376,8 @@ mod tests {
 
         let mut fs = FontSystem::new();
         let mut p = SourceControlPanel::new(&mut fs, dir.clone());
-        p.refresh(&mut fs);
+        // Synchronous equivalent of refresh() for the test (refresh() is now async).
+        p.apply_data(&mut fs, 0, git::branch(&dir), git::status(&dir), git::merge_state(&dir), git::commit_log(&dir, 200));
         let in_merge = p.merge_rows.iter().any(|r| r.path == "c.txt");
         let in_unstaged = p.unstaged_rows.iter().any(|r| r.path == "c.txt");
         let _ = std::fs::remove_dir_all(&dir);
