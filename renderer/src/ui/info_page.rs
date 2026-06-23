@@ -128,6 +128,19 @@ impl InfoPage {
         }
     }
 
+    /// Body rect for the Markdown file preview: left-aligned and near the full pane
+    /// width (VSCode-style), with only a modest gutter — unlike `body`, which centers
+    /// a narrow reading column and leaves large side margins.
+    pub fn preview_body(region: Rect) -> Rect {
+        let pad = theme::zpx(24.0);
+        Rect {
+            x: region.x + pad,
+            y: region.y + pad,
+            w: (region.w - pad * 2.0).max(0.0),
+            h: (region.h - pad).max(0.0),
+        }
+    }
+
     /// (Re)shape all rows for `width`, cached per zoom + width.
     pub fn shape(&mut self, fs: &mut FontSystem, width: f32) {
         let key = format!("{:.2}x{:.0}", theme::ui_zoom(), width);

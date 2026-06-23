@@ -14,7 +14,7 @@
 // Protocol details are pinned in `PROTOCOL.md` (reverse-engineered from the VS Code
 // extension; re-verify on Claude Code updates).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 
 use serde_json::Value;
@@ -40,6 +40,17 @@ pub struct McpRequest {
 pub struct McpServer {
     pub port: u16,
     lock_path: PathBuf,
+    token: String,
+}
+
+impl McpServer {
+    /// Re-advertise this window for a new workspace (the user opened a folder in an
+    /// existing/folder-less window). Rewrites the discovery lockfile in place — same
+    /// port and token, so any live `claude` connection is undisturbed — but with the
+    /// new `workspaceFolders`, so Claude Code can match the IDE to the session.
+    pub fn set_workspace(&self, workspace: &Path) {
+        let _ = discovery::write_lock(self.port, workspace, &self.token);
+    }
 }
 
 impl Drop for McpServer {

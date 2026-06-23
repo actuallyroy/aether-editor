@@ -37,7 +37,7 @@ pub fn start(
     });
 
     eprintln!("[mcp] IDE server on 127.0.0.1:{port}");
-    Some(McpServer { port, lock_path })
+    Some(McpServer { port, lock_path, token })
 }
 
 /// Try random ports in [10000, 65535] (the range Claude Code expects) until one binds.

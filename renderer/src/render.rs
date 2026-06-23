@@ -503,7 +503,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         // Markdown preview: parse + shape the source (`rope`) at the reading-column
         // width, then size the scroll viewport from the rendered height.
         let region = editor_region(&layout);
-        let body = crate::ui::info_page::InfoPage::body(region);
+        let body = crate::ui::info_page::InfoPage::preview_body(region);
         let src = app.workspace.active_doc().map(|d| d.text()).unwrap_or_default();
         let key = app.workspace.active_doc().map(|d| format!("{}#{}", d.name, d.version)).unwrap_or_default();
         if let Some(d) = app.workspace.active_doc_mut() {
@@ -2528,8 +2528,8 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             let body = crate::ui::info_page::InfoPage::body(editor_region(&layout));
             page.draw(body, d.scroll_y(), &mut areas);
         } else if let Some(md) = d.markdown_preview.as_ref() {
-            // Markdown preview: render the parsed blocks in a centered reading column.
-            let body = crate::ui::info_page::InfoPage::body(editor_region(&layout));
+            // Markdown preview: render the parsed blocks across the pane width.
+            let body = crate::ui::info_page::InfoPage::preview_body(editor_region(&layout));
             let size_of = |k: &str| gpu.media.size(k);
             md.draw(body, d.scroll_y(), &size_of, &mut areas, &mut preview_img_rects);
         } else if d.binary {

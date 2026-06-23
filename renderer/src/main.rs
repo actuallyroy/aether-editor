@@ -5048,6 +5048,15 @@ impl App {
             sp.reset();
         }
         self.refresh_source_control(); // update the change-count badge for the new repo
+        // Re-advertise this window's MCP server for the new workspace so Claude Code
+        // (which matches the IDE connection by workspace folder) attaches correctly —
+        // otherwise a folder opened in a New (folder-less) Window keeps the empty
+        // workspaceFolders the server was started with. Same port/token, so any live
+        // `claude` connection is undisturbed.
+        if let Some(mcp) = &self.mcp {
+            mcp.set_workspace(&self.cwd);
+        }
+        mcp::agents::register_claude(&self.cwd); // re-register the bridge for the new root
         self.persist_state(); // remember this folder for the next launch
         self.start_fs_watcher(); // watch the new workspace root
         // Rebuild the native menu so the "Open Recent" submenu reflects the new entry.

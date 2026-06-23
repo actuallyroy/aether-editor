@@ -79,6 +79,64 @@ fn img_placeholder_h() -> f32 { 160.0 * theme::ui_zoom() }
 fn img_max_h() -> f32 { 420.0 * theme::ui_zoom() }
 fn block_gap() -> f32 { 4.0 * theme::ui_zoom() } // vertical space between stacked text blocks
 
+/// Format buffered table rows as a column-aligned monospace block: header row, a
+/// `─┼─` separator rule, then body rows. Each column is padded to its widest cell
+/// (capped so one long cell can't blow out the layout; overflow is truncated `…`).
+/// Rendered in a monospace font so the padding lines columns up.
+fn render_table(rows: &[Vec<String>]) -> String {
+    const MAX_COL: usize = 48;
+    let ncols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    if ncols == 0 {
+        return String::new();
+    }
+    let cell = |row: &[String], i: usize| -> String {
+        row.get(i).map(|s| s.trim()).unwrap_or("").replace('\n', " ")
+    };
+    let mut widths = vec![0usize; ncols];
+    for row in rows {
+        for (i, w) in widths.iter_mut().enumerate() {
+            *w = (*w).max(cell(row, i).chars().count().min(MAX_COL));
+        }
+    }
+    let pad = |s: &str, w: usize| -> String {
+        let chars: Vec<char> = s.chars().collect();
+        if chars.len() > w {
+            let mut t: String = chars[..w.saturating_sub(1)].iter().collect();
+            t.push('…');
+            t
+        } else {
+            let mut t = s.to_string();
+            t.extend(std::iter::repeat(' ').take(w - chars.len()));
+            t
+        }
+    };
+    let mut out = String::new();
+    for (ri, row) in rows.iter().enumerate() {
+        for i in 0..ncols {
+            if i > 0 {
+                out.push_str(" │ ");
+            }
+            out.push_str(&pad(&cell(row, i), widths[i]));
+        }
+        while out.ends_with(' ') {
+            out.pop();
+        }
+        out.push('\n');
+        if ri == 0 {
+            // Header underline aligned to the columns.
+            for (i, w) in widths.iter().enumerate() {
+                if i > 0 {
+                    out.push_str("─┼─");
+                }
+                out.extend(std::iter::repeat('─').take(*w));
+            }
+            out.push('\n');
+        }
+    }
+    out.push('\n');
+    out
+}
+
 impl Markdown {
     pub fn new(_fs: &mut FontSystem) -> Self {
         Self { blocks: Vec::new(), image_urls: Vec::new(), last_key: String::new(), width: 0.0 }
@@ -102,8 +160,11 @@ impl Markdown {
         let mut spans: Vec<(String, Attrs<'static>)> = Vec::new();
         let mut st = Style::new();
         let mut list_stack: Vec<Option<u64>> = Vec::new();
-        let mut cell_idx = 0u32; // column position within the current table row
         let mut image_depth = 0u32; // >0 while inside an image (skip its alt text)
+        // Tables are buffered (rows of plain-cell text) and rendered column-aligned in
+        // a monospace block on TagEnd::Table, instead of inline run-together cells.
+        let mut in_table = false;
+        let mut table_rows: Vec<Vec<String>> = Vec::new();
 
         // Flush accumulated inline spans into a Text block shaped at `metrics`
         // (the block's uniform line advance — headings use a larger metrics so
@@ -177,15 +238,17 @@ impl Markdown {
                         spans.push((format!("{indent}{marker}"), attrs(theme::UI_FAMILY(), theme::MD_LIST())));
                     }
                     Tag::BlockQuote(_) => st.quote = true,
-                    // Tables: render each row on its own line with separated cells
-                    // (no column alignment yet, but readable instead of run-together).
-                    Tag::Table(_) => flush(&mut spans, &mut self.blocks, fs, base_m, &mut cur_links),
-                    Tag::TableHead | Tag::TableRow => cell_idx = 0,
+                    // Tables: buffer cells, then render column-aligned (monospace) on end.
+                    Tag::Table(_) => {
+                        flush(&mut spans, &mut self.blocks, fs, base_m, &mut cur_links);
+                        in_table = true;
+                        table_rows.clear();
+                    }
+                    Tag::TableHead | Tag::TableRow => table_rows.push(Vec::new()),
                     Tag::TableCell => {
-                        if cell_idx > 0 {
-                            spans.push((" │ ".into(), attrs(theme::UI_FAMILY(), theme::FG_DIM())));
+                        if let Some(row) = table_rows.last_mut() {
+                            row.push(String::new());
                         }
-                        cell_idx += 1;
                     }
                     _ => {}
                 },
@@ -207,16 +270,34 @@ impl Markdown {
                     }
                     TagEnd::Image => image_depth = image_depth.saturating_sub(1),
                     TagEnd::List(_) => { list_stack.pop(); if list_stack.is_empty() { spans.push(("\n".into(), base)); } }
-                    TagEnd::Item => spans.push(("\n".into(), base)),
+                    // Flush each item as its own block so the inter-block gap separates
+                    // bullets (a single '\n' packed them with no breathing room).
+                    TagEnd::Item => flush(&mut spans, &mut self.blocks, fs, base_m, &mut cur_links),
                     TagEnd::BlockQuote(_) => { st.quote = false; spans.push(("\n".into(), base)); }
                     TagEnd::Paragraph => spans.push(("\n\n".into(), base)),
-                    TagEnd::TableHead | TagEnd::TableRow => spans.push(("\n".into(), base)),
-                    TagEnd::Table => spans.push(("\n".into(), base)),
+                    TagEnd::TableHead | TagEnd::TableRow => {}
+                    TagEnd::Table => {
+                        in_table = false;
+                        if !table_rows.is_empty() {
+                            spans.push((render_table(&table_rows), attrs(theme::MONO_FAMILY(), theme::FG_TEXT())));
+                            flush(&mut spans, &mut self.blocks, fs, base_m, &mut cur_links);
+                        }
+                        table_rows.clear();
+                    }
                     _ => {}
                 },
                 Event::Text(t) => {
-                    if image_depth == 0 {
+                    if in_table {
+                        if let Some(c) = table_rows.last_mut().and_then(|r| r.last_mut()) {
+                            c.push_str(&t);
+                        }
+                    } else if image_depth == 0 {
                         spans.push((t.to_string(), st.text_attrs()));
+                    }
+                }
+                Event::Code(t) if in_table => {
+                    if let Some(c) = table_rows.last_mut().and_then(|r| r.last_mut()) {
+                        c.push_str(&t);
                     }
                 }
                 Event::Code(t) => spans.push((t.to_string(), attrs(theme::MONO_FAMILY(), theme::MD_CODE()))),
