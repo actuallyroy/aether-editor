@@ -8788,9 +8788,44 @@ pub(crate) fn gh_program() -> String {
                 return p.to_string();
             }
         }
-        if let Ok(out) = std::process::Command::new("/bin/sh").args(["-lc", "command -v gh"]).output() {
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !s.is_empty() {
+        // Last resort: ask a login shell where gh lives (covers asdf, nvm-style
+        // PATH tweaks). Try the user's actual shell first (zsh sources ~/.zshrc on
+        // -i), then /bin/sh; a login+interactive shell sees the full PATH.
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        for sh in [shell.as_str(), "/bin/sh"] {
+            if let Ok(out) = std::process::Command::new(sh).args(["-lic", "command -v gh"]).output() {
+                let s = String::from_utf8_lossy(&out.stdout).trim().lines().last().unwrap_or("").to_string();
+                if !s.is_empty() && std::path::Path::new(&s).exists() {
+                    return s;
+                }
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Windows GUI processes inherit the system PATH captured at logon, so a
+        // freshly-installed (or winget/scoop) gh may not be on it. Probe the common
+        // install locations, then fall back to `where gh`.
+        let mut cands: Vec<std::path::PathBuf> = vec![
+            r"C:\Program Files\GitHub CLI\gh.exe".into(),
+            r"C:\Program Files (x86)\GitHub CLI\gh.exe".into(),
+        ];
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            cands.push(std::path::Path::new(&local).join(r"Microsoft\WinGet\Links\gh.exe"));
+            cands.push(std::path::Path::new(&local).join(r"Programs\GitHub CLI\gh.exe"));
+        }
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            cands.push(std::path::Path::new(&profile).join(r"scoop\shims\gh.exe"));
+        }
+        for p in cands {
+            if p.exists() {
+                return p.to_string_lossy().into_owned();
+            }
+        }
+        use std::os::windows::process::CommandExt;
+        if let Ok(out) = std::process::Command::new("where").arg("gh").creation_flags(0x0800_0000).output() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().lines().next().unwrap_or("").to_string();
+            if !s.is_empty() && std::path::Path::new(&s).exists() {
                 return s;
             }
         }

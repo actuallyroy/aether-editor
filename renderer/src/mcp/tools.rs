@@ -466,8 +466,11 @@ pub fn execute(app: &mut crate::App, name: &str, args: &Value) -> Result<Value, 
                 env!("CARGO_PKG_VERSION")
             );
             // gh authors under the user's account (blocks briefly — a one-off, user-driven action).
+            // Resolve gh via the platform-aware lookup: GUI-launched apps don't inherit
+            // the shell PATH, so a bare "gh" often isn't found on macOS/Windows.
+            let gh = crate::gh_program();
             let out = if let Some(n) = args.get("issue").and_then(|i| i.as_u64()) {
-                std::process::Command::new("gh")
+                std::process::Command::new(&gh)
                     .args(["issue", "comment", &n.to_string(), "--repo", repo, "--body", &body])
                     .output()
             } else {
@@ -475,7 +478,7 @@ pub fn execute(app: &mut crate::App, name: &str, args: &Value) -> Result<Value, 
                     let snippet: String = message.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(80).collect();
                     format!("[feedback] {snippet}")
                 });
-                std::process::Command::new("gh")
+                std::process::Command::new(&gh)
                     .args(["issue", "create", "--repo", repo, "--title", &title, "--body", &body])
                     .output()
             };

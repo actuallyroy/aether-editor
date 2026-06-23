@@ -2,9 +2,10 @@
 // serve MCP JSON-RPC (initialize / tools/list / tools/call). Tool calls are forwarded
 // to the UI thread (see `mcp::McpRequest`).
 
+use std::io::ErrorKind;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{channel, Sender, TryRecvError};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -82,16 +83,50 @@ fn serve_conn(stream: TcpStream, token: String, req_tx: Sender<McpRequest>, prox
         }
     };
 
+    // Decouple tool execution from the read loop. The old design ran each
+    // `tools/call` inline and blocked the connection for up to 15s waiting on the UI
+    // thread — during which incoming WebSocket Pings went unanswered (tungstenite only
+    // auto-replies to Pings when read()/flush() is called), so the client's keepalive
+    // tore the connection down. It got worse under load, when the UI thread is busy and
+    // replies are slow. See issues #43/#45.
+    //
+    // Now the socket is non-blocking: the loop polls reads frequently (so pings are
+    // answered within ~10ms), and each `tools/call` runs on its own worker thread that
+    // posts the finished JSON-RPC response back over `resp_rx`. Responses are written as
+    // they complete (JSON-RPC matches by id, so out-of-order delivery is fine). The
+    // connection stays alive and responsive under sustained multi-terminal load.
+    if ws.get_ref().set_nonblocking(true).is_err() {
+        return;
+    }
+    let (resp_tx, resp_rx) = channel::<Value>();
     loop {
+        // 1) Write any tool responses that have completed since the last pass.
+        loop {
+            match resp_rx.try_recv() {
+                Ok(v) => {
+                    if !write_msg(&mut ws, tungstenite::Message::Text(v.to_string())) {
+                        return;
+                    }
+                }
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        // 2) Read the next client message (non-blocking; WouldBlock → idle nap).
         let msg = match ws.read() {
             Ok(m) => m,
+            Err(tungstenite::Error::Io(e))
+                if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
             Err(_) => break,
         };
         let text = match msg {
             tungstenite::Message::Text(t) => t,
             tungstenite::Message::Close(_) => break,
-            tungstenite::Message::Ping(p) => {
-                let _ = ws.write(tungstenite::Message::Pong(p));
+            // read() already enqueued the Pong; just push it out promptly.
+            tungstenite::Message::Ping(_) => {
                 let _ = ws.flush();
                 continue;
             }
@@ -103,6 +138,20 @@ fn serve_conn(stream: TcpStream, token: String, req_tx: Sender<McpRequest>, prox
         let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let params = req.get("params").cloned().unwrap_or(Value::Null);
 
+        // `tools/call` can block on the UI thread for up to 15s → run it off the read
+        // loop so pings and other requests keep being serviced meanwhile.
+        if method == "tools/call" {
+            let params = params.clone();
+            let req_tx = req_tx.clone();
+            let proxy = proxy.clone();
+            let resp_tx = resp_tx.clone();
+            std::thread::spawn(move || {
+                let _ = resp_tx.send(handle_call(&id, &params, &req_tx, &proxy));
+            });
+            continue;
+        }
+
+        // Cheap, non-blocking methods are handled inline.
         let response = match method {
             "initialize" => Some(ok_result(
                 &id,
@@ -118,15 +167,33 @@ fn serve_conn(stream: TcpStream, token: String, req_tx: Sender<McpRequest>, prox
             "notifications/initialized" => None,
             "ping" => Some(ok_result(&id, json!({}))),
             "tools/list" => Some(ok_result(&id, json!({ "tools": tools::list() }))),
-            "tools/call" => Some(handle_call(&id, &params, &req_tx, &proxy)),
             _ if id.is_some() => Some(err_result(&id, -32601, "method not found")),
             _ => None,
         };
         if let Some(resp) = response {
-            if ws.write(tungstenite::Message::Text(resp.to_string())).is_err() {
+            if !write_msg(&mut ws, tungstenite::Message::Text(resp.to_string())) {
                 break;
             }
-            let _ = ws.flush();
+        }
+    }
+}
+
+/// Send one WebSocket message on a non-blocking socket, retrying the flush while it
+/// would block (the message is already queued inside tungstenite). Returns false on a
+/// fatal connection error — the caller should drop the connection.
+fn write_msg(ws: &mut tungstenite::WebSocket<TcpStream>, msg: tungstenite::Message) -> bool {
+    match ws.write(msg) {
+        Ok(()) => {}
+        Err(tungstenite::Error::Io(e)) if e.kind() == ErrorKind::WouldBlock => {}
+        Err(_) => return false,
+    }
+    loop {
+        match ws.flush() {
+            Ok(()) => return true,
+            Err(tungstenite::Error::Io(e)) if e.kind() == ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => return false,
         }
     }
 }

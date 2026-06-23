@@ -1361,8 +1361,10 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         }
         // Current line highlight across full editor width (editor.renderLineHighlight).
         // Wrap-aware via the document's visual bounds (covers all wrapped rows).
-        // Skipped in diff views (the per-line add/del backgrounds carry the meaning).
-        if crate::settings::render_line_highlight() && d.diff.is_none() {
+        // Skipped in diff views (the per-line add/del backgrounds carry the meaning)
+        // and in the read-only Markdown preview (no caret line to highlight — it was
+        // painting a gray band behind the first heading).
+        if crate::settings::render_line_highlight() && d.diff.is_none() && d.markdown_preview.is_none() {
             let (ltop, lh) = d.line_visual_bounds(cur_line);
             let line_y = layout.editor_text.y + theme::EDITOR_PAD() + ltop - d.scroll_y() - foff(cur_line);
             if let Some((qy, qh)) = clip_v(line_y, lh) {
@@ -2246,6 +2248,15 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
 
     // ---- Build text areas ----
     let active_idx = app.workspace.active;
+
+    // Markdown-preview table grid lines: collected here (the quad phase) so they sit
+    // behind the cell text drawn later in the areas phase.
+    if let Some(md) = app.workspace.active_doc().and_then(|d| d.markdown_preview.as_ref()) {
+        let body = crate::ui::info_page::InfoPage::preview_body(editor_region(&layout));
+        let scroll = app.workspace.active_doc().map(|d| d.scroll_y()).unwrap_or(0.0);
+        let size_of = |k: &str| gpu.media.size(k);
+        bg_quads.extend(md.collect_quads(body, scroll, &size_of));
+    }
 
     let (cfg_w, cfg_h) = (gpu.config.width, gpu.config.height);
     gpu.quad_renderer
