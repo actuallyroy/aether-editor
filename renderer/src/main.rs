@@ -7518,6 +7518,9 @@ impl App {
                     self.terminal.focused = true; // typing continues in the shell (#31)
                 } else if let Some(dir) = target {
                     self.move_tree_entry(&src, &dir);
+                } else if src.is_file() && crate::render::editor_region(&self.layout()).contains(p) {
+                    // Dropped onto the editor area → open it (matches OS file-drop).
+                    self.open_file_at(src, 1, 0);
                 }
                 self.redraw();
             } else if src.is_file() {
