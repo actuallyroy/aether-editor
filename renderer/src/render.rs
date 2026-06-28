@@ -1232,8 +1232,12 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         }
         // (status-bar seam drawn after its bg fill, further down)
     }
-    // Tab strip bg
-    bg_quads.push(layout.tab_strip.quad(theme::TAB_BAR_BG()));
+    // Tab strip bg. When the terminal panel covers the tab strip (h collapses to 0),
+    // skip all tab chrome so labels/close-× don't draw over the terminal.
+    let draw_tabs = layout.tab_strip.h > 0.0;
+    if draw_tabs {
+        bg_quads.push(layout.tab_strip.quad(theme::TAB_BAR_BG()));
+    }
     // Breadcrumb bar bg + bottom seam (drawn between the tab strip and editor).
     if layout.breadcrumbs.h > 0.0 {
         let bc = layout.breadcrumbs;
@@ -1252,6 +1256,9 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     };
     let tab_rects = layout.tab_rects(n_tabs);
     for (i, tab) in tab_rects.iter().enumerate() {
+        if !draw_tabs {
+            break;
+        }
         let active = active_tab == Some(i);
         let hover = app.hovered_tab == Some(i);
         let fill = if active {
@@ -1282,13 +1289,15 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         }
     }
     // Bottom border of tab strip.
-    bg_quads.push(Quad::new(
-        layout.tab_strip.x,
-        layout.tab_strip.y + layout.tab_strip.h - 1.0,
-        layout.tab_strip.w,
-        1.0,
-        [0.10, 0.10, 0.10, 1.0],
-    ));
+    if draw_tabs {
+        bg_quads.push(Quad::new(
+            layout.tab_strip.x,
+            layout.tab_strip.y + layout.tab_strip.h - 1.0,
+            layout.tab_strip.w,
+            1.0,
+            [0.10, 0.10, 0.10, 1.0],
+        ));
+    }
 
     // Editor bg
     let editor_full = editor_region(&layout);
@@ -1910,8 +1919,10 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             completion_anchor = Some((px, py));
         }
 
-        // Editor scrollbars (auto-hide overlay; vertical + horizontal).
-        if !modal_open {
+        // Editor scrollbars (auto-hide overlay; vertical + horizontal). Skip when the
+        // editor region is collapsed (e.g. the terminal covers it) so the horizontal
+        // bar doesn't draw at the top over the terminal.
+        if !modal_open && layout.editor_text.h > 0.0 {
             d.scroll.draw(now, &mut fg_quads);
         }
         // Side-by-side diff: a horizontal scrollbar under each pane (independent —
@@ -2441,6 +2452,9 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // so each tab shows only its own label. Geometry comes from `tab_rects`.
     let tab_rects = layout.tab_rects(n_tabs);
     for (i, tab) in tab_rects.iter().enumerate() {
+        if !draw_tabs {
+            break;
+        }
         let active = active_tab == Some(i);
         let line_top = i as f32 * theme::UI_LINE_HEIGHT();
         let color = if active {

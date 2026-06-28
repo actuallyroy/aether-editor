@@ -346,7 +346,7 @@ fn build_file_peek(df: &diff::Diff, fname: String, clicked_line: usize, doc_vers
 
 // Trackpad momentum (fling) tuning. The gesture itself is applied directly; these only
 // govern the coast after the fingers lift. Glide distance ≈ lift-off velocity · FLING_TAU.
-const FLING_TAU: f32 = 0.32; // friction time-constant (s); larger = longer coast
+const FLING_TAU: f32 = 0.42; // friction time-constant (s); larger = longer coast
 const FLING_MIN: f32 = 120.0; // px/s below which a lift starts no fling (gentle scroll)
 const FLING_STOP: f32 = 30.0; // px/s at which a live fling is considered stopped
 const FLING_VEL_MAX: f32 = 9000.0; // px/s cap on a frantic flick
@@ -7850,10 +7850,10 @@ impl App {
         self.mouse_pos = self.scroll_anchor;
         let mut moved = false;
         if vy.abs() > 0.0 {
-            moved |= self.on_scroll_moved(vy * dt);
+            moved |= self.on_scroll(vy * dt);
         }
         if vx.abs() > 0.0 {
-            moved |= self.on_scroll_h_moved(vx * dt);
+            moved |= self.on_scroll_h(vx * dt);
         }
         self.mouse_pos = saved;
         let decay = (-dt / FLING_TAU).exp();
@@ -7865,36 +7865,11 @@ impl App {
         self.scroll_flinging
     }
 
-    /// `on_scroll` that reports whether the target actually moved (for fling edge-stop).
-    fn on_scroll_moved(&mut self, dy: f32) -> bool {
-        let before = self.focused_scroll_offset();
-        self.on_scroll(dy);
-        self.focused_scroll_offset() != before
-    }
 
-    fn on_scroll_h_moved(&mut self, dx: f32) -> bool {
-        let before = self.focused_scroll_offset();
-        self.on_scroll_h(dx);
-        self.focused_scroll_offset() != before
-    }
-
-    /// A cheap snapshot of the scroll offset under the pointer, used only to detect
-    /// "did the fling actually move anything" so it can stop dead at content edges.
-    /// Falls back to the active document's offset (the common fling target).
-    fn focused_scroll_offset(&self) -> (f32, f32) {
-        let p = (self.mouse_pos.x as f32, self.mouse_pos.y as f32);
-        if self.terminal.visible {
-            if let Some(g) = self.terminal.groups.get(self.terminal.active) {
-                if let Some(pane) = g.panes.get(g.focused) {
-                    let _ = p;
-                    return pane.scroll.offset();
-                }
-            }
-        }
-        self.workspace.active_doc().map_or((0.0, 0.0), |d| (d.scroll_x(), d.scroll_y()))
-    }
-
-    fn on_scroll(&mut self, dy: f32) {
+    /// Route a vertical scroll to the region under the pointer. Returns true if some
+    /// region actually scrolled — the fling uses this to know whether to keep coasting
+    /// (so momentum works uniformly in every scrollable region, and stops at edges).
+    fn on_scroll(&mut self, dy: f32) -> bool {
         let layout = self.layout();
         let p = (self.mouse_pos.x as f32, self.mouse_pos.y as f32);
         // Inline gutter-diff peek: wheel over the zone scrolls its diff body.
@@ -7903,11 +7878,14 @@ impl App {
             if let Some(d) = self.workspace.active_doc() {
                 let gm = render::peek_geom(d, self.gutter_peek.as_ref().unwrap().anchor_line, &layout, rows);
                 if gm.zone.contains(p) {
+                    let mut moved = false;
                     if let Some(pk) = self.gutter_peek.as_mut() {
+                        let before = pk.scroll;
                         pk.scroll = (pk.scroll - dy).clamp(0.0, gm.max_scroll);
+                        moved = pk.scroll != before;
                     }
                     self.redraw();
-                    return;
+                    return moved;
                 }
             }
         }
@@ -7923,40 +7901,42 @@ impl App {
                 if lay.search.contains(p) {
                     g.ui.settings_search.scroll_h(-dy);
                     self.redraw();
-                    return;
+                    return true;
                 }
                 if edit_rect.map_or(false, |r| r.contains(p)) {
                     g.ui.settings_input.scroll_h(-dy);
                     self.redraw();
-                    return;
+                    return true;
                 }
             }
             let max = (self.settings_editor.content_h - lay.right.h).max(0.0);
+            let before = self.settings_editor.scroll;
             self.settings_editor.scroll = (self.settings_editor.scroll - dy).clamp(0.0, max);
             self.redraw();
-            return;
+            return self.settings_editor.scroll != before;
         }
         // Command palette: the wheel scrolls its list only when the pointer is over
         // the card; elsewhere the editor scrolls underneath (useful while previewing).
         if self.palette.active {
             if layout.palette.as_ref().map_or(false, |pal| pal.box_.contains(p)) {
+                let before = self.palette.scroll;
                 self.palette.scroll = (self.palette.scroll - dy).max(0.0);
                 self.redraw();
-                return;
+                return self.palette.scroll != before;
             }
         }
         // Terminal scrollback: the panel owns its pane ScrollViews; consumes the
         // event (when over the content) so the editor doesn't scroll underneath.
         if self.terminal.on_scroll(p, &layout, dy) {
             self.redraw();
-            return;
+            return true;
         }
         // AI chat (right sidebar) scrolls when the cursor is over it.
         if self.right_sidebar_visible {
             if let Some(c) = self.chat.as_mut() {
                 if c.on_wheel(p, layout.right_sidebar, dy) {
                     self.redraw();
-                    return;
+                    return true;
                 }
             }
         }
@@ -7964,17 +7944,18 @@ impl App {
         if let Some(body) = layout.outline_body_rect().filter(|b| b.contains(p)) {
             if let Some(o) = self.outline.as_mut() {
                 let _ = body;
-                o.scroll.on_wheel(0.0, dy);
+                let moved = o.scroll.on_wheel(0.0, dy);
                 self.redraw();
-                return;
+                return moved;
             }
         }
         // File tree scrolls when the cursor is over the tree region.
         if self.sidebar_visible && self.sidebar_view == SidebarView::Explorer {
             let region = layout.tree_region();
-            if region.contains(p) && self.explorer.scroll.on_wheel(0.0, dy) {
+            if region.contains(p) {
+                let moved = self.explorer.scroll.on_wheel(0.0, dy);
                 self.redraw();
-                return;
+                return moved;
             }
         }
         // Extensions list scrolls when the cursor is over its region (the panel
@@ -7982,9 +7963,10 @@ impl App {
         if self.sidebar_visible && self.sidebar_view == SidebarView::Extensions {
             let region = layout.tree_region();
             if let Some(ep) = self.extensions_panel.as_mut() {
-                if ep.on_wheel(p, region, dy) {
+                if region.contains(p) {
+                    let moved = ep.on_wheel(p, region, dy);
                     self.redraw();
-                    return;
+                    return moved;
                 }
             }
         }
@@ -7992,9 +7974,10 @@ impl App {
         if self.sidebar_visible && self.sidebar_view == SidebarView::Search {
             let region = layout.sidebar;
             if let Some(sp) = self.search.as_mut() {
-                if sp.on_wheel(p, region, dy) {
+                if region.contains(p) {
+                    let moved = sp.on_wheel(p, region, dy);
                     self.redraw();
-                    return;
+                    return moved;
                 }
             }
         }
@@ -8002,9 +7985,10 @@ impl App {
         if self.sidebar_visible && self.sidebar_view == SidebarView::SourceControl {
             let region = layout.panel_region();
             if let Some(scp) = self.source_control.as_mut() {
-                if scp.on_wheel(p, region, dy) {
+                if region.contains(p) {
+                    let moved = scp.on_wheel(p, region, dy);
                     self.redraw();
-                    return;
+                    return moved;
                 }
             }
         }
@@ -8012,21 +7996,22 @@ impl App {
         if self.sidebar_visible && self.sidebar_view == SidebarView::Debug {
             let region = layout.panel_region();
             if let Some(dp) = self.debug.as_mut() {
-                if dp.on_wheel(p, region, dy) {
+                if region.contains(p) {
+                    let moved = dp.on_wheel(p, region, dy);
                     self.redraw();
-                    return;
+                    return moved;
                 }
             }
         }
         // The extension detail page (README) scrolls when it's open and the cursor
         // is over the editor area.
         if self.detail.open_extension.is_some() && layout.editor_text.contains(p) {
-            if self.detail.ext_detail_scroll.on_wheel(0.0, dy) {
-                self.redraw();
-            }
-            return;
+            let moved = self.detail.ext_detail_scroll.on_wheel(0.0, dy);
+            self.redraw();
+            return moved;
         }
-        // Image tab: the wheel zooms about the cursor instead of scrolling.
+        // Image tab: the wheel zooms about the cursor instead of scrolling. A fling
+        // must NOT keep zooming after lift-off, so this returns false (stops the fling).
         if let Some(key) = self.workspace.active_doc().and_then(|d| d.image.clone()) {
             let region = render::editor_region(&layout);
             if region.contains(p) {
@@ -8038,19 +8023,22 @@ impl App {
                     self.redraw();
                 }
             }
-            return;
+            return false;
         }
         if !layout.editor_text.contains(p) {
             // Could route to sidebar tree, but flat list fits fine for now.
-            return;
+            return false;
         }
         // Editor: the active document's ScrollView owns the offset/clamp (metrics
         // are set each frame in render).
         if let Some(d) = self.workspace.active_doc_mut() {
-            if d.scroll.on_wheel(0.0, dy) {
+            let moved = d.scroll.on_wheel(0.0, dy);
+            if moved {
                 self.redraw();
             }
+            return moved;
         }
+        false
     }
 
     /// Scroll the single-line input under `p` horizontally by `dx` px, if any. Used
@@ -8091,31 +8079,37 @@ impl App {
         false
     }
 
-    fn on_scroll_h(&mut self, dx: f32) {
+    /// Horizontal counterpart of `on_scroll`; returns true if something scrolled.
+    fn on_scroll_h(&mut self, dx: f32) -> bool {
         let p = (self.mouse_pos.x as f32, self.mouse_pos.y as f32);
         let layout = self.layout();
         // Horizontal wheel (incl. Ctrl/Shift+wheel and trackpad) over an input box
         // scrolls its text — same as a vertical wheel there.
         if self.scroll_input_h(p, &layout, dx) {
             self.redraw();
-            return;
+            return true;
         }
         if let Some(d) = self.workspace.active_doc_mut() {
             // Diff: scroll only the pane under the cursor (independent panes).
             if d.diff.is_some() {
                 let (_, lt, _, rt) = render::diff_pane_rects(render::editor_region(&layout));
                 let pane = if rt.contains(p) { Some((1, rt.w)) } else if lt.contains(p) { Some((0, lt.w)) } else { None };
+                let mut moved = false;
                 if let Some((i, vw)) = pane {
-                    if d.diff_hwheel(i, dx, vw) {
+                    moved = d.diff_hwheel(i, dx, vw);
+                    if moved {
                         self.redraw();
                     }
                 }
-                return;
+                return moved;
             }
-            if d.scroll.on_wheel(dx, 0.0) {
+            let moved = d.scroll.on_wheel(dx, 0.0);
+            if moved {
                 self.redraw();
             }
+            return moved;
         }
+        false
     }
 
     fn on_key(&mut self, event: winit::event::KeyEvent) {

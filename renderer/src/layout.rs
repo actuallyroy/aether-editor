@@ -128,14 +128,24 @@ impl Layout {
         // editor share whatever space (`above_h`) is left above it.
         let content_top = tb;
         let content_h = (h - sb_h - tb).max(0.0);
-        let term_h = match terminal_height {
+        let mut term_h = match terminal_height {
             Some(req) => req.min(content_h),
             None => 0.0,
         };
-        let above_h = (content_h - term_h).max(0.0);
-        let tab_h = theme::TAB_HEIGHT().min(above_h);
+        // The editor chrome (tab strip + breadcrumbs) is all-or-nothing: rather than
+        // squeeze it (which would clip the filename/close-× over the terminal), once the
+        // terminal grows past the point where the full chrome + a sliver of editor fit,
+        // it snaps to covering the whole content area up to the window header.
         let bc_full = if show_breadcrumbs { theme::BREADCRUMB_HEIGHT() } else { 0.0 };
-        let bc_h = bc_full.min((above_h - tab_h).max(0.0));
+        let chrome = theme::TAB_HEIGHT() + bc_full;
+        let mut above_h = (content_h - term_h).max(0.0);
+        if term_h > 0.0 && above_h < chrome {
+            term_h = content_h;
+            above_h = 0.0;
+        }
+        let show_chrome = above_h >= chrome;
+        let tab_h = if show_chrome { theme::TAB_HEIGHT() } else { 0.0 };
+        let bc_h = if show_chrome { bc_full } else { 0.0 };
         let tab_strip = Rect { x: editor_left, y: content_top, w: content_w, h: tab_h };
         let breadcrumbs = Rect { x: editor_left, y: content_top + tab_h, w: content_w, h: bc_h };
         let editor_y = content_top + tab_h + bc_h;
