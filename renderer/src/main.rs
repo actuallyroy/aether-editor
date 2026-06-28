@@ -356,6 +356,8 @@ pub(crate) struct App {
     pub(crate) editor: ui::editor_view::EditorView,
     pub(crate) mods: ModifiersState,
     pub(crate) clipboard: Option<Clipboard>,
+    /// Monotonic counter to give each pasted-image temp file a unique name.
+    pub(crate) paste_image_seq: u32,
     pub(crate) sidebar_visible: bool,
     pub(crate) sidebar_split: Splitter,
     pub(crate) palette: PaletteState,
@@ -583,6 +585,7 @@ impl App {
             editor: ui::editor_view::EditorView::new(),
             mods: ModifiersState::empty(),
             clipboard: Clipboard::new().ok(),
+            paste_image_seq: 0,
             sidebar_visible: true,
             sidebar_split: Splitter::new(
                 theme::SIDEBAR_WIDTH(),
@@ -1805,10 +1808,10 @@ impl App {
                             let _ = cb.set_text(text);
                         }
                         self.terminal.clear_focused_selection();
-                    } else if let Some(text) = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok()) {
-                        self.terminal.paste_focused(&text);
+                        self.redraw();
+                    } else {
+                        self.terminal_paste_clipboard();
                     }
-                    self.redraw();
                     return;
                 }
             }
@@ -5671,6 +5674,48 @@ impl App {
         self.ensure_cursor_visible();
     }
 
+    /// Paste the clipboard into the focused terminal. Prefers text; if the clipboard
+    /// holds an image instead (e.g. a screenshot) and no text, the image is written to a
+    /// temp PNG and its quoted path is pasted — so TUIs like Claude Code, which read
+    /// image files from a path, can pick it up. (On Linux/Wayland the CLI usually can't
+    /// read the image clipboard itself, so the terminal bridges it via a file.)
+    fn terminal_paste_clipboard(&mut self) {
+        if let Some(text) = self
+            .clipboard
+            .as_mut()
+            .and_then(|cb| cb.get_text().ok())
+            .filter(|t| !t.is_empty())
+        {
+            self.terminal.clear_focused_selection();
+            self.terminal.paste_focused(&text);
+            self.redraw();
+            return;
+        }
+        if let Some(path) = self.clipboard_image_to_temp() {
+            self.terminal.clear_focused_selection();
+            // Quote the path so shells/TUIs handle spaces; trailing space lets the user
+            // keep typing or hit Enter.
+            self.terminal.paste_focused(&format!("'{}' ", path.display()));
+            self.redraw();
+        }
+    }
+
+    /// If the clipboard holds an image, write it to a temp PNG and return its path.
+    fn clipboard_image_to_temp(&mut self) -> Option<PathBuf> {
+        let img = self.clipboard.as_mut().and_then(|cb| cb.get_image().ok())?;
+        let (w, h) = (img.width as u32, img.height as u32);
+        let buf: image::RgbaImage =
+            image::ImageBuffer::from_raw(w, h, img.bytes.into_owned())?;
+        let path = std::env::temp_dir().join(format!(
+            "aether-paste-{}-{}.png",
+            std::process::id(),
+            self.paste_image_seq
+        ));
+        self.paste_image_seq = self.paste_image_seq.wrapping_add(1);
+        buf.save(&path).ok()?;
+        Some(path)
+    }
+
     fn cut(&mut self) {
         self.copy();
         if let Some(gpu) = self.gpu.as_mut() {
@@ -8055,11 +8100,7 @@ impl App {
                     self.mods.control_key()
                 };
                 if paste_mod && is_v {
-                    if let Some(text) = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok()) {
-                        self.terminal.clear_focused_selection();
-                        self.terminal.paste_focused(&text);
-                        self.redraw();
-                    }
+                    self.terminal_paste_clipboard();
                     return;
                 }
                 let alt = self.mods.alt_key();
