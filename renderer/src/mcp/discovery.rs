@@ -40,6 +40,46 @@ pub fn write_lock(port: u16, workspace: &Path, token: &str) -> Option<PathBuf> {
     Some(path)
 }
 
+/// Remove `<port>.lock` files whose owning process is dead — stale entries from
+/// crashed/force-quit/superseded windows otherwise make Claude Code try a dead port and
+/// fail to connect (-32000), especially when two locks share a workspace. Run on startup.
+pub fn clean_stale_locks() {
+    let Some(dir) = ide_dir() else { return };
+    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("lock") {
+            continue;
+        }
+        let pid = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v.get("pid").and_then(|p| p.as_u64()));
+        // Remove malformed locks (no pid) and locks for dead processes.
+        if pid.map_or(true, |p| !pid_alive(p)) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Whether `pid` is a live process (best-effort; never reaps a live window's lock).
+fn pid_alive(pid: u64) -> bool {
+    #[cfg(unix)]
+    {
+        // `kill -0` exits 0 if the process exists and is signalable, non-zero otherwise.
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .map_or(true, |s| s.success()) // on spawn failure, keep the lock (don't reap)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
 /// A non-cryptographic localhost token (the real gate is the 0600 file + loopback bind).
 /// Avoids pulling in a rand/uuid dependency; mirrors `ptyhost::daemon::gen_token`.
 pub fn gen_token() -> String {

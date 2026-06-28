@@ -24,6 +24,7 @@ pub fn start(
 ) -> Option<McpServer> {
     let (listener, port) = bind_port()?;
     let token = discovery::gen_token();
+    discovery::clean_stale_locks(); // reap dead windows' locks so clients don't try a dead port
     let lock_path = discovery::write_lock(port, &workspace, &token)?;
 
     let accept_token = token.clone();
@@ -199,13 +200,13 @@ fn write_msg(ws: &mut tungstenite::WebSocket<TcpStream>, msg: tungstenite::Messa
 }
 
 /// Run one tool on the UI thread (via the bridge) and return its raw result Value.
-fn call_tool(name: &str, args: Value, req_tx: &Sender<McpRequest>, proxy: &EventLoopProxy<()>) -> Result<Value, String> {
+fn call_tool(name: &str, args: Value, req_tx: &Sender<McpRequest>, proxy: &EventLoopProxy<()>, timeout: Duration) -> Result<Value, String> {
     let (tx, rx) = channel();
     if req_tx.send(McpRequest { tool: name.to_string(), args, reply: tx }).is_err() {
         return Err("ide event loop unavailable".into());
     }
     let _ = proxy.send_event(()); // wake the UI thread to drain the request
-    rx.recv_timeout(Duration::from_secs(15)).unwrap_or_else(|_| Err("tool timed out".into()))
+    rx.recv_timeout(timeout).unwrap_or_else(|_| Err("tool timed out".into()))
 }
 
 /// Build the `initialize` instructions: orient the model on the terminal tools and list
@@ -221,7 +222,9 @@ fn startup_instructions(req_tx: &Sender<McpRequest>, proxy: &EventLoopProxy<()>)
          last N). Call listTerminals anytime to refresh. Report bugs/feedback about Aether \
          itself with submitFeedback (files a GitHub issue via the user's gh CLI).\n\n",
     );
-    let terms = call_tool("listTerminals", Value::Null, req_tx, proxy)
+    // Short timeout: a wedged UI thread must NOT stall the connect handshake (that surfaces
+    // to the client as -32000). Fall back to the base instructions if it doesn't answer fast.
+    let terms = call_tool("listTerminals", Value::Null, req_tx, proxy, Duration::from_millis(500))
         .ok()
         .and_then(|v| v.get("terminals").and_then(|t| t.as_array()).cloned())
         .unwrap_or_default();
@@ -244,7 +247,7 @@ fn startup_instructions(req_tx: &Sender<McpRequest>, proxy: &EventLoopProxy<()>)
 fn handle_call(id: &Option<Value>, params: &Value, req_tx: &Sender<McpRequest>, proxy: &EventLoopProxy<()>) -> Value {
     let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
     let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-    match call_tool(&name, args, req_tx, proxy) {
+    match call_tool(&name, args, req_tx, proxy, Duration::from_secs(15)) {
         Ok(value) => {
             // MCP tool result: a single text block carrying the JSON payload (matches
             // how Claude Code's IDE tools return structured data).
