@@ -448,11 +448,17 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         let content_h = app.workspace.tree.nodes.len() as f32 * theme::TREE_ROW_HEIGHT();
         app.explorer.scroll.set_metrics(tr, (tr.w, content_h));
     }
-    // Keep the terminal panel's resize bounds tied to the window height (and zoom),
-    // so it can grow to most of the window instead of a fixed zoom-1 cap.
+    // Keep the terminal panel's resize bounds tied to the window height (and zoom), so
+    // it can be dragged/maximized all the way up to the window header (covering the tab
+    // strip + breadcrumbs) — i.e. the full content area between the title and status bars.
     {
-        let max_h = (gpu.config.height as f32 - theme::zpx(200.0)).max(theme::TERMINAL_MIN_HEIGHT());
-        app.terminal.split.set_bounds(theme::TERMINAL_MIN_HEIGHT(), max_h);
+        let max_h = (gpu.config.height as f32 - theme::TITLE_BAR_H() - theme::STATUS_BAR_HEIGHT())
+            .max(theme::TERMINAL_MIN_HEIGHT());
+        // While dragging, let the panel shrink down to just its header (so it follows the
+        // cursor smoothly toward the status bar) but no further — below the header the
+        // tabs would spill over the status bar. The release handler closes it from there.
+        let min_h = if app.terminal.split.is_dragging() { theme::TERMINAL_HEADER_H() } else { theme::TERMINAL_MIN_HEIGHT() };
+        app.terminal.split.set_bounds(min_h, max_h);
     }
     if app.sidebar_visible && app.sidebar_view == SidebarView::SourceControl {
         if let Some(scp) = app.source_control.as_mut() {

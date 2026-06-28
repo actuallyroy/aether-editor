@@ -117,37 +117,34 @@ impl Layout {
             h: panel_h,
         };
         let content_right = w - rw;
-        let tab_strip = Rect {
-            x: editor_left,
-            y: tb,
-            w: (content_right - editor_left).max(0.0),
-            h: theme::TAB_HEIGHT(),
-        };
+        let content_w = (content_right - editor_left).max(0.0);
         // The find/replace widget floats over the editor's top-right (it doesn't
         // push the editor down), so no vertical reservation here.
         let _ = find_active;
-        // Breadcrumb path bar sits between the tab strip and the editor; it pushes
-        // the editor down by its height (0 when hidden).
-        let breadcrumbs = Rect {
-            x: editor_left,
-            y: tb + tab_strip.h,
-            w: (content_right - editor_left).max(0.0),
-            h: if show_breadcrumbs { theme::BREADCRUMB_HEIGHT() } else { 0.0 },
-        };
-        let editor_y = tb + tab_strip.h + breadcrumbs.h;
-        // Terminal panel sits above the status bar; the editor shrinks to fit. A
-        // maximize request (huge height) is clamped here to fill the whole content
-        // area (editor_h → 0); normal drag is bounded by the splitter's own max.
+        // The terminal panel occupies the bottom `term_h` of the content area (between
+        // the title and status bars) and grows UPWARD: it first eats the editor, then
+        // the breadcrumbs, then the tab strip — so a maximized/fully-dragged terminal
+        // covers everything up to the window header. The tab strip + breadcrumbs +
+        // editor share whatever space (`above_h`) is left above it.
+        let content_top = tb;
+        let content_h = (h - sb_h - tb).max(0.0);
         let term_h = match terminal_height {
-            Some(req) => req.min((h - editor_y - sb_h).max(0.0)),
+            Some(req) => req.min(content_h),
             None => 0.0,
         };
-        let editor_h = (h - editor_y - sb_h - term_h).max(0.0);
+        let above_h = (content_h - term_h).max(0.0);
+        let tab_h = theme::TAB_HEIGHT().min(above_h);
+        let bc_full = if show_breadcrumbs { theme::BREADCRUMB_HEIGHT() } else { 0.0 };
+        let bc_h = bc_full.min((above_h - tab_h).max(0.0));
+        let tab_strip = Rect { x: editor_left, y: content_top, w: content_w, h: tab_h };
+        let breadcrumbs = Rect { x: editor_left, y: content_top + tab_h, w: content_w, h: bc_h };
+        let editor_y = content_top + tab_h + bc_h;
+        let editor_h = (above_h - tab_h - bc_h).max(0.0);
         let terminal_panel = if term_h > 0.0 {
             Some(Rect {
                 x: editor_left,
-                y: editor_y + editor_h,
-                w: (content_right - editor_left).max(0.0),
+                y: content_top + above_h,
+                w: content_w,
                 h: term_h,
             })
         } else {

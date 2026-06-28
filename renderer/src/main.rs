@@ -344,6 +344,13 @@ fn build_file_peek(df: &diff::Diff, fname: String, clicked_line: usize, doc_vers
     }
 }
 
+// Trackpad momentum (fling) tuning. The gesture itself is applied directly; these only
+// govern the coast after the fingers lift. Glide distance ≈ lift-off velocity · FLING_TAU.
+const FLING_TAU: f32 = 0.32; // friction time-constant (s); larger = longer coast
+const FLING_MIN: f32 = 120.0; // px/s below which a lift starts no fling (gentle scroll)
+const FLING_STOP: f32 = 30.0; // px/s at which a live fling is considered stopped
+const FLING_VEL_MAX: f32 = 9000.0; // px/s cap on a frantic flick
+
 pub(crate) struct App {
     pub(crate) cwd: PathBuf,
     pub(crate) initial_file: Option<PathBuf>,
@@ -358,6 +365,18 @@ pub(crate) struct App {
     pub(crate) clipboard: Option<Clipboard>,
     /// Monotonic counter to give each pasted-image temp file a unique name.
     pub(crate) paste_image_seq: u32,
+    /// Trackpad momentum: velocity (px/s, in the dispatched dx/dy units) estimated
+    /// during a precise-scroll gesture, the time of the last scroll tick, and whether
+    /// a post-lift fling is currently coasting. Wheel scrolling doesn't use these.
+    pub(crate) scroll_vel: (f32, f32),
+    pub(crate) scroll_tick: Option<Instant>,
+    pub(crate) scroll_flinging: bool,
+    /// Pointer position captured during the gesture; the fling stays routed to this
+    /// region even if the cursor later moves off the scroll view.
+    pub(crate) scroll_anchor: PhysicalPosition<f64>,
+    /// True while a drag started on the status bar is stretching the terminal open
+    /// (the terminal may still be hidden until the drag passes the reveal threshold).
+    pub(crate) status_grip: bool,
     pub(crate) sidebar_visible: bool,
     pub(crate) sidebar_split: Splitter,
     pub(crate) palette: PaletteState,
@@ -586,6 +605,11 @@ impl App {
             mods: ModifiersState::empty(),
             clipboard: Clipboard::new().ok(),
             paste_image_seq: 0,
+            scroll_vel: (0.0, 0.0),
+            scroll_tick: None,
+            scroll_flinging: false,
+            scroll_anchor: PhysicalPosition::new(0.0, 0.0),
+            status_grip: false,
             sidebar_visible: true,
             sidebar_split: Splitter::new(
                 theme::SIDEBAR_WIDTH(),
@@ -1208,6 +1232,15 @@ impl App {
             && layout
                 .terminal_panel
                 .map_or(false, |panel| self.terminal.split.handle_rect(panel).contains(p));
+        // With the terminal closed, its resize handle lives on the status bar's top edge
+        // (VS Code-style): grab it to drag the panel back open.
+        let over_status_edge = layout.palette.is_none() && !self.terminal.visible && {
+            let half = theme::SIDEBAR_RESIZE_HANDLE() * 0.5;
+            p.1 >= layout.status_bar.y - half
+                && p.1 <= layout.status_bar.y + half
+                && p.0 >= layout.status_bar.x
+                && p.0 < layout.status_bar.x + layout.status_bar.w
+        };
         // Terminal panel header buttons + tab-list rows are clickable IconButtons/rows.
         let over_term_btn = self.terminal.visible
             && layout.palette.is_none()
@@ -1363,7 +1396,7 @@ impl App {
             c
         } else if let Some(c) = find_cursor {
             c
-        } else if self.terminal.split.is_dragging() || over_term_handle {
+        } else if self.terminal.split.is_dragging() || over_term_handle || over_status_edge {
             self.terminal.split.cursor()
         } else if over_term_btn {
             CursorIcon::Pointer
@@ -6558,6 +6591,23 @@ impl App {
             return;
         }
 
+        // Closed-terminal reveal handle: a thin strip on the status bar's top edge.
+        // Grabbing it starts a resize drag that opens the panel (VS Code-style).
+        if !self.terminal.visible && layout.palette.is_none() {
+            let half = theme::SIDEBAR_RESIZE_HANDLE() * 0.5;
+            let edge = Rect {
+                x: layout.status_bar.x,
+                y: layout.status_bar.y - half,
+                w: layout.status_bar.w,
+                h: half * 2.0,
+            };
+            if edge.contains((x, y)) {
+                self.status_grip = true;
+                self.terminal.split.begin_drag();
+                return;
+            }
+        }
+
         if layout.status_bar.contains((x, y)) {
             // Branch indicator (far left): open the checkout quick-pick. Geometry must
             // match render.rs's status-bar branch block.
@@ -6591,6 +6641,12 @@ impl App {
                 self.zoom_step(0.1);
             } else if cells[1].contains((x, y)) {
                 self.set_zoom(1.0); // click the % to reset
+            } else {
+                // Empty status-bar area is a grip: drag up to reveal/resize the terminal.
+                // The terminal stays hidden until the drag passes the reveal threshold
+                // (so a plain click doesn't pop it open).
+                self.status_grip = true;
+                self.terminal.split.begin_drag();
             }
             return;
         }
@@ -7464,8 +7520,23 @@ impl App {
         if self.terminal.split.is_dragging() && self.mouse_pressed {
             // Height is measured up from the panel's bottom edge (status bar top).
             let origin = self.layout().status_bar.y;
-            if self.terminal.split.drag(y, origin) {
-                self.redraw();
+            // Status-bar grip: reveal the terminal once dragged up far enough, then let
+            // the normal splitter drag take the height from there.
+            if self.status_grip && !self.terminal.visible && origin - y > theme::SIDEBAR_RESIZE_HANDLE() {
+                self.toggle_terminal();
+                // Open exactly at the cursor. Lower the min first (render only relaxes it
+                // to the header height on the NEXT frame) so set_size isn't clamped up to
+                // the closed min — which would flash the panel at ~min height for a frame.
+                self.terminal.split.set_min(theme::TERMINAL_HEADER_H());
+                self.terminal.split.set_size(origin - y);
+            }
+            if self.terminal.visible {
+                self.terminal.maximized = false;
+                // The panel follows the cursor down past its minimum (render relaxed the
+                // min while dragging); the release handler decides whether to close.
+                if self.terminal.split.drag(y, origin) {
+                    self.redraw();
+                }
             }
             return;
         }
@@ -7655,7 +7726,19 @@ impl App {
         if let Some(c) = self.chat.as_mut() {
             c.scroll.release();
         }
+        // Finishing a terminal resize: if it was shrunk below half the minimum, treat it
+        // as a close (and reset the stored height so it reopens at a sensible size).
+        // Otherwise the splitter re-clamps back up to the minimum on the next frame.
+        if self.terminal.split.is_dragging()
+            && self.terminal.visible
+            && self.terminal.split.size() < theme::TERMINAL_MIN_HEIGHT()
+        {
+            self.terminal.visible = false;
+            self.terminal.focused = false;
+            self.terminal.split.set_size(theme::TERMINAL_HEIGHT());
+        }
         self.terminal.split.release();
+        self.status_grip = false;
         self.terminal.release_scrolls();
         self.terminal.selection_release();
         self.terminal.end_tab_drag();
@@ -7712,6 +7795,103 @@ impl App {
         self.workspace.tree.refresh();
         self.invalidate_file_index();
         self.refresh_source_control();
+    }
+
+    /// Update the running velocity estimate from one precise-scroll delta. `started`
+    /// resets the estimate (new gesture). Velocity is in px/s of the dispatched dx/dy.
+    fn track_scroll_velocity(&mut self, dx: f32, dy: f32, started: bool) {
+        let now = Instant::now();
+        // dt since the last tick; on the first event of a gesture use a nominal frame.
+        let dt = if started {
+            0.016
+        } else {
+            self.scroll_tick.map_or(0.016, |t| now.saturating_duration_since(t).as_secs_f32())
+        }
+        .clamp(0.004, 0.1); // guard against sub-ms gaps (huge inst) and long pauses
+        let inst = (dx / dt, dy / dt);
+        if started {
+            self.scroll_vel = inst;
+        } else {
+            // Light EWMA so the lift-off velocity tracks the recent gesture, not noise.
+            const A: f32 = 0.4;
+            self.scroll_vel.0 = self.scroll_vel.0 * (1.0 - A) + inst.0 * A;
+            self.scroll_vel.1 = self.scroll_vel.1 * (1.0 - A) + inst.1 * A;
+        }
+        self.scroll_tick = Some(now);
+    }
+
+    /// Begin a momentum fling using the tracked velocity, if it's fast enough to bother.
+    fn start_scroll_fling(&mut self) {
+        let v = &mut self.scroll_vel;
+        v.0 = v.0.clamp(-FLING_VEL_MAX, FLING_VEL_MAX);
+        v.1 = v.1.clamp(-FLING_VEL_MAX, FLING_VEL_MAX);
+        if v.0.abs() > FLING_MIN || v.1.abs() > FLING_MIN {
+            self.scroll_flinging = true;
+            self.scroll_tick = Some(Instant::now());
+            self.redraw();
+        } else {
+            self.scroll_flinging = false;
+        }
+    }
+
+    /// Advance an active fling by one frame: scroll by velocity·dt, decay under
+    /// friction, and stop when slow or when nothing moved (hit an edge). Returns true
+    /// while the fling is still live (caller should keep waking).
+    fn step_scroll_fling(&mut self, now: Instant) -> bool {
+        if !self.scroll_flinging {
+            return false;
+        }
+        let dt = self.scroll_tick.map_or(0.016, |t| now.saturating_duration_since(t).as_secs_f32()).clamp(0.001, 0.05);
+        self.scroll_tick = Some(now);
+        let (vx, vy) = self.scroll_vel;
+        // Route the fling to the gesture's region (the anchor), not wherever the cursor
+        // happens to be now — so moving the pointer away doesn't stop the coast.
+        let saved = self.mouse_pos;
+        self.mouse_pos = self.scroll_anchor;
+        let mut moved = false;
+        if vy.abs() > 0.0 {
+            moved |= self.on_scroll_moved(vy * dt);
+        }
+        if vx.abs() > 0.0 {
+            moved |= self.on_scroll_h_moved(vx * dt);
+        }
+        self.mouse_pos = saved;
+        let decay = (-dt / FLING_TAU).exp();
+        self.scroll_vel.0 *= decay;
+        self.scroll_vel.1 *= decay;
+        if !moved || (self.scroll_vel.0.abs() < FLING_STOP && self.scroll_vel.1.abs() < FLING_STOP) {
+            self.scroll_flinging = false;
+        }
+        self.scroll_flinging
+    }
+
+    /// `on_scroll` that reports whether the target actually moved (for fling edge-stop).
+    fn on_scroll_moved(&mut self, dy: f32) -> bool {
+        let before = self.focused_scroll_offset();
+        self.on_scroll(dy);
+        self.focused_scroll_offset() != before
+    }
+
+    fn on_scroll_h_moved(&mut self, dx: f32) -> bool {
+        let before = self.focused_scroll_offset();
+        self.on_scroll_h(dx);
+        self.focused_scroll_offset() != before
+    }
+
+    /// A cheap snapshot of the scroll offset under the pointer, used only to detect
+    /// "did the fling actually move anything" so it can stop dead at content edges.
+    /// Falls back to the active document's offset (the common fling target).
+    fn focused_scroll_offset(&self) -> (f32, f32) {
+        let p = (self.mouse_pos.x as f32, self.mouse_pos.y as f32);
+        if self.terminal.visible {
+            if let Some(g) = self.terminal.groups.get(self.terminal.active) {
+                if let Some(pane) = g.panes.get(g.focused) {
+                    let _ = p;
+                    return pane.scroll.offset();
+                }
+            }
+        }
+        self.workspace.active_doc().map_or((0.0, 0.0), |d| (d.scroll_x(), d.scroll_y()))
     }
 
     fn on_scroll(&mut self, dy: f32) {
@@ -9489,6 +9669,15 @@ impl ApplicationHandler for App {
             self.apply_claude_live(live, now);
         }
 
+        // Trackpad momentum: advance a coasting fling and keep waking until it settles.
+        if self.scroll_flinging {
+            if self.step_scroll_fling(now) {
+                self.redraw();
+                el.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(8)));
+                return;
+            }
+        }
+
         // Integrated terminal: keep ticking while open so new output appears promptly.
         if self.terminal.visible {
             let mut changed = polled;
@@ -9767,7 +9956,8 @@ impl ApplicationHandler for App {
                     _ => {}
                 }
             }
-            WindowEvent::MouseWheel { delta, .. } => {
+            WindowEvent::MouseWheel { delta, phase, .. } => {
+                let pixel = matches!(delta, MouseScrollDelta::PixelDelta(_));
                 let (mut dx, mut dy) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => {
                         (x * theme::LINE_HEIGHT() * 3.0, y * theme::LINE_HEIGHT() * 3.0)
@@ -9779,11 +9969,27 @@ impl ApplicationHandler for App {
                     dx = dy;
                     dy = 0.0;
                 }
-                if dy != 0.0 {
-                    self.on_scroll(dy);
-                }
-                if dx != 0.0 {
-                    self.on_scroll_h(dx);
+                // A real (mouse-wheel) event interrupts any coasting fling.
+                self.scroll_flinging = false;
+                if pixel && phase == winit::event::TouchPhase::Ended {
+                    // Fingers lifted: coast with the velocity built up during the gesture.
+                    self.start_scroll_fling();
+                } else {
+                    // Precise-scroll gesture (or wheel): apply directly — the trackpad's
+                    // deltas are already smooth — and, for pixel events, track velocity so
+                    // the eventual lift can fling.
+                    if pixel {
+                        self.track_scroll_velocity(dx, dy, phase == winit::event::TouchPhase::Started);
+                        // Remember where the gesture is happening so the fling keeps
+                        // scrolling this region after the cursor moves away.
+                        self.scroll_anchor = self.mouse_pos;
+                    }
+                    if dy != 0.0 {
+                        self.on_scroll(dy);
+                    }
+                    if dx != 0.0 {
+                        self.on_scroll_h(dx);
+                    }
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {

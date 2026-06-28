@@ -2699,6 +2699,19 @@ impl Splitter {
         }
     }
 
+    /// Force the drag state on (used when another grip — e.g. the status bar — starts
+    /// resizing this panel without the cursor being on the handle strip).
+    pub fn begin_drag(&mut self) {
+        self.dragging = true;
+    }
+
+    /// Lower (or raise) just the minimum and re-clamp. Used so a freshly-revealed panel
+    /// can be sized to the cursor immediately, before the next frame updates the bounds.
+    pub fn set_min(&mut self, min: f32) {
+        self.min = min.min(self.max);
+        self.size = self.size.clamp(self.min, self.max);
+    }
+
     /// Begin a drag if `p` lands on the handle. Returns true if a drag started.
     pub fn press(&mut self, p: (f32, f32), region: Rect) -> bool {
         if self.handle_rect(region).contains(p) {
