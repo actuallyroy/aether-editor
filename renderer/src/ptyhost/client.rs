@@ -10,7 +10,14 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use winit::event_loop::EventLoopProxy;
+
 use super::{Frame, HostInfo, Msg, TermId, TermInfo};
+
+/// Wakes the GUI event loop when a daemon frame arrives, so new terminal output is
+/// drained the instant it lands. Without it, the loop had to busy-poll at ~33Hz
+/// whenever the terminal panel was open — which kept the CPU from ever sleeping.
+pub type Waker = EventLoopProxy<()>;
 
 /// Shared write half of the daemon connection — cloned into every `Terminal`.
 pub type Conn = Arc<Mutex<TcpStream>>;
@@ -48,15 +55,15 @@ pub struct Client {
 impl Client {
     /// Connect to the running daemon, or spawn one (detached) and connect. Returns
     /// the client plus the daemon's current terminals (to re-attach on launch).
-    pub fn connect_or_spawn(workspace: &str) -> Option<(Client, Vec<TermInfo>)> {
-        if let Some(c) = try_connect(workspace) {
+    pub fn connect_or_spawn(workspace: &str, waker: Option<Waker>) -> Option<(Client, Vec<TermInfo>)> {
+        if let Some(c) = try_connect(workspace, waker.clone()) {
             return Some(c);
         }
         spawn_daemon();
         // The daemon needs a moment to bind + write its discovery file.
         for _ in 0..60 {
             std::thread::sleep(Duration::from_millis(50));
-            if let Some(c) = try_connect(workspace) {
+            if let Some(c) = try_connect(workspace, waker.clone()) {
                 return Some(c);
             }
         }
@@ -173,7 +180,7 @@ impl Client {
 
 /// Read the discovery file, connect, authenticate (declaring the window's workspace
 /// so re-attach is scoped to it), and start the reader thread.
-fn try_connect(workspace: &str) -> Option<(Client, Vec<TermInfo>)> {
+fn try_connect(workspace: &str, waker: Option<Waker>) -> Option<(Client, Vec<TermInfo>)> {
     let path = super::info_path()?;
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
@@ -222,6 +229,12 @@ fn try_connect(workspace: &str) -> Option<(Client, Vec<TermInfo>)> {
             Ok(f) => {
                 if tx.send(f).is_err() {
                     break;
+                }
+                // Nudge the GUI loop so it drains this frame immediately while idle —
+                // otherwise it only notices output by polling, forcing a perpetual
+                // 30ms tick the whole time the panel is open.
+                if let Some(w) = &waker {
+                    let _ = w.send_event(());
                 }
             }
             Err(_) => break, // daemon gone / socket closed

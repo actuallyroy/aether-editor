@@ -9685,7 +9685,17 @@ impl ApplicationHandler for App {
                 self.redraw();
             }
             self.cursor_blink_on = true;
-            el.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(30)));
+            // Only hold the fast output-batching tick while bytes are actively arriving;
+            // the 30ms cadence coalesces a burst into ~33fps. Once output goes quiet,
+            // fall back to the cursor-blink cadence and let the pty reader's waker nudge
+            // us the instant new output lands — so an idle terminal panel no longer pins
+            // the CPU at 33Hz forever (the main battery drain).
+            let wake = if polled {
+                now + Duration::from_millis(30)
+            } else {
+                self.term_last_blink + Duration::from_millis(theme::BLINK_MS)
+            };
+            el.set_control_flow(ControlFlow::WaitUntil(wake));
             return;
         }
 
@@ -10159,6 +10169,10 @@ fn main() -> Result<()> {
     macos_launcher::ensure_icon_async();
     let mut app = App::new(root, initial_file);
     app.proxy = Some(event_loop.create_proxy());
+    // Let the terminal's daemon connection wake the loop on output, so it doesn't
+    // have to busy-poll while the panel is open (see the terminal branch in
+    // `about_to_wait`).
+    app.terminal.set_waker(event_loop.create_proxy());
     event_loop.run_app(&mut app)?;
     Ok(())
 }

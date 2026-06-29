@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use crate::layout::Layout;
-use crate::ptyhost::client::{Client, Incoming};
+use crate::ptyhost::client::{Client, Incoming, Waker};
 use crate::terminal;
 use crate::theme;
 use crate::widgets::{Axis, Rect, Splitter};
@@ -59,6 +59,10 @@ pub struct TerminalPanel {
     /// IDE-integration MCP port (set once the GUI's MCP server starts). Injected as
     /// `CLAUDE_CODE_SSE_PORT` into shells we spawn so `claude` auto-connects.
     ide_port: Option<u16>,
+    /// Wakes the event loop when daemon frames arrive (set once the loop exists, like
+    /// `App::proxy`). Handed to the client's reader thread on connect so terminal
+    /// output drains without busy-polling.
+    waker: Option<Waker>,
 }
 
 impl TerminalPanel {
@@ -86,6 +90,7 @@ impl TerminalPanel {
             reattach: Vec::new(),
             tab_drag: None,
             ide_port: None,
+            waker: None,
         }
     }
 
@@ -93,6 +98,12 @@ impl TerminalPanel {
     /// so `claude` auto-connects to this window.
     pub fn set_ide_port(&mut self, port: u16) {
         self.ide_port = Some(port);
+    }
+
+    /// Hand the panel the event-loop waker so the daemon connection can nudge the GUI
+    /// when output arrives. Set once at startup, before the first terminal connects.
+    pub fn set_waker(&mut self, waker: Waker) {
+        self.waker = Some(waker);
     }
 
     /// Env vars injected into shells we spawn (IDE auto-detect).
@@ -134,7 +145,9 @@ impl TerminalPanel {
         // Sweep daemons stranded by past protocol bumps of this binary (their
         // shells would otherwise run invisibly forever after an in-app update).
         crate::ptyhost::cleanup_stale_daemons();
-        if let Some((client, terminals)) = Client::connect_or_spawn(&self.cwd.to_string_lossy()) {
+        if let Some((client, terminals)) =
+            Client::connect_or_spawn(&self.cwd.to_string_lossy(), self.waker.clone())
+        {
             self.client = Some(client);
             self.reattach = terminals;
         }
