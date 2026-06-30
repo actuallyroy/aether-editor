@@ -906,9 +906,6 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 let rects = crate::terminal_pane_rects(area, n);
                 let panes = app.terminal.groups.get_mut(app.terminal.active).map(|g| &mut g.panes);
                 for (i, pane) in panes.into_iter().flatten().enumerate() {
-                    if !pane.dirty {
-                        continue;
-                    }
                     let rect = rects[i];
                     // Clamp to the same max the caret uses (`total - grid_rows`) so the
                     // text window never starts past the point where the bottom line fits
@@ -916,6 +913,13 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     let grid_rows = pane.term.dims().1;
                     let back = pane.term.total_lines().saturating_sub(grid_rows);
                     let top_line = ((pane.scroll.offset().1 / theme::LINE_HEIGHT()).round() as usize).min(back);
+                    // Reshape on a content change (`dirty`) OR when the window moved to a
+                    // new `top_line` without one — the per-frame bg/cursor quads already
+                    // use the live `top_line`, so a stale buffer here is what stitches old
+                    // rows under the new frame.
+                    if !pane.dirty && pane.shaped_top == Some(top_line) {
+                        continue;
+                    }
                     let owned: Vec<(String, Attrs)> = pane
                         .term
                         .visual_spans(top_line)
@@ -954,6 +958,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                         app.terminal_cell_w = adv;
                     }
                     pane.dirty = false;
+                    pane.shaped_top = Some(top_line);
                 }
             }
         }

@@ -18,6 +18,13 @@ pub struct Pane {
     pub term: Terminal,
     pub scroll: ScrollView,
     pub dirty: bool,
+    /// The `top_line` the glyph buffer was last shaped at. The buffer caches the
+    /// rows from `top_line` down and is otherwise only rebuilt on `dirty`, but the
+    /// scroll offset (hence `top_line`) can shift without a content change — e.g.
+    /// `stick_to_end` re-pinning or a geometry clamp in `set_metrics`, neither of
+    /// which sets `dirty`. Reshaping when this no longer matches the current
+    /// `top_line` keeps the cached text from being stitched onto stale rows.
+    pub shaped_top: Option<usize>,
     /// Text selection as (anchor, head), each a `(line, col)` in combined-buffer
     /// coordinates (`scrollback ++ live`). `None` when there's no selection.
     pub sel: Option<(TermPos, TermPos)>,
@@ -42,6 +49,7 @@ impl Pane {
                 stick_to_end: true,
             }),
             dirty: true,
+            shaped_top: None,
             sel: None,
             sel_dragging: false,
             pending_cmd: None,
