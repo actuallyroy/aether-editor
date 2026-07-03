@@ -194,6 +194,20 @@ impl TerminalPanel {
                         if let Some(c) = self.client.as_ref() {
                             c.detach(id);
                         }
+                    } else if let Some(c) = self.client.as_ref() {
+                        // Persist this tab's stable MCP id against the daemon terminal,
+                        // so a reconnect/restart re-attaches with the same id (#46). Only
+                        // for single-pane groups — a split pane becomes its own tab on
+                        // reattach, so sharing the group id would collide.
+                        if let Some(g) = self
+                            .groups
+                            .iter()
+                            .find(|g| g.panes.iter().any(|p| p.term.id == id))
+                        {
+                            if g.panes.len() == 1 {
+                                c.set_tab_id(id, g.id);
+                            }
+                        }
                     }
                 }
                 Incoming::Backlog { id, data } => {
@@ -753,9 +767,18 @@ impl TerminalPanel {
                     } else {
                         (info.rows as usize, info.cols as usize)
                     };
+                    let tab_id = info.tab_id;
                     let term = terminal::Terminal::new_bound(client.conn(), info.id, rows, cols, info.title);
                     client.attach(info.id);
-                    self.groups.push(terminal::Group::new(terminal::Pane::wrap(term)));
+                    let pane = terminal::Pane::wrap(term);
+                    // Restore the same MCP-facing id the daemon persisted, so external
+                    // references survive reconnect/restart (#46). 0 = unknown → fresh id.
+                    let group = if tab_id != 0 {
+                        terminal::Group::with_id(pane, tab_id)
+                    } else {
+                        terminal::Group::new(pane)
+                    };
+                    self.groups.push(group);
                 }
                 self.active = 0;
                 self.mark_dirty();

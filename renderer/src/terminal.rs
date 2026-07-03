@@ -94,6 +94,23 @@ impl Group {
         }
     }
 
+    /// Re-create a group with a known stable id (the one persisted by the daemon),
+    /// so an MCP-referenced terminal keeps the same id across reconnect/restart (#46).
+    /// Also advances the monotonic allocator past `id` so a future fresh tab can't
+    /// collide with a restored one.
+    pub fn with_id(pane: Pane, id: u64) -> Self {
+        use std::sync::atomic::Ordering;
+        // Bump NEXT_TAB_ID to at least id+1 (CAS loop — never lower it).
+        let mut cur = NEXT_TAB_ID.load(Ordering::Relaxed);
+        while cur <= id {
+            match NEXT_TAB_ID.compare_exchange_weak(cur, id + 1, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+        Self { panes: vec![pane], focused: 0, id }
+    }
+
     /// Tab label — the focused pane's shell name (e.g. "cmd"), with a "+N" suffix
     /// when the group holds multiple split panes.
     pub fn title(&self) -> String {

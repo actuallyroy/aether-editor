@@ -270,3 +270,10 @@ pub fn entries(idx: usize) -> &'static [Entry] {
         _ => &[],
     }
 }
+
+/// Does this entry open a cascading submenu (rather than run a command)? Used by the
+/// custom in-window menu to render a `›` and pop out a child list on hover/click.
+/// (On macOS the native menu builds real `Submenu`s instead — see `macos_menu`.)
+pub fn is_submenu(cmd: &MenuCmd) -> bool {
+    matches!(cmd, MenuCmd::OpenRecent)
+}

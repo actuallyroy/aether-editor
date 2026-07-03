@@ -162,6 +162,66 @@ impl IconButton {
     }
 }
 
+/// A reusable text button: a filled, rounded rect with a centered label, hover/press
+/// tinting, and two visual weights. The single source of truth for button chrome so
+/// the SCM Commit / Initialize buttons, dialog actions, and inline actions look and
+/// behave alike. Like the other widgets it owns its label buffer but takes the rect
+/// at draw time (layout lives with the caller).
+#[derive(Clone, Copy, PartialEq)]
+pub enum ButtonKind {
+    Primary,   // accent fill, white label — the affirmative / default action
+    Secondary, // subtle fill, normal label — secondary actions (Cancel, …)
+}
+
+pub struct Button {
+    label: TextLabel,
+    pub kind: ButtonKind,
+}
+
+impl Button {
+    pub fn new(fs: &mut FontSystem, text: &str, kind: ButtonKind) -> Self {
+        let mut label = TextLabel::new(fs, 400.0, theme::UI_LINE_HEIGHT());
+        label.set(fs, text, theme::UI_FAMILY());
+        Self { label, kind }
+    }
+    pub fn set_text(&mut self, fs: &mut FontSystem, text: &str) {
+        self.label.set(fs, text, theme::UI_FAMILY());
+    }
+    pub fn reshape(&mut self, fs: &mut FontSystem) {
+        self.label.reshape(fs);
+    }
+    /// Preferred content width (label + comfortable horizontal padding).
+    pub fn width(&self) -> f32 {
+        self.label.width() + theme::zpx(28.0)
+    }
+    fn fill(&self, hovered: bool, pressed: bool) -> [f32; 4] {
+        match self.kind {
+            ButtonKind::Primary => {
+                let [r, g, b, a] = theme::ACCENT();
+                let k = if pressed { 0.9 } else if hovered { 1.12 } else { 1.0 };
+                [r * k, g * k, b * k, a]
+            }
+            ButtonKind::Secondary => {
+                if hovered || pressed { theme::DIALOG_BTN_HOVER() } else { theme::DIALOG_BTN() }
+            }
+        }
+    }
+    fn text_color(&self) -> glyphon::Color {
+        match self.kind {
+            ButtonKind::Primary => theme::BADGE_FG(),
+            ButtonKind::Secondary => theme::FG_TEXT(),
+        }
+    }
+    /// Rounded fill for the bg pass.
+    pub fn draw_bg(&self, rect: Rect, hovered: bool, pressed: bool, quads: &mut Vec<Quad>) {
+        quads.push(rect.rounded_quad(self.fill(hovered, pressed), theme::zpx(5.0)));
+    }
+    /// Centered label for the text pass.
+    pub fn draw<'a>(&'a self, rect: Rect, areas: &mut Vec<TextArea<'a>>) {
+        self.label.draw_center(rect, self.text_color(), areas);
+    }
+}
+
 /// Reusable single-line text label. Owns its buffer *and* its last content, so
 /// it reshapes only when the text actually changes (no parallel cache string),
 /// and draws a TextArea clipped to a supplied rect — that rect being the single
@@ -1620,12 +1680,37 @@ impl ListView {
     /// Widest shaped row (px) including the left+right padding — for sizing a popup
     /// (e.g. a context menu) to its content instead of a fixed width.
     pub fn content_width(&self) -> f32 {
-        let max = self
-            .buffer
-            .layout_runs()
-            .map(|r| r.line_w)
-            .fold(0.0_f32, f32::max);
-        max + self.pad_x() * 2.0
+        self.max_line_w() + self.pad_x() * 2.0
+    }
+
+    /// Widest shaped row (px), no padding.
+    pub fn max_line_w(&self) -> f32 {
+        self.buffer.layout_runs().map(|r| r.line_w).fold(0.0_f32, f32::max)
+    }
+
+    /// Shaped width (px) of a single row's text, or None if that row has no run.
+    pub fn line_w(&self, row: usize) -> Option<f32> {
+        self.buffer.layout_runs().find(|r| r.line_i == row).map(|r| r.line_w)
+    }
+
+    /// Push the whole buffer at an explicit (left, top), clipped to `clip`. Used to
+    /// render one right-aligned row of a multi-row buffer: position so the target
+    /// line lands where wanted and clip to that row so the rest is hidden.
+    pub fn push_at<'a>(&'a self, left: f32, top: f32, clip: Rect, color: glyphon::Color, areas: &mut Vec<TextArea<'a>>) {
+        areas.push(TextArea {
+            buffer: &self.buffer,
+            left,
+            top,
+            scale: 1.0,
+            bounds: TextBounds {
+                left: clip.x as i32,
+                top: clip.y as i32,
+                right: (clip.x + clip.w) as i32,
+                bottom: (clip.y + clip.h) as i32,
+            },
+            default_color: color,
+            custom_glyphs: &[],
+        });
     }
 
     /// Draw the buffer with row 0 placed at `top`, clipped to `clip`. Lets a
@@ -2235,22 +2320,36 @@ impl Keycaps {
 /// row geometry/hit-test/draw, so item rects are the single source of truth for
 /// hover highlight and clicks. The caller maps item index → action.
 pub struct Menu {
-    list: ListView,
+    list: ListView,   // labels (left column)
+    hints: ListView,  // shortcut hints (right column, right-aligned per row)
     count: usize,
     base_w: f32,  // unzoomed MAX width (the menu never grows past this)
     box_w: f32,   // current zoomed width, sized to the entries' content
+    label_col_w: f32, // clip width for labels (they truncate before the hint column)
     seps: Vec<usize>, // separator row indices — drawn as divider lines, not clickable
+    arrow: IconButton, // right-aligned "›" glyph for cascading-submenu rows
+    arrows: Vec<usize>, // row indices that open a submenu (draw the arrow)
 }
 
 impl Menu {
     pub fn new(fs: &mut FontSystem, width: f32) -> Self {
         Self {
             list: ListView::new(fs, width, 400.0, theme::MENU_ITEM_H(), 12.0),
+            hints: ListView::new(fs, width, 400.0, theme::MENU_ITEM_H(), 12.0),
             count: 0,
             base_w: width / theme::ui_zoom(),
             box_w: width,
+            label_col_w: width,
             seps: Vec::new(),
+            arrow: IconButton::new(fs, '›', theme::UI_FAMILY(), theme::UI_FONT_SIZE()),
+            arrows: Vec::new(),
         }
+    }
+
+    /// Mark which rows are cascading-submenu parents — they get a right-aligned `›`
+    /// drawn in the text color. Call after `set_entries` (which clears the marks).
+    pub fn set_arrows(&mut self, rows: Vec<usize>) {
+        self.arrows = rows;
     }
 
     /// Current popup width — sized to the widest entry (set in `set_entries`),
@@ -2259,10 +2358,12 @@ impl Menu {
         self.box_w
     }
 
-    /// Full rows: `(label, shortcut-hint, is_separator)`. Hints render dim after the
-    /// label; separator rows draw as divider lines and don't hover or click. Raw
-    /// hint strings (`"Ctrl+Shift+P"`) are reformatted into compact key-cap symbols
-    /// (`⇧⌘P` on macOS, `Ctrl+⇧+P`-style elsewhere) so they read like a real menu.
+    /// Full rows: `(label, shortcut-hint, is_separator)`. Labels fill the left
+    /// column; shortcut hints are drawn dim and RIGHT-ALIGNED in their own column so
+    /// they line up and never clip — a long label truncates before the hint instead.
+    /// Separator rows draw as divider lines and don't hover or click. Raw hint strings
+    /// (`"Ctrl+Shift+P"`) are reformatted into compact key-cap symbols (`⇧⌘P` on macOS,
+    /// `Ctrl+⇧+P`-style elsewhere) so they read like a real menu.
     pub fn set_entries(&mut self, fs: &mut FontSystem, rows: &[(&str, &str, bool)]) {
         let label_attrs = glyphon::Attrs::new()
             .family(glyphon::Family::Name(theme::UI_FAMILY()))
@@ -2270,33 +2371,44 @@ impl Menu {
         let hint_attrs = glyphon::Attrs::new()
             .family(glyphon::Family::Name(theme::UI_FAMILY()))
             .color(theme::FG_DIM());
-        let mut key = String::from("M\n");
-        let mut spans: Vec<(String, glyphon::Attrs<'static>)> = Vec::new();
+        let mut lkey = String::from("L\n");
+        let mut lspans: Vec<(String, glyphon::Attrs<'static>)> = Vec::new();
+        let mut hkey = String::from("H\n");
+        let mut hspans: Vec<(String, glyphon::Attrs<'static>)> = Vec::new();
         self.seps.clear();
+        self.arrows.clear();
+        self.arrow.reshape(fs);
         for (i, (label, hint, sep)) in rows.iter().enumerate() {
             if *sep {
                 self.seps.push(i);
-                spans.push(("\n".to_string(), label_attrs));
-                key.push_str("--\n");
+                lspans.push(("\n".to_string(), label_attrs));
+                hspans.push(("\n".to_string(), hint_attrs));
+                lkey.push_str("--\n");
+                hkey.push_str("--\n");
                 continue;
             }
-            spans.push((format!(" {}", label), label_attrs));
+            lspans.push((format!(" {}\n", label), label_attrs));
+            lkey.push_str(label);
+            lkey.push('\n');
             let pretty = pretty_hint(hint);
-            if pretty.is_empty() {
-                spans.push(("\n".to_string(), label_attrs));
-            } else {
-                spans.push((format!("    {}\n", pretty), hint_attrs));
-            }
-            key.push_str(label);
-            key.push(' ');
-            key.push_str(&pretty);
-            key.push('\n');
+            hspans.push((format!("{}\n", pretty), hint_attrs));
+            hkey.push_str(&pretty);
+            hkey.push('\n');
         }
-        // Shape at the max width (no wrap), then size the box to the actual content
-        // so short menus aren't needlessly wide. Clamp to a minimum and the max.
+        // Shape both columns at the max width (no wrap), then size the box to fit the
+        // widest label + a gap + the widest hint, clamped to a min and the max. When
+        // the total would exceed the max, the label column shrinks (labels truncate).
         let max_w = self.base_w * theme::ui_zoom();
-        self.list.set_rich(fs, &key, &spans, max_w, 4000.0);
-        self.box_w = (self.list.content_width() + theme::zpx(20.0)).clamp(theme::zpx(120.0), max_w);
+        self.list.set_rich(fs, &lkey, &lspans, max_w, 4000.0);
+        self.hints.set_rich(fs, &hkey, &hspans, max_w, 4000.0);
+        let pad = self.list.pad_x();
+        let gap = theme::zpx(28.0);
+        let label_raw = self.list.max_line_w();
+        let hint_raw = self.hints.max_line_w();
+        let hint_block = if hint_raw > 0.5 { gap + hint_raw } else { 0.0 };
+        self.box_w = (pad + label_raw + hint_block + pad).clamp(theme::zpx(120.0), max_w);
+        // Right edge the labels clip at (leaving the gap + hint column free).
+        self.label_col_w = (self.box_w - pad - hint_block).max(pad);
         self.count = rows.len();
     }
 
@@ -2320,6 +2432,11 @@ impl Menu {
         self.list
             .row_at(self.inner(menu), p, self.count)
             .filter(|i| !self.seps.contains(i))
+    }
+
+    /// Screen rect of row `i` — used to anchor a cascading submenu beside its parent.
+    pub fn row_rect(&self, menu: Rect, i: usize) -> Rect {
+        self.list.row_rect(self.inner(menu), i)
     }
 
     pub fn draw_bg(&self, menu: Rect, hovered: Option<usize>, quads: &mut Vec<Quad>) {
@@ -2354,7 +2471,33 @@ impl Menu {
     }
 
     pub fn draw<'a>(&'a self, menu: Rect, areas: &mut Vec<TextArea<'a>>) {
-        self.list.draw(self.inner(menu), theme::FG_TEXT(), areas);
+        let inner = self.inner(menu);
+        let pad = self.list.pad_x();
+        // Labels, clipped to the label column so a long one truncates before the hint.
+        let label_clip = Rect { x: inner.x, y: inner.y, w: self.label_col_w, h: inner.h };
+        self.list.draw(label_clip, theme::FG_TEXT(), areas);
+        // Shortcut hints: right-aligned in their column. Each is one line of the hints
+        // buffer, positioned so that line's right edge hugs the row's right padding and
+        // clipped to its own row (the rest of the buffer is hidden by the clip).
+        for i in 0..self.count {
+            if self.seps.contains(&i) {
+                continue;
+            }
+            if let Some(w) = self.hints.line_w(i) {
+                if w > 0.5 {
+                    let row = self.list.row_rect(inner, i);
+                    let left = row.x + row.w - pad - w;
+                    self.hints.push_at(left, inner.y, row, theme::FG_DIM(), areas);
+                }
+            }
+        }
+        // Right-aligned submenu arrows, in the same colour as the label text.
+        for &i in &self.arrows {
+            let row = self.list.row_rect(inner, i);
+            let w = theme::MENU_ITEM_H();
+            let cell = Rect { x: row.x + row.w - w - pad, y: row.y, w, h: row.h };
+            self.arrow.draw(cell, theme::FG_TEXT(), areas);
+        }
     }
 }
 
@@ -2364,7 +2507,7 @@ impl Menu {
 /// lives here as the single source of truth for draw + hit-test.
 pub struct Dialog {
     message: TextLabel,
-    buttons: Vec<TextLabel>,
+    buttons: Vec<Button>,
     check: TextLabel,
     width: f32,
 }
@@ -2384,10 +2527,11 @@ impl Dialog {
     pub fn set(&mut self, fs: &mut FontSystem, message: &str, buttons: &[&str], check: Option<&str>) {
         self.message.set(fs, message, theme::UI_FAMILY());
         if self.buttons.len() != buttons.len() {
-            self.buttons = buttons.iter().map(|_| TextLabel::new(fs, 200.0, theme::DIALOG_BTN_H())).collect();
-        }
-        for (b, l) in self.buttons.iter_mut().zip(buttons) {
-            b.set(fs, l, theme::UI_FAMILY());
+            self.buttons = buttons.iter().map(|l| Button::new(fs, l, ButtonKind::Secondary)).collect();
+        } else {
+            for (b, l) in self.buttons.iter_mut().zip(buttons) {
+                b.set_text(fs, l);
+            }
         }
         if let Some(c) = check {
             self.check.set(fs, c, theme::UI_FAMILY());
@@ -2457,9 +2601,8 @@ impl Dialog {
         }
         quads.push(Rect { x: b.x - 1.0, y: b.y - 1.0, w: b.w + 2.0, h: b.h + 2.0 }.rounded_quad(theme::PALETTE_BORDER(), radius + 1.0));
         quads.push(b.rounded_quad(theme::PALETTE_BG(), radius));
-        for (i, r) in self.button_rects(b).iter().enumerate() {
-            let c = if hovered == Some(i) { theme::DIALOG_BTN_HOVER() } else { theme::DIALOG_BTN() };
-            quads.push(r.rounded_quad(c, theme::zpx(6.0)));
+        for (i, (btn, r)) in self.buttons.iter().zip(self.button_rects(b)).enumerate() {
+            btn.draw_bg(r, hovered == Some(i), false, quads);
         }
         if has_check {
             let cb = self.check_box(b);
@@ -2472,8 +2615,8 @@ impl Dialog {
         let pad = theme::zpx(18.0);
         let msg = Rect { x: b.x + pad, y: b.y + theme::zpx(20.0), w: b.w - pad * 2.0, h: theme::UI_LINE_HEIGHT() };
         self.message.draw_left(msg, 0.0, theme::FG_TEXT(), areas);
-        for (lab, r) in self.buttons.iter().zip(self.button_rects(b)) {
-            lab.draw_center(r, theme::FG_TEXT(), areas);
+        for (btn, r) in self.buttons.iter().zip(self.button_rects(b)) {
+            btn.draw(r, areas);
         }
         if has_check {
             let cb = self.check_box(b);

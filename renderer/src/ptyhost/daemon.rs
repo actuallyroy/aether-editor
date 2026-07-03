@@ -32,6 +32,11 @@ struct Term {
     /// and the SIGWINCH makes TUIs (Claude Code) repaint cleanly (#32).
     rows: u16,
     cols: u16,
+    /// The GUI-side stable tab id (the MCP-facing `Group::id`) this terminal was last
+    /// bound to. Persisted here so a reconnect/restart re-attaches with the SAME id an
+    /// external MCP client stored, instead of a freshly-allocated one (#46). `0` = unset
+    /// (older client, or a split pane that doesn't survive reattach as its own tab).
+    tab_id: u64,
 }
 
 enum Event {
@@ -167,7 +172,7 @@ pub fn run() -> io::Result<()> {
                         let terminals: Vec<TermInfo> = terms
                             .iter()
                             .filter(|(_, t)| t.owner.is_none() && &t.workspace == workspace)
-                            .map(|(id, t)| TermInfo { id: *id, title: t.title.clone(), cwd: t.workspace.clone(), rows: t.rows, cols: t.cols })
+                            .map(|(id, t)| TermInfo { id: *id, title: t.title.clone(), cwd: t.workspace.clone(), rows: t.rows, cols: t.cols, tab_id: t.tab_id })
                             .collect();
                         send(&mut conns, cid, Frame::Control(Msg::Welcome { terminals }));
                     } else {
@@ -233,6 +238,15 @@ pub fn run() -> io::Result<()> {
                             }
                         }
                     }
+                    Frame::Control(Msg::SetTabId { id, tab_id }) => {
+                        // Persist the GUI's stable tab id so a reconnect/restart
+                        // re-attaches with the same MCP-facing id (#46).
+                        if let Some(t) = terms.get_mut(&id) {
+                            if t.owner == Some(cid) {
+                                t.tab_id = tab_id;
+                            }
+                        }
+                    }
                     Frame::Control(Msg::Detach { id }) => {
                         if let Some(t) = terms.get_mut(&id) {
                             if t.owner == Some(cid) {
@@ -285,7 +299,7 @@ pub fn run() -> io::Result<()> {
                         let terminals: Vec<TermInfo> = terms
                             .iter()
                             .filter(|(_, t)| t.owner.is_none() && !workspace.is_empty() && t.workspace == workspace)
-                            .map(|(id, t)| TermInfo { id: *id, title: t.title.clone(), cwd: t.workspace.clone(), rows: t.rows, cols: t.cols })
+                            .map(|(id, t)| TermInfo { id: *id, title: t.title.clone(), cwd: t.workspace.clone(), rows: t.rows, cols: t.cols, tab_id: t.tab_id })
                             .collect();
                         workspaces.insert(cid, workspace);
                         send(&mut conns, cid, Frame::Control(Msg::Welcome { terminals }));
@@ -365,6 +379,7 @@ fn spawn_term(cwd: &str, workspace: &str, owner: u64, rows: u16, cols: u16, id: 
         backlog: VecDeque::new(),
         rows,
         cols,
+        tab_id: 0,
     })
 }
 

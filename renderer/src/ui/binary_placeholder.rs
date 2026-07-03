@@ -7,7 +7,7 @@ use glyphon::{Color, FontSystem, TextArea};
 
 use crate::quad::Quad;
 use crate::theme;
-use crate::widgets::{IconButton, Rect, TextLabel};
+use crate::widgets::{Button, ButtonKind, IconButton, Rect, TextLabel};
 
 const WARN_GLYPH: char = '\u{ea6c}'; // codicon "warning"
 const LINE1: &str = "The file is not displayed in the editor because it is";
@@ -18,7 +18,7 @@ pub struct BinaryPlaceholder {
     icon: IconButton,
     line1: TextLabel,
     line2: TextLabel,
-    btn: TextLabel,
+    btn: Button,
 }
 
 fn color4(c: [f32; 4]) -> Color {
@@ -30,10 +30,9 @@ impl BinaryPlaceholder {
         let icon = IconButton::new(fs, WARN_GLYPH, theme::icon_family(WARN_GLYPH), theme::zpx(56.0));
         let mut line1 = TextLabel::new(fs, theme::zpx(700.0), theme::UI_LINE_HEIGHT());
         let mut line2 = TextLabel::new(fs, theme::zpx(700.0), theme::UI_LINE_HEIGHT());
-        let mut btn = TextLabel::new(fs, theme::zpx(200.0), theme::UI_LINE_HEIGHT());
+        let btn = Button::new(fs, BTN_LABEL, ButtonKind::Primary);
         line1.set(fs, LINE1, theme::UI_FAMILY());
         line2.set(fs, LINE2, theme::UI_FAMILY());
-        btn.set(fs, BTN_LABEL, theme::UI_FAMILY());
         Self { icon, line1, line2, btn }
     }
 
@@ -62,8 +61,7 @@ impl BinaryPlaceholder {
     }
 
     pub fn draw_quads(&self, region: Rect, hovered: bool, out: &mut Vec<Quad>) {
-        let bg = if hovered { theme::ACCENT_DIM() } else { theme::ACCENT() };
-        out.push(self.button_rect(region).rounded_quad(bg, theme::zpx(4.0)));
+        self.btn.draw_bg(self.button_rect(region), hovered, false, out);
     }
 
     pub fn draw<'a>(&'a self, region: Rect, areas: &mut Vec<TextArea<'a>>) {
@@ -80,6 +78,6 @@ impl BinaryPlaceholder {
         self.line1.draw_center(l1, theme::FG_DIM(), areas);
         self.line2.draw_center(l2, theme::FG_DIM(), areas);
         // Button label, centered in the button rect.
-        self.btn.draw_center(self.button_rect(region), Color::rgb(255, 255, 255), areas);
+        self.btn.draw(self.button_rect(region), areas);
     }
 }

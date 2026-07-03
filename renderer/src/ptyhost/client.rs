@@ -88,6 +88,11 @@ impl Client {
     pub fn rename(&self, id: TermId, title: &str) {
         send(&self.conn, Frame::Control(Msg::Rename { id, title: title.to_string() }));
     }
+    /// Persist the GUI's stable tab id for a terminal, so a reconnect/restart
+    /// re-attaches with the same MCP-facing id (#46).
+    pub fn set_tab_id(&self, id: TermId, tab_id: u64) {
+        send(&self.conn, Frame::Control(Msg::SetTabId { id, tab_id }));
+    }
     /// Release a terminal back to the daemon (kept running, reclaimable later).
     pub fn detach(&self, id: TermId) {
         send(&self.conn, Frame::Control(Msg::Detach { id }));

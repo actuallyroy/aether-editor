@@ -9,7 +9,7 @@ use glyphon::{FontSystem, TextArea};
 
 use crate::quad::Quad;
 use crate::theme;
-use crate::widgets::{Rect, TextInput, TextLabel};
+use crate::widgets::{Button, ButtonKind, Rect, TextInput, TextLabel};
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum FeedbackType {
@@ -59,8 +59,8 @@ pub struct FeedbackForm {
     l_details: TextLabel,
     l_sysinfo: TextLabel,
     l_screenshot: TextLabel,
-    l_submit: TextLabel,
-    l_cancel: TextLabel,
+    submit_btn: Button,
+    cancel_btn: Button,
     l_check: TextLabel,
     chips: [TextLabel; 3],
 }
@@ -91,8 +91,8 @@ impl FeedbackForm {
             l_details: mk(fs, "Details"),
             l_sysinfo: mk(fs, "Include system information (Aether version, OS)"),
             l_screenshot: mk(fs, "Attach a screenshot of the editor"),
-            l_submit: mk(fs, "Create on GitHub"),
-            l_cancel: mk(fs, "Cancel"),
+            submit_btn: Button::new(fs, "Create on GitHub", ButtonKind::Primary),
+            cancel_btn: Button::new(fs, "Cancel", ButtonKind::Secondary),
             l_check: {
                 let mut l = TextLabel::new(fs, 24.0, theme::UI_LINE_HEIGHT());
                 l.set(fs, "\u{eab2}", theme::ICON_FAMILY); // codicon "check"
@@ -178,8 +178,8 @@ impl FeedbackForm {
             }
         }
         // Buttons.
-        bg.push(r.submit.rounded_quad(theme::DIALOG_BTN_HOVER(), theme::zpx(6.0)));
-        bg.push(r.cancel.rounded_quad(theme::DIALOG_BTN(), theme::zpx(6.0)));
+        self.submit_btn.draw_bg(r.submit, false, false, bg);
+        self.cancel_btn.draw_bg(r.cancel, false, false, bg);
         // Selection highlight (under text) + caret (over text) of the focused field.
         let pad = 8.0 * theme::ui_zoom();
         let (fld, frect) = if self.focus == Field::Title { (&self.title, r.title) } else { (&self.details, r.details) };
@@ -201,12 +201,12 @@ impl FeedbackForm {
             &mut self.l_details,
             &mut self.l_sysinfo,
             &mut self.l_screenshot,
-            &mut self.l_submit,
-            &mut self.l_cancel,
             &mut self.l_check,
         ] {
             l.reshape(fs);
         }
+        self.submit_btn.reshape(fs);
+        self.cancel_btn.reshape(fs);
         for c in self.chips.iter_mut() {
             c.reshape(fs);
         }
@@ -246,8 +246,8 @@ impl FeedbackForm {
             label.push(row.x + 24.0 * theme::ui_zoom(), row, theme::FG_TEXT(), areas);
         }
         // Buttons.
-        self.l_submit.push(r.submit.x + (r.submit.w - self.l_submit.width()) * 0.5, r.submit, theme::FG_ACTIVE(), areas);
-        self.l_cancel.push(r.cancel.x + (r.cancel.w - self.l_cancel.width()) * 0.5, r.cancel, theme::FG_TEXT(), areas);
+        self.submit_btn.draw(r.submit, areas);
+        self.cancel_btn.draw(r.cancel, areas);
     }
 
     pub fn on_press(&mut self, pt: (f32, f32), win: (f32, f32), clicks: u32) -> FormAction {

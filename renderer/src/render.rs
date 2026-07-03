@@ -1567,7 +1567,37 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 if line >= nlines || d.is_line_hidden(line) {
                     continue;
                 }
-                let levels = level_of(line).unwrap_or(0);
+                // Blank lines continue the guides of their enclosing block rather
+                // than breaking them: VSCode draws min(above, below) content-line
+                // levels on an empty line (0 if it's outside any block — leading or
+                // trailing blanks).
+                let levels = match level_of(line) {
+                    Some(l) => l,
+                    None => {
+                        let mut above = None;
+                        let mut a = line;
+                        while a > 0 {
+                            a -= 1;
+                            if let Some(l) = level_of(a) {
+                                above = Some(l);
+                                break;
+                            }
+                        }
+                        let mut below = None;
+                        let mut b = line + 1;
+                        while b < nlines {
+                            if let Some(l) = level_of(b) {
+                                below = Some(l);
+                                break;
+                            }
+                            b += 1;
+                        }
+                        match (above, below) {
+                            (Some(x), Some(y)) => x.min(y),
+                            _ => 0,
+                        }
+                    }
+                };
                 if levels == 0 {
                     continue;
                 }
@@ -1595,21 +1625,56 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             let gw = theme::zpx(1.0).max(1.0);
             let faint = [0.50, 0.52, 0.62, 0.14];
             let (_, lt, _, rt) = diff_pane_rects(editor_full);
-            let leading_levels = |line: &str| -> usize {
+            // Level of a line, or None for a blank/whitespace-only line (so blank
+            // lines can continue the enclosing block's guides instead of breaking).
+            let level_of_str = |line: &str| -> Option<usize> {
                 let mut cols = 0usize;
                 for c in line.chars() {
                     match c {
                         ' ' => cols += 1,
                         '\t' => cols += tab - (cols % tab),
-                        _ => break,
+                        '\n' | '\r' => return None,
+                        _ => return Some(cols / unit),
                     }
                 }
-                cols / unit
+                None
             };
             for (pi, (buf, pane)) in [(&d.buffer, lt), (right, rt)].into_iter().enumerate() {
+                let line_level = |i: usize| buf.lines.get(i).and_then(|bl| level_of_str(bl.text()));
+                let nlines = buf.lines.len();
                 for run in buf.layout_runs() {
-                    let Some(bl) = buf.lines.get(run.line_i) else { continue };
-                    let levels = leading_levels(bl.text());
+                    if buf.lines.get(run.line_i).is_none() {
+                        continue;
+                    }
+                    // Blank lines bridge the guides of their enclosing block (min of
+                    // the nearest content line above and below), matching the editor.
+                    let levels = match line_level(run.line_i) {
+                        Some(l) => l,
+                        None => {
+                            let mut above = None;
+                            let mut a = run.line_i;
+                            while a > 0 {
+                                a -= 1;
+                                if let Some(l) = line_level(a) {
+                                    above = Some(l);
+                                    break;
+                                }
+                            }
+                            let mut below = None;
+                            let mut b = run.line_i + 1;
+                            while b < nlines {
+                                if let Some(l) = line_level(b) {
+                                    below = Some(l);
+                                    break;
+                                }
+                                b += 1;
+                            }
+                            match (above, below) {
+                                (Some(x), Some(y)) => x.min(y),
+                                _ => 0,
+                            }
+                        }
+                    };
                     if levels == 0 {
                         continue;
                     }
@@ -1999,7 +2064,9 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 let y0 = track.y + (start_line as f32 / total) * track.h;
                 let y1 = track.y + ((marks[j].0 + 1) as f32 / total) * track.h;
                 let h = (y1 - y0).max(mh);
-                fg_quads.push(Quad::new(track.x, y0, track.w, h, col(kind)));
+                // Left lane of the track (find/selection ticks take the right lane) so
+                // the two decoration types read separately, VSCode-style.
+                fg_quads.push(Quad::new(track.x, y0, (track.w * 0.5).max(1.0), h, col(kind)));
                 i = j + 1;
             }
         }
@@ -2013,13 +2080,17 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             let mh = theme::zpx(2.0).max(1.0);
             let inset = theme::zpx(1.0);
             let base = theme::FIND_MATCH();
+            // Right lane of the track — git-change bars occupy the left lane, so find /
+            // selection ticks stay visually separate.
+            let lane_x = track.x + track.w * 0.5;
+            let lane_w = (track.w * 0.5).max(1.0);
             for (i, &(s, _)) in ov_matches.iter().enumerate() {
                 let line = d.rope.byte_to_line(s.min(d.rope.len_bytes())) as f32;
                 let y = track.y + (line / total) * track.h - mh * 0.5;
                 let current = app.find.active && app.find.index == Some(i);
                 let color = if current { theme::ACCENT() } else { base };
-                let w = if current { track.w } else { track.w - inset * 2.0 };
-                let x = if current { track.x } else { track.x + inset };
+                let w = if current { lane_w } else { lane_w - inset * 2.0 };
+                let x = if current { lane_x } else { lane_x + inset };
                 fg_quads.push(Quad::new(x, y, w, mh, color));
             }
         }
@@ -3337,6 +3408,47 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 gpu.text_renderer.render(&gpu.atlas, &gpu.viewport, &mut pass)?;
             }
             gpu.queue.submit(Some(encm.finish()));
+
+            // ---- Cascading submenu (e.g. File > Open Recent), drawn over the parent ----
+            if let Some(entry_idx) = app.menu_sub_open {
+                let row = gpu.ui.menu_dropdown.row_rect(menu, entry_idx);
+                let anchor = (menu.x + menu.w - theme::zpx(4.0), row.y - theme::zpx(4.0));
+                let sub = gpu.ui.menu_submenu.rect(anchor, (cfg_w as f32, cfg_h as f32));
+                let mut sq: Vec<Quad> = Vec::new();
+                gpu.ui.menu_submenu.draw_bg(sub, app.menu_sub_hover, &mut sq);
+                gpu.quad_renderer
+                    .prepare(&gpu.device, &gpu.queue, &sq, &[], (cfg_w, cfg_h));
+                let mut sareas: Vec<TextArea> = Vec::new();
+                gpu.ui.menu_submenu.draw(sub, &mut sareas);
+                gpu.text_renderer.prepare(
+                    &gpu.device,
+                    &gpu.queue,
+                    &mut gpu.font_system,
+                    &mut gpu.atlas,
+                    &gpu.viewport,
+                    sareas,
+                    &mut gpu.swash_cache,
+                )?;
+                let mut encs = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
+                    label: Some("aether-submenu-pass"),
+                });
+                {
+                    let mut pass = encs.begin_render_pass(&RenderPassDescriptor {
+                        label: Some("aether-submenu"),
+                        color_attachments: &[Some(RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    gpu.quad_renderer.render_bg(&mut pass);
+                    gpu.text_renderer.render(&gpu.atlas, &gpu.viewport, &mut pass)?;
+                }
+                gpu.queue.submit(Some(encs.finish()));
+            }
         }
     }
 

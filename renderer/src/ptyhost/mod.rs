@@ -52,6 +52,9 @@ pub enum Msg {
     /// Set a terminal's display title (tab rename) — stored in the daemon so the
     /// name survives a GUI restart / re-attach.
     Rename { id: TermId, title: String },
+    /// Persist the GUI's stable tab id for a terminal, so a reconnect/restart
+    /// re-attaches with the same MCP-facing id (#46).
+    SetTabId { id: TermId, tab_id: u64 },
     /// Release a terminal without killing it (window switched folders) — it becomes
     /// an orphan, reclaimable by the next window that opens its workspace.
     Detach { id: TermId },
@@ -98,6 +101,11 @@ pub struct TermInfo {
     pub rows: u16,
     #[serde(default)]
     pub cols: u16,
+    /// The GUI's stable MCP-facing tab id, persisted by the daemon so it survives a
+    /// reconnect/restart (#46). `default` (0) ⇒ an older daemon that doesn't track it,
+    /// or a split pane — the client allocates a fresh id in that case.
+    #[serde(default)]
+    pub tab_id: u64,
 }
 
 /// A framed message on the wire. Control is JSON; Write/Output carry raw terminal

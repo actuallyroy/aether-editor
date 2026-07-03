@@ -18,7 +18,7 @@ use crate::git;
 use crate::quad::Quad;
 use crate::theme;
 use crate::ui::Intent;
-use crate::widgets::{IconButton, IconList, IconRow, Rect, ScrollOpts, ScrollView, TextInput, TextLabel};
+use crate::widgets::{Button, ButtonKind, IconButton, IconList, IconRow, Rect, ScrollOpts, ScrollView, TextInput, TextLabel};
 
 // Geometry is reactive, not frozen: row height tracks the sidebar's (which scales
 // with UI zoom) and the paddings scale with zoom too, so the whole panel stays
@@ -133,8 +133,8 @@ pub struct SourceControlPanel {
     l_staged: TextLabel,
     l_unstaged: TextLabel,
     l_merge: TextLabel,
-    l_commit: TextLabel,
-    l_continue: TextLabel, // commit-button label while mid-rebase (continues the rebase)
+    commit_btn: Button,
+    continue_btn: Button, // commit button while mid-rebase (continues the rebase)
     count_staged: TextLabel,
     count_unstaged: TextLabel,
     count_merge: TextLabel,
@@ -182,6 +182,10 @@ pub struct SourceControlPanel {
     graph_dirty: bool, // the GRAPH subjects buffer needs rebuilding (expand toggled)
     pub graph_scroll: ScrollView, // independent scroll for the pinned GRAPH section
     l_graph: TextLabel, // "GRAPH" section header
+    is_repo: bool, // false ⇒ folder isn't a git repo → show the Initialize prompt
+    l_no_repo: TextLabel,   // empty-state caption
+    init_btn: Button,       // "Initialize Repository" button
+    init_hover: bool,       // pointer over the Initialize button
 }
 
 impl SourceControlPanel {
@@ -236,8 +240,8 @@ impl SourceControlPanel {
             l_staged: mk(fs, "Staged Changes"),
             l_unstaged: mk(fs, "Changes"),
             l_merge: mk(fs, "Merge Changes"),
-            l_commit: mk(fs, "✓ Commit"),
-            l_continue: mk(fs, "✓ Continue"),
+            commit_btn: Button::new(fs, "✓ Commit", ButtonKind::Primary),
+            continue_btn: Button::new(fs, "✓ Continue", ButtonKind::Primary),
             count_staged: mk(fs, "0"),
             count_unstaged: mk(fs, "0"),
             count_merge: mk(fs, "0"),
@@ -281,6 +285,10 @@ impl SourceControlPanel {
             graph_dirty: false,
             graph_scroll: ScrollView::new(ScrollOpts { vertical: true, horizontal: false, stick_to_end: false }),
             l_graph: mk(fs, "GRAPH"),
+            is_repo: true,
+            l_no_repo: mk(fs, "The current folder is not a repository."),
+            init_btn: Button::new(fs, "Initialize Repository", ButtonKind::Primary),
+            init_hover: false,
         }
     }
 
@@ -297,7 +305,6 @@ impl SourceControlPanel {
             &mut self.l_staged,
             &mut self.l_unstaged,
             &mut self.l_merge,
-            &mut self.l_commit,
             &mut self.count_staged,
             &mut self.count_unstaged,
             &mut self.count_merge,
@@ -322,6 +329,9 @@ impl SourceControlPanel {
         for b in &mut self.badges {
             b.reshape(fs);
         }
+        self.commit_btn.reshape(fs);
+        self.continue_btn.reshape(fs);
+        self.init_btn.reshape(fs);
         self.staged.reshape_icons(fs);
         self.unstaged.reshape_icons(fs);
         self.merge.reshape_icons(fs);
@@ -380,8 +390,59 @@ impl SourceControlPanel {
     /// log) on a background thread. Results arrive as `WorkerMsg::ScmData` and are
     /// applied via `apply_data`. Bumping the gen makes any in-flight refresh stale.
     pub fn refresh(&mut self, tx: &std::sync::mpsc::Sender<crate::marketplace::WorkerMsg>) {
+        // Cheap (cached) — drives the Initialize-Repository empty state.
+        self.is_repo = self.root.as_os_str().is_empty() || git::is_repo(&self.root);
+        if !self.root.as_os_str().is_empty() && !self.is_repo {
+            self.clear_data(); // no repo → drop stale branch/counts so the badge clears
+            return; // the panel shows the Init prompt instead
+        }
         self.refresh_gen = self.refresh_gen.wrapping_add(1);
         git::refresh_scm_async(self.root.clone(), self.refresh_gen, tx.clone());
+    }
+
+    /// Drop all git-derived state (branch, change counts, file rows, graph) — used
+    /// when the folder has no repo so the activity-bar badge and status-bar branch
+    /// don't linger from the previously-open repo.
+    fn clear_data(&mut self) {
+        self.branch = None;
+        self.change_count = 0;
+        self.conflict_count = 0;
+        self.merge_state = None;
+        self.staged_rows.clear();
+        self.unstaged_rows.clear();
+        self.merge_rows.clear();
+        self.staged_vis.clear();
+        self.unstaged_vis.clear();
+        self.merge_vis.clear();
+        self.graph = None;
+        self.graph_expanded = None;
+        self.graph_files.clear();
+        self.hovered = None;
+        self.selected = None;
+    }
+
+    /// The centred "Initialize Repository" button rect (empty-state).
+    fn init_button_rect(region: Rect) -> Rect {
+        let w = (region.w - theme::zpx(24.0)).min(theme::zpx(280.0));
+        let h = row_h() + theme::zpx(8.0);
+        Rect { x: region.x + (region.w - w) * 0.5, y: region.y + row_h() * 3.0, w, h }
+    }
+
+    /// True (and the button is live) when the folder has no git repo. Set by `refresh`.
+    pub fn no_repo(&self) -> bool {
+        !self.is_repo && !self.root.as_os_str().is_empty()
+    }
+
+    /// Hit-test the Initialize button; also updates its hover state. Returns true when
+    /// the point is on the button (empty-state only).
+    pub fn init_button_at(&self, region: Rect, pt: (f32, f32)) -> bool {
+        self.no_repo() && Self::init_button_rect(region).contains(pt)
+    }
+
+    pub fn set_init_hover(&mut self, h: bool) -> bool {
+        let changed = self.init_hover != h;
+        self.init_hover = h;
+        changed
     }
 
     /// Apply git data fetched off-thread. `gen`-gated: drops results older than the
@@ -1105,6 +1166,11 @@ impl SourceControlPanel {
 
     // ---- Drawing ----
     pub fn draw_quads(&self, region: Rect, blink: bool, now: std::time::Instant, bg: &mut Vec<Quad>, fg: &mut Vec<Quad>) {
+        // Empty state: no git repo → just the Initialize button (VSCode-style).
+        if self.no_repo() {
+            self.init_btn.draw_bg(Self::init_button_rect(region), self.init_hover, false, bg);
+            return;
+        }
         if self.changes_open {
         let m = Self::msg_rect(region);
         let ir = theme::zpx(7.0);
@@ -1130,7 +1196,8 @@ impl SourceControlPanel {
                 fg.push(self.msg.caret_quad(m, theme::zpx(6.0)));
             }
         }
-        bg.push(Self::commit_rect(region).rounded_quad(theme::ACCENT_DIM(), theme::zpx(5.0)));
+        let commit_btn = if self.merge_state == Some("REBASING") { &self.continue_btn } else { &self.commit_btn };
+        commit_btn.draw_bg(Self::commit_rect(region), false, false, bg);
         // Split divider between the Commit label and its dropdown chevron.
         let cc = Self::commit_chevron(region);
         bg.push(Quad::new(cc.x, cc.y + theme::zpx(5.0), 1.0, cc.h - theme::zpx(10.0), [0.0, 0.0, 0.0, 0.25]));
@@ -1283,6 +1350,13 @@ impl SourceControlPanel {
     }
 
     pub fn draw_text<'b>(&'b self, region: Rect, areas: &mut Vec<TextArea<'b>>) {
+        if self.no_repo() {
+            let btn = Self::init_button_rect(region);
+            let cap = Rect { x: region.x + theme::zpx(12.0), y: btn.y - row_h() * 1.5, w: region.w - theme::zpx(24.0), h: row_h() };
+            self.l_no_repo.draw_center(cap, theme::FG_DIM(), areas);
+            self.init_btn.draw(btn, areas);
+            return;
+        }
         let ch = Self::changes_hdr(region);
         // Collapse twistie + "CHANGES" header.
         let chev = Rect { x: ch.x, y: ch.y, w: hdr_chev_w(), h: ch.h };
@@ -1307,9 +1381,9 @@ impl SourceControlPanel {
         // mid-rebase it reads "Continue" — a plain commit there would strand the rebase, so
         // the button runs `rebase --continue` instead (see git::commit).
         let cm = Self::commit_main(region);
-        let label = if self.merge_state == Some("REBASING") { &self.l_continue } else { &self.l_commit };
-        label.push(cm.x + (cm.w - label.width()) * 0.5, cm, theme::FG_TEXT(), areas);
-        self.push_icon(&self.ic_chevron, Self::commit_chevron(region), theme::FG_TEXT(), areas);
+        let commit_btn = if self.merge_state == Some("REBASING") { &self.continue_btn } else { &self.commit_btn };
+        commit_btn.draw(cm, areas);
+        self.push_icon(&self.ic_chevron, Self::commit_chevron(region), theme::BADGE_FG(), areas);
 
         let vp = self.groups_viewport(region);
         // Merge Changes group — conflicted files, shown at the top while a merge is
@@ -1528,6 +1602,9 @@ impl SourceControlPanel {
 
     // ---- Input ----
     pub fn hover(&mut self, pt: (f32, f32), region: Rect) -> bool {
+        if self.no_repo() {
+            return self.set_init_hover(self.init_button_at(region, pt));
+        }
         let in_groups = self.groups_viewport(region).contains(pt);
         let sl = self.staged_list(region);
         let ul = self.unstaged_list(region);
@@ -1722,6 +1799,9 @@ impl SourceControlPanel {
     /// button, forgot the cursor"). Covers toolbar + header + row-action icons (via
     /// `tooltip_at`), file/folder rows, the commit split button, and graph rows.
     pub fn over_clickable(&self, pt: (f32, f32), region: Rect) -> bool {
+        if self.no_repo() {
+            return self.init_button_at(region, pt);
+        }
         if self.tooltip_at(pt, region).is_some() || self.over_row(pt, region) {
             return true;
         }
@@ -1871,7 +1951,7 @@ impl SourceControlPanel {
 
     /// True when `pt` is over the commit message box — drives the I-beam cursor.
     pub fn over_message(&self, pt: (f32, f32), region: Rect) -> bool {
-        Self::msg_rect(region).contains(pt)
+        !self.no_repo() && Self::msg_rect(region).contains(pt)
     }
 
     /// Extend the commit-box selection while the mouse is dragged. Returns true
@@ -1919,6 +1999,13 @@ impl SourceControlPanel {
     }
 
     pub fn on_press(&mut self, pt: (f32, f32), region: Rect, clicks: u32, out: &mut Vec<Intent>) -> bool {
+        // Empty state: the only target is the Initialize Repository button.
+        if self.no_repo() {
+            if self.init_button_at(region, pt) {
+                out.push(Intent::GitInit);
+            }
+            return true;
+        }
         // Grab the CHANGES/GRAPH divider to resize the split.
         if self.graph.is_some() && self.graph_open {
             let div = self.graph_section_top(region);

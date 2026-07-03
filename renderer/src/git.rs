@@ -7,9 +7,10 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
 /// Cache of `cwd → repo top-level` so we resolve `git rev-parse --show-toplevel`
-/// only once per directory (it's run on every git command otherwise).
-fn toplevel_cache() -> &'static Mutex<HashMap<PathBuf, PathBuf>> {
-    static C: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
+/// only once per directory (it's run on every git command otherwise). `None` = the
+/// directory is not inside a git work tree (distinct from "a repo rooted at cwd").
+fn toplevel_cache() -> &'static Mutex<HashMap<PathBuf, Option<PathBuf>>> {
+    static C: OnceLock<Mutex<HashMap<PathBuf, Option<PathBuf>>>> = OnceLock::new();
     C.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -18,14 +19,26 @@ fn toplevel_cache() -> &'static Mutex<HashMap<PathBuf, PathBuf>> {
 /// status paths (repo-root-relative) aligned with diff/stage pathspecs — otherwise
 /// opening a *subdirectory* of a repo breaks diffs ("No changes.").
 pub fn repo_root(cwd: &Path) -> PathBuf {
+    toplevel(cwd).unwrap_or_else(|| cwd.to_path_buf())
+}
+
+/// The git top-level for `cwd`, or `None` when it isn't inside a git work tree.
+/// Use this (not `repo_root`) to decide whether git features apply at all — e.g.
+/// the SCM "Initialize Repository" prompt and the editor's change gutter.
+pub fn repo_root_opt(cwd: &Path) -> Option<PathBuf> {
     toplevel(cwd)
 }
 
-fn toplevel(cwd: &Path) -> PathBuf {
+/// Is `cwd` inside a git repository?
+pub fn is_repo(cwd: &Path) -> bool {
+    toplevel(cwd).is_some()
+}
+
+fn toplevel(cwd: &Path) -> Option<PathBuf> {
     if let Some(hit) = toplevel_cache().lock().unwrap().get(cwd) {
         return hit.clone();
     }
-    let out = Command::new("git")
+    let out = git_command()
         .arg("-C")
         .arg(cwd)
         .args(["rev-parse", "--show-toplevel"])
@@ -33,12 +46,23 @@ fn toplevel(cwd: &Path) -> PathBuf {
     let top = match out {
         Ok(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if s.is_empty() { cwd.to_path_buf() } else { PathBuf::from(s) }
+            (!s.is_empty()).then(|| PathBuf::from(s))
         }
-        _ => cwd.to_path_buf(),
+        _ => None,
     };
     toplevel_cache().lock().unwrap().insert(cwd.to_path_buf(), top.clone());
     top
+}
+
+/// A `git` command preconfigured to trust any working tree (`-c safe.directory=*`).
+/// Editors routinely open folders the user owns but that git flags with "dubious
+/// ownership" — e.g. a repo on an external/mounted drive owned by root. Without this,
+/// every git call fails and the repo looks like a non-repo. The user explicitly chose
+/// to open the folder, so trusting it is the right default.
+pub fn git_command() -> Command {
+    let mut c = Command::new("git");
+    c.args(["-c", "safe.directory=*"]);
+    c
 }
 
 #[cfg(windows)]
@@ -140,8 +164,8 @@ pub fn user_name(root: &Path) -> Option<String> {
 }
 
 fn git(root: &Path, args: &[&str]) -> Option<String> {
-    let root = toplevel(root);
-    let mut cmd = Command::new("git");
+    let root = repo_root(root);
+    let mut cmd = git_command();
     cmd.arg("-C").arg(&root).args(args);
     #[cfg(windows)]
     {
@@ -184,7 +208,7 @@ pub fn merge_state(root: &Path) -> Option<&'static str> {
     // worktrees, and `.git`-file submodules — joining `root/.git` does not).
     let gd = git(root, &["rev-parse", "--git-dir"])?;
     let gd = PathBuf::from(gd.trim());
-    let gd = if gd.is_absolute() { gd } else { toplevel(root).join(gd) };
+    let gd = if gd.is_absolute() { gd } else { repo_root(root).join(gd) };
     if gd.join("MERGE_HEAD").exists() {
         Some("MERGING")
     } else if gd.join("rebase-merge").exists() || gd.join("rebase-apply").exists() {
@@ -225,7 +249,7 @@ pub fn discard(root: &Path, path: &str, untracked: bool) {
         // An untracked entry can be a file or a whole directory (git reports the
         // latter as "dir/"); try file removal first, then recursive dir removal.
         // `path` is repo-root-relative, so join the top-level (not cwd).
-        let target = toplevel(root).join(path);
+        let target = repo_root(root).join(path);
         let _ = std::fs::remove_file(&target).or_else(|_| std::fs::remove_dir_all(&target));
     } else {
         let _ = git(root, &["restore", "--", path]);
@@ -308,7 +332,7 @@ pub fn commit_diff(root: &Path) -> Option<String> {
 /// Returns true on success.
 pub fn apply_patch(root: &Path, patch: &str, cached: bool, reverse: bool) -> bool {
     use std::io::Write;
-    let mut cmd = Command::new("git");
+    let mut cmd = git_command();
     cmd.arg("-C").arg(root).args(["apply", "--unidiff-zero"]);
     if cached {
         cmd.arg("--cached");
@@ -441,6 +465,21 @@ pub fn branches(root: &Path) -> Vec<String> {
     names
 }
 
+/// Initialize a git repository in `dir` (`git init`). Returns true on success and
+/// clears the toplevel cache so `is_repo`/`repo_root` re-detect the new repo.
+pub fn init(dir: &Path) -> bool {
+    let ok = git_command()
+        .arg("-C")
+        .arg(dir)
+        .args(["init", "-q"])
+        .output()
+        .map_or(false, |o| o.status.success());
+    if ok {
+        toplevel_cache().lock().unwrap().clear();
+    }
+    ok
+}
+
 /// Switch to an existing branch (`git checkout <branch>`). Returns true on success.
 pub fn checkout(root: &Path, branch: &str) -> bool {
     git(root, &["checkout", branch]).is_some()
@@ -570,7 +609,7 @@ pub fn ignored(root: &Path) -> std::collections::HashSet<PathBuf> {
         return std::collections::HashSet::new();
     };
     // `git status` paths are repo-root-relative, so join the top-level (not cwd).
-    let top = toplevel(root);
+    let top = repo_root(root);
     out.lines()
         .filter_map(|line| {
             let bytes = line.as_bytes();
@@ -631,7 +670,7 @@ mod tests {
     use std::process::Command;
 
     fn run(root: &Path, args: &[&str]) {
-        let ok = Command::new("git").arg("-C").arg(root).args(args).status().map(|s| s.success()).unwrap_or(false);
+        let ok = git_command().arg("-C").arg(root).args(args).status().map(|s| s.success()).unwrap_or(false);
         assert!(ok, "git {args:?} failed");
     }
 

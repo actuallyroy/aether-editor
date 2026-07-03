@@ -50,6 +50,7 @@ pub struct UiBuffers {
     pub merge_hint_inc: TextLabel, // "(Incoming Change)" after the >>>>>>> marker
     pub tab_icons: std::collections::HashMap<char, crate::widgets::IconButton>, // per-tab file-type icon overlays
     pub menu_dropdown: Menu,   // top menu-bar dropdown (File/Edit/…)
+    pub menu_submenu: Menu,    // cascading submenu of the dropdown (e.g. Open Recent)
     pub scm_badge: TextLabel,  // change-count badge on the Source Control icon
     pub img_minus: TextLabel,  // image zoom-out control
     pub img_plus: TextLabel,   // image zoom-in control
@@ -313,7 +314,8 @@ impl GpuState {
             ),
             find: crate::ui::find_widget::FindWidget::new(&mut font_system),
             ctx: Menu::new(&mut font_system, 280.0),
-            menu_dropdown: Menu::new(&mut font_system, 220.0),
+            menu_dropdown: Menu::new(&mut font_system, 340.0),
+            menu_submenu: Menu::new(&mut font_system, 320.0),
             scm_badge: TextLabel::new(&mut font_system, 40.0, theme::ACTIVITY_ICON_SIZE()),
             img_minus: {
                 let mut l = TextLabel::new(&mut font_system, 38.0, 30.0);

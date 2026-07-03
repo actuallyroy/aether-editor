@@ -397,6 +397,9 @@ pub(crate) struct App {
     pub(crate) hovered_menu: Option<usize>,
     pub(crate) open_menu: Option<usize>,        // which top menu's dropdown is open
     pub(crate) menu_dd_hover: Option<usize>,    // hovered entry within the open dropdown
+    pub(crate) menu_sub_open: Option<usize>,    // primary-dropdown entry whose submenu is open
+    pub(crate) menu_sub_hover: Option<usize>,   // hovered row within the open submenu
+    pub(crate) menu_sub_entries: Vec<(String, menus::MenuCmd)>, // dynamic submenu content
     pub(crate) feedback_form: Option<ui::feedback_form::FeedbackForm>, // modal feedback form
     /// Pending feedback issue (title, body) awaiting a screenshot capture on the
     /// next render frame; consumed by `render` which captures + uploads off-thread.
@@ -641,6 +644,9 @@ impl App {
             hovered_menu: None,
             open_menu: None,
             menu_dd_hover: None,
+            menu_sub_open: None,
+            menu_sub_hover: None,
+            menu_sub_entries: Vec::new(),
             feedback_form: None,
             pending_capture: None,
             update_available: None,
@@ -973,6 +979,27 @@ impl App {
             let hov = self.menu_dd_item_at(p.0, p.1);
             if hov != self.menu_dd_hover {
                 self.menu_dd_hover = hov;
+                changed = true;
+            }
+            // Cascading submenu: hovering a submenu-parent row opens its child list;
+            // hovering any other primary row closes it. While the pointer is over the
+            // open submenu itself, leave it open and just track the child hover.
+            let over_sub = self.menu_sub_item_at(p.0, p.1);
+            if let Some(open) = self.open_menu {
+                if let Some(i) = hov {
+                    let is_parent = menus::entries(open).get(i).map_or(false, |e| menus::is_submenu(&e.cmd));
+                    if is_parent {
+                        self.open_menu_submenu(i);
+                    } else {
+                        self.close_menu_submenu();
+                    }
+                } else if over_sub.is_none() && self.menu_sub_rect().map_or(true, |r| !r.contains(p)) {
+                    // Pointer left both the primary dropdown and the submenu box.
+                    self.close_menu_submenu();
+                }
+            }
+            if over_sub != self.menu_sub_hover {
+                self.menu_sub_hover = over_sub;
                 changed = true;
             }
         }
@@ -1332,7 +1359,9 @@ impl App {
                     g.ui.ctx.rect(*a, win).contains(p)
                 }))
                 .unwrap_or(false);
-            let in_dd = self.open_menu.is_some() && self.menu_dd_rect().map_or(false, |r| r.contains(p));
+            let in_dd = self.open_menu.is_some()
+                && (self.menu_dd_rect().map_or(false, |r| r.contains(p))
+                    || self.menu_sub_rect().map_or(false, |r| r.contains(p)));
             let in_palette_list = layout.palette.as_ref().map_or(false, |pal| pal.box_.contains(p));
             let in_palette_input = layout.palette.as_ref().map_or(false, |pal| pal.input.contains(p));
             let modal = self.dialog.is_some() || self.feedback_form.is_some();
@@ -2246,7 +2275,7 @@ impl App {
 
     /// SCM "Open File (HEAD)": the committed version in a read-only tab.
     fn open_file_at_head(&mut self, rel: String) {
-        let out = std::process::Command::new("git")
+        let out = git::git_command()
             .arg("-C")
             .arg(&self.cwd)
             .args(["show", &format!("HEAD:{rel}")])
@@ -2312,8 +2341,15 @@ impl App {
             .zip(&labels)
             .map(|(e, l)| (l.as_str(), e.hint, matches!(e.cmd, menus::MenuCmd::Separator)))
             .collect();
+        let arrows: Vec<usize> = menus::entries(idx)
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| menus::is_submenu(&e.cmd))
+            .map(|(i, _)| i)
+            .collect();
         if let Some(g) = self.gpu.as_mut() {
             g.ui.menu_dropdown.set_entries(&mut g.font_system, &rows);
+            g.ui.menu_dropdown.set_arrows(arrows);
         }
         self.open_menu = Some(idx);
         self.menu_dd_hover = None;
@@ -2323,8 +2359,84 @@ impl App {
     fn close_app_menu(&mut self) {
         if self.open_menu.take().is_some() {
             self.menu_dd_hover = None;
+            self.close_menu_submenu();
             self.redraw();
         }
+    }
+
+    /// Build and open the cascading submenu for the primary-dropdown entry `entry_idx`.
+    /// Currently only "Open Recent" (a dynamic list of recent folders). No-op if that
+    /// entry isn't a submenu parent, or if the submenu is already open for it.
+    fn open_menu_submenu(&mut self, entry_idx: usize) {
+        let Some(open) = self.open_menu else { return };
+        let Some(entry) = menus::entries(open).get(entry_idx) else { return };
+        if !menus::is_submenu(&entry.cmd) {
+            return self.close_menu_submenu();
+        }
+        if self.menu_sub_open == Some(entry_idx) {
+            return; // already open for this parent
+        }
+        // The only submenu today: File > Open Recent → recent folders.
+        let entries: Vec<(String, menus::MenuCmd)> = match entry.cmd {
+            menus::MenuCmd::OpenRecent => {
+                let recents: Vec<PathBuf> =
+                    state::State::load().recent.into_iter().filter(|p| p.is_dir()).collect();
+                if recents.is_empty() {
+                    vec![("No Recent Folders".to_string(), menus::MenuCmd::Separator)]
+                } else {
+                    recents
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| {
+                            let label = p
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| p.to_string_lossy().into_owned());
+                            (label, menus::MenuCmd::OpenRecentPath(i))
+                        })
+                        .collect()
+                }
+            }
+            _ => return,
+        };
+        // The empty-state row ("No Recent Folders", cmd Separator) renders as plain
+        // disabled text (not a divider line); its click is ignored below.
+        let rows: Vec<(&str, &str, bool)> =
+            entries.iter().map(|(l, _)| (l.as_str(), "", false)).collect();
+        if let Some(g) = self.gpu.as_mut() {
+            g.ui.menu_submenu.set_entries(&mut g.font_system, &rows);
+        }
+        self.menu_sub_entries = entries;
+        self.menu_sub_open = Some(entry_idx);
+        self.menu_sub_hover = None;
+        self.redraw();
+    }
+
+    fn close_menu_submenu(&mut self) {
+        if self.menu_sub_open.take().is_some() {
+            self.menu_sub_hover = None;
+            self.menu_sub_entries.clear();
+            self.redraw();
+        }
+    }
+
+    /// Screen rect of the open submenu box, anchored just past the right edge of its
+    /// parent row (falls left of the parent if it would overflow the window).
+    fn menu_sub_rect(&self) -> Option<crate::widgets::Rect> {
+        let entry_idx = self.menu_sub_open?;
+        let parent = self.menu_dd_rect()?;
+        let g = self.gpu.as_ref()?;
+        let row = g.ui.menu_dropdown.row_rect(parent, entry_idx);
+        let win = (g.config.width as f32, g.config.height as f32);
+        // Anchor at the row's top-right; a small overlap reads as connected.
+        let anchor = (parent.x + parent.w - theme::zpx(4.0), row.y - theme::zpx(4.0));
+        Some(g.ui.menu_submenu.rect(anchor, win))
+    }
+
+    fn menu_sub_item_at(&self, x: f32, y: f32) -> Option<usize> {
+        let r = self.menu_sub_rect()?;
+        let g = self.gpu.as_ref()?;
+        g.ui.menu_submenu.item_at(r, (x, y))
     }
 
     /// Screen rect of the currently open dropdown box (anchored under its title).
@@ -2686,7 +2798,14 @@ impl App {
     /// once per file, and recompute the marks each tick if the buffer changed. Mirrors
     /// `maybe_request_blame`'s gating (plain editable tracked file).
     fn maybe_request_diff_base(&mut self) {
-        let need = matches!(self.workspace.active_doc(), Some(d)
+        // Change bars only make sense for a file tracked by the workspace's repo.
+        // Skip entirely when the folder isn't a git repo, or the active file lives
+        // outside the repo root (opened from elsewhere) — otherwise git treats it as
+        // an empty baseline and paints every line "added" (#gutter-on-no-git).
+        let repo = git::repo_root_opt(&self.cwd);
+        let in_repo = matches!((self.workspace.active_doc().and_then(|d| d.path.as_ref()), repo.as_ref()),
+            (Some(p), Some(root)) if p.starts_with(root));
+        let need = in_repo && matches!(self.workspace.active_doc(), Some(d)
             if !d.diff_base_requested
                 && d.path.is_some()
                 && !d.read_only
@@ -3025,6 +3144,19 @@ impl App {
                 self.redraw();
             }
             ui::Intent::GitRefresh => self.refresh_source_control(),
+            ui::Intent::GitInit => {
+                if git::init(&self.cwd) {
+                    // Re-root the panel at the freshly-created repo and refresh so the
+                    // change groups replace the Initialize prompt; gutters re-enable
+                    // on the next tick now that the folder is a repo.
+                    if let Some(scp) = self.source_control.as_mut() {
+                        scp.set_root(git::repo_root(&self.cwd));
+                    }
+                    self.refresh_source_control();
+                    self.start_fs_watcher();
+                }
+                self.redraw();
+            }
             ui::Intent::GitCommitPush { msg, stage_all } => {
                 if git::commit(&self.cwd, &msg, stage_all) {
                     git::push(&self.cwd);
@@ -6208,10 +6340,23 @@ impl App {
                 } else {
                     self.open_app_menu(t);
                 }
+            } else if let Some(i) = self.menu_sub_item_at(x, y) {
+                // Click landed in the open cascading submenu. Ignore the disabled
+                // empty-state placeholder (cmd Separator).
+                if let Some(cmd) = self.menu_sub_entries.get(i).map(|(_, c)| *c) {
+                    if !matches!(cmd, menus::MenuCmd::Separator) {
+                        self.exec_menu_cmd(cmd);
+                    }
+                }
             } else if let Some(i) = self.menu_dd_item_at(x, y) {
                 if let Some(e) = menus::entries(open).get(i) {
                     let cmd = e.cmd;
-                    self.exec_menu_cmd(cmd);
+                    // A submenu parent: open (or keep) its child list instead of running.
+                    if menus::is_submenu(&cmd) {
+                        self.open_menu_submenu(i);
+                    } else {
+                        self.exec_menu_cmd(cmd);
+                    }
                 }
             } else {
                 self.close_app_menu();

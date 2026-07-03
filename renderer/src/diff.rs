@@ -8,7 +8,6 @@
 // backgrounds and gutters driven by `rows`.
 
 use std::path::Path;
-use std::process::Command;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -83,7 +82,7 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
     // Run from the repo top-level so repo-root-relative pathspecs (from `git status`)
     // resolve correctly even when the opened folder is a subdirectory of the repo.
     let root = crate::git::repo_root(root);
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::git::git_command();
     cmd.arg("-C").arg(&root).args(args);
     #[cfg(windows)]
     {

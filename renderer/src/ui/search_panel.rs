@@ -18,7 +18,7 @@ use crate::quad::Quad;
 use crate::search::{self, FileMatches, SearchOpts};
 use crate::theme;
 use crate::ui::Intent;
-use crate::widgets::{IconButton, IconList, IconRow, Rect, ScrollOpts, ScrollView, TextInput, TextLabel};
+use crate::widgets::{Button, ButtonKind, IconButton, IconList, IconRow, Rect, ScrollOpts, ScrollView, TextInput, TextLabel};
 use arboard::Clipboard;
 
 const OPT: f32 = 18.0; // option-toggle square size
@@ -37,7 +37,7 @@ pub struct SearchPanel {
     hovered_tool: Option<usize>,
     filters_btn: IconButton, // "…" toggle that shows/hides the include/exclude inputs
     filters_open: bool,
-    replace_all_label: TextLabel,
+    replace_all_btn: Button,
     summary: TextLabel, // "N results in M files"
     last_summary: String,
     scroll: ScrollView,
@@ -70,8 +70,7 @@ impl SearchPanel {
         include.set_placeholder(fs, " files to include");
         let mut exclude = TextInput::new(fs, theme::SIDEBAR_WIDTH(), 30.0);
         exclude.set_placeholder(fs, " files to exclude");
-        let mut replace_all_label = TextLabel::new(fs, theme::SIDEBAR_WIDTH(), 24.0);
-        replace_all_label.set(fs, "Replace All", theme::UI_FAMILY());
+        let replace_all_btn = Button::new(fs, "Replace All", ButtonKind::Secondary);
         let ic = theme::ICON_FAMILY;
         Self {
             query,
@@ -96,7 +95,7 @@ impl SearchPanel {
             hovered_tool: None,
             filters_btn: IconButton::new(fs, theme::ICON_ELLIPSIS, ic, 16.0),
             filters_open: false,
-            replace_all_label,
+            replace_all_btn,
             summary: TextLabel::new(fs, theme::SIDEBAR_WIDTH(), 22.0),
             last_summary: String::new(),
             scroll: ScrollView::new(ScrollOpts::vertical()),
@@ -293,7 +292,7 @@ impl SearchPanel {
             b.reshape(fs);
         }
         self.filters_btn.reshape(fs);
-        self.replace_all_label.reshape(fs);
+        self.replace_all_btn.reshape(fs);
         self.summary.reshape(fs);
     }
 
@@ -409,7 +408,7 @@ impl SearchPanel {
             input_box(inc, bg);
             input_box(exc, bg);
         }
-        bg.push(self.replace_all_rect(region).rounded_quad(theme::DIALOG_BTN(), theme::zpx(6.0)));
+        self.replace_all_btn.draw_bg(self.replace_all_rect(region), false, false, bg);
 
         if self.query_active {
             self.query.selection_quads(q, theme::zpx(6.0), bg);
@@ -499,9 +498,7 @@ impl SearchPanel {
             let color = if on[i] { theme::FG_ACTIVE() } else { theme::FG_DIM() };
             lbl.push(left, *r, color, areas);
         }
-        let ba = self.replace_all_rect(region);
-        let bl = &self.replace_all_label;
-        bl.push(ba.x + (ba.w - bl.width()) * 0.5, ba, theme::FG_TEXT(), areas);
+        self.replace_all_btn.draw(self.replace_all_rect(region), areas);
 
         // Total-occurrence summary line above the results.
         if !self.last_summary.is_empty() {

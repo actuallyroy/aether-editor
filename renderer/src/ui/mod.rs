@@ -67,6 +67,8 @@ pub enum Intent {
     /// Stash only one pathspec — a single file or a whole folder (incl. untracked).
     GitStashPath(String),
     GitRefresh,
+    /// `git init` the current folder (Source Control empty-state button).
+    GitInit,
     /// Generate a commit message from the current diff via Azure OpenAI (✨).
     GitGenerateCommitMessage,
     /// Open the commit graph (Visualize Repository History).
