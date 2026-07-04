@@ -186,8 +186,10 @@ pub fn run() -> io::Result<()> {
                 match frame {
                     Frame::Control(Msg::Create { cwd, rows, cols, env }) => {
                         let workspace = workspaces.get(&cid).cloned().unwrap_or_else(|| cwd.clone());
-                        if let Some(term) = spawn_term(&cwd, &workspace, cid, rows, cols, next_id, tx.clone(), &env) {
-                            let id = next_id;
+                        // The terminal id is the shell's pid (deterministic). `next_id` is
+                        // only a fallback if the platform can't report a pid; bump it either
+                        // way so fallbacks stay unique.
+                        if let Some((id, term)) = spawn_term(&cwd, &workspace, cid, rows, cols, next_id, tx.clone(), &env) {
                             next_id += 1;
                             let title = term.title.clone();
                             terms.insert(id, term);
@@ -326,8 +328,11 @@ fn send(conns: &mut HashMap<u64, TcpStream>, cid: u64, frame: Frame) {
 }
 
 /// Spawn the platform shell on a fresh PTY plus a reader thread that pumps its
-/// output into the event loop. Returns the owned `Term` on success.
-fn spawn_term(cwd: &str, workspace: &str, owner: u64, rows: u16, cols: u16, id: TermId, tx: Sender<Event>, env: &[(String, String)]) -> Option<Term> {
+/// output into the event loop. Returns `(id, Term)` — the id is the shell's real
+/// **process id**, so terminal ids are deterministic and survive window restarts /
+/// MCP reconnects (the daemon keeps the shell alive with the same pid). `fallback_id`
+/// is used only if the platform doesn't report a pid.
+fn spawn_term(cwd: &str, workspace: &str, owner: u64, rows: u16, cols: u16, fallback_id: TermId, tx: Sender<Event>, env: &[(String, String)]) -> Option<(TermId, Term)> {
     let pty = native_pty_system();
     let pair = pty
         .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
@@ -350,6 +355,8 @@ fn spawn_term(cwd: &str, workspace: &str, owner: u64, rows: u16, cols: u16, id: 
         cmd.env(k, v);
     }
     let child = pair.slave.spawn_command(cmd).ok()?;
+    // The shell's OS pid IS the terminal id (deterministic across restarts).
+    let id: TermId = child.process_id().map(|p| p as TermId).unwrap_or(fallback_id);
     drop(pair.slave);
     let mut reader = pair.master.try_clone_reader().ok()?;
     let writer = pair.master.take_writer().ok()?;
@@ -369,18 +376,21 @@ fn spawn_term(cwd: &str, workspace: &str, owner: u64, rows: u16, cols: u16, id: 
             }
         }
     });
-    Some(Term {
-        title,
-        workspace: workspace.to_string(),
-        owner: Some(owner),
-        master: pair.master,
-        writer,
-        child,
-        backlog: VecDeque::new(),
-        rows,
-        cols,
-        tab_id: 0,
-    })
+    Some((
+        id,
+        Term {
+            title,
+            workspace: workspace.to_string(),
+            owner: Some(owner),
+            master: pair.master,
+            writer,
+            child,
+            backlog: VecDeque::new(),
+            rows,
+            cols,
+            tab_id: 0,
+        },
+    ))
 }
 
 /// True when the terminal's shell has a child process (a running command/TUI, not

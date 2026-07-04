@@ -214,13 +214,28 @@ fn call_tool(name: &str, args: Value, req_tx: &Sender<McpRequest>, proxy: &Event
 fn startup_instructions(req_tx: &Sender<McpRequest>, proxy: &EventLoopProxy<()>) -> String {
     let mut s = String::from(
         "Aether IDE (aether-ide). You can drive the editor and its integrated terminals. \
-         Terminals are addressed by a STABLE `id` (not position) — pass it to terminalSend / \
-         terminalSendKey / terminalOutput / focusTerminal. terminalSend pastes text then \
-         presses Enter by default; pass `keys` for a custom key sequence after the text \
-         (e.g. [\"enter\"], [\"ctrl-c\"], [\"down\",\"enter\"]) or enter:false for none. \
-         terminalOutput reads a terminal's content (omit `lines` for all, or pass N for the \
-         last N). Call listTerminals anytime to refresh. Report bugs/feedback about Aether \
-         itself with submitFeedback (files a GitHub issue via the user's gh CLI).\n\n",
+         Terminals are addressed by a STABLE `id` — the shell's OS process id — so it is \
+         deterministic and survives MCP reconnects and Aether restarts (and you can \
+         cross-check it with `ps`). Pass it to terminalSend / terminalSendKey / \
+         terminalOutput / focusTerminal. terminalSend pastes text then presses Enter by \
+         default; pass `keys` for a custom key sequence after the text (e.g. [\"enter\"], \
+         [\"ctrl-c\"], [\"down\",\"enter\"]) or enter:false for none. terminalOutput reads a \
+         terminal's content (omit `lines` for all, or pass N for the last N). Call \
+         listTerminals anytime to refresh. Report bugs/feedback about Aether itself with \
+         submitFeedback (files a GitHub issue via the user's gh CLI).\n\n\
+         ORCHESTRATION — you can run MULTIPLE agents in parallel through these terminals. \
+         To fan a task out: newTerminal for each worker, then terminalSend a \
+         `claude ...` command to launch a Claude Code session in it (use \
+         `--dangerously-skip-permissions` for autonomous work; add `--resume <sessionId> \
+         --fork-session` to give a worker your full context under a fresh id). A worker \
+         reports back by calling terminalSend targeted at YOUR terminal's id — its message \
+         then arrives to you as a prompt, so workers talk to you directly (no polling, no \
+         status files). Find your own terminal id by reading terminalOutput of each \
+         terminal until you see your own session. Prefer having workers report via this \
+         terminal channel; avoid a worker BLOCKING on an MCP call to report (a call to a \
+         stale/closed terminal can hang it) — keep report calls best-effort. If a worker \
+         must build/run the app, note that restarting Aether ends the terminals hosting \
+         the workers.\n\n",
     );
     // Short timeout: a wedged UI thread must NOT stall the connect handshake (that surfaces
     // to the client as -32000). Fall back to the base instructions if it doesn't answer fast.

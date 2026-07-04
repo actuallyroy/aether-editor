@@ -141,8 +141,9 @@ pub fn list() -> Value {
         ),
         tool(
             "listTerminals",
-            "List the terminal tabs (stable id, index, title, active). Use `id` for later \
-             calls — it survives reordering/closing other tabs; `index` does not.",
+            "List the terminal tabs (stable id, index, title, active). The `id` is the \
+             shell's process id — stable across reordering, MCP reconnects, and Aether \
+             restarts; use it for later calls (`index` is positional and shifts).",
             json!({"type":"object","properties":{}}),
         ),
         tool(
@@ -438,6 +439,14 @@ pub fn execute(app: &mut crate::App, name: &str, args: &Value) -> Result<Value, 
             let panel = app.layout().terminal_panel;
             app.terminal.new_terminal_tab(panel, app.terminal_cell_w);
             let index = app.terminal.active; // new_terminal_tab makes it active
+            // The terminal id is the shell's pid, which isn't known until the daemon
+            // spawns it and replies. Pump the daemon connection briefly so we return the
+            // real (stable) id instead of 0.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+            while app.terminal.tab_id(index).unwrap_or(0) == 0 && std::time::Instant::now() < deadline {
+                app.terminal.poll();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
             let id = app.terminal.tab_id(index);
             if let Some(name) = args.get("name").and_then(|n| n.as_str()) {
                 app.terminal.rename_tab(index, name);

@@ -371,14 +371,19 @@ impl TerminalPanel {
         self.groups.len()
     }
 
-    /// The stable id of the tab at `index` (see `terminal::Group::id`).
+    /// The stable id of the tab at `index` — the shell's **process id** (assigned by
+    /// the pty daemon, from the tab's original/first pane). Deterministic across window
+    /// restarts and MCP reconnects, and verifiable with `ps`. `0` while a just-created
+    /// shell hasn't bound yet (callers wait for the bind — see `newTerminal`).
     pub fn tab_id(&self, index: usize) -> Option<u64> {
-        self.groups.get(index).map(|g| g.id)
+        self.groups.get(index).and_then(|g| g.panes.first()).map(|p| p.term.id)
     }
 
-    /// The position index of the tab with stable `id`, or None if it's gone.
+    /// The position index of the tab whose shell pid is `id`, or None if it's gone.
     pub fn tab_index_by_id(&self, id: u64) -> Option<usize> {
-        self.groups.iter().position(|g| g.id == id)
+        self.groups
+            .iter()
+            .position(|g| g.panes.first().map_or(false, |p| p.term.id == id))
     }
 
     /// Read the recent text (most recent `max_lines`) of a tab's focused pane — for the
