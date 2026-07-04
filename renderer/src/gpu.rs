@@ -70,6 +70,7 @@ pub struct UiBuffers {
     pub ctx: Menu, // generic right-click context menu (editor / tabs / SCM / …)
     pub dialog: Dialog,
     pub diag_hover: HoverCard, // floating tooltip for the diagnostic under the pointer
+    pub lsp_hover_md: crate::markdown::Markdown, // LSP hover card (type/doc, markdown-rendered)
     pub commit_card: HoverCard, // commit-graph: full message on hover
     pub ext_detail: ExtensionDetail,
     pub panel_text: Buffer,          // PROBLEMS/OUTPUT/DEBUG CONSOLE text view (non-terminal tabs)
@@ -347,6 +348,7 @@ impl GpuState {
             drag_ghost: TextLabel::new(&mut font_system, 320.0, theme::TREE_ROW_HEIGHT()),
             dialog: Dialog::new(&mut font_system),
             diag_hover: HoverCard::new(&mut font_system),
+            lsp_hover_md: crate::markdown::Markdown::new(&mut font_system),
             commit_card: HoverCard::new(&mut font_system),
             ext_detail: ExtensionDetail::new(&mut font_system),
             panel_text: make_ui_buffer_mono(&mut font_system, 4000.0, 4000.0),

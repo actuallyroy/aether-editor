@@ -251,6 +251,35 @@ pub fn parse_workspace_edit(r: &Value) -> Vec<(String, Vec<TextEdit>)> {
     out
 }
 
+/// Flatten a `textDocument/hover` result's `contents` into a markdown string (kept
+/// as markdown so the hover card renders code blocks + dividers richly). Handles all
+/// three LSP shapes: `MarkupContent {kind,value}`, a `MarkedString` (bare string or
+/// `{language,value}` — wrapped back into a fenced code block), and an array of them.
+pub fn parse_hover(result: &Value) -> String {
+    fn one(v: &Value) -> Option<String> {
+        if let Some(s) = v.as_str() {
+            return Some(s.to_string());
+        }
+        let val = v.get("value").and_then(|x| x.as_str())?;
+        // A MarkedString {language,value} is a code block; MarkupContent value is
+        // already markdown.
+        match v.get("language").and_then(|l| l.as_str()) {
+            Some(lang) if !lang.is_empty() => Some(format!("```{lang}\n{val}\n```")),
+            _ => Some(val.to_string()),
+        }
+    }
+    let Some(contents) = result.get("contents") else {
+        return String::new();
+    };
+    match contents {
+        Value::String(s) => s.clone(),
+        Value::Array(a) => a.iter().filter_map(one).collect::<Vec<_>>().join("\n\n"),
+        v => one(v).unwrap_or_default(),
+    }
+    .trim()
+    .to_string()
+}
+
 /// Shape check for location-flavored responses (vs completion lists, which are
 /// also arrays): single Location object, null, or an array whose first element
 /// carries `uri` / `targetUri` / `location`.
@@ -749,6 +778,27 @@ impl LspClient {
         id
     }
 
+    /// Request hover info (`textDocument/hover`) at a position. Returns the request id.
+    pub fn request_hover(&mut self, uri: &str, line: u32, character: u32) -> i64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "textDocument/hover",
+            "params": {
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character }
+            }
+        });
+        if self.initialized {
+            self.send_raw(msg);
+        } else {
+            self.pending.push(msg);
+        }
+        id
+    }
+
     /// Fire a position-based request (`textDocument/definition` family). The
     /// references flavor adds its required `context` param.
     pub fn request_at(&mut self, kind: LocKind, uri: &str, line: u32, character: u32) -> i64 {
@@ -913,6 +963,16 @@ impl LspManager {
     /// True if `id` is the newest completion request (drop superseded responses).
     pub fn is_current_completion(&self, id: i64) -> bool {
         self.comp_pending == Some(id)
+    }
+
+    /// Fire a `textDocument/hover` on whatever running server serves `lang`. Returns
+    /// the request id (None when no server is up), so the caller can match the reply.
+    pub fn request_hover(&mut self, lang: &str, uri: &str, line: u32, character: u32) -> Option<i64> {
+        let name = registry()
+            .iter()
+            .find(|s| s.languages.contains(&lang) && self.clients.iter().any(|c| c.server == s.name))
+            .map(|s| s.name)?;
+        Some(self.client_mut(name)?.request_hover(uri, line, character))
     }
 
     /// Fire a Go-to / references request on whatever running server serves `lang`.
@@ -1396,6 +1456,10 @@ fn handle_server_message(server: &'static str, msg: &Value, reply_tx: &Sender<Ve
                     // WorkspaceEdit (rename).
                     let changes = parse_workspace_edit(r);
                     let _ = tx.send(WorkerMsg::LspWorkspaceEdit { id: id.as_i64().unwrap_or(0), changes });
+                } else if r.get("contents").is_some() {
+                    // Hover: { contents, range? }. `contents` is unique to hover.
+                    let markdown = parse_hover(r);
+                    let _ = tx.send(WorkerMsg::LspHover { id: id.as_i64().unwrap_or(0), markdown });
                 } else if looks_like_locations(r) {
                     // Location / LocationLink / SymbolInformation results (or null —
                     // "no definition found"). Routed by id on the main thread; empty

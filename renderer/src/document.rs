@@ -178,6 +178,9 @@ fn window_string(rope: &Rope, first: usize, count: usize) -> String {
 /// files skip rich styling, and logs are overwhelmingly ASCII.
 fn shape_window(buffer: &mut Buffer, fs: &mut FontSystem, text: &str, count: usize) {
     buffer.set_metrics(fs, Metrics::new(theme::FONT_SIZE(), theme::LINE_HEIGHT()));
+    // Render tabs at the configured width (cosmic-text defaults to 8) so tab-indented
+    // files aren't drawn double-wide and the indent guides line up.
+    buffer.set_tab_width(fs, crate::settings::current().editor_tab_size.max(1) as u16);
     buffer.set_wrap(fs, Wrap::None);
     buffer.set_size(fs, None, Some((count as f32 + 2.0) * theme::LINE_HEIGHT() + 200.0));
     let mono = Attrs::new().family(Family::Name(theme::MONO_FAMILY()));
@@ -202,6 +205,9 @@ fn apply_buffer_text(
 ) {
     // Pick up the current editor font size / line height (driven by settings).
     buffer.set_metrics(fs, Metrics::new(theme::FONT_SIZE(), theme::LINE_HEIGHT()));
+    // Tabs render at the configured width (cosmic-text defaults to 8) — matches VS Code
+    // and keeps the indent guides aligned with tab-indented code.
+    buffer.set_tab_width(fs, crate::settings::current().editor_tab_size.max(1) as u16);
     // editor.wordWrap: Some(width) wraps at that width; None = unbounded (no wrap).
     buffer.set_wrap(fs, if wrap_width.is_some() { Wrap::WordOrGlyph } else { Wrap::None });
     let h = (lines as f32 + 2.0) * theme::LINE_HEIGHT() + 200.0;
@@ -1062,6 +1068,31 @@ impl Document {
         self.byte_visual(self.sel.head)
     }
 
+    /// The font's real monospace cell width (px) — the MOST COMMON positive glyph
+    /// advance in the shaped buffer, matching how the terminal measures its cell. Used
+    /// to place indent guides and column rulers exactly on the text, instead of the old
+    /// `FONT_SIZE * 0.6` guess (which drifts, worst at deep indents). Falls back to that
+    /// estimate for an empty buffer. Bounded scan so it's cheap per frame.
+    pub fn mono_advance(&self) -> f32 {
+        let mut counts: std::collections::HashMap<u32, (f32, u32)> = std::collections::HashMap::new();
+        for w in self
+            .buffer
+            .layout_runs()
+            .flat_map(|r| r.glyphs.iter())
+            .map(|g| g.w)
+            .filter(|w| *w > 0.5)
+            .take(400)
+        {
+            counts.entry(w.to_bits()).or_insert((w, 0)).1 += 1;
+        }
+        counts
+            .values()
+            .copied()
+            .max_by_key(|(_, c)| *c)
+            .map(|(w, _)| w)
+            .unwrap_or(theme::FONT_SIZE() * 0.6)
+    }
+
     /// Buffer-local (x, top, height) of an arbitrary byte offset (the caret math,
     /// generalized — used e.g. for the drag-and-drop insertion caret).
     pub fn byte_visual(&self, byte: usize) -> (f32, f32, f32) {
@@ -1867,6 +1898,17 @@ impl Document {
             .map(|c| c.len_utf16())
             .sum();
         (line as u32, col as u32)
+    }
+
+    /// Buffer byte offset under a text-relative point (`buf_x/buf_y` are relative to
+    /// the text's top-left — caller subtracts the editor pad and adds scroll). None if
+    /// the point is past the last line. Used to position LSP hover requests.
+    pub fn byte_at(&self, buf_x: f32, buf_y: f32) -> Option<usize> {
+        let hit = self.buffer.hit(buf_x, buf_y)?;
+        if hit.line >= self.rope.len_lines() {
+            return None;
+        }
+        Some(self.rope.line_to_byte(hit.line) + hit.index.min(self.rope.line(hit.line).len_bytes()))
     }
 
     /// The diagnostic message under a buffer-relative point (for hover tooltips),

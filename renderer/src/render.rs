@@ -1506,7 +1506,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         // editor.rulers — vertical guide line(s) at N monospace columns.
         let rulers = crate::settings::rulers();
         if rulers > 0 {
-            let char_w = theme::FONT_SIZE() * 0.6; // monospace advance approximation
+            let char_w = d.mono_advance(); // real monospace cell width (not an estimate)
             let rx = layout.editor_text.x + theme::EDITOR_PAD() + rulers as f32 * char_w - d.scroll_x();
             if rx > layout.editor_text.x && rx < layout.editor_text.x + layout.editor_text.w {
                 bg_quads.push(Quad::new(rx, layout.editor_text.y, 1.0, layout.editor_text.h, theme::BORDER()));
@@ -1521,7 +1521,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             // STEP is the unit detected from the file's own indentation.
             let tab = crate::settings::current().editor_tab_size.max(1);
             let unit = d.indent_unit(tab).max(1);
-            let char_w = theme::FONT_SIZE() * 0.6;
+            let char_w = d.mono_advance();
             let gw = theme::zpx(1.0).max(1.0);
             let faint = [0.50, 0.52, 0.62, 0.14];
             let active_c = [0.58, 0.62, 0.78, 0.5]; // active block's guide, like the trees
@@ -1621,7 +1621,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         if let (Some(_), Some(right)) = (d.diff.as_ref(), d.diff_right.as_ref()) {
             let tab = crate::settings::current().editor_tab_size.max(1);
             let unit = d.indent_unit(tab).max(1);
-            let char_w = theme::FONT_SIZE() * 0.6;
+            let char_w = d.mono_advance();
             let gw = theme::zpx(1.0).max(1.0);
             let faint = [0.50, 0.52, 0.62, 0.14];
             let (_, lt, _, rt) = diff_pane_rects(editor_full);
@@ -3769,6 +3769,96 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 gpu.text_renderer.render(&gpu.atlas, &gpu.viewport, &mut pass)?;
             }
             gpu.queue.submit(Some(ench.finish()));
+        }
+
+        // ---- LSP hover card (type/doc): a fixed-size, rounded, scrollable card that
+        // renders the server's markdown (code blocks, dividers). Mutually exclusive
+        // with the diagnostic card (only one is set at a time by the input handler). ----
+        if let Some((md_src, hx, hy)) = app.lsp_hover.clone() {
+            let z = theme::ui_zoom();
+            let pad = theme::zpx(12.0);
+            let radius = theme::zpx(10.0);
+            let max_w = 520.0 * z;
+            let max_h = 340.0 * z;
+            let inner_w = max_w - pad * 2.0;
+            gpu.ui.lsp_hover_md.set(&mut gpu.font_system, &md_src, &md_src, inner_w);
+            let no_img = |_: &str| None;
+            let content_h = gpu.ui.lsp_hover_md.content_height(&no_img);
+            let inner_h = content_h.min(max_h - pad * 2.0);
+            let card_w = inner_w + pad * 2.0;
+            let card_h = inner_h + pad * 2.0;
+            // Prefer above the anchor (VS Code style); flip below / clamp to screen.
+            let gap = theme::zpx(8.0);
+            let edge = theme::zpx(6.0);
+            let mut x = hx;
+            let mut y = hy - card_h - gap;
+            if y < edge {
+                y = hy + theme::zpx(18.0);
+            }
+            if x + card_w > cfg_w as f32 - edge {
+                x = cfg_w as f32 - card_w - edge;
+            }
+            x = x.max(edge);
+            y = y.min(cfg_h as f32 - card_h - edge).max(edge);
+            let card = Rect { x, y, w: card_w, h: card_h };
+            app.lsp_hover_rect = Some(card);
+            let inner = Rect { x: x + pad, y: y + pad, w: inner_w, h: inner_h };
+            let max_scroll = (content_h - inner_h).max(0.0);
+            let scroll = app.lsp_hover_scroll.clamp(0.0, max_scroll);
+            app.lsp_hover_scroll = scroll; // write back the clamped value
+
+            let mut hq: Vec<Quad> = Vec::new();
+            // Soft drop shadow so the card floats above the code.
+            for i in 1..=5 {
+                let s = i as f32 * theme::zpx(2.0);
+                let a = 0.13 * (1.0 - (i as f32 - 1.0) / 5.0);
+                hq.push(Rect { x: x - s, y: y - s + theme::zpx(2.0), w: card_w + s * 2.0, h: card_h + s * 2.0 }.rounded_quad([0.0, 0.0, 0.0, a], radius + s));
+            }
+            hq.push(Rect { x: x - 1.0, y: y - 1.0, w: card_w + 2.0, h: card_h + 2.0 }.rounded_quad(theme::PALETTE_BORDER(), radius + 1.0));
+            hq.push(card.rounded_quad(theme::PALETTE_BG(), radius));
+            hq.extend(gpu.ui.lsp_hover_md.collect_quads(inner, scroll, &no_img));
+            // Scrollbar thumb when the content overflows.
+            if max_scroll > 0.5 {
+                let tw = theme::zpx(4.0);
+                let tx = x + card_w - tw - theme::zpx(3.0);
+                let thumb_h = (inner_h * inner_h / content_h).max(theme::zpx(24.0));
+                let ty = inner.y + (scroll / max_scroll) * (inner_h - thumb_h);
+                hq.push(Rect { x: tx, y: ty, w: tw, h: thumb_h }.rounded_quad([1.0, 1.0, 1.0, 0.20], tw * 0.5));
+            }
+            gpu.quad_renderer.prepare(&gpu.device, &gpu.queue, &hq, &[], (cfg_w, cfg_h));
+            let mut hareas: Vec<TextArea> = Vec::new();
+            let mut img_rects: Vec<(String, Rect)> = Vec::new();
+            gpu.ui.lsp_hover_md.draw(inner, scroll, &no_img, &mut hareas, &mut img_rects);
+            gpu.text_renderer.prepare(
+                &gpu.device,
+                &gpu.queue,
+                &mut gpu.font_system,
+                &mut gpu.atlas,
+                &gpu.viewport,
+                hareas,
+                &mut gpu.swash_cache,
+            )?;
+            let mut ench = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("aether-lsphover-pass"),
+            });
+            {
+                let mut pass = ench.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("aether-lsphover"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                gpu.quad_renderer.render_bg(&mut pass);
+                gpu.text_renderer.render(&gpu.atlas, &gpu.viewport, &mut pass)?;
+            }
+            gpu.queue.submit(Some(ench.finish()));
+        } else {
+            app.lsp_hover_rect = None;
         }
     }
 

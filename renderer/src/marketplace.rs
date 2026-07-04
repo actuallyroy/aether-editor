@@ -65,6 +65,7 @@ pub enum WorkerMsg {
     LspDiagnosticReport { id: i64, diags: Vec<crate::lsp::Diagnostic> }, // pull diagnostic response
     LspSemanticTokens { id: i64, data: Vec<u32> },              // semanticTokens/full response
     LspCompletion { id: i64, items: Vec<crate::lsp::CompletionItem> }, // textDocument/completion response
+    LspHover { id: i64, markdown: String },                     // textDocument/hover response (display text)
     LspLocations { id: i64, locs: Vec<crate::lsp::LspLocation> }, // definition/references/symbol response
     LspTextEdits { id: i64, edits: Vec<crate::lsp::TextEdit> },   // formatting response (TextEdit[])
     LspWorkspaceEdit { id: i64, changes: Vec<(String, Vec<crate::lsp::TextEdit>)> }, // rename response

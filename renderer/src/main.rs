@@ -391,6 +391,18 @@ pub(crate) struct App {
     /// A diagnostic the pointer is resting on, awaiting the hover delay before it's
     /// promoted to a visible `hover_tip`. (info, x, y, when the rest started.)
     pub(crate) hover_pending: Option<(crate::lsp::DiagHover, f32, f32, Instant)>,
+    /// LSP hover (type/doc tooltip). `lsp_hover` is the visible card (text, x, y);
+    /// `lsp_hover_dwell` stages a request after the pointer rests (line, col, x, y,
+    /// start); `lsp_hover_req` is the in-flight request (id, x, y); `lsp_hover_at`
+    /// is the (line, col) currently dwelt/requested/shown, to dedupe re-requests.
+    pub(crate) lsp_hover: Option<(String, f32, f32)>,
+    pub(crate) lsp_hover_dwell: Option<(u32, u32, f32, f32, Instant)>,
+    pub(crate) lsp_hover_req: Option<(i64, f32, f32)>,
+    pub(crate) lsp_hover_at: Option<(u32, u32)>,
+    /// Scroll offset within the hover card, and the card's screen rect (cached by
+    /// render each frame) so the input handlers can hit-test / wheel-scroll it.
+    pub(crate) lsp_hover_scroll: f32,
+    pub(crate) lsp_hover_rect: Option<crate::widgets::Rect>,
     pub(crate) hovered_activity: Option<usize>,
     pub(crate) hovered_titlebtn: Option<usize>,
     pub(crate) hovered_search: bool,
@@ -638,6 +650,12 @@ impl App {
             hovered_tree: None,
             hover_tip: None,
             hover_pending: None,
+            lsp_hover: None,
+            lsp_hover_dwell: None,
+            lsp_hover_req: None,
+            lsp_hover_at: None,
+            lsp_hover_scroll: 0.0,
+            lsp_hover_rect: None,
             hovered_activity: None,
             hovered_titlebtn: None,
             hovered_search: false,
@@ -1153,6 +1171,7 @@ impl App {
                 let on_link = g.ui.diag_hover.link_rect(card).map_or(false, |lr| lr.contains(p));
                 (bridge.contains(p), on_link)
             });
+        let has_squiggle = squiggle.is_some();
         if over_card {
             self.hover_pending = None; // leave hover_tip as-is
         } else if let Some((info, cx, cy)) = squiggle {
@@ -1172,6 +1191,44 @@ impl App {
             // Off any squiggle and not over the card → dismiss.
             self.hover_pending = None;
             if self.hover_tip.take().is_some() {
+                changed = true;
+            }
+        }
+        // LSP hover (type/doc): dwell over a token, then request `textDocument/hover`.
+        // Yields to the diagnostic card when the pointer is over a squiggle.
+        let lsp_target = if ed_inside && !over_scroll_thumb && !has_squiggle {
+            self.workspace.active_doc().and_then(|d| {
+                d.language_id()?;
+                let bx = p.0 - (layout.editor_text.x + theme::EDITOR_PAD()) + d.scroll_x();
+                let by = p.1 - (layout.editor_text.y + theme::EDITOR_PAD()) + d.scroll_y();
+                d.byte_at(bx, by).map(|b| d.lsp_pos(b))
+            })
+        } else {
+            None
+        };
+        // Keep the card up while the pointer is over it (or in the small bridge gap).
+        let over_lsp_card = self.lsp_hover_rect.map_or(false, |card| {
+            let m = theme::zpx(20.0);
+            crate::widgets::Rect { x: card.x - m, y: card.y - m, w: card.w + 2.0 * m, h: card.h + 2.0 * m }.contains(p)
+        });
+        if over_lsp_card {
+            self.lsp_hover_dwell = None; // don't restart the timer while reading it
+        } else if let Some((line, col)) = lsp_target {
+            if self.lsp_hover_at != Some((line, col)) {
+                // Moved onto a new token: stage a fresh dwell, drop any stale card.
+                self.lsp_hover_at = Some((line, col));
+                self.lsp_hover_dwell = Some((line, col, p.0, p.1, Instant::now()));
+                self.lsp_hover_req = None;
+                if self.lsp_hover.take().is_some() {
+                    changed = true;
+                }
+            }
+        } else {
+            // Off the text entirely → clear everything.
+            self.lsp_hover_at = None;
+            self.lsp_hover_dwell = None;
+            self.lsp_hover_req = None;
+            if self.lsp_hover.take().is_some() {
                 changed = true;
             }
         }
@@ -8015,8 +8072,23 @@ impl App {
     /// region actually scrolled — the fling uses this to know whether to keep coasting
     /// (so momentum works uniformly in every scrollable region, and stops at edges).
     fn on_scroll(&mut self, dy: f32) -> bool {
-        let layout = self.layout();
         let p = (self.mouse_pos.x as f32, self.mouse_pos.y as f32);
+        // Wheel over the hover card scrolls its content instead of the editor (render
+        // clamps + writes back the offset, so over-scroll self-corrects).
+        if self.lsp_hover.is_some() && self.lsp_hover_rect.map_or(false, |r| r.contains(p)) {
+            self.lsp_hover_scroll = (self.lsp_hover_scroll - dy).max(0.0);
+            self.redraw();
+            return true;
+        }
+        // Otherwise scrolling shifts the text under the pointer → any hover is stale.
+        self.lsp_hover = None;
+        self.lsp_hover_rect = None;
+        self.lsp_hover_dwell = None;
+        self.lsp_hover_req = None;
+        self.lsp_hover_at = None;
+        self.hover_tip = None;
+        self.hover_pending = None;
+        let layout = self.layout();
         // Inline gutter-diff peek: wheel over the zone scrolls its diff body.
         if self.gutter_peek.is_some() {
             let rows = self.gpu.as_ref().map_or(0, |g| g.ui.peek.layout_runs().count());
@@ -9492,6 +9564,20 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
+                WorkerMsg::LspHover { id, markdown } => {
+                    // Only accept the reply to the newest in-flight hover request, and
+                    // only if the pointer is still on that token (req not cleared).
+                    if let Some((req_id, hx, hy)) = self.lsp_hover_req {
+                        if req_id == id {
+                            self.lsp_hover_req = None;
+                            if !markdown.trim().is_empty() {
+                                self.lsp_hover = Some((markdown, hx, hy));
+                                self.lsp_hover_scroll = 0.0; // fresh card starts at top
+                                self.redraw();
+                            }
+                        }
+                    }
+                }
                 WorkerMsg::LspExited { server } => self.lsp.drop_server(server),
                 WorkerMsg::LspLog { server, message } => {
                     eprintln!("[lsp:{server}] {message}");
@@ -9708,6 +9794,21 @@ impl ApplicationHandler for App {
         }
         let hover_wake = self.hover_pending.as_ref().map(|(.., t0)| *t0 + HOVER_DELAY);
 
+        // Fire an LSP hover request once the pointer has rested on a token.
+        if let Some((line, col, hx, hy, t0)) = self.lsp_hover_dwell {
+            if now.duration_since(t0) >= HOVER_DELAY {
+                self.lsp_hover_dwell = None;
+                if let Some(d) = self.workspace.active_doc() {
+                    if let (Some(uri), Some(lang)) = (d.uri(), d.language_id()) {
+                        if let Some(id) = self.lsp.request_hover(lang, &uri, line, col) {
+                            self.lsp_hover_req = Some((id, hx, hy));
+                        }
+                    }
+                }
+            }
+        }
+        let lsp_hover_wake = self.lsp_hover_dwell.as_ref().map(|(.., t0)| *t0 + HOVER_DELAY);
+
         // Promote a rested inline-blame annotation into its full-commit card.
         if let Some((txt, bx, by, t0)) = self.blame_pending.clone() {
             if now.duration_since(t0) >= BLAME_DELAY {
@@ -9891,7 +9992,7 @@ impl ApplicationHandler for App {
                 min_instant(
                     min_instant(
                         min_instant(
-                            min_instant(min_instant(min_instant(scroll_wake, autosave_wake), hover_wake), search_wake),
+                            min_instant(min_instant(min_instant(min_instant(scroll_wake, autosave_wake), hover_wake), lsp_hover_wake), search_wake),
                             blame_wake,
                         ),
                         fs_wake,
@@ -9916,6 +10017,9 @@ impl ApplicationHandler for App {
         let blink_wake = self.last_blink + interval;
         let mut wake = scroll_wake.map_or(blink_wake, |s| s.min(blink_wake));
         if let Some(hw) = hover_wake {
+            wake = wake.min(hw);
+        }
+        if let Some(hw) = lsp_hover_wake {
             wake = wake.min(hw);
         }
         if let Some(sw) = search_wake {
