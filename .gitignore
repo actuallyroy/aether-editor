@@ -10,3 +10,5 @@ Cargo.lock
 nova-perf.log
 aether-perf.log
 PRD.md
+# Local MCP server config (may contain API keys)
+.mcp.json
