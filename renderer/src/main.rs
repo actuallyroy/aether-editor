@@ -4385,7 +4385,14 @@ impl App {
                 }
                 return;
             };
-            let active = self.workspace.active == Some(tab);
+            // The docked webview is a real OS window stacked above us, so any editor
+            // overlay (menus, palette, dialogs, context menu) would render UNDER it —
+            // hide the webview while one is open.
+            let overlay_open = self.open_menu.is_some()
+                || self.ctx_menu.is_some()
+                || self.palette.active
+                || self.dialog.is_some();
+            let active = self.workspace.active == Some(tab) && !overlay_open;
             // Root coordinates: editor-window origin + the editor-pane rect.
             let origin = self
                 .gpu
