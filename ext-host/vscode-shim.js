@@ -389,8 +389,13 @@ function createVscode(rpc) {
         rpc.notify('commands/registerCommand', { command });
         return new Disposable(() => commands.delete(command));
       },
-      executeCommand: (command, ...args) =>
-        rpc.request('commands/executeCommand', { command, args }),
+      executeCommand: (command, ...args) => {
+        // Commands registered IN this host run directly; everything else goes to aether.
+        const local = commands.get(command);
+        if (local) return Promise.resolve(local(...args));
+        return rpc.request('commands/executeCommand', { command, args });
+      },
+      getCommands: () => Promise.resolve([...commands.keys()]),
     },
 
     workspace: {

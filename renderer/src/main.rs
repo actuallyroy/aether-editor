@@ -4382,6 +4382,7 @@ impl App {
     /// Run an extension-contributed command (palette or status-bar click), activating
     /// its owning extension first if it hasn't been yet (VSCode's onCommand behavior).
     fn run_ext_command(&mut self, command: &str) {
+        eprintln!("[aether] run_ext_command: {command}");
         // Internal palette rows for registered webview views.
         if let Some(view_id) = command.strip_prefix("__webview:") {
             let view_id = view_id.to_string();
@@ -4413,6 +4414,11 @@ impl App {
         let method = value.get("method").and_then(|m| m.as_str()).map(String::from);
         let id = value.get("id").cloned();
         let params = value.get("params").cloned().unwrap_or(serde_json::Value::Null);
+        if let Some(m) = method.as_deref() {
+            if m != "log" {
+                eprintln!("[exthost→aether] {m} {}", params.to_string().chars().take(160).collect::<String>());
+            }
+        }
         match method.as_deref() {
             Some("log") => {
                 let lvl = params.get("level").and_then(|v| v.as_str()).unwrap_or("info");
@@ -4484,6 +4490,32 @@ impl App {
                     }
                 }
             }
+            Some("webview/createPanel") => {
+                // The extension opened a webview PANEL (createWebviewPanel) — spawn a
+                // webview-host window for it. It supplies the (negative) instance id.
+                let iid = params.get("instanceId").and_then(|v| v.as_i64()).unwrap_or(0);
+                let title = params.get("title").and_then(|v| v.as_str()).unwrap_or("Webview").to_string();
+                let vtype = params.get("viewType").and_then(|v| v.as_str()).unwrap_or("panel").to_string();
+                if !self.webviews.iter().any(|w| w.instance_id == iid) {
+                    let roots: Vec<std::path::PathBuf> =
+                        self.ext_registry.iter().map(|e| e.path.clone()).collect();
+                    match exthost::WebviewProc::start(
+                        &vtype,
+                        iid,
+                        &title,
+                        &roots,
+                        self.worker_tx.clone(),
+                        self.proxy.clone(),
+                    ) {
+                        Some(wv) => self.webviews.push(wv),
+                        None => self.show_toast("Couldn't start the webview host."),
+                    }
+                }
+            }
+            Some("webview/disposePanel") => {
+                let iid = params.get("instanceId").and_then(|v| v.as_i64()).unwrap_or(0);
+                self.webviews.retain(|w| w.instance_id != iid);
+            }
             Some("webview/setHtml") => {
                 let iid = params.get("instanceId").and_then(|v| v.as_i64()).unwrap_or(0);
                 let html = params.get("html").and_then(|v| v.as_str()).unwrap_or("");
@@ -4499,7 +4531,22 @@ impl App {
             }
             Some("commands/registerCommand") => { /* palette rows come from contributes.commands */ }
             Some("commands/executeCommand") => {
-                // Extension asked aether to run a command — only ext→ext for now.
+                // VSCode built-ins extensions rely on. `<viewId>.focus` reveals a
+                // sidebar view — for a registered webview view, that means opening
+                // (or focusing) its webview-host window.
+                let cmd = params.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if let Some(view_id) = cmd.strip_suffix(".focus").map(String::from) {
+                    if self.ext_webview_views.iter().any(|v| *v == view_id) {
+                        self.open_ext_webview(&view_id);
+                    }
+                } else if cmd.starts_with("workbench.view.extension.") {
+                    // Opening a whole view container: show its first registered view.
+                    if let Some(vid) = self.ext_webview_views.first().cloned() {
+                        self.open_ext_webview(&vid);
+                    }
+                } else if cmd == "setContext" {
+                    // Context keys aren't modeled — fine to ignore.
+                }
                 if let (Some(id), Some(h)) = (id.as_ref(), self.ext_host.as_ref()) {
                     h.respond(id, serde_json::Value::Null);
                 }
@@ -10022,6 +10069,14 @@ impl ApplicationHandler for App {
                                 h.notify("webview/disposed", serde_json::json!({ "instanceId": instance }));
                             }
                             self.webviews.retain(|w| w.instance_id != instance);
+                        }
+                        Some("console") => {
+                            eprintln!(
+                                "[webview:{}] {}: {}",
+                                instance,
+                                value.get("kind").and_then(|k| k.as_str()).unwrap_or("log"),
+                                value.get("msg").and_then(|m| m.as_str()).unwrap_or("")
+                            );
                         }
                         _ => {} // "ready" needs no action — commands queue in the pipe
                     }
