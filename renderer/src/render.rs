@@ -3242,6 +3242,36 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         }
     }
 
+    // ---- Webview tab: draw the composited extension webview (captured frames) ----
+    if let Some(iid) = app.workspace.active_doc().and_then(|d| d.webview) {
+        let key = format!("webview:{iid}");
+        eprintln!("[wv-draw] key={key} size={:?}", gpu.media.size(&key));
+        if gpu.media.size(&key).is_some() {
+            let region = editor_region(&layout);
+            let now_ms = app.anim_start.elapsed().as_millis() as u64;
+            let items = vec![(key, region)];
+            gpu.media.prepare(&gpu.device, &gpu.queue, &items, (cfg_w, cfg_h), now_ms);
+            let mut enc = gpu
+                .device
+                .create_command_encoder(&CommandEncoderDescriptor { label: Some("aether-webview-pass") });
+            {
+                let mut pass = enc.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("aether-webview"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                gpu.media.render(&mut pass);
+            }
+            gpu.queue.submit(Some(enc.finish()));
+        }
+    }
+
     // ---- Image tab: draw the active image (scaled/panned) + zoom controls ----
     if let Some((key, scale_opt, pan)) = app
         .workspace

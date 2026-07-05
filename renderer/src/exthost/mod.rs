@@ -172,8 +172,13 @@ pub struct WebviewProc {
     pub instance_id: i64,
     pub view_id: String,
     pub title: String,
+    /// Frame exchange file (/dev/shm) the host writes BGRA frames into.
+    pub shm_path: PathBuf,
+    /// The private Xvfb display number this webview renders on (embed mode).
+    pub display: u32,
     stdin: Mutex<std::process::ChildStdin>,
     child: std::process::Child,
+    xvfb: Option<std::process::Child>,
 }
 
 impl WebviewProc {
@@ -192,19 +197,33 @@ impl WebviewProc {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit()); // surface webkit crashes in our log
+        // Embed mode: give the host its own PRIVATE Xvfb display — it renders
+        // normally there (accelerated, un-throttled, never on the user's screen);
+        // the editor captures frames and injects XTEST input on that display.
+        let mut xvfb = None;
+        let mut display = 0u32;
         if embed {
-            // Reparenting needs both sides on X11 (XWayland on Wayland sessions).
+            display = crate::virtual_display::free_display();
+            xvfb = crate::virtual_display::spawn_xvfb(display);
+            if xvfb.is_none() {
+                return None; // no Xvfb — embedding unavailable
+            }
+            cmd.env("DISPLAY", format!(":{display}"));
             cmd.env("GDK_BACKEND", "x11");
+            cmd.env_remove("WAYLAND_DISPLAY");
         }
         let mut child = cmd.spawn().ok()?;
         let mut stdin = child.stdin.take()?;
         let stdout = child.stdout.take()?;
+        let shm_path = std::path::Path::new("/dev/shm")
+            .join(format!("aether-wv-{}-{}", std::process::id(), instance_id.unsigned_abs()));
         let init = json!({
             "cmd": "init",
             "title": title,
             "width": 520,
             "height": 760,
             "embed": embed,
+            "shm": shm_path.to_string_lossy(),
             "roots": roots.iter().map(|r| r.to_string_lossy()).collect::<Vec<_>>(),
         });
         let mut line = init.to_string();
@@ -227,8 +246,11 @@ impl WebviewProc {
             instance_id,
             view_id: view_id.to_string(),
             title: title.to_string(),
+            shm_path,
+            display,
             stdin: Mutex::new(stdin),
             child,
+            xvfb,
         })
     }
 
@@ -240,6 +262,20 @@ impl WebviewProc {
             let _ = w.flush();
         }
     }
+    // ---- input forwarding (editor → offscreen webview) ----
+    pub fn input_motion(&self, x: f64, y: f64, state: u32) {
+        self.send(json!({"cmd": "input", "kind": "motion", "x": x, "y": y, "state": state}));
+    }
+    pub fn input_button(&self, x: f64, y: f64, button: u32, press: bool, state: u32) {
+        self.send(json!({"cmd": "input", "kind": "button", "x": x, "y": y, "button": button, "press": press, "state": state}));
+    }
+    pub fn input_scroll(&self, x: f64, y: f64, dx: f64, dy: f64, state: u32) {
+        self.send(json!({"cmd": "input", "kind": "scroll", "x": x, "y": y, "dx": dx, "dy": dy, "state": state}));
+    }
+    pub fn input_key(&self, keyval: u32, press: bool, state: u32) {
+        self.send(json!({"cmd": "input", "kind": "key", "keyval": keyval, "press": press, "state": state}));
+    }
+
     /// Position-sync a docked webview window (root coordinates).
     pub fn set_bounds(&self, x: i32, y: i32, w: u32, h: u32) {
         self.send(json!({"cmd": "bounds", "x": x, "y": y, "w": w, "h": h}));
@@ -259,6 +295,11 @@ impl Drop for WebviewProc {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(x) = self.xvfb.as_mut() {
+            let _ = x.kill();
+            let _ = x.wait();
+        }
+        let _ = std::fs::remove_file(&self.shm_path);
     }
 }
 

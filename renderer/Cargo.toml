@@ -60,4 +60,7 @@ muda = "0.16"
 wry = "0.47"
 gtk = "0.18"
 glib = "0.18"
-x11rb = "0.13"
+x11rb = { version = "0.13", features = ["composite", "shape", "xtest"] }
+# Snapshot API for the offscreen webview (webkit renders frames itself — the only
+# reliable headless frame source). Version matches wry's own webkit2gtk dep.
+webkit2gtk = { version = "2.0", features = ["v2_40"] }

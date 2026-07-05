@@ -225,31 +225,25 @@ pub fn run() -> anyhow::Result<()> {
         .and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|x| x.as_str().map(PathBuf::from)).collect())
         .unwrap_or_default();
-    // Embed mode: the parent will XReparent this window into the editor — no
-    // decorations, and the ready event carries our X window id.
+    // Embed mode: fully OFFSCREEN — the webview lives in a GtkOffscreenWindow that
+    // never appears on any screen; frames are written to `shm` (a /dev/shm file) and
+    // announced with `frame` events. The editor draws them as a GPU texture and
+    // forwards input back as synthesized GDK events.
     let embed = init.get("embed").and_then(|v| v.as_bool()).unwrap_or(false);
+    let shm_path = init.get("shm").and_then(|v| v.as_str()).map(String::from);
 
     // ---- GTK window ----
+    // Embed mode: a plain undecorated window — but our DISPLAY is a private Xvfb
+    // server, so it renders normally (accelerated, un-throttled) without ever
+    // appearing on the user's screen. The editor captures frames from the virtual
+    // display and injects input with XTEST.
     use gtk::prelude::*;
     let window = gtk::Window::new(gtk::WindowType::Toplevel);
     window.set_title(&title);
     window.set_default_size(width, height);
     if embed {
-        // "Docked" mode: an undecorated transient toplevel the editor position-syncs
-        // over its editor area (true reparenting gets overdrawn by the editor's
-        // Vulkan swapchain under XWayland). WM_TRANSIENT_FOR is set by the parent.
         window.set_decorated(false);
-        // Kill GTK's client-side decoration shadow/margin — a docked panel must sit
-        // flush inside the editor rect, not float with a drop shadow.
-        let css = gtk::CssProvider::new();
-        let _ = css.load_from_data(b"decoration { box-shadow: none; margin: 0; border-radius: 0; } window { box-shadow: none; }");
-        if let Some(screen) = gtk::gdk::Screen::default() {
-            gtk::StyleContext::add_provider_for_screen(&screen, &css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
-        }
-        window.set_skip_taskbar_hint(true);
-        window.set_skip_pager_hint(true);
-        window.set_type_hint(gtk::gdk::WindowTypeHint::Utility);
-        window.set_accept_focus(true);
+        window.move_(0, 0);
     } else {
         // Floating mode: stay above the editor instead of vanishing behind it
         // whenever the editor takes focus.
@@ -333,15 +327,16 @@ pub fn run() -> anyhow::Result<()> {
     };
 
     window.show_all();
-    // Under the X11 GDK backend, report our X window id so the parent can reparent us.
+    // Report our X window id — the editor captures/targets it on the virtual display.
     let xid: u64 = {
         extern "C" {
             fn gdk_x11_window_get_xid(window: *mut std::ffi::c_void) -> u64;
         }
         use gtk::glib::translate::ToGlibPtr;
         match window.window() {
-            Some(gdk_win) if gtk::gdk::Display::default()
-                .map_or(false, |d| d.type_().name().contains("X11")) =>
+            Some(gdk_win)
+                if gtk::gdk::Display::default()
+                    .map_or(false, |d| d.type_().name().contains("X11")) =>
             {
                 let ptr: *mut gtk::gdk::ffi::GdkWindow = gdk_win.to_glib_none().0;
                 unsafe { gdk_x11_window_get_xid(ptr as *mut _) }
@@ -393,22 +388,27 @@ pub fn run() -> anyhow::Result<()> {
                     let _ = webview.evaluate_script(&js);
                 }
                 Some("bounds") => {
-                    // Root-coordinate rect from the editor (docked-tab position sync).
                     let g = |k: &str| cmd.get(k).and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                    if !window.is_visible() {
-                        window.show();
-                    }
-                    window.move_(g("x"), g("y"));
-                    window.resize(g("w").max(1), g("h").max(1));
-                    // Also resize the underlying GdkWindow — GtkWindow::resize alone
-                    // is sometimes ignored for mapped utility windows.
-                    if let Some(gdk_win) = window.window() {
-                        gdk_win.move_resize(g("x"), g("y"), g("w").max(1), g("h").max(1));
-                        gdk_win.raise();
+                    if embed {
+                        // Offscreen: only the SIZE matters (frames must fit the pane).
+                        window.resize(g("w").max(1), g("h").max(1));
+                        window.set_size_request(g("w").max(1), g("h").max(1));
+                    } else {
+                        if !window.is_visible() {
+                            window.show();
+                        }
+                        window.move_(g("x"), g("y"));
+                        window.resize(g("w").max(1), g("h").max(1));
+                        if let Some(gdk_win) = window.window() {
+                            gdk_win.move_resize(g("x"), g("y"), g("w").max(1), g("h").max(1));
+                            gdk_win.raise();
+                        }
                     }
                 }
                 Some("visible") => {
-                    if cmd.get("value").and_then(|v| v.as_bool()).unwrap_or(true) {
+                    if embed {
+                        // Offscreen windows are never user-visible; nothing to do.
+                    } else if cmd.get("value").and_then(|v| v.as_bool()).unwrap_or(true) {
                         window.present(); // show AND raise above the editor
                     } else {
                         window.hide();

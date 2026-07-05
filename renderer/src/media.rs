@@ -54,6 +54,9 @@ pub struct Media {
     instance_buf: Buffer,
     capacity_bytes: u64,
     images: HashMap<String, Decoded>,
+    // Live streams (webview panes): kept textures so per-frame updates are a
+    // write_texture instead of a full texture+bindgroup rebuild.
+    streams: HashMap<String, (wgpu::Texture, u32, u32)>,
     // Draw order built by `prepare`: (key, frame index) parallel to instance buffer.
     order: Vec<(String, usize)>,
 }
@@ -162,6 +165,7 @@ impl Media {
             instance_buf,
             capacity_bytes,
             images: HashMap::new(),
+            streams: HashMap::new(),
             order: Vec::new(),
         }
     }
@@ -213,6 +217,70 @@ impl Media {
                 BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
             ],
         })
+    }
+
+    /// Drop a media entry (e.g. a live webview stream re-uploading each frame).
+    pub fn remove(&mut self, key: &str) {
+        self.images.remove(key);
+        self.streams.remove(key);
+    }
+
+    /// Update a LIVE stream entry: same-size frames become a cheap write_texture
+    /// into the kept texture; a size change rebuilds it.
+    pub fn update_stream(&mut self, device: &Device, queue: &Queue, key: &str, rgba: &[u8], w: u32, h: u32) {
+        if let Some((tex, tw, th)) = self.streams.get(key) {
+            if *tw == w && *th == h {
+                queue.write_texture(
+                    ImageCopyTexture {
+                        texture: tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    rgba,
+                    ImageDataLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(h) },
+                    Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                );
+                return;
+            }
+        }
+        // (Re)create the texture + bind group for the new size.
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("media-stream-tex"),
+            size: Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            ImageCopyTexture {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            ImageDataLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(h) },
+            Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bg = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("media-stream-bg"),
+            layout: &self.bgl,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: self.uniform_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
+                BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+            ],
+        });
+        self.images.insert(
+            key.to_string(),
+            Decoded { frames: vec![bg], delays_ms: vec![0], total_ms: 0, w, h },
+        );
+        self.streams.insert(key.to_string(), (texture, w, h));
     }
 
     /// Upload already-decoded frames (cheap GPU work) as a media entry. The heavy

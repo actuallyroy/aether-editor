@@ -14,6 +14,8 @@ mod codicon_names;
 mod webview_host;
 #[cfg(target_os = "linux")]
 mod x11_embed;
+#[cfg(target_os = "linux")]
+mod virtual_display;
 mod commands;
 mod completion;
 mod dap;
@@ -582,6 +584,15 @@ pub(crate) struct App {
     pub(crate) webview_dock: Option<(i64, u32)>,
     /// Last rect the docked child was configured to (skip redundant X roundtrips).
     pub(crate) webview_dock_rect: Option<(i32, i32, u32, u32)>,
+    /// When the last composited webview frame was captured (throttles to ~30fps).
+    pub(crate) webview_frame_at: Option<Instant>,
+    /// A mouse press was forwarded to the webview — route the drag + release too.
+    pub(crate) webview_mouse_down: bool,
+    /// Hash of the last uploaded webview frame (skip unchanged captures).
+    pub(crate) webview_frame_hash: u64,
+    /// Per-webview virtual-display connections (capture + XTEST input).
+    #[cfg(target_os = "linux")]
+    pub(crate) webview_vds: std::collections::HashMap<i64, virtual_display::VirtualDisplay>,
     /// Name of the extension currently being installed (drives the "Installing…"
     /// button state and blocks duplicate clicks).
     pub(crate) installing: Option<String>,
@@ -790,6 +801,11 @@ impl App {
             webview_embedder: None,
             webview_dock: None,
             webview_dock_rect: None,
+            webview_frame_at: None,
+            webview_mouse_down: false,
+            webview_frame_hash: 0,
+            #[cfg(target_os = "linux")]
+            webview_vds: std::collections::HashMap::new(),
             installing: None,
             detail: ui::ext_detail_view::ExtDetailView::new(),
             pending_close: false,
@@ -4372,8 +4388,7 @@ impl App {
     fn sync_webview_dock(&mut self) {
         #[cfg(target_os = "linux")]
         {
-            let Some((instance, xid)) = self.webview_dock else { return };
-            let Some(e) = self.webview_embedder.as_ref() else { return };
+            let Some((instance, _)) = self.webview_dock else { return };
             let tab = self.workspace.documents.iter().position(|d| d.webview == Some(instance));
             let Some(tab) = tab else {
                 // Tab closed → dispose the webview like VSCode does.
@@ -4385,64 +4400,62 @@ impl App {
                 }
                 return;
             };
-            // The docked webview is a real OS window stacked above us, so any editor
-            // overlay (menus, palette, dialogs, context menu) would render UNDER it —
-            // hide the webview while one is open.
-            let overlay_open = self.open_menu.is_some()
-                || self.ctx_menu.is_some()
-                || self.palette.active
-                || self.dialog.is_some();
-            let active = self.workspace.active == Some(tab) && !overlay_open;
-            // Root coordinates: editor-window origin + the editor-pane rect.
-            let origin = self
-                .gpu
-                .as_ref()
-                .and_then(|g| g.window.inner_position().ok())
-                .unwrap_or(winit::dpi::PhysicalPosition::new(0, 0));
-            let rect = if active {
-                let l = self.layout();
-                // Cover the whole editor pane: gutter + text, below the tab strip.
-                let x = l.gutter.x.min(l.editor_text.x);
-                let w = (l.editor_text.x + l.editor_text.w) - x;
-                (
-                    origin.x + x as i32,
-                    origin.y + l.editor_text.y as i32,
-                    w as u32,
-                    l.editor_text.h as u32,
-                )
-            } else {
-                (0, 0, 0, 0) // hidden while another tab is focused
-            };
+            let _ = tab;
+            // Offscreen host: only the SIZE matters — frames must match the pane.
+            let l = self.layout();
+            let x = l.gutter.x.min(l.editor_text.x);
+            let w = (l.editor_text.x + l.editor_text.w) - x;
+            let rect = (0, 0, w as u32, l.editor_text.h as u32);
             if self.webview_dock_rect == Some(rect) {
                 return;
             }
-            let first = self.webview_dock_rect.is_none();
             self.webview_dock_rect = Some(rect);
-            let proc = self.webviews.iter().find(|w| w.instance_id == instance);
-            let Some(proc) = proc else { return };
-            if first {
-                e.set_transient_for(xid); // WM stacks the child above this window only
-            }
-            if active {
-                proc.set_visible(true);
+            if let Some(proc) = self.webviews.iter().find(|w| w.instance_id == instance) {
                 proc.set_bounds(rect.0, rect.1, rect.2, rect.3);
-                if first {
-                    e.focus(xid);
-                }
-            } else {
-                proc.set_visible(false);
             }
         }
     }
 
-    /// True when this window can embed webviews (X11 / XWayland backend).
+    /// True when this platform embeds webviews (offscreen frames need only GTK).
     fn webview_embed_possible(&self) -> bool {
-        #[cfg(target_os = "linux")]
-        {
-            self.gpu.as_ref().and_then(|g| x11_embed::window_xid(&g.window)).is_some()
+        cfg!(target_os = "linux")
+    }
+
+    /// The docked webview proc, when the ACTIVE tab is its webview pane.
+    fn active_webview(&self) -> Option<&exthost::WebviewProc> {
+        let iid = self.workspace.active_doc().and_then(|d| d.webview)?;
+        self.webviews.iter().find(|p| p.instance_id == iid)
+    }
+
+    /// Point → webview-relative coordinates when inside the editor pane.
+    fn webview_rel(&self, x: f32, y: f32) -> Option<(f64, f64)> {
+        let l = self.layout();
+        let x0 = l.gutter.x.min(l.editor_text.x);
+        let region = crate::widgets::Rect {
+            x: x0,
+            y: l.editor_text.y,
+            w: (l.editor_text.x + l.editor_text.w) - x0,
+            h: l.editor_text.h,
+        };
+        region.contains((x, y)).then(|| ((x - region.x) as f64, (y - region.y) as f64))
+    }
+
+    /// Current modifiers as a GDK state mask (Shift/Control/Mod1 + Button1).
+    fn gdk_state(&self, button1: bool) -> u32 {
+        let mut s = 0u32;
+        if self.mods.shift_key() {
+            s |= 1; // GDK_SHIFT_MASK
         }
-        #[cfg(not(target_os = "linux"))]
-        false
+        if self.mods.control_key() {
+            s |= 4; // GDK_CONTROL_MASK
+        }
+        if self.mods.alt_key() {
+            s |= 8; // GDK_MOD1_MASK
+        }
+        if button1 {
+            s |= 1 << 8; // GDK_BUTTON1_MASK
+        }
+        s
     }
 
     /// Open (or focus) an extension webview view: spawn a webview-host process and ask
@@ -6694,13 +6707,17 @@ impl App {
     }
 
     fn on_mouse_press(&mut self, x: f32, y: f32) {
-        // A click in the editor returns keyboard focus from a docked webview child
-        // (clicks INSIDE the child go straight to it and never reach us).
+        // Clicks inside a webview pane are forwarded to its virtual display.
         #[cfg(target_os = "linux")]
-        if self.webview_dock.is_some() {
-            if let Some(e) = self.webview_embedder.as_ref() {
-                e.focus_parent();
+        if let (Some(proc), Some((rx, ry))) = (self.active_webview(), self.webview_rel(x, y)) {
+            let iid = proc.instance_id;
+            if let Some(vd) = self.webview_vds.get(&iid) {
+                vd.button(rx, ry, 1, true);
+                self.webview_mouse_down = true;
+                self.webview_frame_at = None; // capture the result immediately
+                self.redraw();
             }
+            return;
         }
         let layout = self.layout();
 
@@ -7926,6 +7943,17 @@ impl App {
     }
 
     fn on_mouse_move(&mut self, x: f32, y: f32) {
+        // Webview pane: forward pointer motion (hover states, drags) and skip the
+        // editor's own hover machinery while inside it.
+        #[cfg(target_os = "linux")]
+        if let Some((rx, ry)) = self.webview_rel(x, y) {
+            if let Some(iid) = self.active_webview().map(|p| p.instance_id) {
+                if let Some(vd) = self.webview_vds.get(&iid) {
+                    vd.motion(rx, ry);
+                }
+                return;
+            }
+        }
         // Commit-history file drag: handle first and return, so the per-move hover/
         // cursor/graph recompute below doesn't run each event (that was the drag lag).
         // Only the drag-ghost needs to follow, which a plain redraw covers.
@@ -8335,6 +8363,23 @@ impl App {
     }
 
     fn on_mouse_release(&mut self) {
+        // Finish a webview-forwarded click.
+        if self.webview_mouse_down {
+            self.webview_mouse_down = false;
+            #[cfg(target_os = "linux")]
+            {
+                let p = (self.mouse_pos.x as f32, self.mouse_pos.y as f32);
+                let rel = self.webview_rel(p.0, p.1).unwrap_or((0.0, 0.0));
+                if let Some(iid) = self.active_webview().map(|p| p.instance_id) {
+                    if let Some(vd) = self.webview_vds.get(&iid) {
+                        vd.button(rel.0, rel.1, 1, false);
+                        self.webview_frame_at = None;
+                        self.redraw();
+                    }
+                }
+            }
+            return;
+        }
         // Text drag-move: drop the selection at the target, or — if the press never
         // became a drag — place the caret now (deferred from press).
         if let Some(tm) = self.editor.text_move.take() {
@@ -8860,6 +8905,33 @@ impl App {
     fn on_key(&mut self, event: winit::event::KeyEvent) {
         if event.state != ElementState::Pressed {
             return;
+        }
+        // Webview pane focused: typing belongs to the page. Editor-level chords
+        // (Ctrl combos beyond clipboard/select-all, palette, F-keys) stay ours.
+        if self.active_webview().is_some() && !self.palette.active && self.dialog.is_none() {
+            let ctrl = self.mods.control_key();
+            let pass_ctrl = matches!(
+                event.logical_key.as_ref(),
+                Key::Character("a") | Key::Character("c") | Key::Character("v")
+                    | Key::Character("x") | Key::Character("z") | Key::Character("y")
+            );
+            let f_key = matches!(event.logical_key.as_ref(), Key::Named(k) if {
+                let n = format!("{k:?}");
+                n.starts_with('F') && n.len() <= 3
+            });
+            if (!ctrl || pass_ctrl) && !f_key {
+                if let Some(keyval) = gdk_keyval_of(&event) {
+                    #[cfg(target_os = "linux")]
+                    if let Some(iid) = self.active_webview().map(|p| p.instance_id) {
+                        if let Some(vd) = self.webview_vds.get(&iid) {
+                            vd.key(keyval, ctrl);
+                            self.webview_frame_at = None;
+                            self.redraw();
+                        }
+                    }
+                    return;
+                }
+            }
         }
         // Double-Shift opens the command palette (IntelliJ-style). A lone Shift tap
         // twice within the window — any other key in between resets the chain.
@@ -9815,6 +9887,43 @@ fn urlencode(s: &str) -> String {
     out
 }
 
+/// Translate a winit key event into a GDK keyval (X keysym) for webview forwarding.
+/// Unicode characters map per the GDK rule (`0x01000000 | codepoint`, ASCII as-is);
+/// named keys use their fixed keysym values.
+fn gdk_keyval_of(event: &winit::event::KeyEvent) -> Option<u32> {
+    use winit::keyboard::{Key, NamedKey};
+    match event.logical_key.as_ref() {
+        Key::Character(s) => {
+            let c = s.chars().next()?;
+            let cp = c as u32;
+            Some(if (0x20..=0x7e).contains(&cp) || (0xa0..=0xff).contains(&cp) {
+                cp
+            } else {
+                0x0100_0000 | cp
+            })
+        }
+        Key::Named(k) => Some(match k {
+            NamedKey::Enter => 0xff0d,
+            NamedKey::Tab => 0xff09,
+            NamedKey::Space => 0x20,
+            NamedKey::Backspace => 0xff08,
+            NamedKey::Escape => 0xff1b,
+            NamedKey::Delete => 0xffff,
+            NamedKey::ArrowUp => 0xff52,
+            NamedKey::ArrowDown => 0xff54,
+            NamedKey::ArrowLeft => 0xff51,
+            NamedKey::ArrowRight => 0xff53,
+            NamedKey::Home => 0xff50,
+            NamedKey::End => 0xff57,
+            NamedKey::PageUp => 0xff55,
+            NamedKey::PageDown => 0xff56,
+            NamedKey::Insert => 0xff63,
+            _ => return None,
+        }),
+        _ => None,
+    }
+}
+
 fn open_url(url: &str) {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return;
@@ -9878,9 +9987,46 @@ impl ApplicationHandler for App {
             el.exit();
             return;
         }
-        // Keep a docked webview's X window glued to the right-sidebar rect (no-op
-        // unless the rect actually changed).
+        // Keep a docked webview's off-screen X window sized to the editor pane
+        // (no-op unless the rect actually changed).
         self.sync_webview_dock();
+        // Virtual-display frame pump: while a webview tab is active, capture its
+        // window off the Xvfb display (~30fps) and upload for the render pass.
+        #[cfg(target_os = "linux")]
+        if let Some((instance, xid)) = self.webview_dock {
+            let active = self
+                .workspace
+                .active_doc()
+                .map_or(false, |d| d.webview == Some(instance));
+            if active && xid != 0 {
+                const FRAME: std::time::Duration = std::time::Duration::from_millis(16);
+                if self.webview_frame_at.map_or(true, |t| t.elapsed() >= FRAME) {
+                    self.webview_frame_at = Some(Instant::now());
+                    if let Some((w, h, rgba)) =
+                        self.webview_vds.get(&instance).and_then(|vd| vd.capture(xid))
+                    {
+                        // Skip unchanged frames (cheap 8-byte-stride hash) — no
+                        // texture write, no redraw.
+                        let mut hash = 0xcbf29ce484222325u64;
+                        for chunk in rgba.chunks_exact(64) {
+                            let v = u64::from_ne_bytes(chunk[..8].try_into().unwrap());
+                            hash = (hash ^ v).wrapping_mul(0x100000001b3);
+                        }
+                        if hash != self.webview_frame_hash {
+                            self.webview_frame_hash = hash;
+                            if let Some(g) = self.gpu.as_mut() {
+                                let key = format!("webview:{instance}");
+                                g.media.update_stream(&g.device, &g.queue, &key, &rgba, w, h);
+                            }
+                            self.redraw();
+                        }
+                    }
+                }
+                el.set_control_flow(ControlFlow::WaitUntil(
+                    self.webview_frame_at.unwrap_or_else(Instant::now) + FRAME,
+                ));
+            }
+        }
         // Expire toast notifications (~6s), waking again for the next expiry. This runs
         // BEFORE the terminal-key scheduling so a sooner key deadline wins the WaitUntil.
         if !self.toasts.is_empty() {
@@ -10187,50 +10333,76 @@ impl ApplicationHandler for App {
                             }
                         }
                         Some("ready") => {
-                            // Child window is up — dock it into the right sidebar when
-                            // it reported an X window id (X11/XWayland only).
+                            // Host is up on its virtual display — connect for
+                            // capture + input, and open its editor TAB.
+                            let xid = value.get("xid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                             #[cfg(target_os = "linux")]
                             {
-                                let xid = value.get("xid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                                if xid != 0 {
-                                    if self.webview_embedder.is_none() {
-                                        if let Some(pxid) = self
-                                            .gpu
-                                            .as_ref()
-                                            .and_then(|g| x11_embed::window_xid(&g.window))
-                                        {
-                                            self.webview_embedder = x11_embed::Embedder::new(pxid);
+                                let display = self
+                                    .webviews
+                                    .iter()
+                                    .find(|w| w.instance_id == instance)
+                                    .map(|w| w.display)
+                                    .unwrap_or(0);
+                                if let Some(vd) = virtual_display::VirtualDisplay::connect(display) {
+                                    self.webview_vds.insert(instance, vd);
+                                }
+                            }
+                            self.webview_dock = Some((instance, xid));
+                            self.webview_dock_rect = None; // force a size sync
+                            let title = self
+                                .webviews
+                                .iter()
+                                .find(|w| w.instance_id == instance)
+                                .map(|w| w.title.clone())
+                                .unwrap_or_else(|| "Webview".into());
+                            if let Some(g) = self.gpu.as_mut() {
+                                self.workspace.open_webview(title, instance, &mut g.font_system);
+                            }
+                            self.sync_webview_dock();
+                            self.redraw();
+                        }
+                        Some("frame") => {
+                            // A new offscreen frame is in the shm file: BGRA
+                            // premultiplied (cairo ARGB32, little-endian).
+                            let w = value.get("w").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                            let h = value.get("h").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                            let shm = self
+                                .webviews
+                                .iter()
+                                .find(|p| p.instance_id == instance)
+                                .map(|p| p.shm_path.clone());
+                            eprintln!("[wv-frame] instance={instance} {w}x{h} shm={:?}", shm.is_some());
+                            if let (Some(shm), true) = (shm, w > 0 && h > 0) {
+                                if let Ok(mut data) = std::fs::read(&shm) {
+                                    eprintln!("[wv-frame] read {} bytes (need {})", data.len(), w * h * 4);
+                                    if data.len() >= (w * h * 4) as usize {
+                                        data.truncate((w * h * 4) as usize);
+                                        for px in data.chunks_exact_mut(4) {
+                                            px.swap(0, 2); // BGRA -> RGBA
+                                            px[3] = 255;
                                         }
-                                    }
-                                    if self.webview_embedder.is_some() {
-                                        self.webview_dock = Some((instance, xid));
-                                        self.webview_dock_rect = None; // force a configure
-                                        // The webview lives in an editor TAB (like a
-                                        // VSCode webview panel), not a sidebar.
-                                        let title = self
-                                            .webviews
-                                            .iter()
-                                            .find(|w| w.instance_id == instance)
-                                            .map(|w| w.title.clone())
-                                            .unwrap_or_else(|| "Webview".into());
                                         if let Some(g) = self.gpu.as_mut() {
-                                            self.workspace.open_webview(title, instance, &mut g.font_system);
+                                            let key = format!("webview:{instance}");
+                                            g.media.remove(&key); // live stream: replace every frame
+                                            g.media.upload_frames(
+                                                &g.device,
+                                                &g.queue,
+                                                &key,
+                                                vec![crate::media::DecodedFrame {
+                                                    rgba: data,
+                                                    w,
+                                                    h,
+                                                    delay_ms: 0,
+                                                }],
+                                            );
                                         }
-                                        self.sync_webview_dock();
                                         self.redraw();
                                     }
                                 }
                             }
                         }
-                        Some("focus") => {
-                            // The page saw a pointerdown — hand it keyboard focus.
-                            #[cfg(target_os = "linux")]
-                            if let (Some(e), Some((_, xid))) =
-                                (self.webview_embedder.as_ref(), self.webview_dock)
-                            {
-                                e.focus(xid);
-                            }
-                        }
+                        Some("focus") => { /* composited mode: input is forwarded, not focused */ }
                         Some("console") => {
                             eprintln!(
                                 "[webview:{}] {}: {}",
@@ -10906,6 +11078,24 @@ impl ApplicationHandler for App {
                     dx = dy;
                     dy = 0.0;
                 }
+                // Webview pane: forward the scroll as wheel notches (X buttons —
+                // positive winit dy = up).
+                #[cfg(target_os = "linux")]
+                {
+                    let p = (self.mouse_pos.x as f32, self.mouse_pos.y as f32);
+                    if let (Some(proc), Some((rx, ry))) =
+                        (self.active_webview(), self.webview_rel(p.0, p.1))
+                    {
+                        let iid = proc.instance_id;
+                        let step = theme::LINE_HEIGHT() * 3.0;
+                        if let Some(vd) = self.webview_vds.get(&iid) {
+                            vd.scroll(rx, ry, -(dx / step) as f64, -(dy / step) as f64);
+                            self.webview_frame_at = None;
+                            self.redraw();
+                        }
+                        return;
+                    }
+                }
                 // A real (mouse-wheel) event interrupts any coasting fling.
                 self.scroll_flinging = false;
                 if pixel && phase == winit::event::TouchPhase::Ended {
@@ -11102,20 +11292,8 @@ fn main() -> Result<()> {
             )
         }
     };
-    // Linux: prefer the X11 backend (XWayland on Wayland sessions). Cross-process
-    // window embedding (extension webviews docked into the editor) needs X11
-    // reparenting, which Wayland forbids. Set AETHER_WAYLAND=1 to opt out — webviews
-    // then open as separate floating windows.
-    #[cfg(target_os = "linux")]
-    let event_loop = {
-        use winit::platform::x11::EventLoopBuilderExtX11;
-        if std::env::var_os("AETHER_WAYLAND").is_none() && std::env::var_os("DISPLAY").is_some() {
-            EventLoop::builder().with_x11().build()?
-        } else {
-            EventLoop::new()?
-        }
-    };
-    #[cfg(not(target_os = "linux"))]
+    // Native backend (Wayland on Wayland sessions — crisp HiDPI). Webview panes
+    // render via offscreen frames, so no X11 embedding is needed anymore.
     let event_loop = EventLoop::new()?;
     // If launched from a per-folder bundle, render its letter-badge icon in the background
     // (ready for next launch) — never on the Open Folder path.
