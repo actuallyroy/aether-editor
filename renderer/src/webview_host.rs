@@ -239,6 +239,13 @@ pub fn run() -> anyhow::Result<()> {
         // over its editor area (true reparenting gets overdrawn by the editor's
         // Vulkan swapchain under XWayland). WM_TRANSIENT_FOR is set by the parent.
         window.set_decorated(false);
+        // Kill GTK's client-side decoration shadow/margin — a docked panel must sit
+        // flush inside the editor rect, not float with a drop shadow.
+        let css = gtk::CssProvider::new();
+        let _ = css.load_from_data(b"decoration { box-shadow: none; margin: 0; border-radius: 0; } window { box-shadow: none; }");
+        if let Some(screen) = gtk::gdk::Screen::default() {
+            gtk::StyleContext::add_provider_for_screen(&screen, &css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        }
         window.set_skip_taskbar_hint(true);
         window.set_skip_pager_hint(true);
         window.set_type_hint(gtk::gdk::WindowTypeHint::Utility);
