@@ -200,7 +200,7 @@ impl ExtensionDetail {
         } else if supported {
             "Supported in Aether"
         } else {
-            "Needs runtime"
+            "Not applicable in Aether"
         };
         section(&mut side, "STATUS", status.into());
         let skey = format!("{publisher}{name}{version}{downloads}{supported}");

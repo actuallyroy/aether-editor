@@ -1334,6 +1334,8 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         app.workspace.active
     };
     let tab_rects = layout.tab_rects(n_tabs);
+    // Extension-provided webview tab icons (atlas images, drawn in a later pass).
+    let mut tab_img_icons: Vec<crate::icon::IconInstance> = Vec::new();
     for (i, tab) in tab_rects.iter().enumerate() {
         if !draw_tabs {
             break;
@@ -2617,7 +2619,21 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             theme::TAB_FG_INACTIVE()
         };
         // File-type icon overlay at the tab's left (Seti brand glyph), centered.
-        let icon = if i < app.workspace.documents.len() {
+        // Webview tabs draw the extension's own icon (atlas image) instead.
+        let webview_icon_uv = app.workspace.documents.get(i)
+            .and_then(|d| d.webview)
+            .and_then(|iid| app.webview_icons.get(&iid))
+            .and_then(|key| gpu.icon_atlas.get(key));
+        if let Some(uv) = webview_icon_uv {
+            let s = theme::zpx(16.0);
+            tab_img_icons.push(crate::icon::IconInstance {
+                rect: [tab.x + theme::zpx(8.0), tab.y + (tab.h - s) * 0.5, s, s],
+                uv,
+            });
+        }
+        let icon = if webview_icon_uv.is_some() {
+            None
+        } else if i < app.workspace.documents.len() {
             Some(doc_tab_icon(&app.workspace.documents[i]))
         } else if app.detail.open_extension.is_some() {
             Some((theme::ICON_EXTENSIONS, theme::FG_DIM()))
@@ -2629,6 +2645,8 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 let slot = Rect { x: tab.x + theme::zpx(8.0), y: tab.y, w: theme::zpx(20.0), h: tab.h };
                 ib.draw_clipped(slot, *tab, gcolor, &mut areas);
             }
+            tab.x + theme::zpx(30.0)
+        } else if webview_icon_uv.is_some() {
             tab.x + theme::zpx(30.0)
         } else {
             tab.x + theme::zpx(12.0)
@@ -3166,6 +3184,29 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         gpu.quad_renderer.render_fg(&mut pass);
     }
     gpu.queue.submit(Some(encoder.finish()));
+
+    // ---- Extension webview tab icons (atlas images over the tab strip) ----
+    if !tab_img_icons.is_empty() {
+        gpu.icon_atlas.prepare(&gpu.device, &gpu.queue, &tab_img_icons, (cfg_w, cfg_h));
+        let mut enc = gpu
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor { label: Some("aether-tabicon-pass") });
+        {
+            let mut pass = enc.begin_render_pass(&RenderPassDescriptor {
+                label: Some("aether-tabicon"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            gpu.icon_atlas.render(&mut pass);
+        }
+        gpu.queue.submit(Some(enc.finish()));
+    }
 
     // ---- README images: request any referenced by the active tab, then draw ----
     if app.detail.open_extension.is_some() {

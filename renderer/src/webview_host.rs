@@ -389,8 +389,14 @@ pub fn run() -> anyhow::Result<()> {
                 }
                 Some("bounds") => {
                     let g = |k: &str| cmd.get(k).and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                    // Match the editor's UI zoom (pane rect is in physical pixels).
+                    if let Some(z) = cmd.get("zoom").and_then(|v| v.as_f64()) {
+                        use wry::WebViewExtUnix;
+                        use webkit2gtk::WebViewExt;
+                        webview.webview().set_zoom_level(z);
+                    }
                     if embed {
-                        // Offscreen: only the SIZE matters (frames must fit the pane).
+                        // Virtual display: only the SIZE matters (frames must fit the pane).
                         window.resize(g("w").max(1), g("h").max(1));
                         window.set_size_request(g("w").max(1), g("h").max(1));
                     } else {

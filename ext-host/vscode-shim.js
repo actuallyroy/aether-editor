@@ -136,7 +136,26 @@ function createVscode(rpc) {
   const onDidChange = new VsEvent();
   const onDidSave = new VsEvent();
   const onDidChangeActive = new VsEvent();
-  let activeEditor = undefined;
+  // A full TextEditor wrapper. Many extensions dereference activeTextEditor (and
+  // its .selection) at module load without null checks, so activeEditor always
+  // holds a valid editor over an (initially empty) document.
+  function makeEditor(doc) {
+    return {
+      document: doc,
+      selection: new Selection(0, 0, 0, 0),
+      selections: [new Selection(0, 0, 0, 0)],
+      visibleRanges: [new Range(0, 0, doc.lineCount, 0)],
+      options: { tabSize: 4, insertSpaces: true },
+      viewColumn: 1,
+      edit: () => Promise.resolve(false),
+      insertSnippet: () => Promise.resolve(false),
+      setDecorations: () => {},
+      revealRange: () => {},
+      show: () => {},
+      hide: () => {},
+    };
+  }
+  let activeEditor;
 
   function makeDoc(uri, languageId, version, text) {
     const lines = text.split('\n');
@@ -154,6 +173,8 @@ function createVscode(rpc) {
       get lineCount() { return lines.length; },
     };
   }
+
+  activeEditor = makeEditor(makeDoc('untitled:Untitled', 'plaintext', 0, ''));
 
   // ---- hover providers + commands (called back BY aether) ----
   let nextProviderId = 1;
@@ -356,15 +377,26 @@ function createVscode(rpc) {
         view.viewType = viewType;
         rpc.notify('webview/createPanel', { instanceId, viewType, title });
         const onDispose = new VsEvent();
-        return {
+        const panel = {
           webview: view.webview,
           viewType, title, visible: true, active: true, viewColumn: 1,
           reveal: () => {},
           dispose: () => { rpc.notify('webview/disposePanel', { instanceId }); onDispose.fire(); },
           get onDidDispose() { return onDispose.event; },
           onDidChangeViewState: () => new Disposable(() => {}),
-          iconPath: undefined,
         };
+        // The extension's panel icon becomes the editor-tab icon.
+        let icon;
+        Object.defineProperty(panel, 'iconPath', {
+          get: () => icon,
+          set: (v) => {
+            icon = v;
+            const one = v && (v.dark || v.light || v);
+            const p = one && (one.fsPath || String(one).replace(/^file:\/\//, ''));
+            if (p) rpc.notify('webview/setIcon', { instanceId, path: p });
+          },
+        });
+        return panel;
       },
       registerFileDecorationProvider: () => new Disposable(() => {}),
       registerTerminalLinkProvider: () => new Disposable(() => {}),
@@ -584,9 +616,9 @@ function createVscode(rpc) {
       }
     },
     didChangeActive({ uri, languageId }) {
-      if (!uri) { activeEditor = undefined; onDidChangeActive.fire(undefined); return; }
+      if (!uri) return; // keep the last (or default) editor — never undefined
       const doc = docs.get(uri) || makeDoc(uri, languageId || 'plaintext', 0, '');
-      activeEditor = { document: doc, selection: undefined };
+      activeEditor = makeEditor(doc);
       onDidChangeActive.fire(activeEditor);
     },
     didSave({ uri }) {

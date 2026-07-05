@@ -590,6 +590,8 @@ pub(crate) struct App {
     pub(crate) webview_mouse_down: bool,
     /// Hash of the last uploaded webview frame (skip unchanged captures).
     pub(crate) webview_frame_hash: u64,
+    /// Extension-provided tab icons: webview instance → icon-atlas key.
+    pub(crate) webview_icons: std::collections::HashMap<i64, String>,
     /// Per-webview virtual-display connections (capture + XTEST input).
     #[cfg(target_os = "linux")]
     pub(crate) webview_vds: std::collections::HashMap<i64, virtual_display::VirtualDisplay>,
@@ -804,6 +806,7 @@ impl App {
             webview_frame_at: None,
             webview_mouse_down: false,
             webview_frame_hash: 0,
+            webview_icons: std::collections::HashMap::new(),
             #[cfg(target_os = "linux")]
             webview_vds: std::collections::HashMap::new(),
             installing: None,
@@ -4401,17 +4404,19 @@ impl App {
                 return;
             };
             let _ = tab;
-            // Offscreen host: only the SIZE matters — frames must match the pane.
+            // Virtual-display host: only SIZE + ZOOM matter — frames must match the
+            // pane 1:1 and the page must scale with the editor's UI zoom.
             let l = self.layout();
             let x = l.gutter.x.min(l.editor_text.x);
             let w = (l.editor_text.x + l.editor_text.w) - x;
-            let rect = (0, 0, w as u32, l.editor_text.h as u32);
+            let zoom = theme::ui_zoom() as f64;
+            let rect = ((zoom * 100.0) as i32, 0, w as u32, l.editor_text.h as u32);
             if self.webview_dock_rect == Some(rect) {
                 return;
             }
             self.webview_dock_rect = Some(rect);
             if let Some(proc) = self.webviews.iter().find(|w| w.instance_id == instance) {
-                proc.set_bounds(rect.0, rect.1, rect.2, rect.3);
+                proc.set_bounds(0, 0, rect.2, rect.3, zoom);
             }
         }
     }
@@ -4467,10 +4472,18 @@ impl App {
         let iid = self.next_webview_id;
         self.next_webview_id += 1;
         let roots: Vec<std::path::PathBuf> = self.ext_registry.iter().map(|e| e.path.clone()).collect();
+        // Use the extension's declared view name (contributes.views) as the title.
+        let title = self
+            .ext_registry
+            .iter()
+            .flat_map(|e| e.views.iter())
+            .find(|(id, _)| id == view_id)
+            .map(|(_, name)| name.clone())
+            .unwrap_or_else(|| view_id.to_string());
         let Some(wv) = exthost::WebviewProc::start(
             view_id,
             iid,
-            view_id,
+            &title,
             &roots,
             self.webview_embed_possible(),
             self.worker_tx.clone(),
@@ -4616,6 +4629,28 @@ impl App {
                     ) {
                         Some(wv) => self.webviews.push(wv),
                         None => self.show_toast("Couldn't start the webview host."),
+                    }
+                }
+            }
+            Some("webview/setIcon") => {
+                // The extension's panel icon → editor-tab icon. SVGs can't be
+                // rasterized yet; use a raster sibling when one exists.
+                let iid = params.get("instanceId").and_then(|v| v.as_i64()).unwrap_or(0);
+                if let Some(path) = params.get("path").and_then(|v| v.as_str()) {
+                    let mut p = std::path::PathBuf::from(path);
+                    if p.extension().and_then(|e| e.to_str()) == Some("svg") {
+                        let png = p.with_extension("png");
+                        if png.exists() {
+                            p = png;
+                        }
+                    }
+                    if let Ok(bytes) = std::fs::read(&p) {
+                        if let Some(g) = self.gpu.as_mut() {
+                            let key = format!("webview-icon:{iid}");
+                            if g.icon_atlas.load_bytes(&g.queue, &key, &bytes).is_some() {
+                                self.webview_icons.insert(iid, key);
+                            }
+                        }
                     }
                 }
             }
@@ -5011,24 +5046,32 @@ impl App {
             self.palette.set_source(mode, vec![commands::PickItem::new(label, "")]);
             return;
         }
+        // Extension-contributed commands ride along after the built-ins — refreshed
+        // every pass (cheap), since opening directly into `>` skips the mode-change
+        // rebuild below.
+        if mode == commands::PaletteMode::Commands {
+            self.palette.ext_commands = self
+                .ext_registry
+                .iter()
+                .flat_map(|e| e.commands.iter().cloned())
+                .collect();
+            for vid in &self.ext_webview_views {
+                let name = self
+                    .ext_registry
+                    .iter()
+                    .flat_map(|e| e.views.iter())
+                    .find(|(id, _)| id == vid)
+                    .map(|(_, n)| n.as_str())
+                    .unwrap_or(vid.as_str());
+                self.palette
+                    .ext_commands
+                    .push((format!("__webview:{vid}"), format!("View: Show {name}")));
+            }
+        }
         // Rebuild the source only when the mode changes (file/symbol scans are not free).
         if self.palette.mode != mode {
             match mode {
-                commands::PaletteMode::Commands => {
-                    // Extension-contributed commands ride along after the built-ins.
-                    self.palette.ext_commands = self
-                        .ext_registry
-                        .iter()
-                        .flat_map(|e| e.commands.iter().cloned())
-                        .collect();
-                    // Registered webview views get an "open" row too.
-                    for vid in &self.ext_webview_views {
-                        self.palette
-                            .ext_commands
-                            .push((format!("__webview:{vid}"), format!("View: Show {vid}")));
-                    }
-                    self.palette.set_source(mode, Vec::new());
-                }
+                commands::PaletteMode::Commands => self.palette.set_source(mode, Vec::new()),
                 commands::PaletteMode::Files => {
                     let items = self.file_index();
                     self.palette.set_source(mode, items);

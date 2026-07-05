@@ -116,7 +116,8 @@ impl ExtDetailView {
             ExtKind::Theme => s.push_str("### Color Theme\nContributes a color theme Aether can apply natively.\n\n"),
             ExtKind::Grammar => s.push_str("### Syntax Highlighting\nShips TextMate grammars Aether runs natively for syntax coloring.\n\n"),
             ExtKind::Declarative => s.push_str("### Language Support\nContributes snippets / language configuration.\n\n"),
-            ExtKind::Code => s.push_str("### Code Extension\nNeeds the JavaScript extension runtime (not yet supported in Aether).\n\n"),
+            ExtKind::Code => s.push_str("### Code Extension\nRuns in Aether's extension host.\n\n"),
+            ExtKind::Incompatible => s.push_str("### Not applicable in Aether\nThis extension patches VSCode's own interface (custom workbench CSS); a native editor has no HTML shell for it to affect.\n\n"),
         }
         if !e.grammar_paths.is_empty() {
             s.push_str(&format!("- {} grammar file(s)\n", e.grammar_paths.len()));

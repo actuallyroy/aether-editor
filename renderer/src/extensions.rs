@@ -88,10 +88,11 @@ pub fn open_ext_view(
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ExtKind {
-    Theme,       // contributes color themes — installable (applies the theme)
-    Grammar,     // ships TextMate grammars — installable (runs them natively)
-    Declarative, // snippets / languages only — supported class, not yet applied
-    Code,        // needs a JS host / webview — unsupported
+    Theme,        // contributes color themes — installable (applies the theme)
+    Grammar,      // ships TextMate grammars — installable (runs them natively)
+    Declarative,  // snippets / languages only — supported class, not yet applied
+    Code,         // JS extension — runs in Aether's extension host
+    Incompatible, // patches VSCode's Electron shell (custom workbench CSS etc.)
 }
 
 /// One color theme contributed by an extension (a `contributes.themes` entry).
@@ -124,14 +125,15 @@ pub struct Extension {
 
 impl Extension {
     pub fn supported(&self) -> bool {
-        self.kind != ExtKind::Code
+        self.kind != ExtKind::Incompatible
     }
     pub fn category(&self) -> &'static str {
         match self.kind {
             ExtKind::Theme => "Color Theme",
             ExtKind::Grammar => "Syntax",
             ExtKind::Declarative => "Language",
-            ExtKind::Code => "Code (needs runtime)",
+            ExtKind::Code => "Code",
+            ExtKind::Incompatible => "VSCode-only (patches its UI)",
         }
     }
 }
@@ -305,11 +307,37 @@ fn parse(v: &Value, ext_dir: &std::path::Path) -> Option<Extension> {
         })
         .unwrap_or_default();
 
+    // Extensions that exist to patch VSCode's Electron shell (custom workbench
+    // CSS injectors and their dependents) have nothing to affect in a native
+    // editor — flag them so users aren't misled. Manifest-level signals only.
+    let incompatible = {
+        let deps_hit = v
+            .get("extensionDependencies")
+            .and_then(|d| d.as_array())
+            .map(|a| {
+                a.iter().filter_map(|x| x.as_str()).any(|d| {
+                    let d = d.to_ascii_lowercase();
+                    d.contains("vscode-custom-css") || d.contains("apc-extension")
+                })
+            })
+            .unwrap_or(false);
+        let conf_hit = v
+            .pointer("/contributes/configuration")
+            .map(|c| {
+                let s = c.to_string();
+                s.contains("vscode_custom_css") || s.contains("\"apc.")
+            })
+            .unwrap_or(false);
+        deps_hit || conf_hit
+    };
+
     // Themes and TextMate grammars are usable without JS (we parse/run them
     // natively), so they're installable even if the package also ships code.
-    // Snippet/language-only packs are a supported class; anything else with a JS
-    // entry needs the (not-yet-built) extension runtime, so it's unsupported.
-    let kind = if !theme_defs.is_empty() {
+    // Snippet/language-only packs are a supported class; code extensions run in
+    // Aether's extension host.
+    let kind = if incompatible {
+        ExtKind::Incompatible
+    } else if !theme_defs.is_empty() {
         ExtKind::Theme
     } else if !grammar_paths.is_empty() {
         ExtKind::Grammar

@@ -276,9 +276,9 @@ impl WebviewProc {
         self.send(json!({"cmd": "input", "kind": "key", "keyval": keyval, "press": press, "state": state}));
     }
 
-    /// Position-sync a docked webview window (root coordinates).
-    pub fn set_bounds(&self, x: i32, y: i32, w: u32, h: u32) {
-        self.send(json!({"cmd": "bounds", "x": x, "y": y, "w": w, "h": h}));
+    /// Size-sync a docked webview window; `zoom` matches the editor's UI zoom.
+    pub fn set_bounds(&self, x: i32, y: i32, w: u32, h: u32, zoom: f64) {
+        self.send(json!({"cmd": "bounds", "x": x, "y": y, "w": w, "h": h, "zoom": zoom}));
     }
     pub fn set_visible(&self, value: bool) {
         self.send(json!({"cmd": "visible", "value": value}));
@@ -311,6 +311,8 @@ pub struct ExtInfo {
     pub activation_events: Vec<String>,
     /// Palette-visible commands from `contributes.commands`: `(command id, title)`.
     pub commands: Vec<(String, String)>,
+    /// Webview views from `contributes.views`: `(view id, display name)`.
+    pub views: Vec<(String, String)>,
 }
 
 /// Scan each directory for immediate subfolders containing a `package.json` with a
@@ -350,7 +352,28 @@ pub fn discover(dirs: &[PathBuf]) -> Vec<ExtInfo> {
                         .collect()
                 })
                 .unwrap_or_default();
-            out.push(ExtInfo { path: p, name, activation_events, commands });
+            let views = v
+                .pointer("/contributes/views")
+                .and_then(|c| c.as_object())
+                .map(|containers| {
+                    containers
+                        .values()
+                        .filter_map(|arr| arr.as_array())
+                        .flatten()
+                        .filter_map(|view| {
+                            let id = view.get("id")?.as_str()?.to_string();
+                            let name = view
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .filter(|n| !n.is_empty())
+                                .unwrap_or(&id)
+                                .to_string();
+                            Some((id, name))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push(ExtInfo { path: p, name, activation_events, commands, views });
         }
     }
     out
