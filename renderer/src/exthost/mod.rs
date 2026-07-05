@@ -171,6 +171,7 @@ impl ExtHost {
 pub struct WebviewProc {
     pub instance_id: i64,
     pub view_id: String,
+    pub title: String,
     stdin: Mutex<std::process::ChildStdin>,
     child: std::process::Child,
 }
@@ -181,17 +182,21 @@ impl WebviewProc {
         instance_id: i64,
         title: &str,
         roots: &[PathBuf],
+        embed: bool,
         tx: Sender<WorkerMsg>,
         proxy: Option<EventLoopProxy<()>>,
     ) -> Option<WebviewProc> {
         let exe = std::env::current_exe().ok()?;
-        let mut child = std::process::Command::new(exe)
-            .arg("--webview-host")
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("--webview-host")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .ok()?;
+            .stderr(std::process::Stdio::inherit()); // surface webkit crashes in our log
+        if embed {
+            // Reparenting needs both sides on X11 (XWayland on Wayland sessions).
+            cmd.env("GDK_BACKEND", "x11");
+        }
+        let mut child = cmd.spawn().ok()?;
         let mut stdin = child.stdin.take()?;
         let stdout = child.stdout.take()?;
         let init = json!({
@@ -199,6 +204,7 @@ impl WebviewProc {
             "title": title,
             "width": 520,
             "height": 760,
+            "embed": embed,
             "roots": roots.iter().map(|r| r.to_string_lossy()).collect::<Vec<_>>(),
         });
         let mut line = init.to_string();
@@ -220,6 +226,7 @@ impl WebviewProc {
         Some(WebviewProc {
             instance_id,
             view_id: view_id.to_string(),
+            title: title.to_string(),
             stdin: Mutex::new(stdin),
             child,
         })
@@ -232,6 +239,13 @@ impl WebviewProc {
             let _ = w.write_all(s.as_bytes());
             let _ = w.flush();
         }
+    }
+    /// Position-sync a docked webview window (root coordinates).
+    pub fn set_bounds(&self, x: i32, y: i32, w: u32, h: u32) {
+        self.send(json!({"cmd": "bounds", "x": x, "y": y, "w": w, "h": h}));
+    }
+    pub fn set_visible(&self, value: bool) {
+        self.send(json!({"cmd": "visible", "value": value}));
     }
     pub fn set_html(&self, html: &str) {
         self.send(json!({"cmd": "html", "html": html}));

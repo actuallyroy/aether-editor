@@ -94,6 +94,7 @@ pub struct Document {
     pub graph: Option<crate::graph::Graph>,
     pub folds: std::collections::BTreeMap<usize, usize>, // folded regions: header line → last hidden line
     pub image: Option<String>,           // Some(media key) => this tab renders an image
+    pub webview: Option<i64>,            // Some(instance id) => an embedded extension webview covers the editor area
     pub image_scale: Option<f32>,        // None = fit-to-window; Some(s) = absolute scale
     pub image_pan: (f32, f32),           // pan offset (px) from centered position
     pub feedback: bool,                  // Some => Ctrl+Enter submits it as a GitHub issue
@@ -393,6 +394,7 @@ impl Document {
             graph: None,
             folds: std::collections::BTreeMap::new(),
             image: None,
+            webview: None,
             image_scale: None,
             image_pan: (0.0, 0.0),
             feedback: false,
@@ -448,6 +450,16 @@ impl Document {
         d.name = name;
         d.read_only = true;
         d.markdown_preview = Some(crate::markdown::Markdown::new(fs));
+        d
+    }
+
+    /// A tab hosting an embedded extension webview (e.g. the Claude Code panel).
+    /// Nothing is drawn in the editor area — the reparented X child covers it.
+    pub fn new_webview(title: String, instance: i64, fs: &mut FontSystem) -> Self {
+        let mut d = Document::new(None, String::new(), fs);
+        d.name = title;
+        d.read_only = true;
+        d.webview = Some(instance);
         d
     }
 
@@ -566,6 +578,7 @@ impl Document {
             graph: None,
             folds: std::collections::BTreeMap::new(),
             image: Some(key),
+            webview: None,
             image_scale: None,
             image_pan: (0.0, 0.0),
             feedback: false,
@@ -680,6 +693,7 @@ impl Document {
             graph: None,
             folds: std::collections::BTreeMap::new(),
             image: None,
+            webview: None,
             image_scale: None,
             image_pan: (0.0, 0.0),
             feedback: false,

@@ -12,6 +12,8 @@ mod claude_sessions;
 mod codicon_names;
 #[cfg(target_os = "linux")]
 mod webview_host;
+#[cfg(target_os = "linux")]
+mod x11_embed;
 mod commands;
 mod completion;
 mod dap;
@@ -573,6 +575,13 @@ pub(crate) struct App {
     pub(crate) webviews: Vec<exthost::WebviewProc>,
     pub(crate) next_webview_id: i64,
     pub(crate) ext_webview_views: Vec<String>,
+    /// X11 embedding of webviews into the right sidebar (XWayland/X11 only).
+    #[cfg(target_os = "linux")]
+    pub(crate) webview_embedder: Option<x11_embed::Embedder>,
+    /// The docked webview: (instance id, child X window id).
+    pub(crate) webview_dock: Option<(i64, u32)>,
+    /// Last rect the docked child was configured to (skip redundant X roundtrips).
+    pub(crate) webview_dock_rect: Option<(i32, i32, u32, u32)>,
     /// Name of the extension currently being installed (drives the "Installing…"
     /// button state and blocks duplicate clicks).
     pub(crate) installing: Option<String>,
@@ -777,6 +786,10 @@ impl App {
             webviews: Vec::new(),
             next_webview_id: 1,
             ext_webview_views: Vec::new(),
+            #[cfg(target_os = "linux")]
+            webview_embedder: None,
+            webview_dock: None,
+            webview_dock_rect: None,
             installing: None,
             detail: ui::ext_detail_view::ExtDetailView::new(),
             pending_close: false,
@@ -4353,6 +4366,78 @@ impl App {
         self.redraw();
     }
 
+    /// Keep the docked webview's X child glued to the editor area while its tab is
+    /// active; park it off-screen when another tab is focused. If its tab was closed,
+    /// tear the webview down. Cheap no-op unless something changed.
+    fn sync_webview_dock(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            let Some((instance, xid)) = self.webview_dock else { return };
+            let Some(e) = self.webview_embedder.as_ref() else { return };
+            let tab = self.workspace.documents.iter().position(|d| d.webview == Some(instance));
+            let Some(tab) = tab else {
+                // Tab closed → dispose the webview like VSCode does.
+                self.webview_dock = None;
+                self.webview_dock_rect = None;
+                self.webviews.retain(|w| w.instance_id != instance);
+                if let Some(h) = self.ext_host.as_ref() {
+                    h.notify("webview/disposed", serde_json::json!({ "instanceId": instance }));
+                }
+                return;
+            };
+            let active = self.workspace.active == Some(tab);
+            // Root coordinates: editor-window origin + the editor-pane rect.
+            let origin = self
+                .gpu
+                .as_ref()
+                .and_then(|g| g.window.inner_position().ok())
+                .unwrap_or(winit::dpi::PhysicalPosition::new(0, 0));
+            let rect = if active {
+                let l = self.layout();
+                // Cover the whole editor pane: gutter + text, below the tab strip.
+                let x = l.gutter.x.min(l.editor_text.x);
+                let w = (l.editor_text.x + l.editor_text.w) - x;
+                (
+                    origin.x + x as i32,
+                    origin.y + l.editor_text.y as i32,
+                    w as u32,
+                    l.editor_text.h as u32,
+                )
+            } else {
+                (0, 0, 0, 0) // hidden while another tab is focused
+            };
+            if self.webview_dock_rect == Some(rect) {
+                return;
+            }
+            let first = self.webview_dock_rect.is_none();
+            self.webview_dock_rect = Some(rect);
+            let proc = self.webviews.iter().find(|w| w.instance_id == instance);
+            let Some(proc) = proc else { return };
+            if first {
+                e.set_transient_for(xid); // WM stacks the child above this window only
+            }
+            if active {
+                proc.set_visible(true);
+                proc.set_bounds(rect.0, rect.1, rect.2, rect.3);
+                if first {
+                    e.focus(xid);
+                }
+            } else {
+                proc.set_visible(false);
+            }
+        }
+    }
+
+    /// True when this window can embed webviews (X11 / XWayland backend).
+    fn webview_embed_possible(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.gpu.as_ref().and_then(|g| x11_embed::window_xid(&g.window)).is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+
     /// Open (or focus) an extension webview view: spawn a webview-host process and ask
     /// the extension's provider to populate it.
     fn open_ext_webview(&mut self, view_id: &str) {
@@ -4367,6 +4452,7 @@ impl App {
             iid,
             view_id,
             &roots,
+            self.webview_embed_possible(),
             self.worker_tx.clone(),
             self.proxy.clone(),
         ) else {
@@ -4504,6 +4590,7 @@ impl App {
                         iid,
                         &title,
                         &roots,
+                        self.webview_embed_possible(),
                         self.worker_tx.clone(),
                         self.proxy.clone(),
                     ) {
@@ -5628,6 +5715,11 @@ impl App {
             mcp.set_workspace(&self.cwd);
         }
         mcp::agents::register_claude(&self.cwd); // re-register the bridge for the new root
+        // Re-scope the extension host's workspace (workspaceFolders/rootPath) so
+        // extensions (e.g. Claude Code) see the newly opened folder.
+        if let Some(h) = self.ext_host.as_ref() {
+            h.init(&self.cwd);
+        }
         self.persist_state(); // remember this folder for the next launch
         self.start_fs_watcher(); // watch the new workspace root
         // Rebuild the native menu so the "Open Recent" submenu reflects the new entry.
@@ -6595,6 +6687,14 @@ impl App {
     }
 
     fn on_mouse_press(&mut self, x: f32, y: f32) {
+        // A click in the editor returns keyboard focus from a docked webview child
+        // (clicks INSIDE the child go straight to it and never reach us).
+        #[cfg(target_os = "linux")]
+        if self.webview_dock.is_some() {
+            if let Some(e) = self.webview_embedder.as_ref() {
+                e.focus_parent();
+            }
+        }
         let layout = self.layout();
 
         // Any click dismisses the completion popup (VSCode behavior) — the click
@@ -9771,6 +9871,9 @@ impl ApplicationHandler for App {
             el.exit();
             return;
         }
+        // Keep a docked webview's X window glued to the right-sidebar rect (no-op
+        // unless the rect actually changed).
+        self.sync_webview_dock();
         // Expire toast notifications (~6s), waking again for the next expiry. This runs
         // BEFORE the terminal-key scheduling so a sooner key deadline wins the WaitUntil.
         if !self.toasts.is_empty() {
@@ -10069,6 +10172,57 @@ impl ApplicationHandler for App {
                                 h.notify("webview/disposed", serde_json::json!({ "instanceId": instance }));
                             }
                             self.webviews.retain(|w| w.instance_id != instance);
+                            if self.webview_dock.map_or(false, |(i, _)| i == instance) {
+                                self.webview_dock = None;
+                                self.webview_dock_rect = None;
+                                self.right_sidebar_visible = false;
+                                self.redraw();
+                            }
+                        }
+                        Some("ready") => {
+                            // Child window is up — dock it into the right sidebar when
+                            // it reported an X window id (X11/XWayland only).
+                            #[cfg(target_os = "linux")]
+                            {
+                                let xid = value.get("xid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                if xid != 0 {
+                                    if self.webview_embedder.is_none() {
+                                        if let Some(pxid) = self
+                                            .gpu
+                                            .as_ref()
+                                            .and_then(|g| x11_embed::window_xid(&g.window))
+                                        {
+                                            self.webview_embedder = x11_embed::Embedder::new(pxid);
+                                        }
+                                    }
+                                    if self.webview_embedder.is_some() {
+                                        self.webview_dock = Some((instance, xid));
+                                        self.webview_dock_rect = None; // force a configure
+                                        // The webview lives in an editor TAB (like a
+                                        // VSCode webview panel), not a sidebar.
+                                        let title = self
+                                            .webviews
+                                            .iter()
+                                            .find(|w| w.instance_id == instance)
+                                            .map(|w| w.title.clone())
+                                            .unwrap_or_else(|| "Webview".into());
+                                        if let Some(g) = self.gpu.as_mut() {
+                                            self.workspace.open_webview(title, instance, &mut g.font_system);
+                                        }
+                                        self.sync_webview_dock();
+                                        self.redraw();
+                                    }
+                                }
+                            }
+                        }
+                        Some("focus") => {
+                            // The page saw a pointerdown — hand it keyboard focus.
+                            #[cfg(target_os = "linux")]
+                            if let (Some(e), Some((_, xid))) =
+                                (self.webview_embedder.as_ref(), self.webview_dock)
+                            {
+                                e.focus(xid);
+                            }
                         }
                         Some("console") => {
                             eprintln!(
@@ -10941,6 +11095,20 @@ fn main() -> Result<()> {
             )
         }
     };
+    // Linux: prefer the X11 backend (XWayland on Wayland sessions). Cross-process
+    // window embedding (extension webviews docked into the editor) needs X11
+    // reparenting, which Wayland forbids. Set AETHER_WAYLAND=1 to opt out — webviews
+    // then open as separate floating windows.
+    #[cfg(target_os = "linux")]
+    let event_loop = {
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        if std::env::var_os("AETHER_WAYLAND").is_none() && std::env::var_os("DISPLAY").is_some() {
+            EventLoop::builder().with_x11().build()?
+        } else {
+            EventLoop::new()?
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
     let event_loop = EventLoop::new()?;
     // If launched from a per-folder bundle, render its letter-badge icon in the background
     // (ready for next launch) — never on the Open Folder path.

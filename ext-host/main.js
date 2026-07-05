@@ -26,7 +26,13 @@ const hostLog = (level, message) => rpc.notify('log', { level, message });
 let workspaceRoot = null;
 
 // ---- inbound handlers (aether -> host) ----
-rpc.on_method('host/init', (p) => { workspaceRoot = p.root; dispatch.setWorkspace(p); });
+rpc.on_method('host/init', (p) => {
+  workspaceRoot = p.root;
+  // Follow the workspace: extensions spawn helpers (e.g. the claude binary) that
+  // inherit our cwd.
+  try { if (p.root) process.chdir(p.root); } catch (_) {}
+  dispatch.setWorkspace(p);
+});
 rpc.on_method('workspace/didChangeConfiguration', (p) => dispatch.setWorkspace(p));
 rpc.on_method('activate', ({ extensionPath }) => activateExtension(extensionPath, hostLog, dispatch));
 rpc.on_method('deactivate', ({ extensionPath }) => deactivateExtension(extensionPath));

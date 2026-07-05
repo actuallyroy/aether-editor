@@ -193,6 +193,11 @@ const VSCODE_API_SHIM: &str = r#"
       }).join(' ').slice(0, 2000) }));
     } catch (_) {}
   };
+  // When embedded (X11 reparented), a click inside the page must pull keyboard
+  // focus to this window — the editor can't see clicks on a child X window.
+  window.addEventListener('pointerdown', () => {
+    try { window.ipc.postMessage(JSON.stringify({ __aetherFocus: true })); } catch (_) {}
+  }, true);
   const origErr = console.error, origWarn = console.warn;
   console.error = (...a) => { fwd('error')(...a); origErr.apply(console, a); };
   console.warn = (...a) => { fwd('warn')(...a); origWarn.apply(console, a); };
@@ -220,12 +225,30 @@ pub fn run() -> anyhow::Result<()> {
         .and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|x| x.as_str().map(PathBuf::from)).collect())
         .unwrap_or_default();
+    // Embed mode: the parent will XReparent this window into the editor — no
+    // decorations, and the ready event carries our X window id.
+    let embed = init.get("embed").and_then(|v| v.as_bool()).unwrap_or(false);
 
     // ---- GTK window ----
     use gtk::prelude::*;
     let window = gtk::Window::new(gtk::WindowType::Toplevel);
     window.set_title(&title);
     window.set_default_size(width, height);
+    if embed {
+        // "Docked" mode: an undecorated transient toplevel the editor position-syncs
+        // over its editor area (true reparenting gets overdrawn by the editor's
+        // Vulkan swapchain under XWayland). WM_TRANSIENT_FOR is set by the parent.
+        window.set_decorated(false);
+        window.set_skip_taskbar_hint(true);
+        window.set_skip_pager_hint(true);
+        window.set_type_hint(gtk::gdk::WindowTypeHint::Utility);
+        window.set_accept_focus(true);
+    } else {
+        // Floating mode: stay above the editor instead of vanishing behind it
+        // whenever the editor takes focus.
+        window.set_type_hint(gtk::gdk::WindowTypeHint::Utility);
+        window.set_keep_above(true);
+    }
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
     window.add(&vbox);
     window.connect_delete_event(|_, _| {
@@ -234,8 +257,16 @@ pub fn run() -> anyhow::Result<()> {
         glib::Propagation::Proceed
     });
 
+    // The current document, served at aether-res://page/__page__.html. Navigating to a
+    // URL (instead of load_html) keeps webview.uri() parseable — wry's ipc handler
+    // panics (InvalidUri) when the page lives on an unparseable base like about:blank.
+    let page_html = std::sync::Arc::new(std::sync::Mutex::new(String::from(
+        "<html><body style='background:#1e1e1e'></body></html>",
+    )));
+
     // ---- webview ----
     let webview = {
+        let page_html_proto = page_html.clone();
         use wry::WebViewBuilderExtUnix;
         wry::WebViewBuilder::new()
             .with_initialization_script(VSCODE_API_SHIM)
@@ -243,6 +274,10 @@ pub fn run() -> anyhow::Result<()> {
                 // acquireVsCodeApi().postMessage(data) lands here (JSON string body).
                 let body = req.body().as_str();
                 let data: Value = serde_json::from_str(body).unwrap_or(Value::String(body.to_string()));
+                if data.get("__aetherFocus").is_some() {
+                    out(json!({"event": "focus"}));
+                    return;
+                }
                 if let Some(kind) = data.get("__aetherConsole").and_then(|k| k.as_str()) {
                     // Page console/error forwarding — a debug event, not an extension message.
                     let msg = data.get("msg").and_then(|m| m.as_str()).unwrap_or("");
@@ -252,6 +287,14 @@ pub fn run() -> anyhow::Result<()> {
                 out(json!({"event": "message", "data": data}));
             })
             .with_custom_protocol("aether-res".into(), move |_id, request| {
+                // aether-res://page/__page__.html — the extension-provided document.
+                if request.uri().host() == Some("page") {
+                    let body = page_html_proto.lock().unwrap().clone().into_bytes();
+                    return wry::http::Response::builder()
+                        .header("Content-Type", "text/html")
+                        .body(std::borrow::Cow::Owned(body))
+                        .unwrap();
+                }
                 // aether-res://file/<abs path> — only files under an allowed root.
                 let path = PathBuf::from(request.uri().path());
                 let allowed = roots.iter().any(|r| path.starts_with(r));
@@ -278,12 +321,28 @@ pub fn run() -> anyhow::Result<()> {
                         .unwrap(),
                 }
             })
-            .with_html("<html><body style='background:#1e1e1e'></body></html>")
+            .with_url("aether-res://page/__page__.html")
             .build_gtk(&vbox)?
     };
 
     window.show_all();
-    out(json!({"event": "ready"}));
+    // Under the X11 GDK backend, report our X window id so the parent can reparent us.
+    let xid: u64 = {
+        extern "C" {
+            fn gdk_x11_window_get_xid(window: *mut std::ffi::c_void) -> u64;
+        }
+        use gtk::glib::translate::ToGlibPtr;
+        match window.window() {
+            Some(gdk_win) if gtk::gdk::Display::default()
+                .map_or(false, |d| d.type_().name().contains("X11")) =>
+            {
+                let ptr: *mut gtk::gdk::ffi::GdkWindow = gdk_win.to_glib_none().0;
+                unsafe { gdk_x11_window_get_xid(ptr as *mut _) }
+            }
+            _ => 0,
+        }
+    };
+    out(json!({"event": "ready", "xid": xid}));
 
     // ---- stdin command pump: a reader thread feeds the GTK main loop ----
     let (tx, rx) = mpsc::channel::<Value>();
@@ -309,17 +368,44 @@ pub fn run() -> anyhow::Result<()> {
             match cmd.get("cmd").and_then(|c| c.as_str()) {
                 Some("html") => {
                     if let Some(html) = cmd.get("html").and_then(|h| h.as_str()) {
-                        let _ = webview.load_html(html);
+                        *page_html.lock().unwrap() = html.to_string();
+                        let _ = webview.load_url("aether-res://page/__page__.html");
                     }
                 }
                 Some("post") => {
                     // Deliver as a `message` event, exactly how VSCode webviews get it.
+                    // U+2028/U+2029 are valid JSON but break inline JS — escape them.
                     let data = cmd.get("data").cloned().unwrap_or(Value::Null);
+                    let payload = serde_json::to_string(&data)
+                        .unwrap_or_else(|_| "null".into())
+                        .replace('\u{2028}', "\\u2028")
+                        .replace('\u{2029}', "\\u2029");
                     let js = format!(
-                        "window.dispatchEvent(new MessageEvent('message', {{ data: {} }}));",
-                        serde_json::to_string(&data).unwrap_or_else(|_| "null".into())
+                        "window.dispatchEvent(new MessageEvent('message', {{ data: {payload} }}));"
                     );
                     let _ = webview.evaluate_script(&js);
+                }
+                Some("bounds") => {
+                    // Root-coordinate rect from the editor (docked-tab position sync).
+                    let g = |k: &str| cmd.get(k).and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                    if !window.is_visible() {
+                        window.show();
+                    }
+                    window.move_(g("x"), g("y"));
+                    window.resize(g("w").max(1), g("h").max(1));
+                    // Also resize the underlying GdkWindow — GtkWindow::resize alone
+                    // is sometimes ignored for mapped utility windows.
+                    if let Some(gdk_win) = window.window() {
+                        gdk_win.move_resize(g("x"), g("y"), g("w").max(1), g("h").max(1));
+                        gdk_win.raise();
+                    }
+                }
+                Some("visible") => {
+                    if cmd.get("value").and_then(|v| v.as_bool()).unwrap_or(true) {
+                        window.present(); // show AND raise above the editor
+                    } else {
+                        window.hide();
+                    }
                 }
                 Some("quit") => {
                     gtk::main_quit();

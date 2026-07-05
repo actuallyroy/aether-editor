@@ -300,6 +300,18 @@ impl Workspace {
         self.active = Some(self.documents.len() - 1);
     }
 
+    /// Open (or re-focus) an embedded-webview tab, deduped by instance id.
+    pub fn open_webview(&mut self, title: String, instance: i64, fs: &mut FontSystem) {
+        for (i, d) in self.documents.iter().enumerate() {
+            if d.webview == Some(instance) {
+                self.active = Some(i);
+                return;
+            }
+        }
+        self.documents.push(Document::new_webview(title, instance, fs));
+        self.active = Some(self.documents.len() - 1);
+    }
+
     pub fn close_active(&mut self) {
         let Some(i) = self.active else {
             return;
