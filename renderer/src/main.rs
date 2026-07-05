@@ -548,6 +548,13 @@ pub(crate) struct App {
     /// In-flight extension-host hover request (id, anchor x, y) — its result feeds the
     /// same hover card as LSP hover.
     pub(crate) ext_hover_req: Option<(i64, f32, f32)>,
+    /// Document versions already sent to the extension host (uri → version), so we send
+    /// `didOpen` once and `didChange` only when the text actually changes.
+    pub(crate) ext_doc_versions: std::collections::HashMap<String, i32>,
+    /// Discovered runnable extensions and which have already been activated (so an
+    /// `onLanguage` extension fires once, when a matching file first opens).
+    pub(crate) ext_registry: Vec<exthost::ExtInfo>,
+    pub(crate) ext_activated: std::collections::HashSet<std::path::PathBuf>,
     /// Name of the extension currently being installed (drives the "Installing…"
     /// button state and blocks duplicate clicks).
     pub(crate) installing: Option<String>,
@@ -741,6 +748,9 @@ impl App {
             ext_host: None,
             ext_hover_providers: Vec::new(),
             ext_hover_req: None,
+            ext_doc_versions: std::collections::HashMap::new(),
+            ext_registry: Vec::new(),
+            ext_activated: std::collections::HashSet::new(),
             installing: None,
             detail: ui::ext_detail_view::ExtDetailView::new(),
             pending_close: false,
@@ -4276,6 +4286,34 @@ impl App {
         self.redraw();
     }
 
+    /// Activate every discovered extension whose activationEvents match: `*` /
+    /// `onStartupFinished` when `lang` is None, or `onLanguage:<lang>` for a given
+    /// language. Each extension activates at most once.
+    fn activate_matching_extensions(&mut self, lang: Option<&str>) {
+        if self.ext_host.is_none() {
+            return;
+        }
+        let on_lang = lang.map(|l| format!("onLanguage:{l}"));
+        let to_activate: Vec<std::path::PathBuf> = self
+            .ext_registry
+            .iter()
+            .filter(|e| !self.ext_activated.contains(&e.path))
+            .filter(|e| {
+                e.activation_events.iter().any(|ev| match lang {
+                    None => ev == "*" || ev == "onStartupFinished",
+                    Some(_) => Some(ev) == on_lang.as_ref(),
+                })
+            })
+            .map(|e| e.path.clone())
+            .collect();
+        for p in to_activate {
+            if let Some(h) = self.ext_host.as_ref() {
+                h.activate(&p);
+            }
+            self.ext_activated.insert(p);
+        }
+    }
+
     /// Route one inbound JSON-RPC message from the extension host (host → aether).
     /// Requests must be answered (so the host's Promise resolves); notifications are
     /// fire-and-forget. This is the aether-side implementation of the `vscode` API.
@@ -5758,6 +5796,35 @@ impl App {
         // binaries). We deliberately do NOT scan the user's VS Code extensions.
         let Some(ext_dir) = crate::extensions::extensions_dir() else { return };
         self.lsp.sync(&mut self.workspace.documents, &self.cwd, &[ext_dir], &self.worker_tx);
+        self.sync_ext_host_docs();
+    }
+
+    /// Mirror the active document to the extension host so its providers see real text:
+    /// `didOpen` the first time a uri is seen, `didChange` when its version advances.
+    fn sync_ext_host_docs(&mut self) {
+        if self.ext_host.is_none() {
+            return;
+        }
+        let Some(d) = self.workspace.active_doc() else { return };
+        let (Some(uri), Some(lang)) = (d.uri(), d.language_id()) else { return };
+        let version = d.version;
+        if self.ext_doc_versions.get(&uri) == Some(&version) {
+            return;
+        }
+        let first = !self.ext_doc_versions.contains_key(&uri);
+        let text = d.rope.to_string();
+        self.ext_doc_versions.insert(uri.clone(), version);
+        if let Some(h) = self.ext_host.as_ref() {
+            if first {
+                h.did_open(&uri, lang, version, &text);
+            } else {
+                h.did_change(&uri, version, &text);
+            }
+        }
+        // A file of this language just opened → activate any `onLanguage:<lang>` ext.
+        if first {
+            self.activate_matching_extensions(Some(lang));
+        }
     }
 
     fn apply_settings(&mut self) {
@@ -9660,20 +9727,23 @@ impl ApplicationHandler for App {
                     }
                 }
                 WorkerMsg::ExtHostReady => {
-                    // Handshake done: tell the host our workspace, then activate any
-                    // bundled/sample extensions. (Real activation-by-event comes later.)
+                    // Handshake done: tell the host our workspace, discover extensions,
+                    // and activate the ones whose activationEvents fire now.
                     if let Some(h) = self.ext_host.as_ref() {
                         h.init(&self.cwd);
-                        if let Ok(exe) = std::env::current_exe() {
-                            // The sample extension ships next to ext-host/ for now.
-                            for base in exe.parent().into_iter().flat_map(|d| [d.to_path_buf(), d.join(".."), d.join("../..")]) {
-                                let sample = base.join("ext-host/sample-extension");
-                                if sample.join("package.json").exists() {
-                                    h.activate(&sample);
-                                    break;
-                                }
-                            }
-                        }
+                    }
+                    let mut dirs = Vec::new();
+                    if let Some(d) = exthost::bundled_extensions_dir() {
+                        dirs.push(d);
+                    }
+                    if let Some(d) = exthost::user_extensions_dir() {
+                        dirs.push(d);
+                    }
+                    self.ext_registry = exthost::discover(&dirs);
+                    self.activate_matching_extensions(None); // `*` / onStartupFinished
+                    let lang = self.workspace.active_doc().and_then(|d| d.language_id());
+                    if let Some(l) = lang {
+                        self.activate_matching_extensions(Some(l));
                     }
                 }
                 WorkerMsg::ExtHostMsg { value } => self.handle_ext_host_msg(value),

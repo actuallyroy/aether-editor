@@ -141,12 +141,73 @@ impl ExtHost {
             json!({ "uri": uri, "languageId": language_id, "version": version, "text": text }),
         );
     }
+    pub fn did_change(&self, uri: &str, version: i32, text: &str) {
+        self.notify(
+            "workspace/didChangeTextDocument",
+            json!({ "uri": uri, "version": version, "text": text }),
+        );
+    }
     pub fn request_hover(&self, provider_id: i64, uri: &str, line: u32, character: u32) -> i64 {
         self.request(
             "hover/provide",
             json!({ "providerId": provider_id, "uri": uri, "line": line, "character": character }),
         )
     }
+}
+
+/// A discovered runnable extension (has a `main`, i.e. real code — not a theme/grammar).
+#[derive(Clone)]
+pub struct ExtInfo {
+    pub path: PathBuf,
+    pub name: String,
+    pub activation_events: Vec<String>,
+}
+
+/// Scan each directory for immediate subfolders containing a `package.json` with a
+/// `main` entry, and read their name + activationEvents. This is the extension registry
+/// the App activates from.
+pub fn discover(dirs: &[PathBuf]) -> Vec<ExtInfo> {
+    let mut out = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        for e in entries.flatten() {
+            let p = e.path();
+            let pkg = p.join("package.json");
+            if !pkg.exists() {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&pkg) else { continue };
+            let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
+            if v.get("main").and_then(|m| m.as_str()).is_none() {
+                continue; // themes/grammars have no `main` — not runnable
+            }
+            let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("ext").to_string();
+            let activation_events = v
+                .get("activationEvents")
+                .and_then(|a| a.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            out.push(ExtInfo { path: p, name, activation_events });
+        }
+    }
+    out
+}
+
+/// `~/.aether/extensions` — where installed (`.vsix`) extensions live. Created if absent.
+pub fn user_extensions_dir() -> Option<PathBuf> {
+    let dir = dirs_home()?.join(".aether").join("extensions");
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir)
+}
+
+/// The bundled `ext-host/` directory (holds the sample extension), derived from the
+/// host script location.
+pub fn bundled_extensions_dir() -> Option<PathBuf> {
+    host_script().and_then(|p| p.parent().map(|d| d.to_path_buf()))
+}
+
+fn dirs_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from).or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
 }
 
 fn wake(proxy: &Option<EventLoopProxy<()>>) {
