@@ -27,11 +27,59 @@ class Disposable {
   constructor(fn) { this._fn = fn; }
   dispose() { if (this._fn) { this._fn(); this._fn = null; } }
 }
-const Uri = {
-  parse: (s) => ({ scheme: 'file', toString: () => s, fsPath: s.replace(/^file:\/\//, ''), get path() { return this.fsPath; } }),
-  file: (p) => ({ scheme: 'file', toString: () => 'file://' + p, fsPath: p, get path() { return p; } }),
-};
+class Uri {
+  constructor(scheme, authority, path, query, fragment) {
+    this.scheme = scheme || 'file';
+    this.authority = authority || '';
+    this.path = path || '';
+    this.query = query || '';
+    this.fragment = fragment || '';
+  }
+  get fsPath() { return this.path; }
+  static file(p) { return new Uri('file', '', String(p)); }
+  static parse(s) {
+    const m = String(s).match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/([^/?#]*)([^?#]*)(?:\?([^#]*))?(?:#(.*))?$/);
+    if (m) return new Uri(m[1], m[2], m[3] || '/', m[4] || '', m[5] || '');
+    return new Uri('file', '', String(s));
+  }
+  static joinPath(base, ...parts) {
+    const path = require('path');
+    return new Uri(base.scheme, base.authority, path.posix.join(base.path, ...parts), base.query, base.fragment);
+  }
+  with(change) {
+    return new Uri(
+      change.scheme ?? this.scheme, change.authority ?? this.authority,
+      change.path ?? this.path, change.query ?? this.query, change.fragment ?? this.fragment);
+  }
+  toString() {
+    let s = `${this.scheme}://${this.authority}${this.path}`;
+    if (this.query) s += '?' + this.query;
+    if (this.fragment) s += '#' + this.fragment;
+    return s;
+  }
+  toJSON() { return { scheme: this.scheme, authority: this.authority, path: this.path, query: this.query, fragment: this.fragment, fsPath: this.fsPath }; }
+}
 const StatusBarAlignment = { Left: 1, Right: 2 };
+class Selection extends Range {
+  constructor(a, b, c, d) {
+    super(a, b, c, d);
+    this.anchor = this.start; this.active = this.end;
+    this.isEmpty = this.start.line === this.end.line && this.start.character === this.end.character;
+  }
+}
+class ThemeIcon { constructor(id, color) { this.id = id; this.color = color; } }
+class CancellationTokenSource {
+  constructor() {
+    const ev = new VsEvent();
+    this.token = { isCancellationRequested: false, onCancellationRequested: ev.event };
+    this._ev = ev;
+  }
+  cancel() { this.token.isCancellationRequested = true; this._ev.fire(); }
+  dispose() {}
+}
+class RelativePattern {
+  constructor(base, pattern) { this.base = (base && base.fsPath) || String(base); this.pattern = pattern; }
+}
 
 function contentsToMarkdown(contents) {
   // vscode Hover.contents: (string | MarkdownString)[]
@@ -112,6 +160,41 @@ function createVscode(rpc) {
   const hoverProviders = new Map(); // providerId -> {selector, provider}
   const commands = new Map();       // command -> callback
 
+  // ---- webviews (rendered by aether's webview-host process) ----
+  const webviewProviders = new Map(); // viewId -> { provider, options }
+  const webviewInstances = new Map(); // instanceId -> { onMessage: VsEvent, onDispose: VsEvent, view }
+  let nextPanelId = -1; // panels get NEGATIVE instance ids (views get positive, from aether)
+  function makeWebview(instanceId) {
+    const onMessage = new VsEvent();
+    const onDispose = new VsEvent();
+    let html = '';
+    const webview = {
+      get html() { return html; },
+      set html(v) { html = v; rpc.notify('webview/setHtml', { instanceId, html: v }); },
+      options: {},
+      cspSource: 'aether-res:',
+      asWebviewUri: (uri) => {
+        const p = (uri && uri.fsPath) || String(uri).replace(/^file:\/\//, '');
+        return { toString: () => 'aether-res://file' + p, scheme: 'aether-res', fsPath: p };
+      },
+      postMessage: (data) => { rpc.notify('webview/postMessage', { instanceId, data }); return Promise.resolve(true); },
+      get onDidReceiveMessage() { return onMessage.event; },
+    };
+    const view = {
+      webview,
+      viewType: '',
+      visible: true,
+      title: '',
+      description: '',
+      badge: undefined,
+      show: () => {},
+      get onDidDispose() { return onDispose.event; },
+      onDidChangeVisibility: () => new Disposable(() => {}),
+    };
+    webviewInstances.set(instanceId, { onMessage, onDispose, view });
+    return view;
+  }
+
   // ---- status bar items (mirrored to aether's status bar over RPC) ----
   let nextStatusId = 1;
   function makeStatusBarItem(alignment, priority) {
@@ -139,12 +222,73 @@ function createVscode(rpc) {
     return item;
   }
 
+  const onDidOpenTerminal = new VsEvent();
+  const onDidCloseTerminal = new VsEvent();
+  const terminals = [];
+  function makeTerminal(nameOrOpts, shellPath, shellArgs) {
+    const opts = typeof nameOrOpts === 'object' && nameOrOpts !== null ? nameOrOpts : { name: nameOrOpts, shellPath, shellArgs };
+    const term = {
+      name: opts.name || 'Terminal',
+      creationOptions: opts,
+      processId: Promise.resolve(0),
+      exitStatus: undefined,
+      state: { isInteractedWith: false },
+      sendText: (text, addNewLine) =>
+        rpc.notify('terminal/sendText', { name: opts.name || 'Terminal', text, addNewLine: addNewLine !== false }),
+      show: () => rpc.notify('terminal/show', { name: opts.name || 'Terminal' }),
+      hide: () => {},
+      dispose: () => {
+        const i = terminals.indexOf(term);
+        if (i >= 0) terminals.splice(i, 1);
+        onDidCloseTerminal.fire(term);
+      },
+    };
+    terminals.push(term);
+    onDidOpenTerminal.fire(term);
+    return term;
+  }
+
   const vscode = {
-    version: '1.0.0-aether',
-    Position, Range, MarkdownString, Hover, Disposable, Uri,
+    version: '1.90.0',
+    Position, Range, Selection, MarkdownString, Hover, Disposable, Uri,
     EventEmitter: VsEvent,
     StatusBarAlignment,
     ThemeColor: class ThemeColor { constructor(id) { this.id = id; } },
+    ThemeIcon,
+    CancellationTokenSource,
+    RelativePattern,
+    ViewColumn: { Active: -1, Beside: -2, One: 1, Two: 2, Three: 3 },
+    ProgressLocation: { SourceControl: 1, Window: 10, Notification: 15 },
+    ExtensionMode: { Production: 1, Development: 2, Test: 3 },
+    UIKind: { Desktop: 1, Web: 2 },
+    ColorThemeKind: { Light: 1, Dark: 2, HighContrast: 3, HighContrastLight: 4 },
+    ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
+    DiagnosticSeverity: { Error: 0, Warning: 1, Information: 2, Hint: 3 },
+    TextEditorRevealType: { Default: 0, InCenter: 1, InCenterIfOutsideViewport: 2, AtTop: 3 },
+    OverviewRulerLane: { Left: 1, Center: 2, Right: 4, Full: 7 },
+    FileType: { Unknown: 0, File: 1, Directory: 2, SymbolicLink: 64 },
+    TreeItemCollapsibleState: { None: 0, Collapsed: 1, Expanded: 2 },
+    TreeItem: class TreeItem { constructor(label, state) { this.label = label; this.collapsibleState = state || 0; } },
+    CodeLens: class CodeLens { constructor(range, command) { this.range = range; this.command = command; } },
+    NotebookCellOutputItem: class NotebookCellOutputItem {
+      constructor(data, mime) { this.data = data; this.mime = mime; }
+      static text(s, mime) { return new this(Buffer.from(String(s)), mime || 'text/plain'); }
+      static json(v, mime) { return new this(Buffer.from(JSON.stringify(v)), mime || 'text/x-json'); }
+      static error(e) { return new this(Buffer.from(JSON.stringify({ name: e && e.name, message: e && e.message, stack: e && e.stack })), 'application/vnd.code.notebook.error'); }
+      static stdout(s) { return new this(Buffer.from(String(s)), 'application/vnd.code.notebook.stdout'); }
+      static stderr(s) { return new this(Buffer.from(String(s)), 'application/vnd.code.notebook.stderr'); }
+    },
+    NotebookCellOutput: class NotebookCellOutput { constructor(items) { this.items = items || []; } },
+    NotebookCellData: class NotebookCellData { constructor(kind, value, languageId) { this.kind = kind; this.value = value; this.languageId = languageId; } },
+    NotebookCellKind: { Markup: 1, Code: 2 },
+    NotebookEdit: class NotebookEdit { constructor(range, cells) { this.range = range; this.newCells = cells; } },
+    NotebookRange: class NotebookRange { constructor(start, end) { this.start = start; this.end = end; } },
+    WorkspaceEdit: class WorkspaceEdit {
+      constructor() { this._edits = []; }
+      replace(uri, range, text) { this._edits.push({ uri, range, text }); }
+      insert(uri, pos, text) { this._edits.push({ uri, range: new Range(pos, pos), text }); }
+      set() {}
+    },
 
     window: {
       showInformationMessage: (message, ...items) =>
@@ -167,15 +311,75 @@ function createVscode(rpc) {
           prompt: (options && options.prompt) || '', value: (options && options.value) || '',
         }).then((v) => (v == null ? undefined : v)),
       createStatusBarItem: (alignment, priority) => makeStatusBarItem(alignment, priority),
-      createOutputChannel: (name) => ({
-        name,
-        append: (s) => rpc.notify('log', { level: 'info', message: `[${name}] ${s}` }),
-        appendLine: (s) => rpc.notify('log', { level: 'info', message: `[${name}] ${s}` }),
-        show: () => {}, hide: () => {}, clear: () => {}, dispose: () => {},
-      }),
+      registerWebviewViewProvider: (viewId, provider, options) => {
+        webviewProviders.set(viewId, { provider, options: options || {} });
+        rpc.notify('window/registerWebviewViewProvider', { viewId });
+        return new Disposable(() => webviewProviders.delete(viewId));
+      },
+      createOutputChannel: (name) => {
+        const log = (level) => (msg, ...rest) =>
+          rpc.notify('log', { level, message: `[${name}] ${msg}${rest.length ? ' ' + rest.map((r) => JSON.stringify(r)).join(' ') : ''}` });
+        return {
+          name,
+          append: log('info'), appendLine: log('info'),
+          trace: log('trace'), debug: log('debug'), info: log('info'),
+          warn: log('warn'), error: log('error'),
+          logLevel: 3, onDidChangeLogLevel: () => new Disposable(() => {}),
+          replace: () => {}, show: () => {}, hide: () => {}, clear: () => {}, dispose: () => {},
+        };
+      },
       setStatusBarMessage: () => new Disposable(() => {}),
       get activeTextEditor() { return activeEditor; },
+      get visibleTextEditors() { return activeEditor ? [activeEditor] : []; },
       get onDidChangeActiveTextEditor() { return onDidChangeActive.event; },
+      onDidChangeTextEditorSelection: () => new Disposable(() => {}),
+      onDidChangeTextEditorVisibleRanges: () => new Disposable(() => {}),
+      onDidChangeVisibleTextEditors: () => new Disposable(() => {}),
+      onDidChangeWindowState: () => new Disposable(() => {}),
+      onDidChangeActiveColorTheme: () => new Disposable(() => {}),
+      state: { focused: true, active: true },
+      activeColorTheme: { kind: 2 }, // Dark
+      createTerminal: (nameOrOpts, shellPath, shellArgs) => makeTerminal(nameOrOpts, shellPath, shellArgs),
+      get terminals() { return [...terminals]; },
+      activeTerminal: undefined,
+      get onDidOpenTerminal() { return onDidOpenTerminal.event; },
+      get onDidCloseTerminal() { return onDidCloseTerminal.event; },
+      onDidChangeActiveTerminal: () => new Disposable(() => {}),
+      onDidChangeTerminalState: () => new Disposable(() => {}),
+      registerUriHandler: () => new Disposable(() => {}),
+      registerWebviewPanelSerializer: () => new Disposable(() => {}),
+      createWebviewPanel: (viewType, title, _showOpts, _options) => {
+        // A webview panel is just another webview instance; aether shows it in its
+        // own webview-host window. Reuses the sidebar plumbing.
+        const instanceId = nextPanelId--;
+        const view = makeWebview(instanceId);
+        view.viewType = viewType;
+        rpc.notify('webview/createPanel', { instanceId, viewType, title });
+        const onDispose = new VsEvent();
+        return {
+          webview: view.webview,
+          viewType, title, visible: true, active: true, viewColumn: 1,
+          reveal: () => {},
+          dispose: () => { rpc.notify('webview/disposePanel', { instanceId }); onDispose.fire(); },
+          get onDidDispose() { return onDispose.event; },
+          onDidChangeViewState: () => new Disposable(() => {}),
+          iconPath: undefined,
+        };
+      },
+      registerFileDecorationProvider: () => new Disposable(() => {}),
+      registerTerminalLinkProvider: () => new Disposable(() => {}),
+      createTextEditorDecorationType: (opts) => ({ key: 'deco', dispose: () => {}, options: opts }),
+      showTextDocument: (doc) =>
+        rpc.request('window/showTextDocument', { uri: doc && doc.uri ? doc.uri.toString() : String(doc) })
+          .then(() => activeEditor),
+      showSaveDialog: () => Promise.resolve(undefined),
+      showOpenDialog: () => Promise.resolve(undefined),
+      tabGroups: {
+        all: [], activeTabGroup: { tabs: [], activeTab: undefined },
+        onDidChangeTabs: () => new Disposable(() => {}),
+        onDidChangeTabGroups: () => new Disposable(() => {}),
+        close: () => Promise.resolve(true),
+      },
       withProgress: (_opts, task) => task({ report: () => {} }, { isCancellationRequested: false }),
     },
 
@@ -256,6 +460,30 @@ function createVscode(rpc) {
       onDidCloseTextDocument: () => new Disposable(() => {}),
       onDidChangeConfiguration: () => new Disposable(() => {}),
       onDidChangeWorkspaceFolders: () => new Disposable(() => {}),
+      onWillSaveTextDocument: () => new Disposable(() => {}),
+      onDidCreateFiles: () => new Disposable(() => {}),
+      onDidDeleteFiles: () => new Disposable(() => {}),
+      onDidRenameFiles: () => new Disposable(() => {}),
+      onDidChangeTextEditorSelection: () => new Disposable(() => {}),
+      registerTextDocumentContentProvider: () => new Disposable(() => {}),
+      registerFileSystemProvider: () => new Disposable(() => {}),
+      applyEdit: () => Promise.resolve(true),
+      name: ws.root ? path.basename(ws.root) : undefined,
+      workspaceFile: undefined,
+      isTrusted: true,
+      fs: {
+        readFile: (uri) => Promise.resolve(new Uint8Array(fs.readFileSync(uri.fsPath || String(uri)))),
+        writeFile: (uri, data) => { fs.mkdirSync(path.dirname(uri.fsPath), { recursive: true }); fs.writeFileSync(uri.fsPath, Buffer.from(data)); return Promise.resolve(); },
+        stat: (uri) => {
+          const s = fs.statSync(uri.fsPath || String(uri));
+          return Promise.resolve({ type: s.isDirectory() ? 2 : 1, size: s.size, ctime: s.ctimeMs, mtime: s.mtimeMs });
+        },
+        readDirectory: (uri) =>
+          Promise.resolve(fs.readdirSync(uri.fsPath, { withFileTypes: true }).map((e) => [e.name, e.isDirectory() ? 2 : 1])),
+        createDirectory: (uri) => { fs.mkdirSync(uri.fsPath, { recursive: true }); return Promise.resolve(); },
+        delete: (uri, opts) => { fs.rmSync(uri.fsPath, { recursive: !!(opts && opts.recursive), force: true }); return Promise.resolve(); },
+        rename: (a, b) => { fs.renameSync(a.fsPath, b.fsPath); return Promise.resolve(); },
+      },
       createFileSystemWatcher: () => ({
         onDidCreate: () => new Disposable(() => {}), onDidChange: () => new Disposable(() => {}),
         onDidDelete: () => new Disposable(() => {}), dispose: () => {},
@@ -272,10 +500,37 @@ function createVscode(rpc) {
     },
 
     env: {
-      appName: 'Aether', language: 'en', machineId: 'aether', sessionId: 'aether',
+      appName: 'Aether', appHost: 'desktop', language: 'en',
+      machineId: 'aether', sessionId: 'aether-' + process.pid,
+      uriScheme: 'aether', appRoot: '', shell: process.env.SHELL || '/bin/bash',
+      remoteName: undefined, uiKind: 1, isNewAppInstall: false, isTelemetryEnabled: false,
+      onDidChangeTelemetryEnabled: () => new Disposable(() => {}),
+      asExternalUri: (uri) => Promise.resolve(uri),
       openExternal: (uri) => rpc.request('env/openExternal', { uri: String(uri) }).then(() => true),
       clipboard: { writeText: () => Promise.resolve(), readText: () => Promise.resolve('') },
     },
+
+    debug: {
+      onDidStartDebugSession: () => new Disposable(() => {}),
+      onDidTerminateDebugSession: () => new Disposable(() => {}),
+      registerDebugConfigurationProvider: () => new Disposable(() => {}),
+      startDebugging: () => Promise.resolve(false),
+      activeDebugSession: undefined,
+    },
+
+    tasks: {
+      registerTaskProvider: () => new Disposable(() => {}),
+      onDidStartTask: () => new Disposable(() => {}),
+      onDidEndTask: () => new Disposable(() => {}),
+    },
+
+    authentication: {
+      getSession: () => Promise.resolve(undefined),
+      onDidChangeSessions: () => new Disposable(() => {}),
+      registerAuthenticationProvider: () => new Disposable(() => {}),
+    },
+
+    comments: { createCommentController: () => ({ dispose: () => {} }) },
 
     languages: {
       registerHoverProvider: (selector, provider) => {
@@ -289,6 +544,15 @@ function createVscode(rpc) {
       // Stubs so extensions that also register these still load.
       registerCompletionItemProvider: () => new Disposable(() => {}),
       registerDefinitionProvider: () => new Disposable(() => {}),
+      registerCodeLensProvider: () => new Disposable(() => {}),
+      registerCodeActionsProvider: () => new Disposable(() => {}),
+      registerDocumentFormattingEditProvider: () => new Disposable(() => {}),
+      registerDocumentLinkProvider: () => new Disposable(() => {}),
+      registerInlineCompletionItemProvider: () => new Disposable(() => {}),
+      onDidChangeDiagnostics: () => new Disposable(() => {}),
+      getDiagnostics: () => [],
+      setTextDocumentLanguage: (doc) => Promise.resolve(doc),
+      match: () => 0,
       createDiagnosticCollection: () => ({ set: () => {}, delete: () => {}, clear: () => {}, dispose: () => {} }),
     },
   };
@@ -349,6 +613,24 @@ function createVscode(rpc) {
         range = [r.start.line, r.start.character, r.end.line, r.end.character];
       }
       return { contents, range };
+    },
+    // aether asks the provider to populate a fresh webview instance.
+    async resolveWebview({ viewId, instanceId }) {
+      const entry = webviewProviders.get(viewId);
+      if (!entry) throw new Error('no webview provider: ' + viewId);
+      const view = makeWebview(instanceId);
+      view.viewType = viewId;
+      await entry.provider.resolveWebviewView(view, { state: undefined }, { isCancellationRequested: false, onCancellationRequested: () => new Disposable(() => {}) });
+      return { ok: true };
+    },
+    // A message arrived FROM the webview page (acquireVsCodeApi().postMessage).
+    webviewMessage({ instanceId, data }) {
+      const inst = webviewInstances.get(instanceId);
+      if (inst) inst.onMessage.fire(data);
+    },
+    webviewDisposed({ instanceId }) {
+      const inst = webviewInstances.get(instanceId);
+      if (inst) { inst.onDispose.fire(); webviewInstances.delete(instanceId); }
     },
     async invokeCommand({ command, args }) {
       const cb = commands.get(command);

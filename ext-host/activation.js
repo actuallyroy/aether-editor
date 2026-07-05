@@ -28,12 +28,52 @@ async function activateExtension(extPath, hostLog, dispatch) {
     const mainRel = pkg.main || './extension.js';
     const mainPath = require.resolve(path.resolve(extPath, mainRel));
     const mod = require(mainPath);
+    const vscode = require('vscode');
+    const Uri = vscode.Uri;
+    // Persistent JSON-file-backed state store (globalState/workspaceState/secrets).
+    const storageDir = path.join(require('os').homedir(), '.aether', 'ext-storage', pkg.name || 'ext');
+    fs.mkdirSync(storageDir, { recursive: true });
+    const makeStore = (file) => {
+      const p = path.join(storageDir, file);
+      let data = {};
+      try { data = JSON.parse(fs.readFileSync(p, 'utf8')); } catch (_) {}
+      const flush = () => { try { fs.writeFileSync(p, JSON.stringify(data)); } catch (_) {} };
+      return {
+        get: (k, d) => (k in data ? data[k] : d),
+        update: (k, v) => { if (v === undefined) delete data[k]; else data[k] = v; flush(); return Promise.resolve(); },
+        keys: () => Object.keys(data),
+        setKeysForSync: () => {},
+        // secrets API shape rides on the same store:
+        store: (k, v) => { data[k] = v; flush(); return Promise.resolve(); },
+        delete: (k) => { delete data[k]; flush(); return Promise.resolve(); },
+        onDidChange: () => ({ dispose: () => {} }),
+      };
+    };
     const context = {
       subscriptions: [],
       extensionPath: extPath,
-      extensionUri: { fsPath: extPath, toString: () => 'file://' + extPath },
-      globalState: { get: () => undefined, update: () => Promise.resolve(), setKeysForSync: () => {} },
-      workspaceState: { get: () => undefined, update: () => Promise.resolve(), setKeysForSync: () => {} },
+      extensionUri: Uri.file(extPath),
+      extensionMode: 1, // Production
+      extension: {
+        id: `${pkg.publisher || 'unknown'}.${pkg.name || 'ext'}`,
+        packageJSON: pkg, extensionPath: extPath, extensionUri: Uri.file(extPath),
+        isActive: true, exports: undefined,
+      },
+      globalState: makeStore('global.json'),
+      workspaceState: makeStore('workspace.json'),
+      secrets: makeStore('secrets.json'),
+      globalStorageUri: Uri.file(path.join(storageDir, 'globalStorage')),
+      storageUri: Uri.file(path.join(storageDir, 'workspaceStorage')),
+      logUri: Uri.file(path.join(storageDir, 'logs')),
+      globalStoragePath: path.join(storageDir, 'globalStorage'),
+      storagePath: path.join(storageDir, 'workspaceStorage'),
+      logPath: path.join(storageDir, 'logs'),
+      environmentVariableCollection: {
+        replace: () => {}, append: () => {}, prepend: () => {}, get: () => undefined,
+        forEach: () => {}, delete: () => {}, clear: () => {}, persistent: false,
+        getScoped: () => ({ replace: () => {}, append: () => {}, prepend: () => {} }),
+      },
+      languageModelAccessInformation: { canSendRequest: () => undefined, onDidChange: () => ({ dispose: () => {} }) },
       asAbsolutePath: (rel) => path.join(extPath, rel),
     };
     if (typeof mod.activate === 'function') {

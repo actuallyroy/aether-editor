@@ -69,7 +69,9 @@ pub enum WorkerMsg {
     // ---- Extension host (see exthost/mod.rs) ----
     ExtHostReady,                                               // the Node host connected + handshook
     ExtHostMsg { value: serde_json::Value },                   // an inbound JSON-RPC message from the host
-    ExtHostExited,                                             // the Node host connection closed
+    ExtHostExited,
+    /// An event line from a webview-host process (ready / message / closed).
+    WebviewEvent { instance: i64, value: serde_json::Value },                                             // the Node host connection closed
     LspLocations { id: i64, locs: Vec<crate::lsp::LspLocation> }, // definition/references/symbol response
     LspTextEdits { id: i64, edits: Vec<crate::lsp::TextEdit> },   // formatting response (TextEdit[])
     LspWorkspaceEdit { id: i64, changes: Vec<(String, Vec<crate::lsp::TextEdit>)> }, // rename response

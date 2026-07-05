@@ -165,6 +165,89 @@ impl ExtHost {
     }
 }
 
+/// One live extension webview: a spawned `aether --webview-host` process (GTK +
+/// webkit2gtk) showing the view. Talks JSON lines over stdio; its stdout events are
+/// posted as `WorkerMsg::WebviewEvent` for the App to bridge to the extension host.
+pub struct WebviewProc {
+    pub instance_id: i64,
+    pub view_id: String,
+    stdin: Mutex<std::process::ChildStdin>,
+    child: std::process::Child,
+}
+
+impl WebviewProc {
+    pub fn start(
+        view_id: &str,
+        instance_id: i64,
+        title: &str,
+        roots: &[PathBuf],
+        tx: Sender<WorkerMsg>,
+        proxy: Option<EventLoopProxy<()>>,
+    ) -> Option<WebviewProc> {
+        let exe = std::env::current_exe().ok()?;
+        let mut child = std::process::Command::new(exe)
+            .arg("--webview-host")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut stdin = child.stdin.take()?;
+        let stdout = child.stdout.take()?;
+        let init = json!({
+            "cmd": "init",
+            "title": title,
+            "width": 520,
+            "height": 760,
+            "roots": roots.iter().map(|r| r.to_string_lossy()).collect::<Vec<_>>(),
+        });
+        let mut line = init.to_string();
+        line.push('\n');
+        stdin.write_all(line.as_bytes()).ok()?;
+        let iid = instance_id;
+        std::thread::spawn(move || {
+            let reader = std::io::BufReader::new(stdout);
+            for l in reader.lines() {
+                let Ok(l) = l else { break };
+                if let Ok(value) = serde_json::from_str::<Value>(&l) {
+                    let _ = tx.send(WorkerMsg::WebviewEvent { instance: iid, value });
+                    wake(&proxy);
+                }
+            }
+            let _ = tx.send(WorkerMsg::WebviewEvent { instance: iid, value: json!({"event": "closed"}) });
+            wake(&proxy);
+        });
+        Some(WebviewProc {
+            instance_id,
+            view_id: view_id.to_string(),
+            stdin: Mutex::new(stdin),
+            child,
+        })
+    }
+
+    fn send(&self, v: Value) {
+        if let Ok(mut w) = self.stdin.lock() {
+            let mut s = v.to_string();
+            s.push('\n');
+            let _ = w.write_all(s.as_bytes());
+            let _ = w.flush();
+        }
+    }
+    pub fn set_html(&self, html: &str) {
+        self.send(json!({"cmd": "html", "html": html}));
+    }
+    pub fn post(&self, data: &Value) {
+        self.send(json!({"cmd": "post", "data": data}));
+    }
+}
+
+impl Drop for WebviewProc {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// A discovered runnable extension (has a `main`, i.e. real code — not a theme/grammar).
 #[derive(Clone)]
 pub struct ExtInfo {

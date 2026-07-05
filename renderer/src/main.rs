@@ -10,6 +10,8 @@
 mod ai;
 mod claude_sessions;
 mod codicon_names;
+#[cfg(target_os = "linux")]
+mod webview_host;
 mod commands;
 mod completion;
 mod dap;
@@ -566,6 +568,11 @@ pub(crate) struct App {
     /// auto-expiring. Used for extension messages (info/warning/error).
     pub(crate) toasts: Vec<(String, Instant)>,
     pub(crate) toasts_dirty: bool,
+    /// Live extension webviews (each a `--webview-host` process) and the webview
+    /// view ids extensions have registered providers for.
+    pub(crate) webviews: Vec<exthost::WebviewProc>,
+    pub(crate) next_webview_id: i64,
+    pub(crate) ext_webview_views: Vec<String>,
     /// Name of the extension currently being installed (drives the "Installing…"
     /// button state and blocks duplicate clicks).
     pub(crate) installing: Option<String>,
@@ -767,6 +774,9 @@ impl App {
             ext_last_active: None,
             toasts: Vec::new(),
             toasts_dirty: false,
+            webviews: Vec::new(),
+            next_webview_id: 1,
+            ext_webview_views: Vec::new(),
             installing: None,
             detail: ui::ext_detail_view::ExtDetailView::new(),
             pending_close: false,
@@ -4343,9 +4353,41 @@ impl App {
         self.redraw();
     }
 
+    /// Open (or focus) an extension webview view: spawn a webview-host process and ask
+    /// the extension's provider to populate it.
+    fn open_ext_webview(&mut self, view_id: &str) {
+        if self.webviews.iter().any(|w| w.view_id == view_id) {
+            return; // already open (separate window — the WM handles focus)
+        }
+        let iid = self.next_webview_id;
+        self.next_webview_id += 1;
+        let roots: Vec<std::path::PathBuf> = self.ext_registry.iter().map(|e| e.path.clone()).collect();
+        let Some(wv) = exthost::WebviewProc::start(
+            view_id,
+            iid,
+            view_id,
+            &roots,
+            self.worker_tx.clone(),
+            self.proxy.clone(),
+        ) else {
+            self.show_toast("Couldn't start the webview host.");
+            return;
+        };
+        self.webviews.push(wv);
+        if let Some(h) = self.ext_host.as_ref() {
+            h.request("webview/resolve", serde_json::json!({ "viewId": view_id, "instanceId": iid }));
+        }
+    }
+
     /// Run an extension-contributed command (palette or status-bar click), activating
     /// its owning extension first if it hasn't been yet (VSCode's onCommand behavior).
     fn run_ext_command(&mut self, command: &str) {
+        // Internal palette rows for registered webview views.
+        if let Some(view_id) = command.strip_prefix("__webview:") {
+            let view_id = view_id.to_string();
+            self.open_ext_webview(&view_id);
+            return;
+        }
         let owner = self
             .ext_registry
             .iter()
@@ -4433,6 +4475,26 @@ impl App {
                 }
                 if let (Some(id), Some(h)) = (id.as_ref(), self.ext_host.as_ref()) {
                     h.respond(id, serde_json::Value::Bool(true));
+                }
+            }
+            Some("window/registerWebviewViewProvider") => {
+                if let Some(vid) = params.get("viewId").and_then(|v| v.as_str()) {
+                    if !self.ext_webview_views.iter().any(|v| v == vid) {
+                        self.ext_webview_views.push(vid.to_string());
+                    }
+                }
+            }
+            Some("webview/setHtml") => {
+                let iid = params.get("instanceId").and_then(|v| v.as_i64()).unwrap_or(0);
+                let html = params.get("html").and_then(|v| v.as_str()).unwrap_or("");
+                if let Some(wv) = self.webviews.iter().find(|w| w.instance_id == iid) {
+                    wv.set_html(html);
+                }
+            }
+            Some("webview/postMessage") => {
+                let iid = params.get("instanceId").and_then(|v| v.as_i64()).unwrap_or(0);
+                if let Some(wv) = self.webviews.iter().find(|w| w.instance_id == iid) {
+                    wv.post(params.get("data").unwrap_or(&serde_json::Value::Null));
                 }
             }
             Some("commands/registerCommand") => { /* palette rows come from contributes.commands */ }
@@ -4805,6 +4867,12 @@ impl App {
                         .iter()
                         .flat_map(|e| e.commands.iter().cloned())
                         .collect();
+                    // Registered webview views get an "open" row too.
+                    for vid in &self.ext_webview_views {
+                        self.palette
+                            .ext_commands
+                            .push((format!("__webview:{vid}"), format!("View: Show {vid}")));
+                    }
                     self.palette.set_source(mode, Vec::new());
                 }
                 commands::PaletteMode::Files => {
@@ -9935,6 +10003,29 @@ impl ApplicationHandler for App {
                     }
                 }
                 WorkerMsg::ExtHostMsg { value } => self.handle_ext_host_msg(value),
+                WorkerMsg::WebviewEvent { instance, value } => {
+                    match value.get("event").and_then(|e| e.as_str()) {
+                        // Page → extension (acquireVsCodeApi().postMessage).
+                        Some("message") => {
+                            if let Some(h) = self.ext_host.as_ref() {
+                                h.notify(
+                                    "webview/message",
+                                    serde_json::json!({
+                                        "instanceId": instance,
+                                        "data": value.get("data").cloned().unwrap_or(serde_json::Value::Null),
+                                    }),
+                                );
+                            }
+                        }
+                        Some("closed") => {
+                            if let Some(h) = self.ext_host.as_ref() {
+                                h.notify("webview/disposed", serde_json::json!({ "instanceId": instance }));
+                            }
+                            self.webviews.retain(|w| w.instance_id != instance);
+                        }
+                        _ => {} // "ready" needs no action — commands queue in the pipe
+                    }
+                }
                 WorkerMsg::ExtHostExited => {
                     self.ext_host = None;
                     self.ext_hover_providers.clear();
@@ -10743,6 +10834,13 @@ fn main() -> Result<()> {
     // IDE channel, a regular MCP server's tools aren't filtered by the client.
     if std::env::args().any(|a| a == "--mcp") {
         mcp::proxy::run_stdio()?;
+        return Ok(());
+    }
+    // Webview-host mode: a GTK process rendering one extension webview (see
+    // webview_host.rs). Spawned per webview by the GUI; talks over stdio.
+    #[cfg(target_os = "linux")]
+    if std::env::args().any(|a| a == "--webview-host") {
+        webview_host::run()?;
         return Ok(());
     }
     // Move a legacy ~/.nova config dir to ~/.aether before anything reads config.

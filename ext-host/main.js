@@ -36,6 +36,9 @@ rpc.on_method('workspace/didSaveTextDocument', (p) => dispatch.didSave(p));
 rpc.on_method('editor/didChangeActive', (p) => dispatch.didChangeActive(p));
 rpc.on_method('hover/provide', (p) => dispatch.provideHover(p));
 rpc.on_method('command/invoke', (p) => dispatch.invokeCommand(p));
+rpc.on_method('webview/resolve', (p) => dispatch.resolveWebview(p));
+rpc.on_method('webview/message', (p) => dispatch.webviewMessage(p));
+rpc.on_method('webview/disposed', (p) => dispatch.webviewDisposed(p));
 
 const sock = net.connect(port, '127.0.0.1', () => {
   rpc.attach(sock);

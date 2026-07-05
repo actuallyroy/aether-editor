@@ -52,3 +52,11 @@ notify = "6"
 # custom in-window menu instead.
 [target.'cfg(target_os = "macos")'.dependencies]
 muda = "0.16"
+
+# Webview host (`aether --webview-host`): a separate GTK process that renders
+# extension webviews (Claude Code panel etc.) with webkit2gtk via wry. Separate
+# process because GTK's main loop can't share a thread with winit's.
+[target.'cfg(target_os = "linux")'.dependencies]
+wry = "0.47"
+gtk = "0.18"
+glib = "0.18"
