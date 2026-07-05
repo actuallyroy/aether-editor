@@ -25,6 +25,7 @@ mod graph;
 mod gutter_diff;
 mod icon;
 mod git;
+mod exthost;
 mod highlight;
 mod layout;
 mod lsp;
@@ -540,6 +541,13 @@ pub(crate) struct App {
     /// Language servers (ESLint diagnostics, TS semantic tokens) — the manager owns
     /// the clients, the sync loop, and response routing (see lsp.rs).
     pub(crate) lsp: lsp::LspManager,
+    /// Out-of-process Node extension host (spawned lazily). `ext_hover_providers` are
+    /// the hover-provider ids the host has registered (so we know to ask it on hover).
+    pub(crate) ext_host: Option<exthost::ExtHost>,
+    pub(crate) ext_hover_providers: Vec<i64>,
+    /// In-flight extension-host hover request (id, anchor x, y) — its result feeds the
+    /// same hover card as LSP hover.
+    pub(crate) ext_hover_req: Option<(i64, f32, f32)>,
     /// Name of the extension currently being installed (drives the "Installing…"
     /// button state and blocks duplicate clicks).
     pub(crate) installing: Option<String>,
@@ -730,6 +738,9 @@ impl App {
             worker_rx,
             proxy: None, // set in main() once the event loop exists
             lsp: lsp::LspManager::new(),
+            ext_host: None,
+            ext_hover_providers: Vec::new(),
+            ext_hover_req: None,
             installing: None,
             detail: ui::ext_detail_view::ExtDetailView::new(),
             pending_close: false,
@@ -4265,6 +4276,74 @@ impl App {
         self.redraw();
     }
 
+    /// Route one inbound JSON-RPC message from the extension host (host → aether).
+    /// Requests must be answered (so the host's Promise resolves); notifications are
+    /// fire-and-forget. This is the aether-side implementation of the `vscode` API.
+    fn handle_ext_host_msg(&mut self, value: serde_json::Value) {
+        let method = value.get("method").and_then(|m| m.as_str()).map(String::from);
+        let id = value.get("id").cloned();
+        let params = value.get("params").cloned().unwrap_or(serde_json::Value::Null);
+        match method.as_deref() {
+            Some("log") => {
+                let lvl = params.get("level").and_then(|v| v.as_str()).unwrap_or("info");
+                let msg = params.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                eprintln!("[exthost:{lvl}] {msg}");
+            }
+            Some("window/showInformationMessage") | Some("window/showErrorMessage") => {
+                let msg = params.get("message").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                self.show_info_dialog(&msg);
+                if let (Some(id), Some(h)) = (id.as_ref(), self.ext_host.as_ref()) {
+                    h.respond(id, serde_json::Value::Null);
+                }
+            }
+            Some("languages/registerHoverProvider") => {
+                if let Some(pid) = params.get("providerId").and_then(|v| v.as_i64()) {
+                    if !self.ext_hover_providers.contains(&pid) {
+                        self.ext_hover_providers.push(pid);
+                    }
+                }
+            }
+            Some("commands/registerCommand") => { /* noted; execution wiring comes later */ }
+            Some("workspace/getConfiguration") => {
+                if let (Some(id), Some(h)) = (id.as_ref(), self.ext_host.as_ref()) {
+                    h.respond(id, serde_json::json!({}));
+                }
+            }
+            Some(other) => {
+                // Unknown request → error so the host's Promise doesn't hang forever.
+                let other = other.to_string();
+                if let (Some(id), Some(h)) = (id.as_ref(), self.ext_host.as_ref()) {
+                    h.respond_err(id, &format!("method not found: {other}"));
+                }
+            }
+            None => {
+                // A response to one of OUR requests (activate / hover).
+                if let Some(err) = value.get("error") {
+                    eprintln!("[exthost] request error: {err}");
+                }
+                // Route a hover result into the shared hover card.
+                if let (Some(resp_id), Some((req_id, hx, hy))) =
+                    (value.get("id").and_then(|v| v.as_i64()), self.ext_hover_req)
+                {
+                    if resp_id == req_id {
+                        self.ext_hover_req = None;
+                        if let Some(md) = value
+                            .get("result")
+                            .and_then(|r| r.get("contents"))
+                            .and_then(|c| c.as_str())
+                        {
+                            if !md.trim().is_empty() {
+                                self.lsp_hover = Some((md.to_string(), hx, hy));
+                                self.lsp_hover_scroll = 0.0;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.redraw();
+    }
+
     /// Relaunch the (freshly updated) executable and exit this process.
     fn restart_app(&self) {
         if let Ok(exe) = std::env::current_exe() {
@@ -5604,6 +5683,7 @@ impl App {
             for b in g.layout_btns.iter_mut() {
                 b.reshape(&mut g.font_system);
             }
+            g.fullscreen_exit_btn.reshape(&mut g.font_system);
             for b in g.terminal_btns.iter_mut() {
                 b.reshape(&mut g.font_system);
             }
@@ -6737,16 +6817,17 @@ impl App {
                 self.open_palette();
                 return;
             }
-            // Layout toggles: [0] primary (left) sidebar, [1] bottom panel
-            // (integrated terminal), [2] secondary sidebar is still a placeholder.
+            // Layout toggles: [0] fullscreen, [1] primary (left) sidebar, [2] bottom
+            // panel (integrated terminal), [3] secondary sidebar.
             if let Some(i) = layout.layout_btn_rects().iter().position(|r| r.contains((x, y))) {
                 match i {
-                    0 => {
+                    0 => self.exec_menu_cmd(menus::MenuCmd::FullScreen),
+                    1 => {
                         self.sidebar_visible = !self.sidebar_visible;
                         self.redraw();
                     }
-                    1 => self.toggle_terminal(),
-                    2 => {
+                    2 => self.toggle_terminal(),
+                    3 => {
                         self.right_sidebar_visible = !self.right_sidebar_visible;
                         self.redraw();
                     }
@@ -9578,6 +9659,28 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
+                WorkerMsg::ExtHostReady => {
+                    // Handshake done: tell the host our workspace, then activate any
+                    // bundled/sample extensions. (Real activation-by-event comes later.)
+                    if let Some(h) = self.ext_host.as_ref() {
+                        h.init(&self.cwd);
+                        if let Ok(exe) = std::env::current_exe() {
+                            // The sample extension ships next to ext-host/ for now.
+                            for base in exe.parent().into_iter().flat_map(|d| [d.to_path_buf(), d.join(".."), d.join("../..")]) {
+                                let sample = base.join("ext-host/sample-extension");
+                                if sample.join("package.json").exists() {
+                                    h.activate(&sample);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                WorkerMsg::ExtHostMsg { value } => self.handle_ext_host_msg(value),
+                WorkerMsg::ExtHostExited => {
+                    self.ext_host = None;
+                    self.ext_hover_providers.clear();
+                }
                 WorkerMsg::LspExited { server } => self.lsp.drop_server(server),
                 WorkerMsg::LspLog { server, message } => {
                     eprintln!("[lsp:{server}] {message}");
@@ -9794,16 +9897,27 @@ impl ApplicationHandler for App {
         }
         let hover_wake = self.hover_pending.as_ref().map(|(.., t0)| *t0 + HOVER_DELAY);
 
-        // Fire an LSP hover request once the pointer has rested on a token.
+        // Fire hover requests once the pointer has rested on a token — both the LSP
+        // server and any extension-registered hover provider. Whichever answers with
+        // content fills the hover card.
         if let Some((line, col, hx, hy, t0)) = self.lsp_hover_dwell {
             if now.duration_since(t0) >= HOVER_DELAY {
                 self.lsp_hover_dwell = None;
-                if let Some(d) = self.workspace.active_doc() {
-                    if let (Some(uri), Some(lang)) = (d.uri(), d.language_id()) {
-                        if let Some(id) = self.lsp.request_hover(lang, &uri, line, col) {
-                            self.lsp_hover_req = Some((id, hx, hy));
-                        }
+                let doc = self.workspace.active_doc();
+                let uri = doc.and_then(|d| d.uri());
+                let lang = doc.and_then(|d| d.language_id());
+                if let (Some(uri), Some(lang)) = (uri.as_ref(), lang) {
+                    if let Some(id) = self.lsp.request_hover(lang, uri, line, col) {
+                        self.lsp_hover_req = Some((id, hx, hy));
                     }
+                }
+                // Extension hover: ask the first registered provider (the host filters
+                // by selector; a fuller language match comes later).
+                if let (Some(uri), Some(h), Some(&pid)) =
+                    (uri.as_ref(), self.ext_host.as_ref(), self.ext_hover_providers.first())
+                {
+                    let id = h.request_hover(pid, uri, line, col);
+                    self.ext_hover_req = Some((id, hx, hy));
                 }
             }
         }
@@ -10120,6 +10234,11 @@ impl ApplicationHandler for App {
                             mcp::agents::register_claude(&self.cwd);
                         }
                     }
+                }
+                // Spawn the Node extension host (no-op if Node or the host script is
+                // missing). It connects back asynchronously → WorkerMsg::ExtHostReady.
+                if self.ext_host.is_none() {
+                    self.ext_host = exthost::ExtHost::start(&self.cwd, self.worker_tx.clone(), self.proxy.clone());
                 }
                 // Register this window with the pty-host (single-window-per-folder):
                 // if another live window already has this workspace open, it raises

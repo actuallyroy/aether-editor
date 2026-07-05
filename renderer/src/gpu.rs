@@ -105,6 +105,7 @@ pub struct GpuState {
     pub search: SearchField,
     pub menubar: MenuBar,
     pub layout_btns: Vec<IconButton>,
+    pub fullscreen_exit_btn: IconButton, // shown in place of layout_btns[0] while fullscreen
     pub explorer_btns: Vec<IconButton>,
     pub terminal_tabs: Vec<TextLabel>,   // panel header tab labels (stub)
     pub terminal_btns: Vec<IconButton>,  // panel header right-side icons (stub)
@@ -206,10 +207,12 @@ impl GpuState {
         let search = SearchField::new(&mut font_system);
         let menubar = MenuBar::new(&mut font_system);
         let layout_btns = vec![
+            IconButton::new(&mut font_system, theme::ICON_SCREEN_FULL, ic, 16.0),
             IconButton::new(&mut font_system, theme::ICON_LAYOUT_SIDEBAR_LEFT, ic, 16.0),
             IconButton::new(&mut font_system, theme::ICON_LAYOUT_PANEL, ic, 16.0),
             IconButton::new(&mut font_system, theme::ICON_LAYOUT_SIDEBAR_RIGHT, ic, 16.0),
         ];
+        let fullscreen_exit_btn = IconButton::new(&mut font_system, theme::ICON_SCREEN_NORMAL, ic, 16.0);
         let explorer_btns = vec![
             IconButton::new(&mut font_system, theme::ICON_NEW_FILE, ic, 16.0),
             IconButton::new(&mut font_system, theme::ICON_NEW_FOLDER, ic, 16.0),
@@ -401,6 +404,7 @@ impl GpuState {
             search,
             menubar,
             layout_btns,
+            fullscreen_exit_btn,
             explorer_btns,
             terminal_tabs,
             terminal_btns,

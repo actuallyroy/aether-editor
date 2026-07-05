@@ -1,0 +1,11 @@
+{
+  "name": "aether-sample",
+  "displayName": "Aether Sample Extension",
+  "version": "0.0.1",
+  "engines": { "vscode": "^1.63.0" },
+  "main": "./extension.js",
+  "activationEvents": ["onLanguage:plaintext", "onLanguage:rust", "*"],
+  "contributes": {
+    "commands": [{ "command": "aether.sample.hello", "title": "Aether Sample: Hello" }]
+  }
+}

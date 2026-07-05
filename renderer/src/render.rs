@@ -2394,8 +2394,12 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         gpu.search.draw(layout.header_search_rect(), &mut areas);
     }
     let layout_rects = layout.layout_btn_rects();
+    let fullscreen = gpu.window.fullscreen().is_some();
     for (i, btn) in gpu.layout_btns.iter().enumerate() {
-        btn.draw(layout_rects[i], theme::TITLE_FG(), &mut areas);
+        // The fullscreen toggle (index 0) swaps to the "exit fullscreen" glyph while
+        // the window is fullscreen.
+        let icon = if i == 0 && fullscreen { &gpu.fullscreen_exit_btn } else { btn };
+        icon.draw(layout_rects[i], theme::TITLE_FG(), &mut areas);
     }
     // Window controls — IconButton widgets at their layout rects (the same
     // rects the hover bg used above; glyph is centered in each). Native on macOS.

@@ -309,9 +309,11 @@ impl Layout {
         } else {
             self.title_bar.w - 3.0 * theme::TITLE_BTN_W()
         };
-        (0..3)
+        // 4 buttons: [0] fullscreen, [1] primary sidebar, [2] panel, [3] secondary
+        // sidebar — right-aligned, so the fullscreen icon sits leftmost of the group.
+        (0..4)
             .map(|i| Rect {
-                x: right - (3 - i) as f32 * cw,
+                x: right - (4 - i) as f32 * cw,
                 y: self.title_bar.y,
                 w: cw,
                 h: theme::TITLE_BAR_H(),

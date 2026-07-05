@@ -66,6 +66,10 @@ pub enum WorkerMsg {
     LspSemanticTokens { id: i64, data: Vec<u32> },              // semanticTokens/full response
     LspCompletion { id: i64, items: Vec<crate::lsp::CompletionItem> }, // textDocument/completion response
     LspHover { id: i64, markdown: String },                     // textDocument/hover response (display text)
+    // ---- Extension host (see exthost/mod.rs) ----
+    ExtHostReady,                                               // the Node host connected + handshook
+    ExtHostMsg { value: serde_json::Value },                   // an inbound JSON-RPC message from the host
+    ExtHostExited,                                             // the Node host connection closed
     LspLocations { id: i64, locs: Vec<crate::lsp::LspLocation> }, // definition/references/symbol response
     LspTextEdits { id: i64, edits: Vec<crate::lsp::TextEdit> },   // formatting response (TextEdit[])
     LspWorkspaceEdit { id: i64, changes: Vec<(String, Vec<crate::lsp::TextEdit>)> }, // rename response
