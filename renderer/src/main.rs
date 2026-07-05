@@ -9,6 +9,7 @@
 
 mod ai;
 mod claude_sessions;
+mod codicon_names;
 mod commands;
 mod completion;
 mod dap;
@@ -555,6 +556,16 @@ pub(crate) struct App {
     /// `onLanguage` extension fires once, when a matching file first opens).
     pub(crate) ext_registry: Vec<exthost::ExtInfo>,
     pub(crate) ext_activated: std::collections::HashSet<std::path::PathBuf>,
+    /// Extension status-bar items `(id, text, command)` mirrored from the host
+    /// (e.g. Live Server's "Go Live"). Drawn at the right of the status bar.
+    pub(crate) ext_status_items: Vec<(i64, String, Option<String>)>,
+    pub(crate) ext_status_dirty: bool,
+    /// Last uri sent as `editor/didChangeActive` (so it's sent once per switch).
+    pub(crate) ext_last_active: Option<String>,
+    /// Toast notifications (message, shown-at) — bottom-right cards, VSCode-style,
+    /// auto-expiring. Used for extension messages (info/warning/error).
+    pub(crate) toasts: Vec<(String, Instant)>,
+    pub(crate) toasts_dirty: bool,
     /// Name of the extension currently being installed (drives the "Installing…"
     /// button state and blocks duplicate clicks).
     pub(crate) installing: Option<String>,
@@ -751,6 +762,11 @@ impl App {
             ext_doc_versions: std::collections::HashMap::new(),
             ext_registry: Vec::new(),
             ext_activated: std::collections::HashSet::new(),
+            ext_status_items: Vec::new(),
+            ext_status_dirty: false,
+            ext_last_active: None,
+            toasts: Vec::new(),
+            toasts_dirty: false,
             installing: None,
             detail: ui::ext_detail_view::ExtDetailView::new(),
             pending_close: false,
@@ -4314,6 +4330,40 @@ impl App {
         }
     }
 
+    /// Show a bottom-right toast notification (auto-expires; see about_to_wait).
+    fn show_toast(&mut self, msg: &str) {
+        if msg.trim().is_empty() {
+            return;
+        }
+        self.toasts.push((msg.to_string(), Instant::now()));
+        if self.toasts.len() > 4 {
+            self.toasts.remove(0); // keep the stack shallow
+        }
+        self.toasts_dirty = true;
+        self.redraw();
+    }
+
+    /// Run an extension-contributed command (palette or status-bar click), activating
+    /// its owning extension first if it hasn't been yet (VSCode's onCommand behavior).
+    fn run_ext_command(&mut self, command: &str) {
+        let owner = self
+            .ext_registry
+            .iter()
+            .find(|e| e.commands.iter().any(|(c, _)| c == command))
+            .map(|e| e.path.clone());
+        if let Some(p) = owner {
+            if !self.ext_activated.contains(&p) {
+                if let Some(h) = self.ext_host.as_ref() {
+                    h.activate(&p);
+                }
+                self.ext_activated.insert(p);
+            }
+        }
+        if let Some(h) = self.ext_host.as_ref() {
+            h.invoke_command(command);
+        }
+    }
+
     /// Route one inbound JSON-RPC message from the extension host (host → aether).
     /// Requests must be answered (so the host's Promise resolves); notifications are
     /// fire-and-forget. This is the aether-side implementation of the `vscode` API.
@@ -4329,7 +4379,7 @@ impl App {
             }
             Some("window/showInformationMessage") | Some("window/showErrorMessage") => {
                 let msg = params.get("message").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                self.show_info_dialog(&msg);
+                self.show_toast(&msg);
                 if let (Some(id), Some(h)) = (id.as_ref(), self.ext_host.as_ref()) {
                     h.respond(id, serde_json::Value::Null);
                 }
@@ -4341,7 +4391,57 @@ impl App {
                     }
                 }
             }
-            Some("commands/registerCommand") => { /* noted; execution wiring comes later */ }
+            Some("window/showWarningMessage") => {
+                let msg = params.get("message").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                self.show_toast(&msg);
+                // No button UI yet — resolve with "no item picked".
+                if let (Some(id), Some(h)) = (id.as_ref(), self.ext_host.as_ref()) {
+                    h.respond(id, serde_json::Value::Null);
+                }
+            }
+            Some("window/showQuickPick") | Some("window/showInputBox") => {
+                // No async pick plumbed back yet — resolve as "dismissed".
+                if let (Some(id), Some(h)) = (id.as_ref(), self.ext_host.as_ref()) {
+                    h.respond(id, serde_json::Value::Null);
+                }
+            }
+            Some("window/statusBar") => {
+                let sid = params.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+                let visible = params.get("visible").and_then(|v| v.as_bool()).unwrap_or(false);
+                self.ext_status_items.retain(|(i, _, _)| *i != sid);
+                if visible {
+                    let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let command = params.get("command").and_then(|v| v.as_str()).map(String::from);
+                    self.ext_status_items.push((sid, text, command));
+                }
+                self.ext_status_dirty = true;
+            }
+            Some("workspace/saveAll") => {
+                for d in self.workspace.documents.iter_mut() {
+                    if d.path.is_some() {
+                        let _ = d.save();
+                    }
+                }
+                if let (Some(id), Some(h)) = (id.as_ref(), self.ext_host.as_ref()) {
+                    h.respond(id, serde_json::Value::Bool(true));
+                }
+                self.refresh_source_control();
+            }
+            Some("env/openExternal") => {
+                if let Some(uri) = params.get("uri").and_then(|v| v.as_str()) {
+                    open_url(uri);
+                }
+                if let (Some(id), Some(h)) = (id.as_ref(), self.ext_host.as_ref()) {
+                    h.respond(id, serde_json::Value::Bool(true));
+                }
+            }
+            Some("commands/registerCommand") => { /* palette rows come from contributes.commands */ }
+            Some("commands/executeCommand") => {
+                // Extension asked aether to run a command — only ext→ext for now.
+                if let (Some(id), Some(h)) = (id.as_ref(), self.ext_host.as_ref()) {
+                    h.respond(id, serde_json::Value::Null);
+                }
+            }
             Some("workspace/getConfiguration") => {
                 if let (Some(id), Some(h)) = (id.as_ref(), self.ext_host.as_ref()) {
                     h.respond(id, serde_json::json!({}));
@@ -4698,7 +4798,15 @@ impl App {
         // Rebuild the source only when the mode changes (file/symbol scans are not free).
         if self.palette.mode != mode {
             match mode {
-                commands::PaletteMode::Commands => self.palette.set_source(mode, Vec::new()),
+                commands::PaletteMode::Commands => {
+                    // Extension-contributed commands ride along after the built-ins.
+                    self.palette.ext_commands = self
+                        .ext_registry
+                        .iter()
+                        .flat_map(|e| e.commands.iter().cloned())
+                        .collect();
+                    self.palette.set_source(mode, Vec::new());
+                }
                 commands::PaletteMode::Files => {
                     let items = self.file_index();
                     self.palette.set_source(mode, items);
@@ -4726,6 +4834,9 @@ impl App {
                 if let Some(cmd) = self.palette.selected_command() {
                     self.palette.close();
                     self.exec_command(cmd);
+                } else if let Some(ext_cmd) = self.palette.selected_ext_command() {
+                    self.palette.close();
+                    self.run_ext_command(&ext_cmd);
                 }
                 true
             }
@@ -4908,6 +5019,9 @@ impl App {
                         let text = d.text();
                         for server in d.lsp_servers.clone() {
                             self.lsp.did_save(server, &uri, &text);
+                        }
+                        if let Some(h) = self.ext_host.as_ref() {
+                            h.did_save(&uri);
                         }
                     }
                 }
@@ -5824,6 +5938,14 @@ impl App {
         // A file of this language just opened → activate any `onLanguage:<lang>` ext.
         if first {
             self.activate_matching_extensions(Some(lang));
+        }
+        // Keep the host's `window.activeTextEditor` in sync (Live Server reads
+        // `activeTextEditor.document.fileName` to pick which file to serve).
+        if self.ext_last_active.as_deref() != Some(uri.as_str()) {
+            self.ext_last_active = Some(uri.clone());
+            if let Some(h) = self.ext_host.as_ref() {
+                h.did_change_active(&uri, lang);
+            }
         }
     }
 
@@ -6983,6 +7105,42 @@ impl App {
             if enc_hit {
                 self.open_encoding_pick();
                 return;
+            }
+            // Extension status-bar items (geometry mirrors render.rs).
+            if let Some(g) = self.gpu.as_ref() {
+                if !g.ui.ext_status.is_empty() {
+                    let right_anchor = if self.workspace.active_doc().is_some() {
+                        render::encoding_cell(layout.status_bar, g.ui.encoding.width()).x
+                    } else {
+                        render::zoom_ctrl_cells(layout.status_bar)[0].x
+                    };
+                    let anchor = right_anchor - g.ui.status_right.width() - theme::zpx(16.0);
+                    let widths: Vec<f32> = g
+                        .ui
+                        .ext_status
+                        .iter()
+                        .map(|(_, ic, l)| render::ext_status_item_w(ic, l))
+                        .collect();
+                    let cells = render::ext_status_cells(layout.status_bar, anchor, &widths);
+                    let hit = g
+                        .ui
+                        .ext_status
+                        .iter()
+                        .zip(cells.iter())
+                        .find(|(_, c)| c.contains((x, y)))
+                        .map(|((id, _, _), _)| *id);
+                    if let Some(sid) = hit {
+                        let cmd = self
+                            .ext_status_items
+                            .iter()
+                            .find(|(i, _, _)| *i == sid)
+                            .and_then(|(_, _, c)| c.clone());
+                        if let Some(cmd) = cmd {
+                            self.run_ext_command(&cmd);
+                        }
+                        return;
+                    }
+                }
             }
             let cells = render::zoom_ctrl_cells(layout.status_bar);
             if cells[0].contains((x, y)) {
@@ -9498,6 +9656,21 @@ impl ApplicationHandler for App {
             el.exit();
             return;
         }
+        // Expire toast notifications (~6s), waking again for the next expiry. This runs
+        // BEFORE the terminal-key scheduling so a sooner key deadline wins the WaitUntil.
+        if !self.toasts.is_empty() {
+            const TOAST_TTL: std::time::Duration = std::time::Duration::from_secs(6);
+            let now = Instant::now();
+            let before = self.toasts.len();
+            self.toasts.retain(|(_, t)| now.duration_since(*t) < TOAST_TTL);
+            if self.toasts.len() != before {
+                self.toasts_dirty = true;
+                self.redraw();
+            }
+            if let Some(next) = self.toasts.iter().map(|(_, t)| *t + TOAST_TTL).min() {
+                el.set_control_flow(ControlFlow::WaitUntil(next));
+            }
+        }
         // Fire any due deferred terminal keys (e.g. the Enter after a terminalSend paste),
         // and keep waking until they're delivered.
         if !self.pending_term_keys.is_empty() {
@@ -9569,6 +9742,21 @@ impl ApplicationHandler for App {
                             self.extensions = extensions::scan();
                             self.activate_installed_grammars(); // register grammars now (no reload needed)
                             self.rebuild_ext_rows();
+                            // A runnable extension (has `main`) starts working right away:
+                            // rediscover and fire matching activation events, no reload.
+                            let mut dirs: Vec<std::path::PathBuf> =
+                                exthost::bundled_extensions_dir().into_iter().collect();
+                            dirs.extend(exthost::user_extensions_dir());
+                            self.ext_registry = exthost::discover(&dirs);
+                            self.activate_matching_extensions(None);
+                            if let Some(lang) = self
+                                .workspace
+                                .active_doc()
+                                .and_then(|d| d.language_id())
+                                .map(String::from)
+                            {
+                                self.activate_matching_extensions(Some(&lang));
+                            }
                             // Re-highlight open docs so a newly-installed grammar lights up.
                             if let Some(g) = self.gpu.as_mut() {
                                 for d in self.workspace.documents.iter_mut() {

@@ -142,6 +142,9 @@ pub struct PaletteState {
     pub items: Vec<PickItem>, // the quick-pick source (empty in Commands mode)
     pub scroll: f32,          // list scroll offset in px (clamped/followed in render)
     pub follow_selection: bool, // scroll to keep the selection visible next frame
+    /// Extension-contributed commands `(command id, title)` — appended after the
+    /// built-in `COMMANDS` rows in Commands mode.
+    pub ext_commands: Vec<(String, String)>,
 }
 
 impl PaletteState {
@@ -155,21 +158,37 @@ impl PaletteState {
             items: Vec::new(),
             scroll: 0.0,
             follow_selection: true,
+            ext_commands: Vec::new(),
         }
     }
     /// Number of rows in the active source (commands or item list).
     fn source_len(&self) -> usize {
         match self.mode {
-            PaletteMode::Commands => COMMANDS.len(),
+            PaletteMode::Commands => COMMANDS.len() + self.ext_commands.len(),
             _ => self.items.len(),
         }
     }
     /// The display text of row `i` in the active source (for filtering).
     fn row_text(&self, i: usize) -> String {
         match self.mode {
-            PaletteMode::Commands => COMMANDS[i].1.to_lowercase(),
+            PaletteMode::Commands => self
+                .command_label(i)
+                .map(|s| s.to_lowercase())
+                .unwrap_or_default(),
             _ => self.items[i].label.to_lowercase(),
         }
+    }
+    /// Display label of Commands-mode row `i` (built-in title or extension title).
+    pub fn command_label(&self, i: usize) -> Option<&str> {
+        if i < COMMANDS.len() {
+            Some(COMMANDS[i].1)
+        } else {
+            self.ext_commands.get(i - COMMANDS.len()).map(|(_, t)| t.as_str())
+        }
+    }
+    /// Keyboard-shortcut hint of Commands-mode row `i` ("" for extension commands).
+    pub fn command_hint(&self, i: usize) -> &str {
+        if i < COMMANDS.len() { COMMANDS[i].2 } else { "" }
     }
     pub fn refilter(&mut self, query: &str) {
         let q = query.trim().to_lowercase();
@@ -255,7 +274,20 @@ impl PaletteState {
         if self.mode != PaletteMode::Commands {
             return None;
         }
-        self.filtered.get(self.selected).map(|&i| COMMANDS[i].0)
+        self.filtered
+            .get(self.selected)
+            .and_then(|&i| (i < COMMANDS.len()).then(|| COMMANDS[i].0))
+    }
+    /// The selected EXTENSION command id, if the selection is an extension row.
+    pub fn selected_ext_command(&self) -> Option<String> {
+        if self.mode != PaletteMode::Commands {
+            return None;
+        }
+        self.filtered
+            .get(self.selected)
+            .and_then(|&i| i.checked_sub(COMMANDS.len()))
+            .and_then(|j| self.ext_commands.get(j))
+            .map(|(cmd, _)| cmd.clone())
     }
 }
 

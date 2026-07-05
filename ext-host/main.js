@@ -26,11 +26,14 @@ const hostLog = (level, message) => rpc.notify('log', { level, message });
 let workspaceRoot = null;
 
 // ---- inbound handlers (aether -> host) ----
-rpc.on_method('host/init', ({ root }) => { workspaceRoot = root; });
-rpc.on_method('activate', ({ extensionPath }) => activateExtension(extensionPath, hostLog));
+rpc.on_method('host/init', (p) => { workspaceRoot = p.root; dispatch.setWorkspace(p); });
+rpc.on_method('workspace/didChangeConfiguration', (p) => dispatch.setWorkspace(p));
+rpc.on_method('activate', ({ extensionPath }) => activateExtension(extensionPath, hostLog, dispatch));
 rpc.on_method('deactivate', ({ extensionPath }) => deactivateExtension(extensionPath));
 rpc.on_method('workspace/didOpenTextDocument', (p) => dispatch.didOpen(p));
 rpc.on_method('workspace/didChangeTextDocument', (p) => dispatch.didChange(p));
+rpc.on_method('workspace/didSaveTextDocument', (p) => dispatch.didSave(p));
+rpc.on_method('editor/didChangeActive', (p) => dispatch.didChangeActive(p));
 rpc.on_method('hover/provide', (p) => dispatch.provideHover(p));
 rpc.on_method('command/invoke', (p) => dispatch.invokeCommand(p));
 

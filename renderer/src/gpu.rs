@@ -31,6 +31,8 @@ pub struct UiBuffers {
     pub tabs: Buffer,
     pub status: TextLabel,
     pub status_right: TextLabel,
+    pub ext_status: Vec<(i64, Option<TextLabel>, TextLabel)>, // extension status-bar items (id, codicon, label)
+    pub toast_labels: Vec<TextLabel>, // bottom-right toast notification texts
     pub encoding: TextLabel, // status-bar encoding label (clickable → encoding picker)
     pub breadcrumbs: crate::ui::breadcrumbs::Breadcrumbs, // path bar below the tab strip
     pub branch_icon: TextLabel, // status-bar git-branch glyph (codicon)
@@ -256,6 +258,8 @@ impl GpuState {
             tabs: make_ui_buffer(&mut font_system, 4000.0, theme::TAB_HEIGHT()),
             status: TextLabel::new(&mut font_system, 4000.0, theme::STATUS_BAR_HEIGHT()),
             status_right: TextLabel::new(&mut font_system, 4000.0, theme::STATUS_BAR_HEIGHT()),
+            ext_status: Vec::new(),
+            toast_labels: Vec::new(),
             encoding: TextLabel::new(&mut font_system, 400.0, theme::STATUS_BAR_HEIGHT()),
             breadcrumbs: crate::ui::breadcrumbs::Breadcrumbs::new(&mut font_system),
             branch_icon: TextLabel::new(&mut font_system, 32.0, theme::STATUS_BAR_HEIGHT()),

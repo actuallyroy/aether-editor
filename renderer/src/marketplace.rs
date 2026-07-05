@@ -310,6 +310,15 @@ pub fn install(ext: &RemoteExt, ext_root: &Path) -> Result<PathBuf, String> {
             }
             let mut out = std::fs::File::create(&out_path).map_err(|e| e.to_string())?;
             std::io::copy(&mut file, &mut out).map_err(|e| e.to_string())?;
+            // Preserve the exec bit — extensions bundle helper binaries/scripts
+            // (e.g. Live Server's xdg-open) that must stay executable.
+            #[cfg(unix)]
+            if let Some(mode) = file.unix_mode() {
+                use std::os::unix::fs::PermissionsExt;
+                if mode & 0o111 != 0 {
+                    let _ = std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode & 0o777));
+                }
+            }
         }
     }
     Ok(dest)

@@ -153,6 +153,16 @@ impl ExtHost {
             json!({ "providerId": provider_id, "uri": uri, "line": line, "character": character }),
         )
     }
+    pub fn did_change_active(&self, uri: &str, language_id: &str) {
+        self.notify("editor/didChangeActive", json!({ "uri": uri, "languageId": language_id }));
+    }
+    pub fn did_save(&self, uri: &str) {
+        self.notify("workspace/didSaveTextDocument", json!({ "uri": uri }));
+    }
+    /// Run an extension-registered command (e.g. "Go Live"). Fire-and-forget id.
+    pub fn invoke_command(&self, command: &str) -> i64 {
+        self.request("command/invoke", json!({ "command": command, "args": [] }))
+    }
 }
 
 /// A discovered runnable extension (has a `main`, i.e. real code — not a theme/grammar).
@@ -161,6 +171,8 @@ pub struct ExtInfo {
     pub path: PathBuf,
     pub name: String,
     pub activation_events: Vec<String>,
+    /// Palette-visible commands from `contributes.commands`: `(command id, title)`.
+    pub commands: Vec<(String, String)>,
 }
 
 /// Scan each directory for immediate subfolders containing a `package.json` with a
@@ -187,7 +199,20 @@ pub fn discover(dirs: &[PathBuf]) -> Vec<ExtInfo> {
                 .and_then(|a| a.as_array())
                 .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
                 .unwrap_or_default();
-            out.push(ExtInfo { path: p, name, activation_events });
+            let commands = v
+                .pointer("/contributes/commands")
+                .and_then(|c| c.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|c| {
+                            let cmd = c.get("command")?.as_str()?.to_string();
+                            let title = c.get("title").and_then(|t| t.as_str()).unwrap_or(&cmd).to_string();
+                            Some((cmd, title))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push(ExtInfo { path: p, name, activation_events, commands });
         }
     }
     out

@@ -12,7 +12,6 @@ use wgpu::{
     RenderPassDescriptor, StoreOp, TextureViewDescriptor,
 };
 
-use crate::commands::COMMANDS;
 use crate::extensions::open_ext_view;
 use crate::layout::Layout;
 use crate::quad::Quad;
@@ -345,6 +344,52 @@ pub(crate) fn encoding_cell(status: Rect, label_w: f32) -> Rect {
     let pad = 8.0 * z;
     let w = label_w + 12.0 * z;
     Rect { x: zoom_left - pad - w, y: status.y, w, h: status.h }
+}
+
+/// Content width of one extension status-bar item (icon + gap + text).
+pub(crate) fn ext_status_item_w(icon: &Option<crate::widgets::TextLabel>, label: &crate::widgets::TextLabel) -> f32 {
+    label.width() + icon.as_ref().map_or(0.0, |i| i.width() + theme::zpx(5.0))
+}
+
+/// Split a status-bar text like `"$(broadcast) Go Live"` into (first known codicon
+/// glyph, text with ALL `$(…)` tokens stripped).
+pub(crate) fn parse_status_icon(text: &str) -> (Option<char>, String) {
+    let mut icon = None;
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("$(") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find(')') {
+            Some(end) => {
+                if icon.is_none() {
+                    icon = crate::codicon_names::codicon(&after[..end]);
+                }
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push_str(&rest[start..]);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    (icon, out.trim().to_string())
+}
+
+/// Clickable cells for extension status-bar items, laid right-to-left ending at
+/// `anchor_x`. `widths` are the shaped label widths, in item order. Shared by
+/// render (hover + label) and the click handler.
+pub(crate) fn ext_status_cells(status: Rect, anchor_x: f32, widths: &[f32]) -> Vec<Rect> {
+    let z = theme::ui_zoom();
+    let mut right = anchor_x;
+    let mut out = Vec::with_capacity(widths.len());
+    for w in widths {
+        let cw = w + 16.0 * z;
+        out.push(Rect { x: right - cw, y: status.y, w: cw, h: status.h });
+        right -= cw + 4.0 * z;
+    }
+    out
 }
 
 /// Zoom-control overlay cells [zoom_out, percent, zoom_in, fit], a pill at the
@@ -748,6 +793,35 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         // The encoding sits in its own clickable cell (see the status-bar draw pass).
         let encoding_label = app.workspace.active_doc().map(|d| d.encoding).unwrap_or("UTF-8");
         gpu.ui.encoding.set(fs, encoding_label, theme::UI_FAMILY());
+        // Extension status-bar items (e.g. Live Server's "Go Live") — rebuild the
+        // labels only when the host pushed a change.
+        // Toast texts (bottom-right notifications) — rebuilt on change.
+        if app.toasts_dirty {
+            app.toasts_dirty = false;
+            gpu.ui.toast_labels.clear();
+            for (msg, _) in &app.toasts {
+                let mut l = crate::widgets::TextLabel::new(fs, 420.0 * theme::ui_zoom(), theme::zpx(20.0));
+                l.set(fs, msg, theme::UI_FAMILY());
+                gpu.ui.toast_labels.push(l);
+            }
+        }
+        if app.ext_status_dirty {
+            app.ext_status_dirty = false;
+            gpu.ui.ext_status.clear();
+            for (id, text, _cmd) in &app.ext_status_items {
+                // Resolve VSCode `$(icon)` tokens: the first known one becomes a
+                // codicon glyph; all tokens are stripped from the text.
+                let (icon, clean) = parse_status_icon(text);
+                let icon_label = icon.map(|g| {
+                    let mut l = crate::widgets::TextLabel::new(fs, 40.0, theme::STATUS_BAR_HEIGHT());
+                    l.set(fs, &g.to_string(), theme::ICON_FAMILY);
+                    l
+                });
+                let mut l = crate::widgets::TextLabel::new(fs, 600.0, theme::STATUS_BAR_HEIGHT());
+                l.set(fs, &clean, theme::UI_FAMILY());
+                gpu.ui.ext_status.push((*id, icon_label, l));
+            }
+        }
         // Breadcrumbs: shape the active file's path segments (the component owns its
         // per-segment layout + the click dropdown).
         if layout.breadcrumbs.h > 0.0 {
@@ -1014,7 +1088,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                         // Labels only — shortcuts draw as right-aligned keycap pills
                         // in the palette's late pass (see Keycaps below).
                         for &i in app.palette.filtered.iter() {
-                            list_text.push_str(&format!(" {}\n", COMMANDS[i].1));
+                            list_text.push_str(&format!(" {}\n", app.palette.command_label(i).unwrap_or("")));
                         }
                     }
                     // `%` rows already carry file:line in the label — no detail tag.
@@ -2918,6 +2992,25 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     let right_anchor = enc_cell.map(|c| c.x).unwrap_or(zoom_cells[0].x);
     ui.status_right
         .draw_right(layout.status_bar, 8.0 + (layout.status_bar.x + layout.status_bar.w - right_anchor), sfg, &mut areas);
+    // Extension status-bar items sit left of the right-hand status info, each in a
+    // clickable hover-highlighted cell (Live Server's "Go Live" lives here).
+    if !ui.ext_status.is_empty() {
+        let anchor = right_anchor - ui.status_right.width() - theme::zpx(16.0);
+        let widths: Vec<f32> = ui.ext_status.iter().map(|(_, ic, l)| ext_status_item_w(ic, l)).collect();
+        let cells = ext_status_cells(layout.status_bar, anchor, &widths);
+        let pt = (app.mouse_pos.x as f32, app.mouse_pos.y as f32);
+        for ((_, icon, l), cell) in ui.ext_status.iter().zip(cells.iter()) {
+            if cell.contains(pt) {
+                bg_quads.push(cell.quad(theme::MENU_HOVER()));
+            }
+            let mut x = cell.x + (cell.w - ext_status_item_w(icon, l)) * 0.5;
+            if let Some(ic) = icon {
+                ic.push(x, *cell, sfg, &mut areas);
+                x += ic.width() + theme::zpx(5.0);
+            }
+            l.push(x, *cell, sfg, &mut areas);
+        }
+    }
     for (lbl, c) in [
         (&ui.zoom_minus, zoom_cells[0]),
         (&ui.zoom_pct, zoom_cells[1]),
@@ -3555,7 +3648,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         if app.palette.mode == crate::commands::PaletteMode::Commands {
             let right = pal.list.x + pal.list.w - theme::zpx(12.0);
             for (pos, &i) in app.palette.filtered.iter().enumerate() {
-                let shortcut = COMMANDS[i].2;
+                let shortcut = app.palette.command_hint(i);
                 if shortcut.is_empty() {
                     continue;
                 }
@@ -3864,6 +3957,66 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         } else {
             app.lsp_hover_rect = None;
         }
+    }
+
+    // ---- Toast notifications (bottom-right, VSCode-style, auto-expiring) ----
+    if !app.toasts.is_empty() && !gpu.ui.toast_labels.is_empty() {
+        let (cfg_w, cfg_h) = (gpu.config.width, gpu.config.height);
+        let z = theme::ui_zoom();
+        let pad = theme::zpx(14.0);
+        let radius = theme::zpx(8.0);
+        let gap = theme::zpx(10.0);
+        let card_h = theme::zpx(44.0);
+        let right = cfg_w as f32 - theme::zpx(16.0);
+        // Stack upward from just above the status bar.
+        let mut bottom = cfg_h as f32 - theme::STATUS_BAR_HEIGHT() - theme::zpx(16.0);
+        let mut tq: Vec<Quad> = Vec::new();
+        let mut tareas: Vec<TextArea> = Vec::new();
+        for l in gpu.ui.toast_labels.iter().rev() {
+            let card_w = (l.width() + pad * 2.0).min(460.0 * z);
+            let card = Rect { x: right - card_w, y: bottom - card_h, w: card_w, h: card_h };
+            // Soft shadow + border ring + fill (matches the hover card styling).
+            for i in 1..=4 {
+                let s = i as f32 * theme::zpx(2.0);
+                let a = 0.12 * (1.0 - (i as f32 - 1.0) / 4.0);
+                tq.push(Rect { x: card.x - s, y: card.y - s + theme::zpx(2.0), w: card.w + s * 2.0, h: card.h + s * 2.0 }
+                    .rounded_quad([0.0, 0.0, 0.0, a], radius + s));
+            }
+            tq.push(Rect { x: card.x - 1.0, y: card.y - 1.0, w: card.w + 2.0, h: card.h + 2.0 }
+                .rounded_quad(theme::PALETTE_BORDER(), radius + 1.0));
+            tq.push(card.rounded_quad(theme::PALETTE_BG(), radius));
+            l.push_in(card.x + pad, card, card, theme::FG_TEXT(), &mut tareas);
+            bottom = card.y - gap;
+        }
+        gpu.quad_renderer.prepare(&gpu.device, &gpu.queue, &tq, &[], (cfg_w, cfg_h));
+        gpu.text_renderer.prepare(
+            &gpu.device,
+            &gpu.queue,
+            &mut gpu.font_system,
+            &mut gpu.atlas,
+            &gpu.viewport,
+            tareas,
+            &mut gpu.swash_cache,
+        )?;
+        let mut ench = gpu
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor { label: Some("aether-toast-pass") });
+        {
+            let mut pass = ench.begin_render_pass(&RenderPassDescriptor {
+                label: Some("aether-toast"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            gpu.quad_renderer.render_bg(&mut pass);
+            gpu.text_renderer.render(&gpu.atlas, &gpu.viewport, &mut pass)?;
+        }
+        gpu.queue.submit(Some(ench.finish()));
     }
 
     // ---- Modal dialog overlay (third pass) ----

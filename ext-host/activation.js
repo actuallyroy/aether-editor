@@ -18,10 +18,13 @@ function installVscodeModule(vscode) {
 }
 
 // Load + activate an extension by directory. Returns { ok } or { ok:false, error }.
-async function activateExtension(extPath, hostLog) {
+async function activateExtension(extPath, hostLog, dispatch) {
   try {
     const pkgPath = path.join(extPath, 'package.json');
     const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+    // Register contributed configuration defaults BEFORE activate() runs — the
+    // extension may read its config during activation.
+    if (dispatch && dispatch.registerContributes) dispatch.registerContributes(pkg, extPath);
     const mainRel = pkg.main || './extension.js';
     const mainPath = require.resolve(path.resolve(extPath, mainRel));
     const mod = require(mainPath);
@@ -29,8 +32,8 @@ async function activateExtension(extPath, hostLog) {
       subscriptions: [],
       extensionPath: extPath,
       extensionUri: { fsPath: extPath, toString: () => 'file://' + extPath },
-      globalState: { get: () => undefined, update: () => Promise.resolve() },
-      workspaceState: { get: () => undefined, update: () => Promise.resolve() },
+      globalState: { get: () => undefined, update: () => Promise.resolve(), setKeysForSync: () => {} },
+      workspaceState: { get: () => undefined, update: () => Promise.resolve(), setKeysForSync: () => {} },
       asAbsolutePath: (rel) => path.join(extPath, rel),
     };
     if (typeof mod.activate === 'function') {
