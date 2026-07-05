@@ -198,6 +198,22 @@ const VSCODE_API_SHIM: &str = r#"
   window.addEventListener('pointerdown', () => {
     try { window.ipc.postMessage(JSON.stringify({ __aetherFocus: true })); } catch (_) {}
   }, true);
+  // Report the page's effective cursor so the editor can mirror it.
+  let __lastCursor = '';
+  document.addEventListener('pointerover', (e) => {
+    try {
+      let c = getComputedStyle(e.target).cursor || 'default';
+      if (c === 'auto') {
+        const t = e.target;
+        const editable = t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable);
+        c = editable ? 'text' : 'default';
+      }
+      if (c !== __lastCursor) {
+        __lastCursor = c;
+        window.ipc.postMessage(JSON.stringify({ __aetherCursor: c }));
+      }
+    } catch (_) {}
+  }, true);
   const origErr = console.error, origWarn = console.warn;
   console.error = (...a) => { fwd('error')(...a); origErr.apply(console, a); };
   console.warn = (...a) => { fwd('warn')(...a); origWarn.apply(console, a); };
@@ -277,6 +293,10 @@ pub fn run() -> anyhow::Result<()> {
                 let data: Value = serde_json::from_str(body).unwrap_or(Value::String(body.to_string()));
                 if data.get("__aetherFocus").is_some() {
                     out(json!({"event": "focus"}));
+                    return;
+                }
+                if let Some(c) = data.get("__aetherCursor").and_then(|c| c.as_str()) {
+                    out(json!({"event": "cursor", "value": c}));
                     return;
                 }
                 if let Some(kind) = data.get("__aetherConsole").and_then(|k| k.as_str()) {

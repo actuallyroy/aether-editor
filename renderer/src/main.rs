@@ -592,6 +592,8 @@ pub(crate) struct App {
     pub(crate) webview_frame_hash: u64,
     /// Extension-provided tab icons: webview instance → icon-atlas key.
     pub(crate) webview_icons: std::collections::HashMap<i64, String>,
+    /// The page's reported cursor over the active webview pane.
+    pub(crate) webview_cursor: CursorIcon,
     /// Per-webview virtual-display connections (capture + XTEST input).
     #[cfg(target_os = "linux")]
     pub(crate) webview_vds: std::collections::HashMap<i64, virtual_display::VirtualDisplay>,
@@ -807,6 +809,7 @@ impl App {
             webview_mouse_down: false,
             webview_frame_hash: 0,
             webview_icons: std::collections::HashMap::new(),
+            webview_cursor: CursorIcon::Default,
             #[cfg(target_os = "linux")]
             webview_vds: std::collections::HashMap::new(),
             installing: None,
@@ -1557,6 +1560,9 @@ impl App {
             && self.debug.as_ref().map_or(false, |dp| dp.over_row(p, layout.panel_region()))
         {
             CursorIcon::Pointer
+        } else if self.active_webview().is_some() && self.webview_rel(p.0, p.1).is_some() {
+            // Webview pane: mirror the PAGE's cursor (reported on hover changes).
+            self.webview_cursor
         } else if let Some(c) = chat_cursor {
             c
         } else if let Some(c) = find_cursor {
@@ -10446,6 +10452,24 @@ impl ApplicationHandler for App {
                             }
                         }
                         Some("focus") => { /* composited mode: input is forwarded, not focused */ }
+                        Some("cursor") => {
+                            let v = value.get("value").and_then(|v| v.as_str()).unwrap_or("default");
+                            self.webview_cursor = match v {
+                                "pointer" => CursorIcon::Pointer,
+                                "text" => CursorIcon::Text,
+                                "grab" => CursorIcon::Grab,
+                                "grabbing" => CursorIcon::Grabbing,
+                                "crosshair" => CursorIcon::Crosshair,
+                                "not-allowed" => CursorIcon::NotAllowed,
+                                "wait" | "progress" => CursorIcon::Progress,
+                                "ew-resize" | "col-resize" => CursorIcon::EwResize,
+                                "ns-resize" | "row-resize" => CursorIcon::NsResize,
+                                "move" => CursorIcon::Move,
+                                "help" => CursorIcon::Help,
+                                _ => CursorIcon::Default,
+                            };
+                            self.redraw();
+                        }
                         Some("console") => {
                             eprintln!(
                                 "[webview:{}] {}: {}",
