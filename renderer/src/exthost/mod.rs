@@ -191,6 +191,15 @@ impl WebviewProc {
         tx: Sender<WorkerMsg>,
         proxy: Option<EventLoopProxy<()>>,
     ) -> Option<WebviewProc> {
+        // The webview host (GTK/webkit) is Linux-only for now; on other platforms
+        // `--webview-host` would just open another editor window.
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (view_id, instance_id, title, roots, embed, tx, proxy);
+            return None;
+        }
+        #[cfg(target_os = "linux")]
+        {
         let exe = std::env::current_exe().ok()?;
         let mut cmd = std::process::Command::new(exe);
         cmd.arg("--webview-host")
@@ -252,6 +261,7 @@ impl WebviewProc {
             child,
             xvfb,
         })
+        }
     }
 
     fn send(&self, v: Value) {
@@ -420,6 +430,13 @@ fn host_script() -> Option<PathBuf> {
     if let Ok(cwd) = std::env::current_dir() {
         candidates.push(cwd.join("ext-host/main.js"));
     }
+    // Installed locations (deb: /usr/share/aether; AppImage: <root>/usr/share/aether).
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(prefix) = exe.parent().and_then(|d| d.parent()) {
+            candidates.push(prefix.join("share/aether/ext-host/main.js"));
+        }
+    }
+    candidates.push(PathBuf::from("/usr/share/aether/ext-host/main.js"));
     candidates.into_iter().find(|p| p.exists())
 }
 

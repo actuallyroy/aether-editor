@@ -29,6 +29,11 @@ install -Dm644 "$ROOT/packaging/aether.desktop" \
 install -Dm644 "$ROOT/logo.svg" \
         "$STAGE/usr/share/icons/hicolor/scalable/apps/aether.svg"
 
+# Extension host (Node) + bundled sample extension — resolved by the app at
+# /usr/share/aether/ext-host (see webview/exthost host_script()).
+mkdir -p "$STAGE/usr/share/aether"
+cp -r "$ROOT/ext-host" "$STAGE/usr/share/aether/ext-host"
+
 # Installed size in KiB, for the control file.
 INSTALLED_SIZE="$(du -ks "$STAGE/usr" | cut -f1)"
 
