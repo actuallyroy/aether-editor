@@ -205,8 +205,13 @@ fn id_prefixed(id: TermId, data: &[u8]) -> Vec<u8> {
 /// Wire-protocol generation. Bump ONLY for breaking changes — additive messages
 /// and fields don't need one anymore (unknown control frames are skipped and new
 /// TermInfo fields default), so app updates keep their running sessions.
-/// History: v4 TermInfo rows/cols; v3 Msg::Rename; v2 multi-client.
-pub const PROTO_VERSION: u32 = 4;
+/// History: v5 pid-based terminal ids; v4 TermInfo rows/cols; v3 Msg::Rename; v2 multi-client.
+/// v5 note: the id change is wire-compatible, but terminals only get pid ids from a
+/// daemon running the new code. Bumping the version makes an upgraded GUI spawn a FRESH
+/// daemon (instead of reattaching to the stale pre-pid one), so the deterministic-id fix
+/// takes effect on update without waiting for the old daemon to cycle. One-time cost:
+/// terminals under the old daemon don't carry over on that first launch.
+pub const PROTO_VERSION: u32 = 5;
 
 /// Which daemon family this build talks to. Debug and release builds get their
 /// OWN daemon (sharing one made them fight: duplicate daemons, debug launches
