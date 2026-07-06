@@ -854,7 +854,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         };
         gpu.ui.branch_icon.set(fs, &theme::ICON_SOURCE_CONTROL.to_string(), theme::ICON_FAMILY);
         gpu.ui.branch.set(fs, &branch_name, theme::UI_FAMILY());
-        gpu.ui.zoom_pct.set(fs, &format!("{}%", (theme::ui_zoom() * 100.0).round() as i32), theme::UI_FAMILY());
+        gpu.ui.zoom_pct.set(fs, &format!("{}%", (theme::user_zoom() * 100.0).round() as i32), theme::UI_FAMILY());
 
         // Bottom-panel text view (PROBLEMS / OUTPUT / DEBUG CONSOLE) — shaped here
         // while the font system is mutable; drawn in the panel block below.

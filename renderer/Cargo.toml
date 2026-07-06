@@ -1,6 +1,6 @@
 [package]
 name = "aether-renderer"
-version = "0.5.3"
+version = "0.5.4"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -54,6 +54,11 @@ notify = "6"
 muda = "0.16"
 # Extension webviews: an in-process WKWebView attached as a child NSView of the
 # editor window (no separate host process / virtual display needed on macOS).
+wry = "0.47"
+
+# Extension webviews on Windows: in-process WebView2 child of the editor window
+# (WebView2 runtime ships with Windows 11 / evergreen installer on 10).
+[target.'cfg(target_os = "windows")'.dependencies]
 wry = "0.47"
 
 # Webview host (`aether --webview-host`): a separate GTK process that renders

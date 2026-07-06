@@ -776,8 +776,28 @@ pub fn zpx(px: f32) -> f32 {
     px * ui_zoom()
 }
 pub fn set_ui_zoom(z: f32) {
-    *zoom_cell().write().unwrap() = z.clamp(0.5, 3.0);
+    *zoom_cell().write().unwrap() = z.clamp(0.5, 6.0);
     bump_shape_epoch();
+}
+
+/// The OS display scale factor of the monitor the window is on (1.0 = 96dpi,
+/// 2.0 = retina, 1.3 = 130% fractional scaling). Aether renders in PHYSICAL
+/// pixels, so the effective ui_zoom = display_scale × the user's chosen zoom —
+/// that way the UI comes up normal-sized on any screen (like VSCode) and the
+/// user preference is portable across monitors.
+fn display_scale_cell() -> &'static RwLock<f32> {
+    static S: OnceLock<RwLock<f32>> = OnceLock::new();
+    S.get_or_init(|| RwLock::new(1.0))
+}
+pub fn display_scale() -> f32 {
+    *display_scale_cell().read().unwrap()
+}
+pub fn set_display_scale(s: f32) {
+    *display_scale_cell().write().unwrap() = s.clamp(0.5, 4.0);
+}
+/// The user's zoom preference (1.0 = "100%", DPI factored out).
+pub fn user_zoom() -> f32 {
+    ui_zoom() / display_scale()
 }
 
 // Bumped whenever a change requires every cached text buffer to re-shape (zoom).

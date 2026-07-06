@@ -53,8 +53,12 @@ impl Default for Session {
 /// Persisted session state restored on the next launch.
 #[derive(Clone, Debug, Default)]
 pub struct State {
-    /// UI zoom level (theme::ui_zoom). `None` ⇒ never set, use the default 1.0.
+    /// LEGACY absolute UI zoom (theme::ui_zoom) from builds that ignored display
+    /// scale. Read once for migration; new saves write `zoomRel` instead.
     pub zoom: Option<f32>,
+    /// User zoom preference RELATIVE to the display scale (1.0 = "100%"). The
+    /// effective ui_zoom is display_scale × this, so it's portable across screens.
+    pub zoom_rel: Option<f32>,
     /// The last workspace folder the user had open, reopened on launch.
     pub last_workspace: Option<PathBuf>,
     /// Recently-opened workspace folders, newest first (File > Open Recent).
@@ -148,7 +152,10 @@ impl State {
         let Ok(text) = std::fs::read_to_string(&path) else { return s };
         let Ok(v) = serde_json::from_str::<Value>(&text) else { return s };
         if let Some(z) = v.get("zoom").and_then(|z| z.as_f64()) {
-            s.zoom = Some((z as f32).clamp(0.5, 3.0));
+            s.zoom = Some((z as f32).clamp(0.5, 6.0));
+        }
+        if let Some(z) = v.get("zoomRel").and_then(|z| z.as_f64()) {
+            s.zoom_rel = Some((z as f32).clamp(0.5, 3.0));
         }
         if let Some(p) = v.get("lastWorkspace").and_then(|p| p.as_str()) {
             if !p.is_empty() {
@@ -199,6 +206,7 @@ impl State {
         let Some(path) = state_path() else { return };
         let doc = json!({
             "zoom": self.zoom.unwrap_or(1.0),
+            "zoomRel": self.zoom_rel.unwrap_or(1.0),
             "lastWorkspace": self.last_workspace
                 .as_ref()
                 .map(|p| p.to_string_lossy().to_string())

@@ -12,16 +12,17 @@ mod claude_sessions;
 mod codicon_names;
 #[cfg(target_os = "linux")]
 mod webview_host;
-mod webview_mac;
+mod webview_child;
 mod webview_shim;
 #[cfg(target_os = "linux")]
 mod x11_embed;
 
 /// The per-platform handle to one extension webview: Linux uses an out-of-process
-/// GTK host on a virtual display; macOS an in-process WKWebView child view.
-#[cfg(target_os = "macos")]
-pub(crate) use webview_mac::MacWebview as WebviewHandle;
-#[cfg(not(target_os = "macos"))]
+/// GTK host on a virtual display; macOS/Windows an in-process child webview
+/// (WKWebView / WebView2).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(crate) use webview_child::ChildWebview as WebviewHandle;
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub(crate) use exthost::WebviewProc as WebviewHandle;
 #[cfg(target_os = "linux")]
 mod virtual_display;
@@ -1766,9 +1767,20 @@ impl App {
         // would silently fall back to the built-in dark theme on every launch).
         self.apply_theme_by_name(&s.workbench_color_theme);
 
-        // Restore the persisted UI zoom before the first layout/draw.
-        if let Some(z) = state::State::load().zoom {
+        // Restore the persisted UI zoom before the first layout/draw. The effective
+        // zoom is display_scale × the user's preference, so aether comes up
+        // normal-sized on any monitor (VSCode behavior) with no manual zooming.
+        let sf = self.gpu.as_ref().map(|g| g.window.scale_factor() as f32).unwrap_or(1.0);
+        theme::set_display_scale(sf);
+        let st = state::State::load();
+        if let Some(rel) = st.zoom_rel {
+            self.set_zoom(rel * sf);
+        } else if let Some(z) = st.zoom {
+            // Legacy absolute zoom from DPI-unaware builds: the user picked this
+            // value ON this screen — keep the look, it persists as rel = z/sf.
             self.set_zoom(z);
+        } else {
+            self.set_zoom(sf);
         }
 
         let Some(gpu) = self.gpu.as_mut() else {
@@ -2727,7 +2739,7 @@ impl App {
             }
             menus::MenuCmd::ZoomIn => self.zoom_step(0.1),
             menus::MenuCmd::ZoomOut => self.zoom_step(-0.1),
-            menus::MenuCmd::ZoomReset => self.set_zoom(1.0),
+            menus::MenuCmd::ZoomReset => self.set_zoom(theme::display_scale()),
             menus::MenuCmd::NewTerminal => {
                 if !self.terminal.visible {
                     self.toggle_terminal(); // spawns the first tab when none exist
@@ -4434,7 +4446,7 @@ impl App {
                 proc.set_bounds(0, 0, rect.2, rect.3, zoom);
             }
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             let Some((instance, _)) = self.webview_dock else { return };
             let tab = self.workspace.documents.iter().position(|d| d.webview == Some(instance));
@@ -4487,7 +4499,7 @@ impl App {
     }
 
     /// Create the platform's webview handle for one extension view.
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     fn spawn_webview(
         &mut self,
         view_id: &str,
@@ -4506,8 +4518,8 @@ impl App {
         )
     }
 
-    /// macOS: an in-process WKWebView child view of the editor window.
-    #[cfg(target_os = "macos")]
+    /// macOS/Windows: an in-process child webview of the editor window.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn spawn_webview(
         &mut self,
         view_id: &str,
@@ -4516,7 +4528,7 @@ impl App {
         roots: &[std::path::PathBuf],
     ) -> Option<WebviewHandle> {
         let window = self.gpu.as_ref().map(|g| g.window.clone())?;
-        webview_mac::MacWebview::create(
+        webview_child::ChildWebview::create(
             view_id,
             iid,
             title,
@@ -6098,7 +6110,8 @@ impl App {
             st.last_workspace = Some(self.cwd.clone());
             st.touch_recent(&self.cwd);
         }
-        st.zoom = Some(theme::ui_zoom());
+        st.zoom = Some(theme::ui_zoom()); // legacy key: keeps downgrades looking right
+        st.zoom_rel = Some(theme::user_zoom());
         st.save();
     }
 
@@ -6258,7 +6271,7 @@ impl App {
     }
 
     fn zoom_step(&mut self, delta: f32) {
-        let z = (theme::ui_zoom() + delta).clamp(0.5, 3.0);
+        let z = (theme::ui_zoom() + delta).clamp(0.5, 6.0);
         self.set_zoom(z);
     }
 
@@ -6840,9 +6853,9 @@ impl App {
     }
 
     fn on_mouse_press(&mut self, x: f32, y: f32) {
-        // macOS: a click on aether's own UI must pull keyboard focus back from the
-        // webview child view, or typing keeps landing in the page.
-        #[cfg(target_os = "macos")]
+        // macOS/Windows: a click on aether's own UI must pull keyboard focus back
+        // from the webview child view, or typing keeps landing in the page.
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         if self.webview_rel(x, y).is_none() {
             if let Some((instance, _)) = self.webview_dock {
                 if let Some(wv) = self.webviews.iter().find(|w| w.instance_id == instance) {
@@ -7530,7 +7543,7 @@ impl App {
             } else if cells[2].contains((x, y)) {
                 self.zoom_step(0.1);
             } else if cells[1].contains((x, y)) {
-                self.set_zoom(1.0); // click the % to reset
+                self.set_zoom(theme::display_scale()); // click the % to reset
             } else {
                 // Empty status-bar area is a grip: drag up to reveal/resize the terminal.
                 // The terminal stays hidden until the drag passes the reveal threshold
@@ -9578,7 +9591,7 @@ impl App {
                         return;
                     }
                     KeyCode::Digit0 => {
-                        self.set_zoom(1.0); // Ctrl+0 reset zoom
+                        self.set_zoom(theme::display_scale()); // Ctrl+0 reset zoom
                         return;
                     }
                     KeyCode::KeyC => {
@@ -10512,8 +10525,8 @@ impl ApplicationHandler for App {
                         Some("frame") => {
                             // A new offscreen frame is in the shm file: BGRA
                             // premultiplied (cairo ARGB32, little-endian).
-                            // (Legacy Linux path only — macOS webviews composite themselves.)
-                            #[cfg(not(target_os = "macos"))]
+                            // (Legacy Linux path only — child webviews composite themselves.)
+                            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
                             {
                             let w = value.get("w").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                             let h = value.get("h").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
@@ -11188,6 +11201,13 @@ impl ApplicationHandler for App {
                     g.resize(size.width, size.height);
                 }
                 self.redraw();
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                // The window moved to a monitor with a different DPI: keep the
+                // USER's zoom preference, swap the display-scale component.
+                let user = theme::user_zoom();
+                theme::set_display_scale(scale_factor as f32);
+                self.set_zoom(user * scale_factor as f32);
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_pos = position;

@@ -1,15 +1,16 @@
-// macOS extension-webview backend: an IN-PROCESS WKWebView attached as a child
-// NSView of the editor window. Unlike the Linux path (separate GTK process on a
-// virtual display, frames captured to a GPU texture, input injected with XTEST),
-// macOS lets wry attach a webview to a winit window directly — the OS composites
-// it over our surface, and native input/scrolling/cursors come for free.
+// macOS/Windows extension-webview backend: an IN-PROCESS webview (WKWebView /
+// WebView2) attached as a child view of the editor window. Unlike the Linux path
+// (separate GTK process on a virtual display, frames captured to a GPU texture,
+// input injected with XTEST), these platforms let wry attach a webview to a winit
+// window directly — the OS composites it over our surface, and native
+// input/scrolling/cursors come for free.
 //
 // The trade-off is stacking: the NSView sits ABOVE everything we draw, so the
 // dock-sync code hides it whenever an editor overlay (menu, palette, dialog)
 // would need to render over the pane — same compromise the pre-virtual-display
 // Linux path used.
 
-#![cfg(target_os = "macos")]
+#![cfg(any(target_os = "macos", target_os = "windows"))]
 
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
@@ -22,7 +23,7 @@ use winit::window::Window;
 use crate::marketplace::WorkerMsg;
 use crate::webview_shim::VSCODE_API_SHIM;
 
-pub struct MacWebview {
+pub struct ChildWebview {
     pub instance_id: i64,
     pub view_id: String,
     pub title: String,
@@ -30,7 +31,7 @@ pub struct MacWebview {
     page_html: Arc<Mutex<String>>,
 }
 
-impl MacWebview {
+impl ChildWebview {
     pub fn create(
         view_id: &str,
         instance_id: i64,
@@ -39,7 +40,7 @@ impl MacWebview {
         window: &Window,
         tx: Sender<WorkerMsg>,
         proxy: Option<EventLoopProxy<()>>,
-    ) -> Option<MacWebview> {
+    ) -> Option<ChildWebview> {
         let page_html = Arc::new(Mutex::new(String::from(
             "<html><body style='background:#1e1e1e'></body></html>",
         )));
@@ -123,7 +124,7 @@ impl MacWebview {
         // The view exists as soon as it's built — tell the App to open its tab
         // (the Linux host reports `ready` once its GTK window is up).
         emit(json!({"event": "ready", "xid": 0}));
-        Some(MacWebview {
+        Some(ChildWebview {
             instance_id,
             view_id: view_id.to_string(),
             title: title.to_string(),
@@ -150,11 +151,17 @@ impl MacWebview {
     }
 
     /// Position the child view over the editor pane. Coordinates are PHYSICAL
-    /// pixels (aether's layout space, top-left origin); wry converts to logical
-    /// points. AppKit view origins are BOTTOM-left, and wry passes y through
-    /// unflipped — so flip against the window height here.
+    /// pixels (aether's layout space, top-left origin); wry converts per platform.
+    /// AppKit view origins are BOTTOM-left and wry passes y through unflipped —
+    /// flip against the window height on macOS. Win32 is top-left: no flip.
     pub fn set_bounds(&self, x: i32, y: i32, w: u32, h: u32, zoom: f64, win_h: u32) {
+        #[cfg(target_os = "macos")]
         let flipped_y = win_h as i32 - y - h as i32;
+        #[cfg(not(target_os = "macos"))]
+        let flipped_y = {
+            let _ = win_h;
+            y
+        };
         let _ = self.webview.set_bounds(wry::Rect {
             position: wry::dpi::PhysicalPosition::new(x, flipped_y).into(),
             size: wry::dpi::PhysicalSize::new(w.max(1), h.max(1)).into(),

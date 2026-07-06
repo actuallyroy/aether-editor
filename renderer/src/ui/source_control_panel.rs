@@ -323,6 +323,7 @@ impl SourceControlPanel {
             &mut self.ic_chevron,
             &mut self.ic_sparkle,
             &mut self.l_graph,
+            &mut self.l_no_repo,
         ] {
             l.reshape(fs);
         }
