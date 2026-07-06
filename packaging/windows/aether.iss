@@ -39,6 +39,11 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 ChangesEnvironment=yes
 PrivilegesRequired=admin
+; A running aether.exe locks the file ("DeleteFile failed; code 5"). The Restart
+; Manager asks apps to close, but aether doesn't handle those messages — force
+; terminates it, then RestartApplications relaunches it after the upgrade.
+CloseApplications=force
+RestartApplications=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"

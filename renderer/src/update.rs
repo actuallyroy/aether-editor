@@ -171,7 +171,11 @@ fn download_and_run_installer() -> Result<(), Box<dyn std::error::Error>> {
     std::io::copy(&mut reader, &mut f)?;
     drop(f);
     // /SILENT: progress bar, no wizard clicks. The installer self-elevates (UAC).
-    std::process::Command::new(&tmp).args(["/SILENT"]).spawn()?;
+    // /FORCECLOSEAPPLICATIONS: this running instance locks aether.exe and doesn't
+    // answer Restart Manager close requests — force-close, upgrade, relaunch.
+    std::process::Command::new(&tmp)
+        .args(["/SILENT", "/FORCECLOSEAPPLICATIONS"])
+        .spawn()?;
     Ok(())
 }
 
