@@ -277,14 +277,44 @@ pub fn search(query: &str, size: usize) -> Vec<RemoteExt> {
     out
 }
 
+/// The Open VSX target-platform string for this build. Platform-specific
+/// extensions (e.g. Claude Code) publish one `.vsix` per target, each bundling a
+/// native binary — the generic download URL may point at another platform's build.
+fn target_platform() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "darwin-arm64",
+        ("macos", _) => "darwin-x64",
+        ("windows", "aarch64") => "win32-arm64",
+        ("windows", _) => "win32-x64",
+        (_, "aarch64") => "linux-arm64",
+        _ => "linux-x64",
+    }
+}
+
 /// Download a `.vsix` (a zip) and extract its `extension/` payload into
-/// `~/.vscode/extensions/<namespace>.<name>-<version>/`. Returns the new dir.
+/// `~/.aether/extensions/<namespace>.<name>-<version>/`. Returns the new dir.
 pub fn install(ext: &RemoteExt, ext_root: &Path) -> Result<PathBuf, String> {
-    let url = ext.download_url.as_ref().ok_or("no download url")?;
+    // Prefer THIS platform's build when the extension is target-specific — the
+    // search result's download URL points at an arbitrary target (often alpine).
+    let platform_url = get_string(&format!(
+        "{BASE}/api/{}/{}/{}/latest",
+        ext.namespace,
+        ext.name,
+        target_platform()
+    ))
+    .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+    .and_then(|v| v["files"]["download"].as_str().map(String::from));
+    let url = platform_url
+        .as_ref()
+        .or(ext.download_url.as_ref())
+        .ok_or("no download url")?;
     let resp = agent().get(url).call().map_err(|e| e.to_string())?;
     let mut bytes = Vec::new();
+    // Generous cap: platform builds bundling native binaries run large (Claude
+    // Code's vsix is ~83MB — the old 64MB cap silently truncated the zip, which
+    // surfaced as "invalid Zip archive: Could not find EOCD").
     resp.into_reader()
-        .take(64 * 1024 * 1024)
+        .take(512 * 1024 * 1024)
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
 
