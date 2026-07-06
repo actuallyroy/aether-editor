@@ -12,8 +12,17 @@ mod claude_sessions;
 mod codicon_names;
 #[cfg(target_os = "linux")]
 mod webview_host;
+mod webview_mac;
+mod webview_shim;
 #[cfg(target_os = "linux")]
 mod x11_embed;
+
+/// The per-platform handle to one extension webview: Linux uses an out-of-process
+/// GTK host on a virtual display; macOS an in-process WKWebView child view.
+#[cfg(target_os = "macos")]
+pub(crate) use webview_mac::MacWebview as WebviewHandle;
+#[cfg(not(target_os = "macos"))]
+pub(crate) use exthost::WebviewProc as WebviewHandle;
 #[cfg(target_os = "linux")]
 mod virtual_display;
 mod commands;
@@ -574,7 +583,7 @@ pub(crate) struct App {
     pub(crate) toasts_dirty: bool,
     /// Live extension webviews (each a `--webview-host` process) and the webview
     /// view ids extensions have registered providers for.
-    pub(crate) webviews: Vec<exthost::WebviewProc>,
+    pub(crate) webviews: Vec<WebviewHandle>,
     pub(crate) next_webview_id: i64,
     pub(crate) ext_webview_views: Vec<String>,
     /// X11 embedding of webviews into the right sidebar (XWayland/X11 only).
@@ -4425,6 +4434,97 @@ impl App {
                 proc.set_bounds(0, 0, rect.2, rect.3, zoom);
             }
         }
+        #[cfg(target_os = "macos")]
+        {
+            let Some((instance, _)) = self.webview_dock else { return };
+            let tab = self.workspace.documents.iter().position(|d| d.webview == Some(instance));
+            let Some(tab) = tab else {
+                // Tab closed → dispose the webview like VSCode does.
+                self.webview_dock = None;
+                self.webview_dock_rect = None;
+                self.webviews.retain(|w| w.instance_id != instance);
+                if let Some(h) = self.ext_host.as_ref() {
+                    h.notify("webview/disposed", serde_json::json!({ "instanceId": instance }));
+                }
+                return;
+            };
+            // The NSView is composited ABOVE our surface, so hide it whenever an
+            // editor overlay (menu, palette, dialog, context menu) must draw over
+            // the pane — and whenever its tab isn't the active one.
+            let overlay_open = self.open_menu.is_some()
+                || self.ctx_menu.is_some()
+                || self.palette.active
+                || self.dialog.is_some()
+                || self.feedback_form.is_some()
+                // Extension detail page renders in the editor area WITHOUT switching
+                // the active tab — the webview must yield to it.
+                || self.detail.open_extension.is_some();
+            let active = self.workspace.active == Some(tab) && !overlay_open;
+            let l = self.layout();
+            let x = l.gutter.x.min(l.editor_text.x);
+            let w = (l.editor_text.x + l.editor_text.w) - x;
+            // WKWebView already renders at the display's scale factor — only apply
+            // the USER-zoom component (ui_zoom tracks physical px; the page tracks
+            // logical points), or the page ends up double-scaled on retina.
+            let sf = self.gpu.as_ref().map(|g| g.window.scale_factor()).unwrap_or(1.0);
+            let zoom = theme::ui_zoom() as f64 / sf;
+            let rect = (
+                if active { (zoom * 100.0) as i32 } else { i32::MIN },
+                l.editor_text.y as i32,
+                w as u32,
+                l.editor_text.h as u32,
+            );
+            if self.webview_dock_rect == Some(rect) {
+                return;
+            }
+            self.webview_dock_rect = Some(rect);
+            if let Some(wv) = self.webviews.iter().find(|w| w.instance_id == instance) {
+                let win_h = self.gpu.as_ref().map(|g| g.config.height).unwrap_or(0);
+                wv.set_bounds(x as i32, l.editor_text.y as i32, rect.2, rect.3, zoom, win_h);
+                wv.set_visible(active);
+            }
+        }
+    }
+
+    /// Create the platform's webview handle for one extension view.
+    #[cfg(not(target_os = "macos"))]
+    fn spawn_webview(
+        &mut self,
+        view_id: &str,
+        iid: i64,
+        title: &str,
+        roots: &[std::path::PathBuf],
+    ) -> Option<WebviewHandle> {
+        exthost::WebviewProc::start(
+            view_id,
+            iid,
+            title,
+            roots,
+            self.webview_embed_possible(),
+            self.worker_tx.clone(),
+            self.proxy.clone(),
+        )
+    }
+
+    /// macOS: an in-process WKWebView child view of the editor window.
+    #[cfg(target_os = "macos")]
+    fn spawn_webview(
+        &mut self,
+        view_id: &str,
+        iid: i64,
+        title: &str,
+        roots: &[std::path::PathBuf],
+    ) -> Option<WebviewHandle> {
+        let window = self.gpu.as_ref().map(|g| g.window.clone())?;
+        webview_mac::MacWebview::create(
+            view_id,
+            iid,
+            title,
+            roots,
+            &window,
+            self.worker_tx.clone(),
+            self.proxy.clone(),
+        )
     }
 
     /// True when this platform embeds webviews (offscreen frames need only GTK).
@@ -4433,7 +4533,7 @@ impl App {
     }
 
     /// The docked webview proc, when the ACTIVE tab is its webview pane.
-    fn active_webview(&self) -> Option<&exthost::WebviewProc> {
+    fn active_webview(&self) -> Option<&WebviewHandle> {
         let iid = self.workspace.active_doc().and_then(|d| d.webview)?;
         self.webviews.iter().find(|p| p.instance_id == iid)
     }
@@ -4486,15 +4586,7 @@ impl App {
             .find(|(id, _)| id == view_id)
             .map(|(_, name)| name.clone())
             .unwrap_or_else(|| view_id.to_string());
-        let Some(wv) = exthost::WebviewProc::start(
-            view_id,
-            iid,
-            &title,
-            &roots,
-            self.webview_embed_possible(),
-            self.worker_tx.clone(),
-            self.proxy.clone(),
-        ) else {
+        let Some(wv) = self.spawn_webview(view_id, iid, &title, &roots) else {
             self.show_toast("Couldn't start the webview host.");
             return;
         };
@@ -4624,15 +4716,7 @@ impl App {
                 if !self.webviews.iter().any(|w| w.instance_id == iid) {
                     let roots: Vec<std::path::PathBuf> =
                         self.ext_registry.iter().map(|e| e.path.clone()).collect();
-                    match exthost::WebviewProc::start(
-                        &vtype,
-                        iid,
-                        &title,
-                        &roots,
-                        self.webview_embed_possible(),
-                        self.worker_tx.clone(),
-                        self.proxy.clone(),
-                    ) {
+                    match self.spawn_webview(&vtype, iid, &title, &roots) {
                         Some(wv) => self.webviews.push(wv),
                         None => self.show_toast("Couldn't start the webview host."),
                     }
@@ -6756,6 +6840,16 @@ impl App {
     }
 
     fn on_mouse_press(&mut self, x: f32, y: f32) {
+        // macOS: a click on aether's own UI must pull keyboard focus back from the
+        // webview child view, or typing keeps landing in the page.
+        #[cfg(target_os = "macos")]
+        if self.webview_rel(x, y).is_none() {
+            if let Some((instance, _)) = self.webview_dock {
+                if let Some(wv) = self.webviews.iter().find(|w| w.instance_id == instance) {
+                    wv.focus_parent();
+                }
+            }
+        }
         // Clicks inside a webview pane are forwarded to its virtual display.
         #[cfg(target_os = "linux")]
         if let (Some(proc), Some((rx, ry))) = (self.active_webview(), self.webview_rel(x, y)) {
@@ -8957,6 +9051,10 @@ impl App {
         }
         // Webview pane focused: typing belongs to the page. Editor-level chords
         // (Ctrl combos beyond clipboard/select-all, palette, F-keys) stay ours.
+        // Linux-only: keys are forwarded via XTEST. On macOS the child view gets
+        // keyboard input natively, so aether only sees keys when IT has focus —
+        // and those belong to aether's own widgets.
+        #[cfg(target_os = "linux")]
         if self.active_webview().is_some() && !self.palette.active && self.dialog.is_none() {
             let ctrl = self.mods.control_key();
             let pass_ctrl = matches!(
@@ -10414,6 +10512,9 @@ impl ApplicationHandler for App {
                         Some("frame") => {
                             // A new offscreen frame is in the shm file: BGRA
                             // premultiplied (cairo ARGB32, little-endian).
+                            // (Legacy Linux path only — macOS webviews composite themselves.)
+                            #[cfg(not(target_os = "macos"))]
+                            {
                             let w = value.get("w").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                             let h = value.get("h").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                             let shm = self
@@ -10421,10 +10522,8 @@ impl ApplicationHandler for App {
                                 .iter()
                                 .find(|p| p.instance_id == instance)
                                 .map(|p| p.shm_path.clone());
-                            eprintln!("[wv-frame] instance={instance} {w}x{h} shm={:?}", shm.is_some());
                             if let (Some(shm), true) = (shm, w > 0 && h > 0) {
                                 if let Ok(mut data) = std::fs::read(&shm) {
-                                    eprintln!("[wv-frame] read {} bytes (need {})", data.len(), w * h * 4);
                                     if data.len() >= (w * h * 4) as usize {
                                         data.truncate((w * h * 4) as usize);
                                         for px in data.chunks_exact_mut(4) {
@@ -10450,6 +10549,7 @@ impl ApplicationHandler for App {
                                     }
                                 }
                             }
+                        }
                         }
                         Some("focus") => { /* composited mode: input is forwarded, not focused */ }
                         Some("cursor") => {

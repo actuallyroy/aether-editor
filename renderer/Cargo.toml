@@ -1,6 +1,6 @@
 [package]
 name = "aether-renderer"
-version = "0.5.1"
+version = "0.5.2"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -52,6 +52,9 @@ notify = "6"
 # custom in-window menu instead.
 [target.'cfg(target_os = "macos")'.dependencies]
 muda = "0.16"
+# Extension webviews: an in-process WKWebView attached as a child NSView of the
+# editor window (no separate host process / virtual display needed on macOS).
+wry = "0.47"
 
 # Webview host (`aether --webview-host`): a separate GTK process that renders
 # extension webviews (Claude Code panel etc.) with webkit2gtk via wry. Separate

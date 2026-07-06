@@ -3286,7 +3286,6 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // ---- Webview tab: draw the composited extension webview (captured frames) ----
     if let Some(iid) = app.workspace.active_doc().and_then(|d| d.webview) {
         let key = format!("webview:{iid}");
-        eprintln!("[wv-draw] key={key} size={:?}", gpu.media.size(&key));
         if gpu.media.size(&key).is_some() {
             let region = editor_region(&layout);
             let now_ms = app.anim_start.elapsed().as_millis() as u64;
