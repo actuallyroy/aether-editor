@@ -129,6 +129,8 @@ jobs:
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           cp target/release/aether "$APP/Contents/MacOS/aether"
           chmod +x "$APP/Contents/MacOS/aether"
+          # Node extension host — host_script() looks next to the executable.
+          cp -R ext-host "$APP/Contents/MacOS/ext-host"
           cat > "$APP/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

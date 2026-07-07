@@ -11167,10 +11167,16 @@ impl ApplicationHandler for App {
                     // Extensions silently doing nothing is confusing — say WHY. (The
                     // host script missing only happens in broken installs; Node
                     // missing is common on fresh machines.)
-                    if self.ext_host.is_none() && crate::lsp::resolve_node().is_none() {
-                        self.show_toast(
-                            "Extensions need Node.js — install it from nodejs.org and restart Aether.",
-                        );
+                    if self.ext_host.is_none() {
+                        if crate::lsp::resolve_node().is_none() {
+                            self.show_toast(
+                                "Extensions need Node.js — install it from nodejs.org and restart Aether.",
+                            );
+                        } else {
+                            self.show_toast(
+                                "Extension host missing from this install — extensions are disabled.",
+                            );
+                        }
                     }
                 }
                 // Register this window with the pty-host (single-window-per-folder):

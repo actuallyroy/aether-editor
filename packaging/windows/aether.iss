@@ -55,6 +55,9 @@ Name: "addtopath"; Description: "Add Aether to PATH (run ""aether"" from any ter
 [Files]
 Source: "{#SourceExe}"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
 Source: "aether.ico"; DestDir: "{app}"; Flags: ignoreversion
+; Node extension host — resolved by the app next to the executable
+; (renderer/src/exthost host_script()). Without it extensions can't run.
+Source: "..\..\ext-host\*"; DestDir: "{app}\ext-host"; Flags: ignoreversion recursesubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\aether.ico"
