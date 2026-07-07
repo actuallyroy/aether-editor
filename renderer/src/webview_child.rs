@@ -23,6 +23,13 @@ use winit::window::Window;
 use crate::marketplace::WorkerMsg;
 use crate::webview_shim::VSCODE_API_SHIM;
 
+/// The extension document's address (see the custom-protocol handler for why
+/// the two forms differ).
+#[cfg(not(windows))]
+const PAGE_URL: &str = "aether-res://page/__page__.html";
+#[cfg(windows)]
+const PAGE_URL: &str = "http://aether-res.localhost/page/__page__.html";
+
 pub struct ChildWebview {
     pub instance_id: i64,
     pub view_id: String,
@@ -40,7 +47,7 @@ impl ChildWebview {
         window: &Window,
         tx: Sender<WorkerMsg>,
         proxy: Option<EventLoopProxy<()>>,
-    ) -> Option<ChildWebview> {
+    ) -> Result<ChildWebview, String> {
         let page_html = Arc::new(Mutex::new(String::from(
             "<html><body style='background:#1e1e1e'></body></html>",
         )));
@@ -83,16 +90,29 @@ impl ChildWebview {
                 }
             })
             .with_custom_protocol("aether-res".into(), move |_id, request| {
-                // aether-res://page/__page__.html — the extension-provided document.
-                if request.uri().host() == Some("page") {
+                // macOS: aether-res://<kind>/<path>. Windows: WebView2 can't intercept
+                // custom schemes, so wry serves this as http://aether-res.localhost/
+                // and the KIND becomes the first path segment.
+                let uri = request.uri();
+                let (kind, res_path) = if uri.scheme_str() == Some("aether-res") {
+                    (uri.host().unwrap_or("").to_string(), uri.path().to_string())
+                } else {
+                    let p = uri.path();
+                    let (kind, rest) = p.trim_start_matches('/').split_once('/').unwrap_or((p, ""));
+                    (kind.to_string(), format!("/{rest}"))
+                };
+                // …/page/__page__.html — the extension-provided document.
+                if kind == "page" {
                     let body = page_html_proto.lock().unwrap().clone().into_bytes();
                     return wry::http::Response::builder()
                         .header("Content-Type", "text/html")
                         .body(std::borrow::Cow::Owned(body))
                         .unwrap();
                 }
-                // aether-res://file/<abs path> — only files under an allowed root.
-                let path = PathBuf::from(request.uri().path());
+                // …/file/<abs path> — only files under an allowed root.
+                #[cfg(windows)]
+                let res_path = res_path.trim_start_matches('/').to_string(); // "C:/…"
+                let path = PathBuf::from(&res_path);
                 let allowed = roots.iter().any(|r| path.starts_with(r));
                 let body = if allowed { std::fs::read(&path).ok() } else { None };
                 let mime = match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
@@ -117,14 +137,13 @@ impl ChildWebview {
                         .unwrap(),
                 }
             })
-            .with_url("aether-res://page/__page__.html")
+            .with_url(PAGE_URL)
             .build_as_child(window)
-            .map_err(|e| eprintln!("[webview] create failed: {e}"))
-            .ok()?;
+            .map_err(|e| e.to_string())?;
         // The view exists as soon as it's built — tell the App to open its tab
         // (the Linux host reports `ready` once its GTK window is up).
         emit(json!({"event": "ready", "xid": 0}));
-        Some(ChildWebview {
+        Ok(ChildWebview {
             instance_id,
             view_id: view_id.to_string(),
             title: title.to_string(),
@@ -135,7 +154,7 @@ impl ChildWebview {
 
     pub fn set_html(&self, html: &str) {
         *self.page_html.lock().unwrap() = html.to_string();
-        let _ = self.webview.load_url("aether-res://page/__page__.html");
+        let _ = self.webview.load_url(PAGE_URL);
     }
 
     pub fn post(&self, data: &Value) {

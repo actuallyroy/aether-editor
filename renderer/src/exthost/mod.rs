@@ -396,8 +396,8 @@ pub fn user_extensions_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
-/// The bundled `ext-host/` directory (holds the sample extension), derived from the
-/// host script location.
+/// The bundled `ext-host/` directory (room for future built-in extensions),
+/// derived from the host script location.
 pub fn bundled_extensions_dir() -> Option<PathBuf> {
     host_script().and_then(|p| p.parent().map(|d| d.to_path_buf()))
 }

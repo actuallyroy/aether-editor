@@ -193,10 +193,15 @@ function createVscode(rpc) {
       get html() { return html; },
       set html(v) { html = v; rpc.notify('webview/setHtml', { instanceId, html: v }); },
       options: {},
-      cspSource: 'aether-res:',
+      // Windows (WebView2) can't intercept custom schemes — wry serves custom
+      // protocols there as http://{scheme}.localhost/ instead.
+      cspSource: process.platform === 'win32' ? 'http://aether-res.localhost' : 'aether-res:',
       asWebviewUri: (uri) => {
         const p = (uri && uri.fsPath) || String(uri).replace(/^file:\/\//, '');
-        return { toString: () => 'aether-res://file' + p, scheme: 'aether-res', fsPath: p };
+        const s = process.platform === 'win32'
+          ? 'http://aether-res.localhost/file' + p.replace(/\\/g, '/')
+          : 'aether-res://file' + p;
+        return { toString: () => s, scheme: 'aether-res', fsPath: p };
       },
       postMessage: (data) => { rpc.notify('webview/postMessage', { instanceId, data }); return Promise.resolve(true); },
       get onDidReceiveMessage() { return onMessage.event; },

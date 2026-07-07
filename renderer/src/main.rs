@@ -4528,7 +4528,7 @@ impl App {
         roots: &[std::path::PathBuf],
     ) -> Option<WebviewHandle> {
         let window = self.gpu.as_ref().map(|g| g.window.clone())?;
-        webview_child::ChildWebview::create(
+        match webview_child::ChildWebview::create(
             view_id,
             iid,
             title,
@@ -4536,7 +4536,15 @@ impl App {
             &window,
             self.worker_tx.clone(),
             self.proxy.clone(),
-        )
+        ) {
+            Ok(wv) => Some(wv),
+            Err(e) => {
+                // Windows GUI apps have no visible stderr — put the reason where
+                // the user can see it (e.g. a missing WebView2 runtime).
+                self.show_toast(&format!("Webview failed: {e}"));
+                None
+            }
+        }
     }
 
     /// True when this platform embeds webviews (offscreen frames need only GTK).
@@ -11156,6 +11164,14 @@ impl ApplicationHandler for App {
                 // missing). It connects back asynchronously → WorkerMsg::ExtHostReady.
                 if self.ext_host.is_none() {
                     self.ext_host = exthost::ExtHost::start(&self.cwd, self.worker_tx.clone(), self.proxy.clone());
+                    // Extensions silently doing nothing is confusing — say WHY. (The
+                    // host script missing only happens in broken installs; Node
+                    // missing is common on fresh machines.)
+                    if self.ext_host.is_none() && crate::lsp::resolve_node().is_none() {
+                        self.show_toast(
+                            "Extensions need Node.js — install it from nodejs.org and restart Aether.",
+                        );
+                    }
                 }
                 // Register this window with the pty-host (single-window-per-folder):
                 // if another live window already has this workspace open, it raises
