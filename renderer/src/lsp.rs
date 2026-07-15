@@ -452,6 +452,22 @@ fn resolve_node_uncached() -> Option<String> {
                 return Some(path);
             }
         }
+        // Version managers init in .zshrc, which no login `sh` reads — scan their
+        // install dirs directly (newest version wins). Covers nvm and fnm.
+        if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+            for versions in [home.join(".nvm/versions/node"), home.join(".fnm/node-versions")] {
+                let Ok(entries) = std::fs::read_dir(&versions) else { continue };
+                let mut dirs: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+                dirs.sort(); // lexicographic ~ version order; good enough for "a node"
+                for d in dirs.iter().rev() {
+                    for cand in [d.join("bin/node"), d.join("installation/bin/node")] {
+                        if cand.exists() {
+                            return Some(cand.to_string_lossy().into_owned());
+                        }
+                    }
+                }
+            }
+        }
     }
     None
 }
