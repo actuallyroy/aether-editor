@@ -210,6 +210,18 @@ pub(crate) enum SidebarView {
     ExtView(usize),
 }
 
+/// One row of an extension tree view (flattened; depth = indent level).
+#[derive(Clone)]
+pub(crate) struct ExtTreeRow {
+    pub handle: u64,
+    pub depth: usize,
+    pub label: String,
+    pub description: String,
+    /// 0 = leaf, 1 = collapsed, 2 = expanded (VSCode TreeItemCollapsibleState).
+    pub collapsible: u8,
+    pub expanded: bool,
+}
+
 /// What a modal dialog confirms.
 pub(crate) enum DialogAction {
     DeleteNode(usize),
@@ -584,6 +596,14 @@ pub(crate) struct App {
     pub(crate) webview_targets: std::collections::HashMap<i64, u8>,
     /// View ids that must dock in the RIGHT panel when their webview readies.
     pub(crate) webview_right_pending: std::collections::HashSet<String>,
+    /// Tree views: registered provider view ids, per-view flattened rows, and
+    /// in-flight children requests (request id -> (view id, parent handle)).
+    pub(crate) ext_tree_views: std::collections::HashSet<String>,
+    pub(crate) ext_trees: std::collections::HashMap<String, Vec<ExtTreeRow>>,
+    pub(crate) ext_tree_reqs: std::collections::HashMap<i64, (String, u64)>,
+    pub(crate) ext_tree_dirty: bool,
+    /// Bumped on every tree mutation — part of the list-shape cache key.
+    pub(crate) ext_tree_rev: u64,
     /// Per-instance last-applied (x, y, w, h, visible) — skip redundant syncs.
     pub(crate) webview_rects: std::collections::HashMap<i64, (i32, i32, u32, u32, bool)>,
     /// Discovered runnable extensions and which have already been activated (so an
@@ -826,6 +846,11 @@ impl App {
             webview_sidebar_pending: std::collections::HashSet::new(),
             webview_targets: std::collections::HashMap::new(),
             webview_right_pending: std::collections::HashSet::new(),
+            ext_tree_views: std::collections::HashSet::new(),
+            ext_trees: std::collections::HashMap::new(),
+            ext_tree_reqs: std::collections::HashMap::new(),
+            ext_tree_dirty: false,
+            ext_tree_rev: 0,
             webview_rects: std::collections::HashMap::new(),
             ext_registry: Vec::new(),
             ext_activated: std::collections::HashSet::new(),
@@ -4797,6 +4822,38 @@ impl App {
         out
     }
 
+    /// Request one level of an extension tree view (parent handle 0 = roots).
+    fn request_tree_children(&mut self, view_id: &str, parent: u64) {
+        if let Some(h) = self.ext_host.as_ref() {
+            let id = h.request(
+                "tree/children",
+                serde_json::json!({ "viewId": view_id, "handle": parent }),
+            );
+            self.ext_tree_reqs.insert(id, (view_id.to_string(), parent));
+        }
+    }
+
+    /// Open an extension TREE view in the sidebar: activate its extension, then
+    /// fetch roots (now if the provider is registered, else when it registers).
+    fn open_ext_tree(&mut self, view_id: &str) {
+        let owner = self
+            .ext_registry
+            .iter()
+            .find(|e| e.views.iter().any(|(id, _)| id == view_id))
+            .map(|e| e.path.clone());
+        if let Some(p) = owner {
+            if !self.ext_activated.contains(&p) {
+                if let Some(h) = self.ext_host.as_ref() {
+                    h.activate(&p);
+                }
+                self.ext_activated.insert(p);
+            }
+        }
+        if self.ext_tree_views.contains(view_id) && !self.ext_trees.contains_key(view_id) {
+            self.request_tree_children(view_id, 0);
+        }
+    }
+
     /// Open an extension view docked in the SIDEBAR (activity-bar click).
     fn open_ext_webview_sidebar(&mut self, view_id: &str) {
         self.webview_sidebar_pending.insert(view_id.to_string());
@@ -4964,6 +5021,33 @@ impl App {
                     h.respond(id, serde_json::Value::Bool(true));
                 }
             }
+            Some("window/registerTreeView") => {
+                if let Some(vid) = params.get("viewId").and_then(|v| v.as_str()) {
+                    self.ext_tree_views.insert(vid.to_string());
+                    // If its container is already selected in the sidebar, load roots now.
+                    if let SidebarView::ExtView(i) = self.sidebar_view {
+                        if self.ext_activity_items().get(i).map(|a| a.view_id.as_str()) == Some(vid)
+                            && !self.ext_trees.contains_key(vid)
+                        {
+                            let vid = vid.to_string();
+                            self.request_tree_children(&vid, 0);
+                        }
+                    }
+                }
+            }
+            Some("tree/didChange") => {
+                if let Some(vid) = params.get("viewId").and_then(|v| v.as_str()) {
+                    let vid = vid.to_string();
+                    self.ext_trees.remove(&vid);
+                    self.ext_tree_dirty = true; self.ext_tree_rev += 1;
+                    if let SidebarView::ExtView(i) = self.sidebar_view {
+                        if self.ext_activity_items().get(i).map(|a| a.view_id.clone()) == Some(vid.clone()) {
+                            self.request_tree_children(&vid, 0);
+                        }
+                    }
+                    self.redraw();
+                }
+            }
             Some("window/registerWebviewViewProvider") => {
                 if let Some(vid) = params.get("viewId").and_then(|v| v.as_str()) {
                     if !self.ext_webview_views.iter().any(|v| v == vid) {
@@ -5083,6 +5167,49 @@ impl App {
                 // A response to one of OUR requests (activate / hover).
                 if let Some(err) = value.get("error") {
                     eprintln!("[exthost] request error: {err}");
+                }
+                // Tree children arrived: splice rows under their parent.
+                if let Some(resp_id) = value.get("id").and_then(|v| v.as_i64()) {
+                    if let Some((vid, parent)) = self.ext_tree_reqs.remove(&resp_id) {
+                        let items: Vec<ExtTreeRow> = value
+                            .get("result")
+                            .and_then(|r| r.get("items"))
+                            .and_then(|i| i.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|it| {
+                                        Some(ExtTreeRow {
+                                            handle: it.get("handle")?.as_u64()?,
+                                            depth: 0,
+                                            label: it.get("label").and_then(|l| l.as_str()).unwrap_or("").to_string(),
+                                            description: it
+                                                .get("description")
+                                                .and_then(|d| d.as_str())
+                                                .unwrap_or("")
+                                                .to_string(),
+                                            collapsible: it.get("collapsible").and_then(|c| c.as_u64()).unwrap_or(0) as u8,
+                                            expanded: false,
+                                        })
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let rows = self.ext_trees.entry(vid).or_default();
+                        if parent == 0 {
+                            *rows = items;
+                        } else if let Some(pi) = rows.iter().position(|r| r.handle == parent) {
+                            let depth = rows[pi].depth + 1;
+                            rows[pi].expanded = true;
+                            let mut items = items;
+                            for r in &mut items {
+                                r.depth = depth;
+                            }
+                            rows.splice(pi + 1..pi + 1, items);
+                        }
+                        self.ext_tree_dirty = true; self.ext_tree_rev += 1;
+                        self.redraw();
+                        return;
+                    }
                 }
                 // Route a hover result into the shared hover card.
                 if let (Some(resp_id), Some((req_id, hx, hy))) =
@@ -7182,6 +7309,52 @@ impl App {
                 return;
             }
         }
+        // Extension tree view rows: expand/collapse containers, run leaf commands.
+        if self.sidebar_visible {
+            if let SidebarView::ExtView(vi) = self.sidebar_view {
+                let item = self.ext_activity_items().get(vi).cloned();
+                if let Some(item) = item.filter(|a| !a.is_webview) {
+                    let layout = self.layout();
+                    let tr = layout.tree_region();
+                    if tr.contains((x, y)) {
+                        let count = self.ext_trees.get(&item.view_id).map_or(0, |r| r.len());
+                        let hit = self
+                            .gpu
+                            .as_ref()
+                            .and_then(|g| g.ui.ext_tree_list.row_at(tr, (x, y), count));
+                        if let Some(i) = hit {
+                            let row = self.ext_trees.get(&item.view_id).and_then(|r| r.get(i)).cloned();
+                            if let Some(row) = row {
+                                if row.collapsible > 0 {
+                                    if row.expanded {
+                                        // Collapse: drop descendants (rows deeper than this one).
+                                        if let Some(rows) = self.ext_trees.get_mut(&item.view_id) {
+                                            let mut end = i + 1;
+                                            while end < rows.len() && rows[end].depth > row.depth {
+                                                end += 1;
+                                            }
+                                            rows.drain(i + 1..end);
+                                            rows[i].expanded = false;
+                                        }
+                                        self.ext_tree_dirty = true; self.ext_tree_rev += 1;
+                                    } else {
+                                        self.request_tree_children(&item.view_id, row.handle);
+                                    }
+                                } else if let Some(h) = self.ext_host.as_ref() {
+                                    h.notify(
+                                        "tree/invoke",
+                                        serde_json::json!({ "viewId": item.view_id, "handle": row.handle }),
+                                    );
+                                }
+                                self.redraw();
+                                return;
+                            }
+                        }
+                        return; // click landed in the tree area — don't fall through
+                    }
+                }
+            }
+        }
         // Extension view-header buttons (sidebar header, e.g. Cline's + / gear).
         for (rect, command, ..) in self.ext_view_buttons() {
             if rect.contains((x, y)) {
@@ -7921,9 +8094,7 @@ impl App {
                             if item.is_webview {
                                 self.open_ext_webview_sidebar(&item.view_id);
                             } else {
-                                self.show_toast(
-                                    "This extension uses tree views — not supported in Aether yet.",
-                                );
+                                self.open_ext_tree(&item.view_id);
                             }
                         }
                     }
@@ -10843,6 +11014,17 @@ impl ApplicationHandler for App {
                         }
                         self.sync_ext_host_docs();
                     }
+                    if let Ok(vid) = std::env::var("AETHER_TEST_TREE") {
+                        let tx = self.worker_tx.clone();
+                        let proxy = self.proxy.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_secs(4));
+                            let _ = tx.send(WorkerMsg::OpenUrl(format!("aether-test-tree://{vid}")));
+                            if let Some(p) = proxy {
+                                let _ = p.send_event(());
+                            }
+                        });
+                    }
                     if let Ok(uri) = std::env::var("AETHER_TEST_URI") {
                         // Delay so extensions finish activating + registering handlers.
                         let tx = self.worker_tx.clone();
@@ -10870,9 +11052,19 @@ impl ApplicationHandler for App {
                 }
                 WorkerMsg::ExtHostMsg { value } => self.handle_ext_host_msg(value),
                 WorkerMsg::OpenUrl(url) => {
-                    // aether:// deep link (e.g. an OAuth callback) → extensions'
-                    // registered uri handlers.
-                    if let Some(h) = self.ext_host.as_ref() {
+                    // Debug harness: open a tree view as if its activity icon was clicked.
+                    if let Some(vid) = url.strip_prefix("aether-test-tree://") {
+                        let vid = vid.to_string();
+                        if let Some(i) = self.ext_activity_items().iter().position(|a| a.view_id == vid) {
+                            self.sidebar_view = SidebarView::ExtView(i);
+                            self.sidebar_visible = true;
+                        }
+                        self.open_ext_tree(&vid);
+                        self.ext_tree_dirty = true; self.ext_tree_rev += 1;
+                        self.redraw();
+                    } else if let Some(h) = self.ext_host.as_ref() {
+                        // aether:// deep link (OAuth callback etc.) → extensions'
+                        // registered uri handlers.
                         h.notify("window/handleUri", serde_json::json!({ "uri": url }));
                     }
                 }

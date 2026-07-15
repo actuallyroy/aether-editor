@@ -814,6 +814,54 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 gpu.ui.toast_labels.push(l);
             }
         }
+        // Extension tree view rows (rebuilt when the tree data changes).
+        if app.ext_tree_dirty {
+            app.ext_tree_dirty = false;
+            if let crate::SidebarView::ExtView(i) = app.sidebar_view {
+                if let Some(item) = ext_activity.get(i) {
+                    if !item.is_webview {
+                        let rows: Vec<crate::widgets::IconRow> = app
+                            .ext_trees
+                            .get(&item.view_id)
+                            .map(|rows| {
+                                rows.iter()
+                                    .map(|r| {
+                                        let icon = if r.collapsible > 0 {
+                                            let g = crate::codicon_names::codicon(if r.expanded {
+                                                "chevron-down"
+                                            } else {
+                                                "chevron-right"
+                                            });
+                                            g.map(|g| (g, theme::FG_DIM(), 1.0))
+                                        } else {
+                                            Some((' ', glyphon::Color::rgba(0, 0, 0, 0), 1.0))
+                                        };
+                                        crate::widgets::IconRow {
+                                            depth: r.depth,
+                                            icon,
+                                            label: vec![
+                                                (r.label.clone(), theme::FG_TEXT()),
+                                                (
+                                                    if r.description.is_empty() {
+                                                        String::new()
+                                                    } else {
+                                                        format!("  {}", r.description)
+                                                    },
+                                                    theme::FG_DIM(),
+                                                ),
+                                            ],
+                                        }
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let w = layout.sidebar.w;
+                        let key = format!("{}:{}", item.view_id, app.ext_tree_rev);
+                        gpu.ui.ext_tree_list.set_rows_fit(fs, &key, &rows, w, 8000.0, theme::zpx(8.0));
+                    }
+                }
+            }
+        }
         if app.ext_status_dirty {
             app.ext_status_dirty = false;
             gpu.ui.ext_status.clear();
@@ -2620,6 +2668,12 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         ui.sidebar_header
             .push(layout.sidebar.x + theme::zpx(12.0), hdr, theme::FG_DIM(), &mut areas);
         let tr = layout.tree_region();
+        if let SidebarView::ExtView(i) = app.sidebar_view {
+            let is_tree = ext_activity.get(i).map_or(false, |a| !a.is_webview);
+            if is_tree {
+                ui.ext_tree_list.draw_slice(tr, tr.y, theme::FG_TEXT(), &mut areas);
+            }
+        }
         if app.sidebar_view == SidebarView::Explorer {
             let er = layout.explorer_action_rects();
             for (i, btn) in gpu.explorer_btns.iter().enumerate() {

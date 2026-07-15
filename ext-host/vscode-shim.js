@@ -190,6 +190,19 @@ function createVscode(rpc) {
   const hoverProviders = new Map(); // providerId -> {selector, provider}
   const commands = new Map();       // command -> callback
   const uriHandlers = [];           // window.registerUriHandler handlers (deep links)
+  // Tree views: viewId -> { provider, elems: handle->element, cmds: handle->command, next }
+  const treeViews = new Map();
+  function registerTree(viewId, provider) {
+    const t = { provider, elems: new Map(), cmds: new Map(), next: 1 };
+    treeViews.set(viewId, t);
+    rpc.notify('window/registerTreeView', { viewId });
+    try {
+      if (provider.onDidChangeTreeData) {
+        provider.onDidChangeTreeData(() => rpc.notify('tree/didChange', { viewId }));
+      }
+    } catch (_) {}
+    return new Disposable(() => treeViews.delete(viewId));
+  }
 
   // ---- webviews (rendered by aether's webview-host process) ----
   const webviewProviders = new Map(); // viewId -> { provider, options }
@@ -369,6 +382,26 @@ function createVscode(rpc) {
       // register a no-op so activation doesn't crash (MPE registers one it only
       // uses for .ipynb).
       registerCustomEditorProvider: (viewType, provider, options) => ({ dispose() {} }),
+      // ---- tree views: aether pulls items over RPC (tree/children) and shows
+      // them with its native list widgets; item commands run via tree/invoke.
+      registerTreeDataProvider: (viewId, provider) => registerTree(viewId, provider),
+      createTreeView: (viewId, opts) => {
+        const d = registerTree(viewId, (opts && opts.treeDataProvider) || { getChildren: () => [], getTreeItem: (x) => x });
+        return {
+          dispose: () => d.dispose(),
+          onDidChangeSelection: new VsEvent().event,
+          onDidChangeVisibility: new VsEvent().event,
+          onDidCollapseElement: new VsEvent().event,
+          onDidExpandElement: new VsEvent().event,
+          reveal: () => Promise.resolve(),
+          visible: true,
+          selection: [],
+          badge: undefined,
+          title: '',
+          description: '',
+          message: '',
+        };
+      },
       registerWebviewViewProvider: (viewId, provider, options) => {
         webviewProviders.set(viewId, { provider, options: options || {} });
         rpc.notify('window/registerWebviewViewProvider', { viewId });
@@ -489,14 +522,51 @@ function createVscode(rpc) {
           const k = full(key);
           if (k in ws.settings) return ws.settings[k];
           if (k in configDefaults) return configDefaults[k];
-          return undefined;
+          // VSCode assembles intermediate objects from dotted leaf settings:
+          // get('tree.buttons') -> { reveal: true, ... } built from
+          // `todo-tree.tree.buttons.reveal` etc.
+          const prefix = k + '.';
+          const src = { ...configDefaults, ...ws.settings };
+          let found = false;
+          const out = {};
+          for (const kk of Object.keys(src)) {
+            if (!kk.startsWith(prefix)) continue;
+            found = true;
+            const rest = kk.slice(prefix.length).split('.');
+            let node = out;
+            for (let i = 0; i < rest.length - 1; i++) {
+              if (typeof node[rest[i]] !== 'object' || node[rest[i]] === null) node[rest[i]] = {};
+              node = node[rest[i]];
+            }
+            node[rest[rest.length - 1]] = src[kk];
+          }
+          return found ? out : undefined;
         };
-        return {
+        const cfg = {
           get: (key, dflt) => { const v = lookup(key); return v === undefined ? dflt : v; },
           has: (key) => lookup(key) !== undefined,
           inspect: (key) => ({ key: full(key), defaultValue: configDefaults[full(key)] }),
           update: (key, value) => { ws.settings[full(key)] = value; return Promise.resolve(); },
         };
+        // VSCode also exposes settings as PROPERTIES of the config object
+        // (`getConfiguration('todo-tree.general').tagGroups`) — materialize every
+        // known key under this section, nesting the dotted remainder.
+        if (section) {
+          const prefix = section + '.';
+          const keys = new Set([...Object.keys(configDefaults), ...Object.keys(ws.settings)]);
+          for (const k of keys) {
+            if (!k.startsWith(prefix)) continue;
+            const rest = k.slice(prefix.length).split('.');
+            let node = cfg;
+            for (let i = 0; i < rest.length - 1; i++) {
+              if (typeof node[rest[i]] !== 'object' || node[rest[i]] === null) node[rest[i]] = {};
+              node = node[rest[i]];
+            }
+            const leaf = rest[rest.length - 1];
+            if (!(leaf in node)) node[leaf] = lookup(k.slice(prefix.length));
+          }
+        }
+        return cfg;
       },
       get workspaceFolders() {
         if (!ws.root) return undefined;
@@ -715,6 +785,45 @@ function createVscode(rpc) {
     webviewMessage({ instanceId, data }) {
       const inst = webviewInstances.get(instanceId);
       if (inst) inst.onMessage.fire(data);
+    },
+    // Fetch one level of a tree view: children of `handle` (0 = root). Elements
+    // stay in the host keyed by handle; aether only sees display rows.
+    async treeChildren({ viewId, handle }) {
+      const t = treeViews.get(viewId);
+      if (!t) return { items: [] };
+      const parent = handle ? t.elems.get(handle) : undefined;
+      const kids = (await t.provider.getChildren(parent)) || [];
+      const items = [];
+      for (const el of kids) {
+        const h = t.next++;
+        t.elems.set(h, el);
+        let it;
+        try { it = await t.provider.getTreeItem(el); } catch (e) { console.error('[tree] getTreeItem failed:', e && e.message); it = {}; }
+        it = it || {};
+        let label =
+          typeof it.label === 'object' && it.label ? it.label.label || '' : String(it.label ?? '');
+        // VSCode derives a missing label from resourceUri (file rows do this).
+        if (!label && it.resourceUri) {
+          const p = it.resourceUri.fsPath || String(it.resourceUri);
+          label = require('path').basename(p);
+        }
+        if (it.command) t.cmds.set(h, it.command);
+        items.push({
+          handle: h,
+          label,
+          description: typeof it.description === 'string' ? it.description : '',
+          collapsible: it.collapsibleState || 0, // 0 none, 1 collapsed, 2 expanded
+          icon: (it.iconPath && it.iconPath.id) || null, // ThemeIcon name when present
+        });
+      }
+      return { items };
+    },
+    async treeInvoke({ viewId, handle }) {
+      const t = treeViews.get(viewId);
+      const c = t && t.cmds.get(handle);
+      if (!c) return;
+      const cb = commands.get(c.command);
+      if (cb) await cb(...(c.arguments || []));
     },
     // An aether:// deep link arrived (OAuth callback etc.) — hand it to every
     // registered uri handler as a vscode.Uri.

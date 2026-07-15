@@ -46,6 +46,8 @@ rpc.on_method('webview/resolve', (p) => dispatch.resolveWebview(p));
 rpc.on_method('webview/message', (p) => dispatch.webviewMessage(p));
 rpc.on_method('webview/disposed', (p) => dispatch.webviewDisposed(p));
 rpc.on_method('window/handleUri', (p) => dispatch.handleUri(p));
+rpc.on_method('tree/children', (p) => dispatch.treeChildren(p));
+rpc.on_method('tree/invoke', (p) => dispatch.treeInvoke(p));
 
 const sock = net.connect(port, '127.0.0.1', () => {
   rpc.attach(sock);
