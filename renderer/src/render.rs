@@ -413,6 +413,8 @@ pub(crate) fn image_ctrl_cells(region: Rect) -> [Rect; 4] {
 pub(crate) fn render(app: &mut App) -> Result<()> {
     // Refresh the selection-occurrence highlight before borrowing gpu (needs &mut app).
     app.recompute_selection_highlight();
+    // Snapshot extension title-bar buttons before gpu borrows app mutably.
+    let ext_title_buttons = app.ext_title_buttons();
     let Some(gpu) = app.gpu.as_mut() else {
         return Ok(());
     };
@@ -1336,6 +1338,29 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     let tab_rects = layout.tab_rects(n_tabs);
     // Extension-provided webview tab icons (atlas images, drawn in a later pass).
     let mut tab_img_icons: Vec<crate::icon::IconInstance> = Vec::new();
+    // Extension editor-title buttons at the right end of the tab strip (VSCode's
+    // editor/title navigation group — e.g. MPE's "open preview to the side").
+    if draw_tabs {
+        for (rect, _cmd, icon, _title) in ext_title_buttons.iter().cloned() {
+            let Some(path) = icon else { continue };
+            let key = format!("title-btn:{}", path.display());
+            let uv = gpu.icon_atlas.get(&key).or_else(|| {
+                let bytes = std::fs::read(&path).ok()?;
+                if path.extension().and_then(|e| e.to_str()) == Some("svg") {
+                    gpu.icon_atlas.load_svg_bytes(&gpu.queue, &key, &bytes)
+                } else {
+                    gpu.icon_atlas.load_bytes(&gpu.queue, &key, &bytes)
+                }
+            });
+            if let Some(uv) = uv {
+                let s = theme::zpx(18.0);
+                tab_img_icons.push(crate::icon::IconInstance {
+                    rect: [rect.x + (rect.w - s) * 0.5, rect.y + (rect.h - s) * 0.5, s, s],
+                    uv,
+                });
+            }
+        }
+    }
     for (i, tab) in tab_rects.iter().enumerate() {
         if !draw_tabs {
             break;

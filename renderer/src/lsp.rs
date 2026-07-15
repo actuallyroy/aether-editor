@@ -66,7 +66,15 @@ pub struct DiagHover {
 
 /// `file://` URI for a path (good enough for local files on win/mac/linux).
 pub fn path_to_uri(path: &Path) -> String {
-    let s = path.to_string_lossy().replace('\\', "/");
+    // ALWAYS absolute — documents opened via relative paths (`aether .` +
+    // sidebar) otherwise produce file://test.md-style uris, which break
+    // servers and send extensions' directory walks into infinite loops.
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map(|c| c.join(path)).unwrap_or_else(|_| path.to_path_buf())
+    };
+    let s = abs.to_string_lossy().replace('\\', "/");
     if cfg!(windows) {
         // file:///C:/foo
         format!("file:///{}", s.trim_start_matches('/'))

@@ -196,6 +196,24 @@ impl IconAtlas {
         self.add_image(queue, key, img)
     }
 
+    /// Rasterize an SVG (extension toolbar/tab icons ship as SVG) at 2× the draw
+    /// size and pack into the atlas.
+    pub fn load_svg_bytes(&mut self, queue: &Queue, key: &str, bytes: &[u8]) -> Option<[f32; 4]> {
+        if let Some(uv) = self.slots.get(key) {
+            return Some(*uv);
+        }
+        use resvg::{tiny_skia, usvg};
+        let tree = usvg::Tree::from_data(bytes, &usvg::Options::default()).ok()?;
+        let size = tree.size();
+        const TARGET: f32 = 40.0; // crisp at ~20px draw size on 2× displays
+        let scale = TARGET / size.width().max(size.height()).max(1.0);
+        let (w, h) = ((size.width() * scale).ceil() as u32, (size.height() * scale).ceil() as u32);
+        let mut pm = tiny_skia::Pixmap::new(w.max(1), h.max(1))?;
+        resvg::render(&tree, tiny_skia::Transform::from_scale(scale, scale), &mut pm.as_mut());
+        let img = image::RgbaImage::from_raw(pm.width(), pm.height(), pm.take())?;
+        self.add_image(queue, key, image::DynamicImage::ImageRgba8(img))
+    }
+
     /// Decode raster icon bytes (e.g. a downloaded PNG) and pack into the atlas.
     pub fn load_bytes(&mut self, queue: &Queue, key: &str, bytes: &[u8]) -> Option<[f32; 4]> {
         if let Some(uv) = self.slots.get(key) {

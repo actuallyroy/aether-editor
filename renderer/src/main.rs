@@ -581,6 +581,8 @@ pub(crate) struct App {
     /// Toast notifications (message, shown-at) — bottom-right cards, VSCode-style,
     /// auto-expiring. Used for extension messages (info/warning/error).
     pub(crate) toasts: Vec<(String, Instant)>,
+    /// Debug harness: pending AETHER_TEST_CMD command + when to fire it.
+    pub(crate) ext_test_cmd: Option<(String, Instant)>,
     pub(crate) toasts_dirty: bool,
     /// Live extension webviews (each a `--webview-host` process) and the webview
     /// view ids extensions have registered providers for.
@@ -808,6 +810,7 @@ impl App {
             ext_last_active: None,
             toasts: Vec::new(),
             toasts_dirty: false,
+            ext_test_cmd: None,
             webviews: Vec::new(),
             next_webview_id: 1,
             ext_webview_views: Vec::new(),
@@ -1573,6 +1576,8 @@ impl App {
         } else if self.active_webview().is_some() && self.webview_rel(p.0, p.1).is_some() {
             // Webview pane: mirror the PAGE's cursor (reported on hover changes).
             self.webview_cursor
+        } else if self.ext_title_buttons().iter().any(|(r, ..)| r.contains(p)) {
+            CursorIcon::Pointer
         } else if let Some(c) = chat_cursor {
             c
         } else if let Some(c) = find_cursor {
@@ -4412,6 +4417,74 @@ impl App {
         }
     }
 
+    /// Language id of the active document as extensions see it (LSP id, else a
+    /// sensible mapping from the file extension).
+    fn active_doc_lang(&self) -> Option<String> {
+        let d = self.workspace.active_doc()?;
+        Some(d.language_id().map(String::from).unwrap_or_else(|| match d.ext.as_str() {
+            "md" | "markdown" => "markdown".into(),
+            "txt" | "" => "plaintext".into(),
+            other => other.to_string(),
+        }))
+    }
+
+    /// Evaluate an editor/title `when` clause against the active editor. Supports
+    /// the shapes extensions actually use: `&&`-joined terms of
+    /// `editorLangId|resourceLangId ==|!=|=~ value`. Unknown terms are FALSE
+    /// (hide rather than wrongly show).
+    fn eval_when(&self, when: &str) -> bool {
+        if when.trim().is_empty() {
+            return true;
+        }
+        let Some(lang) = self.active_doc_lang() else { return false };
+        when.split("&&").all(|term| {
+            let t = term.trim();
+            let (key, op, val) = if let Some((k, v)) = t.split_once("==") {
+                (k.trim(), "==", v.trim())
+            } else if let Some((k, v)) = t.split_once("!=") {
+                (k.trim(), "!=", v.trim())
+            } else if let Some((k, v)) = t.split_once("=~") {
+                (k.trim(), "=~", v.trim())
+            } else {
+                return false;
+            };
+            if key != "editorLangId" && key != "resourceLangId" {
+                return false;
+            }
+            match op {
+                "==" => lang == val.trim_matches('\''),
+                "!=" => lang != val.trim_matches('\''),
+                _ => {
+                    let re = val.trim_start_matches('/').trim_end_matches('/');
+                    fancy_regex::Regex::new(re).ok().map_or(false, |r| r.is_match(&lang).unwrap_or(false))
+                }
+            }
+        })
+    }
+
+    /// The extension title-bar buttons applicable to the active editor, with their
+    /// tab-strip rects (right-aligned): `(rect, command, icon path, title)`.
+    pub(crate) fn ext_title_buttons(&self) -> Vec<(widgets::Rect, String, Option<std::path::PathBuf>, String)> {
+        let l = self.layout();
+        if l.tab_strip.h <= 0.0 {
+            return Vec::new();
+        }
+        let s = theme::zpx(28.0); // button slot (icon centers inside)
+        let mut out = Vec::new();
+        let mut x = l.tab_strip.x + l.tab_strip.w - s - theme::zpx(4.0);
+        for e in &self.ext_registry {
+            for b in &e.title_buttons {
+                if b.icon.is_none() || !self.eval_when(&b.when) {
+                    continue;
+                }
+                let rect = widgets::Rect { x, y: l.tab_strip.y, w: s, h: l.tab_strip.h };
+                out.push((rect, b.command.clone(), b.icon.clone(), b.title.clone()));
+                x -= s;
+            }
+        }
+        out
+    }
+
     /// Show a bottom-right toast notification (auto-expires; see about_to_wait).
     fn show_toast(&mut self, msg: &str) {
         if msg.trim().is_empty() {
@@ -6314,7 +6387,18 @@ impl App {
             return;
         }
         let Some(d) = self.workspace.active_doc() else { return };
-        let (Some(uri), Some(lang)) = (d.uri(), d.language_id()) else { return };
+        let Some(uri) = d.uri() else { return };
+        // Extensions care about every file type, not just LSP-served ones —
+        // markdown has no language server, but MPE needs the active .md document.
+        let lang: String = d
+            .language_id()
+            .map(String::from)
+            .unwrap_or_else(|| match d.ext.as_str() {
+                "md" | "markdown" => "markdown".into(),
+                "txt" | "" => "plaintext".into(),
+                other => other.to_string(),
+            });
+        let lang = lang.as_str();
         let version = d.version;
         if self.ext_doc_versions.get(&uri) == Some(&version) {
             return;
@@ -6882,6 +6966,13 @@ impl App {
                 if let Some(wv) = self.webviews.iter().find(|w| w.instance_id == instance) {
                     wv.focus_parent();
                 }
+            }
+        }
+        // Extension editor-title buttons (right end of the tab strip).
+        for (rect, command, _, _) in self.ext_title_buttons() {
+            if rect.contains((x, y)) {
+                self.run_ext_command(&command);
+                return;
             }
         }
         // Clicks inside a webview pane are forwarded to its virtual display.
@@ -10234,6 +10325,16 @@ impl ApplicationHandler for App {
         }
         // Expire toast notifications (~6s), waking again for the next expiry. This runs
         // BEFORE the terminal-key scheduling so a sooner key deadline wins the WaitUntil.
+        // Debug harness: fire the pending AETHER_TEST_CMD once its delay elapses.
+        if let Some((cmd, at)) = self.ext_test_cmd.clone() {
+            if Instant::now() >= at {
+                self.ext_test_cmd = None;
+                eprintln!("[aether-test] running {cmd}");
+                self.run_ext_command(&cmd);
+            } else {
+                el.set_control_flow(ControlFlow::WaitUntil(at));
+            }
+        }
         if !self.toasts.is_empty() {
             const TOAST_TTL: std::time::Duration = std::time::Duration::from_secs(6);
             let now = Instant::now();
@@ -10504,7 +10605,28 @@ impl ApplicationHandler for App {
                         dirs.push(d);
                     }
                     self.ext_registry = exthost::discover(&dirs);
+                    eprintln!(
+                        "[aether] ext registry: {:?}",
+                        self.ext_registry.iter().map(|e| (&e.name, e.activation_events.len())).collect::<Vec<_>>()
+                    );
                     self.activate_matching_extensions(None); // `*` / onStartupFinished
+                    // Debug harness: AETHER_TEST_OPEN=<file> + AETHER_TEST_CMD=<command>
+                    // opens a file and invokes an extension command once the host is up,
+                    // so extension flows can be exercised without clicking through the UI.
+                    if let Ok(f) = std::env::var("AETHER_TEST_OPEN") {
+                        if let Some(g) = self.gpu.as_mut() {
+                            let _ = self.workspace.open_file(std::path::Path::new(&f), &mut g.font_system);
+                        }
+                        self.sync_ext_host_docs();
+                    }
+                    if let Ok(cmd) = std::env::var("AETHER_TEST_CMD") {
+                        let proxy = self.proxy.clone();
+                        // Give activation a beat, then run on the main loop via redraw pump.
+                        self.ext_test_cmd = Some((cmd, Instant::now() + Duration::from_millis(1500)));
+                        if let Some(p) = proxy {
+                            let _ = p.send_event(());
+                        }
+                    }
                     let lang = self.workspace.active_doc().and_then(|d| d.language_id());
                     if let Some(l) = lang {
                         self.activate_matching_extensions(Some(l));

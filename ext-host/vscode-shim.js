@@ -27,8 +27,16 @@ class Disposable {
   constructor(fn) { this._fn = fn; }
   dispose() { if (this._fn) { this._fn(); this._fn = null; } }
 }
+// Debug hot-counter: spots the API a runaway extension loop hammers.
+const __hot = {};
+function __tick(name) {
+  __hot[name] = (__hot[name] || 0) + 1;
+  if (__hot[name] % 5000 === 1 && __hot[name] > 1) console.error('[shim-hot]', name, __hot[name]);
+}
+
 class Uri {
   constructor(scheme, authority, path, query, fragment) {
+    __tick('Uri.new');
     this.scheme = scheme || 'file';
     this.authority = authority || '';
     this.path = path || '';
@@ -37,6 +45,9 @@ class Uri {
   }
   get fsPath() { return this.path; }
   static file(p) { return new Uri('file', '', String(p)); }
+  static from(o) {
+    return new Uri(o.scheme || 'file', o.authority || '', o.path || '', o.query || '', o.fragment || '');
+  }
   static parse(s) {
     const m = String(s).match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/([^/?#]*)([^?#]*)(?:\?([^#]*))?(?:#(.*))?$/);
     if (m) return new Uri(m[1], m[2], m[3] || '/', m[4] || '', m[5] || '');
@@ -44,7 +55,13 @@ class Uri {
   }
   static joinPath(base, ...parts) {
     const path = require('path');
-    return new Uri(base.scheme, base.authority, path.posix.join(base.path, ...parts), base.query, base.fragment);
+    // resolve() (not join()) so `..` clamps at '/': extensions walk uris up the
+    // tree until path === '/', and join('', '..') grows '../../..' forever
+    // (MPE's workspace-folder search OOMed the host on a relative base).
+    return new Uri(
+      base.scheme, base.authority,
+      path.posix.resolve(base.path || '/', ...parts.map(String)),
+      base.query, base.fragment);
   }
   with(change) {
     return new Uri(
@@ -337,6 +354,10 @@ function createVscode(rpc) {
           prompt: (options && options.prompt) || '', value: (options && options.value) || '',
         }).then((v) => (v == null ? undefined : v)),
       createStatusBarItem: (alignment, priority) => makeStatusBarItem(alignment, priority),
+      // Custom editors (webview-as-file-editor) aren't wired into aether yet —
+      // register a no-op so activation doesn't crash (MPE registers one it only
+      // uses for .ipynb).
+      registerCustomEditorProvider: (viewType, provider, options) => ({ dispose() {} }),
       registerWebviewViewProvider: (viewId, provider, options) => {
         webviewProviders.set(viewId, { provider, options: options || {} });
         rpc.notify('window/registerWebviewViewProvider', { viewId });
@@ -375,19 +396,24 @@ function createVscode(rpc) {
       registerUriHandler: () => new Disposable(() => {}),
       registerWebviewPanelSerializer: () => new Disposable(() => {}),
       createWebviewPanel: (viewType, title, _showOpts, _options) => {
+        console.error(`[shim] createWebviewPanel ${viewType} "${title}"`);
         // A webview panel is just another webview instance; aether shows it in its
         // own webview-host window. Reuses the sidebar plumbing.
         const instanceId = nextPanelId--;
         const view = makeWebview(instanceId);
         view.viewType = viewType;
         rpc.notify('webview/createPanel', { instanceId, viewType, title });
-        const onDispose = new VsEvent();
+        // IMPORTANT: the panel's dispose event must be the INSTANCE's event —
+        // that's what webviewDisposed() fires when the user closes the tab in
+        // aether. A separate event here left extensions (MPE) holding a stale
+        // panel, so reopening the preview did nothing.
+        const inst = webviewInstances.get(instanceId);
         const panel = {
           webview: view.webview,
           viewType, title, visible: true, active: true, viewColumn: 1,
           reveal: () => {},
-          dispose: () => { rpc.notify('webview/disposePanel', { instanceId }); onDispose.fire(); },
-          get onDidDispose() { return onDispose.event; },
+          dispose: () => { rpc.notify('webview/disposePanel', { instanceId }); inst.onDispose.fire(); },
+          get onDidDispose() { return view.onDidDispose; },
           onDidChangeViewState: () => new Disposable(() => {}),
         };
         // The extension's panel icon becomes the editor-tab icon.
@@ -439,6 +465,7 @@ function createVscode(rpc) {
       // Synchronous, like vscode: user settings (pushed by aether into ws.settings)
       // override the defaults registered from each extension's contributes.
       getConfiguration: (section) => {
+        __tick('getConfiguration');
         const full = (key) => (section ? section + '.' + key : key);
         const lookup = (key) => {
           const k = full(key);
@@ -459,6 +486,10 @@ function createVscode(rpc) {
       },
       get rootPath() { return ws.root || undefined; },
       getWorkspaceFolder: (uri) => {
+        __tick('getWorkspaceFolder');
+        if (__hot.getWorkspaceFolder < 6 || __hot.getWorkspaceFolder % 5000 < 3) {
+          console.error('[shim] getWorkspaceFolder arg:', JSON.stringify(uri && (uri.fsPath || String(uri))), 'root:', JSON.stringify(ws.root));
+        }
         if (!ws.root || !uri) return undefined;
         const p = uri.fsPath || String(uri);
         return p.startsWith(ws.root) ? { uri: Uri.file(ws.root), name: path.basename(ws.root), index: 0 } : undefined;
@@ -603,7 +634,8 @@ function createVscode(rpc) {
   const dispatch = {
     // host/init + settings updates land here.
     setWorkspace({ root, settings }) {
-      if (root) ws.root = root;
+      // Defense in depth: a relative root breaks extensions' directory walks.
+      if (root) ws.root = require('path').resolve(root);
       if (settings && typeof settings === 'object') Object.assign(ws.settings, settings);
     },
     // activation.js registers each activated extension's contributed config defaults.
@@ -675,6 +707,7 @@ function createVscode(rpc) {
       if (inst) { inst.onDispose.fire(); webviewInstances.delete(instanceId); }
     },
     async invokeCommand({ command, args }) {
+      console.error(`[shim] invokeCommand ${command}`);
       const cb = commands.get(command);
       if (!cb) throw new Error('no such command: ' + command);
       return await cb(...(args || []));

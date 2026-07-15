@@ -23,6 +23,16 @@ pub struct ExtHost {
     _child: std::process::Child,
 }
 
+impl Drop for ExtHost {
+    // Belt-and-braces: the host exits when its socket closes, but a wedged or
+    // busy node (extension servers keep the event loop alive) must not outlive
+    // the editor — orphaned hosts hold ports/lockfiles and confuse later runs.
+    fn drop(&mut self) {
+        let _ = self._child.kill();
+        let _ = self._child.wait();
+    }
+}
+
 impl ExtHost {
     /// Spawn the Node host for `root` and start the accept/reader thread. Returns None if
     /// Node isn't available or the host script can't be located. The connection completes
@@ -130,6 +140,10 @@ impl ExtHost {
 
     // ---- convenience wrappers for the first-slice methods ----
     pub fn init(&self, root: &Path) {
+        // ALWAYS absolute: a relative root ("." from `aether .`) poisons every
+        // uri extensions derive from the workspace — directory-walk loops in
+        // MPE/crossnote never terminate on relative paths (dirname('.') == '.').
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
         self.notify("host/init", json!({ "root": root.to_string_lossy() }));
     }
     pub fn activate(&self, ext_path: &Path) -> i64 {
@@ -323,6 +337,21 @@ pub struct ExtInfo {
     pub commands: Vec<(String, String)>,
     /// Webview views from `contributes.views`: `(view id, display name)`.
     pub views: Vec<(String, String)>,
+    /// Editor-title buttons from `contributes.menus."editor/title"` (navigation group).
+    pub title_buttons: Vec<TitleButton>,
+}
+
+/// One `editor/title` toolbar button an extension contributes (VSCode shows these
+/// at the right end of the tab bar when the `when` clause matches the active editor).
+#[derive(Clone)]
+pub struct TitleButton {
+    pub command: String,
+    /// Raw when-clause, e.g. `editorLangId == markdown` or `editorLangId =~ /^(a|b)$/`.
+    pub when: String,
+    /// Absolute path to the button's icon (dark variant), when it's a file.
+    pub icon: Option<PathBuf>,
+    /// Command title — tooltip/fallback.
+    pub title: String,
 }
 
 /// Scan each directory for immediate subfolders containing a `package.json` with a
@@ -395,7 +424,42 @@ pub fn discover(dirs: &[PathBuf]) -> Vec<ExtInfo> {
                         .collect()
                 })
                 .unwrap_or_default();
-            out.push(ExtInfo { path: p, name, activation_events, commands, views });
+            // editor/title toolbar buttons (navigation group only — the icon row).
+            // The icon comes from the command's `icon` field: a {light,dark} file
+            // pair (use dark — aether's chrome is dark) or a `$(codicon)` string
+            // (no file; skipped for now).
+            let title_buttons = v
+                .pointer("/contributes/menus/editor~1title")
+                .and_then(|m| m.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| {
+                            let command = item.get("command")?.as_str()?.to_string();
+                            if item.get("group").and_then(|g| g.as_str()).map_or(true, |g| !g.starts_with("navigation")) {
+                                return None;
+                            }
+                            let when = item.get("when").and_then(|w| w.as_str()).unwrap_or("").to_string();
+                            let cmd_def = v
+                                .pointer("/contributes/commands")
+                                .and_then(|c| c.as_array())
+                                .and_then(|arr| arr.iter().find(|c| c.get("command").and_then(|x| x.as_str()) == Some(&command)));
+                            let icon = cmd_def
+                                .and_then(|c| c.get("icon"))
+                                .and_then(|i| i.get("dark").and_then(|d| d.as_str()).or_else(|| i.as_str()))
+                                .filter(|s| !s.starts_with("$("))
+                                .map(|rel| p.join(rel.trim_start_matches("./")));
+                            let title = localize(
+                                cmd_def
+                                    .and_then(|c| c.get("title"))
+                                    .and_then(|t| t.as_str())
+                                    .unwrap_or(&command),
+                            );
+                            Some(TitleButton { command, when, icon, title })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push(ExtInfo { path: p, name, activation_events, commands, views, title_buttons });
         }
     }
     out

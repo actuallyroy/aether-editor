@@ -69,7 +69,7 @@ pub struct Document {
     force_join: bool,   // glue the next edit to the current group (replace-selection typing)
     pub buffer: Buffer,
     lang: Lang,
-    ext: String,
+    pub ext: String,
     wrap_width: Option<f32>, // Some(w) when word-wrap is on (wraps at w px)
     eol: String,             // this file's actual line ending ("\n" or "\r\n")
     pub read_only: bool,     // diff views (and future previews) reject edits
