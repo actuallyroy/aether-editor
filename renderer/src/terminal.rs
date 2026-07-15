@@ -1154,16 +1154,99 @@ pub(crate) fn translate_terminal_key(
         // Shift+Tab → backtab (claude code's mode toggle, completion cycling, …).
         Key::Named(NamedKey::Tab) if shift => return Some(b"\x1b[Z".to_vec()),
         Key::Named(NamedKey::Tab) => return Some(b"\t".to_vec()),
-        Key::Named(NamedKey::PageUp) => return Some(b"\x1b[5~".to_vec()),
-        Key::Named(NamedKey::PageDown) => return Some(b"\x1b[6~".to_vec()),
         Key::Named(NamedKey::Escape) => return Some(vec![0x1b]),
-        Key::Named(NamedKey::ArrowUp) => return Some(b"\x1b[A".to_vec()),
-        Key::Named(NamedKey::ArrowDown) => return Some(b"\x1b[B".to_vec()),
-        Key::Named(NamedKey::ArrowRight) => return Some(b"\x1b[C".to_vec()),
-        Key::Named(NamedKey::ArrowLeft) => return Some(b"\x1b[D".to_vec()),
-        Key::Named(NamedKey::Home) => return Some(b"\x1b[H".to_vec()),
-        Key::Named(NamedKey::End) => return Some(b"\x1b[F".to_vec()),
-        Key::Named(NamedKey::Delete) => return Some(b"\x1b[3~".to_vec()),
+        Key::Named(NamedKey::Insert) => return Some(b"\x1b[2~".to_vec()),
+        // Alt+Left/Right → ESC b / ESC f: word motion in zsh/bash's default emacs
+        // keymap (what macOS Terminal sends for Option+arrows).
+        Key::Named(NamedKey::ArrowLeft) if alt && !ctrl && !shift => return Some(b"\x1bb".to_vec()),
+        Key::Named(NamedKey::ArrowRight) if alt && !ctrl && !shift => return Some(b"\x1bf".to_vec()),
+        // Other modified arrows/Home/End → xterm CSI 1;<m> sequences (Shift=+1,
+        // Alt=+2, Ctrl=+4) so TUIs see Shift+arrows, Ctrl+arrows, etc.
+        Key::Named(
+            k @ (NamedKey::ArrowUp
+            | NamedKey::ArrowDown
+            | NamedKey::ArrowRight
+            | NamedKey::ArrowLeft
+            | NamedKey::Home
+            | NamedKey::End),
+        ) => {
+            let ch = match k {
+                NamedKey::ArrowUp => 'A',
+                NamedKey::ArrowDown => 'B',
+                NamedKey::ArrowRight => 'C',
+                NamedKey::ArrowLeft => 'D',
+                NamedKey::Home => 'H',
+                _ => 'F',
+            };
+            let m = 1 + shift as u8 + (alt as u8) * 2 + (ctrl as u8) * 4;
+            return Some(if m > 1 {
+                format!("\x1b[1;{m}{ch}").into_bytes()
+            } else {
+                format!("\x1b[{ch}").into_bytes()
+            });
+        }
+        // Delete/PageUp/PageDown (+ xterm modifiers: Shift=+1, Alt=+2, Ctrl=+4).
+        Key::Named(k @ (NamedKey::Delete | NamedKey::PageUp | NamedKey::PageDown)) => {
+            let n = match k {
+                NamedKey::Delete => 3,
+                NamedKey::PageUp => 5,
+                _ => 6,
+            };
+            let m = 1 + shift as u8 + (alt as u8) * 2 + (ctrl as u8) * 4;
+            return Some(if m > 1 {
+                format!("\x1b[{n};{m}~").into_bytes()
+            } else {
+                format!("\x1b[{n}~").into_bytes()
+            });
+        }
+        // Function keys, modified per xterm: F1-F4 are SS3 P/Q/R/S plain and
+        // CSI 1;<m>P… modified; F5+ are CSI <n>~ / CSI <n>;<m>~.
+        Key::Named(
+            k @ (NamedKey::F1
+            | NamedKey::F2
+            | NamedKey::F3
+            | NamedKey::F4
+            | NamedKey::F5
+            | NamedKey::F6
+            | NamedKey::F7
+            | NamedKey::F8
+            | NamedKey::F9
+            | NamedKey::F10
+            | NamedKey::F11
+            | NamedKey::F12),
+        ) => {
+            let m = 1 + shift as u8 + (alt as u8) * 2 + (ctrl as u8) * 4;
+            let low = match k {
+                NamedKey::F1 => Some('P'),
+                NamedKey::F2 => Some('Q'),
+                NamedKey::F3 => Some('R'),
+                NamedKey::F4 => Some('S'),
+                _ => None,
+            };
+            return Some(match (low, m) {
+                (Some(c), 1) => format!("\x1bO{c}").into_bytes(),
+                (Some(c), m) => format!("\x1b[1;{m}{c}").into_bytes(),
+                (None, m) => {
+                    let n = match k {
+                        NamedKey::F5 => 15,
+                        NamedKey::F6 => 17,
+                        NamedKey::F7 => 18,
+                        NamedKey::F8 => 19,
+                        NamedKey::F9 => 20,
+                        NamedKey::F10 => 21,
+                        NamedKey::F11 => 23,
+                        _ => 24,
+                    };
+                    if m > 1 {
+                        format!("\x1b[{n};{m}~").into_bytes()
+                    } else {
+                        format!("\x1b[{n}~").into_bytes()
+                    }
+                }
+            });
+        }
+        Key::Named(NamedKey::Space) if ctrl => return Some(vec![0x00]), // NUL
+        Key::Named(NamedKey::Space) if alt => return Some(b"\x1b ".to_vec()),
         Key::Named(NamedKey::Space) => return Some(b" ".to_vec()),
         _ => {}
     }
@@ -1206,7 +1289,63 @@ pub(crate) fn translate_terminal_key(
                 _ => None,
             };
             if let Some(l) = letter {
-                return Some(if ctrl { vec![l & 0x1f] } else { vec![0x1b, l] });
+                // Ctrl+Alt+<letter> → ESC + control byte (emacs C-M-x etc.).
+                let l = if shift && !ctrl { l.to_ascii_uppercase() } else { l };
+                return Some(match (ctrl, alt) {
+                    (true, true) => vec![0x1b, l & 0x1f],
+                    (true, false) => vec![l & 0x1f],
+                    _ => vec![0x1b, l],
+                });
+            }
+            // Ctrl+symbol control bytes (xterm): @ NUL, [ ESC, \ FS, ] GS, ^ RS, _ US.
+            if ctrl {
+                let byte = match code {
+                    KeyCode::Digit2 => Some(0x00), // Ctrl+@
+                    KeyCode::BracketLeft => Some(0x1b),
+                    KeyCode::Backslash => Some(0x1c),
+                    KeyCode::BracketRight => Some(0x1d),
+                    KeyCode::Digit6 => Some(0x1e), // Ctrl+^
+                    KeyCode::Minus => Some(0x1f),  // Ctrl+_ (Ctrl+-)
+                    KeyCode::Slash => Some(0x1f),  // Ctrl+/ = undo in many TUIs
+                    _ => None,
+                };
+                if let Some(b) = byte {
+                    return Some(if alt { vec![0x1b, b] } else { vec![b] });
+                }
+            }
+            // Alt+<any other printable> → ESC + the character (Meta prefix). Use the
+            // PHYSICAL key's unshifted/shifted pair — on macOS the logical text is
+            // Option-composed (Option+f = "ƒ"), which shells don't want.
+            if alt && !ctrl {
+                let ch = match code {
+                    KeyCode::Digit1 => Some(if shift { '!' } else { '1' }),
+                    KeyCode::Digit2 => Some(if shift { '@' } else { '2' }),
+                    KeyCode::Digit3 => Some(if shift { '#' } else { '3' }),
+                    KeyCode::Digit4 => Some(if shift { '$' } else { '4' }),
+                    KeyCode::Digit5 => Some(if shift { '%' } else { '5' }),
+                    KeyCode::Digit6 => Some(if shift { '^' } else { '6' }),
+                    KeyCode::Digit7 => Some(if shift { '&' } else { '7' }),
+                    KeyCode::Digit8 => Some(if shift { '*' } else { '8' }),
+                    KeyCode::Digit9 => Some(if shift { '(' } else { '9' }),
+                    KeyCode::Digit0 => Some(if shift { ')' } else { '0' }),
+                    KeyCode::Minus => Some(if shift { '_' } else { '-' }),
+                    KeyCode::Equal => Some(if shift { '+' } else { '=' }),
+                    KeyCode::BracketLeft => Some(if shift { '{' } else { '[' }),
+                    KeyCode::BracketRight => Some(if shift { '}' } else { ']' }),
+                    KeyCode::Backslash => Some(if shift { '|' } else { '\\' }),
+                    KeyCode::Semicolon => Some(if shift { ':' } else { ';' }),
+                    KeyCode::Quote => Some(if shift { '"' } else { '\'' }),
+                    KeyCode::Comma => Some(if shift { '<' } else { ',' }),
+                    KeyCode::Period => Some(if shift { '>' } else { '.' }),
+                    KeyCode::Slash => Some(if shift { '?' } else { '/' }),
+                    KeyCode::Backquote => Some(if shift { '~' } else { '`' }),
+                    _ => None,
+                };
+                if let Some(c) = ch {
+                    let mut v = vec![0x1b];
+                    v.extend(c.to_string().into_bytes());
+                    return Some(v);
+                }
             }
         }
         return None;

@@ -9262,6 +9262,30 @@ impl App {
                     self.terminal_paste_clipboard();
                     return;
                 }
+                // macOS line-editing conventions (iTerm/VSCode): Cmd+Left/Right =
+                // beginning/end of line, Cmd+Backspace = kill line back. Without
+                // this the Cmd-as-Ctrl aliasing above would send Ctrl+arrow CSI
+                // sequences the shell doesn't bind (typing literal ";5D").
+                if cfg!(target_os = "macos") && self.mods.super_key() {
+                    use winit::keyboard::{Key as WKey, NamedKey as WNamed};
+                    let bytes: Option<&[u8]> = match event.logical_key.as_ref() {
+                        WKey::Named(WNamed::ArrowLeft) => Some(b"\x01"),  // Ctrl+A
+                        WKey::Named(WNamed::ArrowRight) => Some(b"\x05"), // Ctrl+E
+                        WKey::Named(WNamed::Backspace) => Some(b"\x15"),  // Ctrl+U
+                        _ => None,
+                    };
+                    if let Some(b) = bytes {
+                        if let Some(g) = self.terminal.groups.get_mut(self.terminal.active) {
+                            if let Some(p) = g.panes.get_mut(g.focused) {
+                                p.term.write(b);
+                                p.scroll.scroll_to_end();
+                                p.dirty = true;
+                            }
+                        }
+                        self.redraw();
+                        return;
+                    }
+                }
                 let alt = self.mods.alt_key();
                 if let Some(mut bytes) = translate_terminal_key(&event, ctrl, extend, alt) {
                     // Escape at an IDLE shell prompt clears the typed input (kill-line,

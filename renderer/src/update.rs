@@ -179,10 +179,81 @@ fn download_and_run_installer() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// True when running from an installed Aether.app bundle — the self-updater's
+/// bare-binary replace would leave bundled resources (ext-host/) stale, so the
+/// whole .app is refreshed from the release DMG instead.
+#[cfg(target_os = "macos")]
+pub fn is_app_bundle_install() -> bool {
+    std::env::current_exe()
+        .map(|p| p.to_string_lossy().contains("/Aether.app/Contents/MacOS/"))
+        .unwrap_or(false)
+}
+#[cfg(not(target_os = "macos"))]
+pub fn is_app_bundle_install() -> bool {
+    false
+}
+
 /// True if Aether was installed by a system installer/package manager whose
 /// binary we can't self-replace — update through the manager instead.
 pub fn is_managed_install() -> bool {
-    is_apt_install() || is_program_files_install()
+    is_apt_install() || is_program_files_install() || is_app_bundle_install()
+}
+
+/// Download the latest DMG and swap the installed Aether.app with the fresh
+/// bundle (binary + ext-host + Info.plist together). Sends `UpdateDone`; on
+/// success the app offers a restart which re-execs the new binary.
+#[cfg(target_os = "macos")]
+pub fn install_dmg_async(tx: Sender<WorkerMsg>) {
+    std::thread::spawn(move || {
+        let ok = install_dmg().is_ok();
+        let _ = tx.send(WorkerMsg::UpdateDone { ok });
+    });
+}
+#[cfg(target_os = "macos")]
+fn install_dmg() -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!(
+        "https://github.com/{OWNER}/{NAME}/releases/latest/download/Aether-macos-arm64.dmg"
+    );
+    let mut reader = ureq::get(&url).call()?.into_reader();
+    let tmp = std::env::temp_dir().join("aether-update.dmg");
+    let mut f = std::fs::File::create(&tmp)?;
+    std::io::copy(&mut reader, &mut f)?;
+    drop(f);
+    // The installed app's location (…/Aether.app/Contents/MacOS/aether → the .app).
+    let exe = std::env::current_exe()?;
+    let app = exe
+        .ancestors()
+        .find(|p| p.extension().map_or(false, |e| e == "app"))
+        .ok_or("not inside an .app bundle")?
+        .to_path_buf();
+    let mount = std::env::temp_dir().join("aether-update-mnt");
+    let _ = std::fs::create_dir_all(&mount);
+    let ok = std::process::Command::new("hdiutil")
+        .args(["attach", "-nobrowse", "-quiet", "-mountpoint"])
+        .arg(&mount)
+        .arg(&tmp)
+        .status()?
+        .success();
+    if !ok {
+        return Err("hdiutil attach failed".into());
+    }
+    // Replace the bundle. Removing a RUNNING app's files is fine on APFS — the
+    // running process keeps its open inodes; the restart picks up the new one.
+    let src = mount.join("Aether.app");
+    let result: Result<(), Box<dyn std::error::Error>> = (|| {
+        if !src.exists() {
+            return Err("DMG has no Aether.app".into());
+        }
+        std::fs::remove_dir_all(&app)?;
+        let status = std::process::Command::new("cp").arg("-R").arg(&src).arg(&app).status()?;
+        if !status.success() {
+            return Err("cp -R failed".into());
+        }
+        Ok(())
+    })();
+    let _ = std::process::Command::new("hdiutil").args(["detach", "-quiet"]).arg(&mount).status();
+    let _ = std::fs::remove_file(&tmp);
+    result
 }
 
 /// Update a managed install the right way for the platform: apt+pkexec on Linux,
@@ -196,7 +267,15 @@ pub fn install_managed_async(tx: Sender<WorkerMsg>) {
     {
         install_windows_async(tx);
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(target_os = "macos")]
+    {
+        if is_app_bundle_install() {
+            install_dmg_async(tx);
+        } else {
+            install_async(tx); // portable binary: plain self-replace
+        }
+    }
+    #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
     {
         install_async(tx);
     }
