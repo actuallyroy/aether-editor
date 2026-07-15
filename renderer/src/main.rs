@@ -5974,6 +5974,7 @@ impl App {
             mcp.set_workspace(&self.cwd);
         }
         mcp::agents::register_claude(&self.cwd); // re-register the bridge for the new root
+        mcp::agents::register_codex();
         // Re-scope the extension host's workspace (workspaceFolders/rootPath) so
         // extensions (e.g. Claude Code) see the newly opened folder.
         if let Some(h) = self.ext_host.as_ref() {
@@ -11316,6 +11317,7 @@ impl ApplicationHandler for App {
                             // Auto-register the `aether --mcp` bridge so agents started
                             // in our terminal get the full tool surface with no setup.
                             mcp::agents::register_claude(&self.cwd);
+                            mcp::agents::register_codex();
                         }
                     }
                 }

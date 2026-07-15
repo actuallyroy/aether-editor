@@ -58,3 +58,44 @@ pub fn register_claude(workspace: &Path) {
         }
     }
 }
+
+/// Register the bridge for Codex by writing an `[mcp_servers.aether]` section into
+/// `~/.codex/config.toml`. Codex's MCP config is GLOBAL (not per-project); the
+/// `--mcp` proxy resolves the right editor instance from its cwd at connect time.
+/// Textual edit (no toml dependency): replace our section if present, else append.
+/// Idempotent, best-effort, and touches nothing outside our own section.
+pub fn register_codex() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else { return };
+    let dir = home.join(".codex");
+    if !dir.is_dir() {
+        return; // codex not installed — don't create its config tree
+    }
+    let path = dir.join("config.toml");
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let section = format!(
+        "[mcp_servers.aether]\ncommand = \"{}\"\nargs = [\"--mcp\"]\n",
+        exe.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"")
+    );
+    let new_text = if let Some(start) = text.find("[mcp_servers.aether]") {
+        // Replace up to the next section header (or EOF).
+        let rest = &text[start..];
+        let end = rest[1..].find("\n[").map(|i| start + 1 + i + 1).unwrap_or(text.len());
+        format!("{}{}{}", &text[..start], section, &text[end..])
+    } else {
+        let sep = if text.is_empty() || text.ends_with("\n\n") {
+            ""
+        } else if text.ends_with('\n') {
+            "\n"
+        } else {
+            "\n\n"
+        };
+        format!("{text}{sep}{section}")
+    };
+    if new_text != text {
+        let tmp = path.with_extension("toml.aether-tmp");
+        if std::fs::write(&tmp, new_text).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
