@@ -10606,10 +10606,6 @@ impl ApplicationHandler for App {
                         dirs.push(d);
                     }
                     self.ext_registry = exthost::discover(&dirs);
-                    eprintln!(
-                        "[aether] ext registry: {:?}",
-                        self.ext_registry.iter().map(|e| (&e.name, e.activation_events.len())).collect::<Vec<_>>()
-                    );
                     self.activate_matching_extensions(None); // `*` / onStartupFinished
                     // Debug harness: AETHER_TEST_OPEN=<file> + AETHER_TEST_CMD=<command>
                     // opens a file and invokes an extension command once the host is up,

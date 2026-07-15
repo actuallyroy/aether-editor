@@ -27,16 +27,8 @@ class Disposable {
   constructor(fn) { this._fn = fn; }
   dispose() { if (this._fn) { this._fn(); this._fn = null; } }
 }
-// Debug hot-counter: spots the API a runaway extension loop hammers.
-const __hot = {};
-function __tick(name) {
-  __hot[name] = (__hot[name] || 0) + 1;
-  if (__hot[name] % 5000 === 1 && __hot[name] > 1) console.error('[shim-hot]', name, __hot[name]);
-}
-
 class Uri {
   constructor(scheme, authority, path, query, fragment) {
-    __tick('Uri.new');
     this.scheme = scheme || 'file';
     this.authority = authority || '';
     this.path = path || '';
@@ -396,7 +388,6 @@ function createVscode(rpc) {
       registerUriHandler: () => new Disposable(() => {}),
       registerWebviewPanelSerializer: () => new Disposable(() => {}),
       createWebviewPanel: (viewType, title, _showOpts, _options) => {
-        console.error(`[shim] createWebviewPanel ${viewType} "${title}"`);
         // A webview panel is just another webview instance; aether shows it in its
         // own webview-host window. Reuses the sidebar plumbing.
         const instanceId = nextPanelId--;
@@ -465,7 +456,6 @@ function createVscode(rpc) {
       // Synchronous, like vscode: user settings (pushed by aether into ws.settings)
       // override the defaults registered from each extension's contributes.
       getConfiguration: (section) => {
-        __tick('getConfiguration');
         const full = (key) => (section ? section + '.' + key : key);
         const lookup = (key) => {
           const k = full(key);
@@ -486,10 +476,6 @@ function createVscode(rpc) {
       },
       get rootPath() { return ws.root || undefined; },
       getWorkspaceFolder: (uri) => {
-        __tick('getWorkspaceFolder');
-        if (__hot.getWorkspaceFolder < 6 || __hot.getWorkspaceFolder % 5000 < 3) {
-          console.error('[shim] getWorkspaceFolder arg:', JSON.stringify(uri && (uri.fsPath || String(uri))), 'root:', JSON.stringify(ws.root));
-        }
         if (!ws.root || !uri) return undefined;
         const p = uri.fsPath || String(uri);
         return p.startsWith(ws.root) ? { uri: Uri.file(ws.root), name: path.basename(ws.root), index: 0 } : undefined;
@@ -707,7 +693,6 @@ function createVscode(rpc) {
       if (inst) { inst.onDispose.fire(); webviewInstances.delete(instanceId); }
     },
     async invokeCommand({ command, args }) {
-      console.error(`[shim] invokeCommand ${command}`);
       const cb = commands.get(command);
       if (!cb) throw new Error('no such command: ' + command);
       return await cb(...(args || []));
