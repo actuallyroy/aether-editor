@@ -1757,6 +1757,19 @@ impl App {
         // Scan installed extensions up front so "Installed" status is accurate from
         // the start and grammar extensions (rainbow-csv, …) activate on launch.
         self.extensions = extensions::scan();
+        // Populate the runnable-extension registry (palette commands, view titles)
+        // immediately — it's pure package.json parsing. ExtHostReady re-runs it and
+        // activates; without this, a dead ext host left the palette empty too.
+        {
+            let mut dirs = Vec::new();
+            if let Some(d) = exthost::bundled_extensions_dir() {
+                dirs.push(d);
+            }
+            if let Some(d) = exthost::user_extensions_dir() {
+                dirs.push(d);
+            }
+            self.ext_registry = exthost::discover(&dirs);
+        }
         self.activate_installed_grammars();
         // The panel was created with empty rows before this scan ran; push the
         // installed list into it now so the Extensions view isn't blank on launch.

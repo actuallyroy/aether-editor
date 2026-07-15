@@ -343,6 +343,18 @@ pub fn discover(dirs: &[PathBuf]) -> Vec<ExtInfo> {
             if v.get("main").and_then(|m| m.as_str()).is_none() {
                 continue; // themes/grammars have no `main` — not runnable
             }
+            // VSCode localization: "%some.key%" strings resolve via package.nls.json.
+            let nls: Option<Value> = std::fs::read_to_string(p.join("package.nls.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok());
+            let localize = |s: &str| -> String {
+                if let (Some(k), Some(n)) = (s.strip_prefix('%').and_then(|x| x.strip_suffix('%')), nls.as_ref()) {
+                    if let Some(t) = n.get(k).and_then(|t| t.as_str()) {
+                        return t.to_string();
+                    }
+                }
+                s.to_string()
+            };
             let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("ext").to_string();
             let activation_events = v
                 .get("activationEvents")
@@ -356,7 +368,7 @@ pub fn discover(dirs: &[PathBuf]) -> Vec<ExtInfo> {
                     arr.iter()
                         .filter_map(|c| {
                             let cmd = c.get("command")?.as_str()?.to_string();
-                            let title = c.get("title").and_then(|t| t.as_str()).unwrap_or(&cmd).to_string();
+                            let title = localize(c.get("title").and_then(|t| t.as_str()).unwrap_or(&cmd));
                             Some((cmd, title))
                         })
                         .collect()
@@ -372,12 +384,12 @@ pub fn discover(dirs: &[PathBuf]) -> Vec<ExtInfo> {
                         .flatten()
                         .filter_map(|view| {
                             let id = view.get("id")?.as_str()?.to_string();
-                            let name = view
-                                .get("name")
-                                .and_then(|n| n.as_str())
-                                .filter(|n| !n.is_empty())
-                                .unwrap_or(&id)
-                                .to_string();
+                            let name = localize(
+                                view.get("name")
+                                    .and_then(|n| n.as_str())
+                                    .filter(|n| !n.is_empty())
+                                    .unwrap_or(&id),
+                            );
                             Some((id, name))
                         })
                         .collect()
@@ -429,6 +441,12 @@ fn host_script() -> Option<PathBuf> {
     }
     if let Ok(cwd) = std::env::current_dir() {
         candidates.push(cwd.join("ext-host/main.js"));
+    }
+    // macOS launcher bundles hardlink the binary into a per-folder .app shim —
+    // ext-host lives next to the CANONICAL executable they point back to.
+    #[cfg(target_os = "macos")]
+    if let Some(dir) = crate::macos_launcher::canonical_exe().parent() {
+        candidates.push(dir.join("ext-host/main.js"));
     }
     // Installed locations (deb: /usr/share/aether; AppImage: <root>/usr/share/aether).
     if let Ok(exe) = std::env::current_exe() {
