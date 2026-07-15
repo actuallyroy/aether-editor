@@ -416,6 +416,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // Snapshot extension title-bar buttons + activity items before gpu borrows app.
     let ext_title_buttons = app.ext_title_buttons();
     let ext_activity: Vec<crate::exthost::ActivityItem> = app.ext_activity_items();
+    let ext_activity_visible: Vec<(usize, crate::exthost::ActivityItem)> = app.ext_activity_visible();
     let ext_view_buttons = app.ext_view_buttons();
     let ext_activity_titles: Vec<String> = ext_activity.iter().map(|a| a.title.clone()).collect();
     let Some(gpu) = app.gpu.as_mut() else {
@@ -1219,13 +1220,19 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
 
     // Activity bar bg + hover (hover rect == the button rect).
     bg_quads.push(layout.activity_bar.quad(theme::ACTIVITY_BAR_BG()));
-    let act_rects = layout.activity_rects_ext(ext_activity.len());
+    let act_rects = layout.activity_rects_ext(ext_activity_visible.len());
     if let Some(idx) = app.hovered_activity {
         bg_quads.push(act_rects[idx].quad(theme::ACTIVITY_BAR_ACTIVE()));
     }
     // Active view: subtle background highlight + the themed accent stripe on its
     // left edge (VS Code's activityBar.activeBorder — Dracula's pink).
-    if let Some(ai) = active_activity_idx(app.sidebar_visible, app.sidebar_view) {
+    let active_slot = match app.sidebar_view {
+        crate::SidebarView::ExtView(stable) if app.sidebar_visible => {
+            ext_activity_visible.iter().position(|(i, _)| *i == stable).map(|p| 5 + p)
+        }
+        v => active_activity_idx(app.sidebar_visible, v),
+    };
+    if let Some(ai) = active_slot {
         let r = act_rects[ai];
         bg_quads.push(r.quad(theme::ACTIVITY_BAR_ACTIVE()));
         bg_quads.push(Quad::new(r.x, r.y, theme::zpx(2.0).max(2.0), r.h, theme::ACTIVITY_ACTIVE_BORDER()));
@@ -2609,9 +2616,15 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     }
 
     // Activity-bar icons — IconButton widgets at their cell rects.
-    let n_ext_act = ext_activity.len();
+    let n_ext_act = ext_activity_visible.len();
     let act_rects = layout.activity_rects_ext(n_ext_act);
-    let active_act = active_activity_idx(app.sidebar_visible, app.sidebar_view);
+    // ExtView holds a STABLE index — map it to its current bar slot.
+    let active_act = match app.sidebar_view {
+        crate::SidebarView::ExtView(stable) if app.sidebar_visible => {
+            ext_activity_visible.iter().position(|(i, _)| *i == stable).map(|p| 5 + p)
+        }
+        v => active_activity_idx(app.sidebar_visible, v),
+    };
     for (i, btn) in gpu.activity_btns.iter().enumerate() {
         // Built-ins keep slots 0..5; the bottom pair (account, gear) shifts past
         // the extension icons.
@@ -2624,7 +2637,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         btn.draw(act_rects[slot], color, &mut areas);
     }
     // Extension activity icons (atlas SVGs), slots 5..5+n.
-    for (i, item) in ext_activity.iter().enumerate() {
+    for (i, (_stable, item)) in ext_activity_visible.iter().enumerate() {
         let key = format!("activity:{}", item.icon.display());
         let uv = gpu.icon_atlas.get(&key).or_else(|| {
             let bytes = std::fs::read(&item.icon).ok()?;

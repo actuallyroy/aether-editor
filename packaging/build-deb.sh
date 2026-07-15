@@ -33,6 +33,10 @@ install -Dm644 "$ROOT/logo.svg" \
 # /usr/share/aether/ext-host (see webview/exthost host_script()).
 mkdir -p "$STAGE/usr/share/aether"
 cp -r "$ROOT/ext-host" "$STAGE/usr/share/aether/ext-host"
+# Bundled ripgrep (extensions resolve VSCode's rg through the ext host).
+if [ -f "$ROOT/ripgrep/rg" ]; then
+    install -Dm755 "$ROOT/ripgrep/rg" "$STAGE/usr/share/aether/ripgrep/rg"
+fi
 
 # Installed size in KiB, for the control file.
 INSTALLED_SIZE="$(du -ks "$STAGE/usr" | cut -f1)"

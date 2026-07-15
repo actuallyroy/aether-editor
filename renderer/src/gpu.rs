@@ -305,7 +305,7 @@ impl GpuState {
             merge_hint_inc: TextLabel::new(&mut font_system, 300.0, theme::UI_LINE_HEIGHT()),
             tab_icons: std::collections::HashMap::new(),
             title_btn_icons: std::collections::HashMap::new(),
-            ext_tree_list: crate::widgets::IconList::new(&mut font_system, crate::theme::SIDEBAR_WIDTH(), 8000.0, crate::theme::UI_LINE_HEIGHT() * 1.4, crate::theme::zpx(8.0)),
+            ext_tree_list: crate::widgets::IconList::new(&mut font_system, crate::theme::SIDEBAR_WIDTH(), 8000.0, crate::theme::TREE_ROW_HEIGHT(), crate::theme::zpx(8.0)),
             palette_input: TextInput::new(&mut font_system, 600.0, theme::PALETTE_INPUT_HEIGHT()),
             settings_search: TextInput::new(&mut font_system, 900.0, theme::zpx(34.0)),
             settings_input: TextInput::new(&mut font_system, 360.0, theme::zpx(28.0)),

@@ -1009,7 +1009,7 @@ impl App {
         }
 
         let new_activity = layout
-            .activity_rects_ext(self.ext_activity_items().len())
+            .activity_rects_ext(self.ext_activity_visible().len())
             .iter()
             .position(|r| r.contains(p));
         if new_activity != self.hovered_activity {
@@ -1733,7 +1733,7 @@ impl App {
                 g.titlebar_btns[i].cursor()
             } else if let Some(i) = new_activity {
                 // Slots: 0..5 built-ins, 5..5+n extension icons, then account/gear.
-                let n_ext = self.ext_activity_items().len();
+                let n_ext = self.ext_activity_visible().len();
                 if i >= 5 && i < 5 + n_ext {
                     CursorIcon::Pointer
                 } else {
@@ -4783,12 +4783,20 @@ impl App {
 
     /// Extension activity-bar items (icon + the container's first webview view),
     /// in registry order.
+    /// ALL extension activity items, in stable registry order. `SidebarView::
+    /// ExtView(i)` indexes THIS list — never the filtered one, whose indices
+    /// shift whenever a when-clause context changes.
     pub(crate) fn ext_activity_items(&self) -> Vec<exthost::ActivityItem> {
-        self.ext_registry
-            .iter()
-            .flat_map(|e| e.activity.iter())
-            .filter(|a| self.eval_when(&a.when))
-            .cloned()
+        self.ext_registry.iter().flat_map(|e| e.activity.iter().cloned()).collect()
+    }
+
+    /// The activity items currently VISIBLE in the bar (when-clauses satisfied),
+    /// paired with their stable index into `ext_activity_items`.
+    pub(crate) fn ext_activity_visible(&self) -> Vec<(usize, exthost::ActivityItem)> {
+        self.ext_activity_items()
+            .into_iter()
+            .enumerate()
+            .filter(|(_, a)| self.eval_when(&a.when))
             .collect()
     }
 
@@ -7318,7 +7326,7 @@ impl App {
                     let tr = layout.tree_region();
                     if tr.contains((x, y)) {
                         let count = self.ext_trees.get(&item.view_id).map_or(0, |r| r.len());
-                        let hit = self
+                                                let hit = self
                             .gpu
                             .as_ref()
                             .and_then(|g| g.ui.ext_tree_list.row_at(tr, (x, y), count));
@@ -8053,7 +8061,8 @@ impl App {
             return;
         }
 
-        let n_ext_activity = self.ext_activity_items().len();
+        let visible_activity = self.ext_activity_visible();
+        let n_ext_activity = visible_activity.len();
         if let Some(idx) = layout.activity_rects_ext(n_ext_activity).iter().position(|r| r.contains((x, y))) {
             // 0 = Explorer, 4 = Extensions, 5.. = extension containers. Clicking the
             // active view's icon toggles the sidebar; another switches to it.
@@ -8063,7 +8072,9 @@ impl App {
                 2 => Some(SidebarView::SourceControl),
                 3 => Some(SidebarView::Debug),
                 4 => Some(SidebarView::Extensions),
-                i if i >= 5 && i < 5 + n_ext_activity => Some(SidebarView::ExtView(i - 5)),
+                i if i >= 5 && i < 5 + n_ext_activity => {
+                    Some(SidebarView::ExtView(visible_activity[i - 5].0))
+                }
                 _ => None,
             };
             if let Some(v) = view {

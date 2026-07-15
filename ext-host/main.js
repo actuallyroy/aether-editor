@@ -31,6 +31,25 @@ rpc.on_method('host/init', (p) => {
   // Follow the workspace: extensions spawn helpers (e.g. the claude binary) that
   // inherit our cwd.
   try { if (p.root) process.chdir(p.root); } catch (_) {}
+  // Bundled ripgrep: synthesize a VSCode-shaped appRoot
+  // (<appRoot>/node_modules/@vscode/ripgrep/bin/rg) pointing at aether's rg, so
+  // extensions that resolve VSCode's bundled ripgrep (Todo Tree etc.) find it.
+  if (p.rgPath) {
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const os = require('os');
+      const appRoot = path.join(os.homedir(), '.aether', 'approot');
+      const binDir = path.join(appRoot, 'node_modules', '@vscode', 'ripgrep', 'bin');
+      const dest = path.join(binDir, process.platform === 'win32' ? 'rg.exe' : 'rg');
+      fs.mkdirSync(binDir, { recursive: true });
+      // Refresh the link/copy if it points elsewhere (updated install path).
+      try { fs.unlinkSync(dest); } catch (_) {}
+      if (process.platform === 'win32') fs.copyFileSync(p.rgPath, dest);
+      else fs.symlinkSync(p.rgPath, dest);
+      p.appRoot = appRoot;
+    } catch (e) { console.error('[ext-host] ripgrep approot setup failed:', e.message); }
+  }
   dispatch.setWorkspace(p);
 });
 rpc.on_method('workspace/didChangeConfiguration', (p) => dispatch.setWorkspace(p));

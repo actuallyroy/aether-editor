@@ -144,7 +144,11 @@ impl ExtHost {
         // uri extensions derive from the workspace — directory-walk loops in
         // MPE/crossnote never terminate on relative paths (dirname('.') == '.').
         let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        self.notify("host/init", json!({ "root": root.to_string_lossy() }));
+        let mut params = json!({ "root": root.to_string_lossy() });
+        if let Some(rg) = bundled_ripgrep() {
+            params["rgPath"] = json!(rg.to_string_lossy());
+        }
+        self.notify("host/init", params);
     }
     pub fn activate(&self, ext_path: &Path) -> i64 {
         self.request("activate", json!({ "extensionPath": ext_path.to_string_lossy() }))
@@ -591,6 +595,34 @@ pub fn user_extensions_dir() -> Option<PathBuf> {
 /// derived from the host script location.
 pub fn bundled_extensions_dir() -> Option<PathBuf> {
     host_script().and_then(|p| p.parent().map(|d| d.to_path_buf()))
+}
+
+/// The ripgrep binary aether ships (extensions resolve VSCode's bundled rg —
+/// Todo Tree and friends). Lives in `ripgrep/` next to `ext-host/`; falls back
+/// to a system rg on PATH for dev builds.
+pub fn bundled_ripgrep() -> Option<PathBuf> {
+    let name = if cfg!(windows) { "rg.exe" } else { "rg" };
+    if let Some(dir) = bundled_extensions_dir().and_then(|d| d.parent().map(|p| p.to_path_buf())) {
+        let p = dir.join("ripgrep").join(name);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    // ext-host dir itself may hold it (dev: repo has ext-host/../ripgrep absent).
+    if let Some(dir) = bundled_extensions_dir() {
+        let p = dir.join("ripgrep").join(name);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    // Dev fallback: whatever rg is on PATH.
+    for base in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"] {
+        let p = PathBuf::from(base).join(name);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
 }
 
 fn dirs_home() -> Option<PathBuf> {

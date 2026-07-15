@@ -81,6 +81,15 @@ jobs:
       # Linux extras: a Debian package (apt/dpkg) and a portable AppImage, both
       # built from the binary above. The .deb also feeds the hosted APT repo
       # (see .github/workflows/pages.yml).
+      - name: Fetch ripgrep (bundled for extensions)
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          set -e
+          RGV=14.1.1
+          curl -sL -o rg.tar.gz "https://github.com/BurntSushi/ripgrep/releases/download/${RGV}/ripgrep-${RGV}-x86_64-unknown-linux-musl.tar.gz"
+          mkdir -p ripgrep && tar -xzf rg.tar.gz --strip-components=1 -C ripgrep "ripgrep-${RGV}-x86_64-unknown-linux-musl/rg"
+          chmod +x ripgrep/rg
+
       - name: Build Linux .deb + AppImage
         if: matrix.os == 'ubuntu-22.04'
         run: |
@@ -98,6 +107,16 @@ jobs:
       # optional PATH entry, and a real Add/Remove Programs uninstaller. The
       # bare aether.exe staged above is kept too (the in-app updater downloads
       # it to self-replace, and it doubles as a portable exe).
+      - name: Fetch ripgrep (bundled for extensions)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $rgv = "14.1.1"
+          iwr "https://github.com/BurntSushi/ripgrep/releases/download/$rgv/ripgrep-$rgv-x86_64-pc-windows-msvc.zip" -OutFile rg.zip
+          Expand-Archive rg.zip -DestinationPath rgtmp
+          New-Item -ItemType Directory -Force ripgrep | Out-Null
+          Copy-Item "rgtmp/ripgrep-$rgv-x86_64-pc-windows-msvc/rg.exe" ripgrep/rg.exe
+
       - name: Build Windows installer (Inno Setup)
         if: matrix.os == 'windows-latest'
         shell: pwsh
@@ -119,6 +138,15 @@ jobs:
       # target). The bare binary above is kept too — the in-app auto-updater
       # downloads `aether-macos-arm64` to self-replace. The .app is unsigned, so
       # first launch needs right-click → Open (or `xattr -cr /Applications/Aether.app`).
+      - name: Fetch ripgrep (bundled for extensions)
+        if: matrix.os == 'macos-latest'
+        run: |
+          set -e
+          RGV=14.1.1
+          curl -sL -o rg.tar.gz "https://github.com/BurntSushi/ripgrep/releases/download/${RGV}/ripgrep-${RGV}-aarch64-apple-darwin.tar.gz"
+          mkdir -p ripgrep && tar -xzf rg.tar.gz --strip-components=1 -C ripgrep "ripgrep-${RGV}-aarch64-apple-darwin/rg"
+          chmod +x ripgrep/rg
+
       - name: Bundle macOS .app + DMG
         if: matrix.os == 'macos-latest'
         run: |
@@ -131,6 +159,8 @@ jobs:
           chmod +x "$APP/Contents/MacOS/aether"
           # Node extension host — host_script() looks next to the executable.
           cp -R ext-host "$APP/Contents/MacOS/ext-host"
+          # Bundled ripgrep — extensions resolve VSCode's rg via the ext host.
+          if [ -f ripgrep/rg ]; then mkdir -p "$APP/Contents/MacOS/ripgrep"; cp ripgrep/rg "$APP/Contents/MacOS/ripgrep/rg"; fi
           cat > "$APP/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

@@ -23,6 +23,9 @@ install -Dm644 "$ROOT/packaging/aether.desktop" "$APPDIR/usr/share/applications/
 install -Dm644 "$ROOT/logo.svg" "$APPDIR/usr/share/icons/hicolor/scalable/apps/aether.svg"
 mkdir -p "$APPDIR/usr/share/aether"
 cp -r "$ROOT/ext-host" "$APPDIR/usr/share/aether/ext-host"
+if [ -f "$ROOT/ripgrep/rg" ]; then
+    install -Dm755 "$ROOT/ripgrep/rg" "$APPDIR/usr/share/aether/ripgrep/rg"
+fi
 
 # appimagetool looks for the desktop file and icon at the AppDir root.
 cp "$APPDIR/usr/share/applications/aether.desktop" "$APPDIR/aether.desktop"

@@ -659,7 +659,7 @@ function createVscode(rpc) {
     env: {
       appName: 'Aether', appHost: 'desktop', language: 'en',
       machineId: 'aether', sessionId: 'aether-' + process.pid,
-      uriScheme: 'aether', appRoot: '', shell: process.env.SHELL || '/bin/bash',
+      uriScheme: 'aether', get appRoot() { return ws.appRoot || ''; }, shell: process.env.SHELL || '/bin/bash',
       remoteName: undefined, uiKind: 1, isNewAppInstall: false, isTelemetryEnabled: false,
       onDidChangeTelemetryEnabled: () => new Disposable(() => {}),
       asExternalUri: (uri) => Promise.resolve(uri),
@@ -717,9 +717,10 @@ function createVscode(rpc) {
   // ---- inbound dispatch (aether -> host), wired by main.js ----
   const dispatch = {
     // host/init + settings updates land here.
-    setWorkspace({ root, settings }) {
+    setWorkspace({ root, settings, appRoot }) {
       // Defense in depth: a relative root breaks extensions' directory walks.
       if (root) ws.root = require('path').resolve(root);
+      if (appRoot) ws.appRoot = appRoot; // VSCode-shaped dir carrying bundled ripgrep
       if (settings && typeof settings === 'object') Object.assign(ws.settings, settings);
     },
     // activation.js registers each activated extension's contributed config defaults.

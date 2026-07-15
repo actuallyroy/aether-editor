@@ -58,6 +58,8 @@ Source: "aether.ico"; DestDir: "{app}"; Flags: ignoreversion
 ; Node extension host — resolved by the app next to the executable
 ; (renderer/src/exthost host_script()). Without it extensions can't run.
 Source: "..\..\ext-host\*"; DestDir: "{app}\ext-host"; Flags: ignoreversion recursesubdirs
+; Bundled ripgrep (extensions resolve VSCode's rg through the ext host).
+Source: "..\..\ripgrep\rg.exe"; DestDir: "{app}\ripgrep"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\aether.ico"
