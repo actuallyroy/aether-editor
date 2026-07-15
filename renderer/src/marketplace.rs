@@ -68,6 +68,8 @@ pub enum WorkerMsg {
     LspHover { id: i64, markdown: String },                     // textDocument/hover response (display text)
     // ---- Extension host (see exthost/mod.rs) ----
     ExtHostReady,                                               // the Node host connected + handshook
+    /// An aether:// deep link from the OS (OAuth callbacks) — forwarded to extensions.
+    OpenUrl(String),
     ExtHostMsg { value: serde_json::Value },                   // an inbound JSON-RPC message from the host
     ExtHostExited,
     /// An event line from a webview-host process (ready / message / closed).

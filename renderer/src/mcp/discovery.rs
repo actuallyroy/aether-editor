@@ -27,6 +27,9 @@ fn set_mode(_path: &Path, _mode: u32) {}
 pub fn write_lock(port: u16, workspace: &Path, token: &str) -> Option<PathBuf> {
     let dir = ide_dir()?;
     let path = dir.join(format!("{port}.lock"));
+    // ALWAYS absolute — clients match their cwd against this path; a relative
+    // "." (from `aether .`) never matches and the IDE tools silently vanish.
+    let workspace = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
     let body = json!({
         "pid": std::process::id(),
         "workspaceFolders": [workspace.to_string_lossy()],

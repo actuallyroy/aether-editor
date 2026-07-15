@@ -247,13 +247,21 @@ impl Layout {
     /// Single source of truth for activity-bar button rects: 5 at the top,
     /// 2 (account, settings) pinned to the bottom. Index matches the icon order.
     pub fn activity_rects(&self) -> Vec<Rect> {
+        self.activity_rects_ext(0)
+    }
+
+    /// Activity-bar cells with `n_ext` extension icons stacked after the 5
+    /// built-ins; the last two cells (account, gear) stay bottom-anchored.
+    /// Index map: 0..5 built-ins, 5..5+n_ext extensions, then account, gear.
+    pub fn activity_rects_ext(&self, n_ext: usize) -> Vec<Rect> {
         let ab = self.activity_bar;
-        (0..7)
+        let top = 5 + n_ext;
+        (0..top + 2)
             .map(|i| {
-                let y = if i < 5 {
+                let y = if i < top {
                     ab.y + i as f32 * theme::ACTIVITY_CELL()
                 } else {
-                    ab.y + ab.h - (7 - i) as f32 * theme::ACTIVITY_CELL()
+                    ab.y + ab.h - (top + 2 - i) as f32 * theme::ACTIVITY_CELL()
                 };
                 Rect {
                     x: ab.x,
@@ -480,6 +488,7 @@ pub(crate) fn active_activity_idx(sidebar_visible: bool, view: SidebarView) -> O
         SidebarView::SourceControl => Some(2),
         SidebarView::Debug => Some(3),
         SidebarView::Extensions => Some(4),
+        SidebarView::ExtView(i) => Some(5 + i),
     }
 }
 

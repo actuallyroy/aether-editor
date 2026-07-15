@@ -189,6 +189,7 @@ function createVscode(rpc) {
   let nextProviderId = 1;
   const hoverProviders = new Map(); // providerId -> {selector, provider}
   const commands = new Map();       // command -> callback
+  const uriHandlers = [];           // window.registerUriHandler handlers (deep links)
 
   // ---- webviews (rendered by aether's webview-host process) ----
   const webviewProviders = new Map(); // viewId -> { provider, options }
@@ -284,7 +285,7 @@ function createVscode(rpc) {
   }
 
   const vscode = {
-    version: '1.90.0',
+    version: '1.106.0',
     Position, Range, Selection, MarkdownString, Hover, Disposable, Uri,
     EventEmitter: VsEvent,
     StatusBarAlignment,
@@ -293,6 +294,24 @@ function createVscode(rpc) {
     CancellationTokenSource,
     RelativePattern,
     ViewColumn: { Active: -1, Beside: -2, One: 1, Two: 2, Three: 3 },
+    // Code-action kinds are dotted-string hierarchies in VSCode; extensions read
+    // these constants at module load (Cline: CodeActionKind.QuickFix).
+    CodeActionKind: (() => {
+      const kind = (v) => ({ value: v, append: (p) => kind(v ? v + '.' + p : p), contains: (o) => String(o && o.value).startsWith(v) });
+      return {
+        Empty: kind(''),
+        QuickFix: kind('quickfix'),
+        Refactor: kind('refactor'),
+        RefactorExtract: kind('refactor.extract'),
+        RefactorInline: kind('refactor.inline'),
+        RefactorMove: kind('refactor.move'),
+        RefactorRewrite: kind('refactor.rewrite'),
+        Source: kind('source'),
+        SourceOrganizeImports: kind('source.organizeImports'),
+        SourceFixAll: kind('source.fixAll'),
+        Notebook: kind('notebook'),
+      };
+    })(),
     ProgressLocation: { SourceControl: 1, Window: 10, Notification: 15 },
     ExtensionMode: { Production: 1, Development: 2, Test: 3 },
     UIKind: { Desktop: 1, Web: 2 },
@@ -385,7 +404,16 @@ function createVscode(rpc) {
       get onDidCloseTerminal() { return onDidCloseTerminal.event; },
       onDidChangeActiveTerminal: () => new Disposable(() => {}),
       onDidChangeTerminalState: () => new Disposable(() => {}),
-      registerUriHandler: () => new Disposable(() => {}),
+      // aether:// deep links (OAuth callbacks etc.) arrive via window/handleUri
+      // and are fanned out to every registered handler (VSCode routes by owning
+      // extension; with one host process the fan-out is equivalent in practice).
+      registerUriHandler: (handler) => {
+        uriHandlers.push(handler);
+        return new Disposable(() => {
+          const i = uriHandlers.indexOf(handler);
+          if (i >= 0) uriHandlers.splice(i, 1);
+        });
+      },
       registerWebviewPanelSerializer: () => new Disposable(() => {}),
       createWebviewPanel: (viewType, title, _showOpts, _options) => {
         // A webview panel is just another webview instance; aether shows it in its
@@ -687,6 +715,14 @@ function createVscode(rpc) {
     webviewMessage({ instanceId, data }) {
       const inst = webviewInstances.get(instanceId);
       if (inst) inst.onMessage.fire(data);
+    },
+    // An aether:// deep link arrived (OAuth callback etc.) — hand it to every
+    // registered uri handler as a vscode.Uri.
+    handleUri({ uri }) {
+      const u = Uri.parse(uri);
+      for (const h of uriHandlers) {
+        try { (h.handleUri || h)(u); } catch (e) { console.error('[uri-handler]', e.message); }
+      }
     },
     webviewDisposed({ instanceId }) {
       const inst = webviewInstances.get(instanceId);

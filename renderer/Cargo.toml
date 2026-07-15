@@ -1,6 +1,6 @@
 [package]
 name = "aether-renderer"
-version = "0.5.10"
+version = "0.5.11"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -52,6 +52,9 @@ notify = "6"
 # custom in-window menu instead.
 [target.'cfg(target_os = "macos")'.dependencies]
 muda = "0.16"
+# aether:// URL scheme (OAuth deep links): Apple Event handler for kAEGetURL.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSObject"] }
 # Extension webviews: an in-process WKWebView attached as a child NSView of the
 # editor window (no separate host process / virtual display needed on macOS).
 wry = "0.47"

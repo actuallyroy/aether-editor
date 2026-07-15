@@ -339,6 +339,31 @@ pub struct ExtInfo {
     pub views: Vec<(String, String)>,
     /// Editor-title buttons from `contributes.menus."editor/title"` (navigation group).
     pub title_buttons: Vec<TitleButton>,
+    /// Activity-bar containers from `contributes.viewsContainers.activitybar`:
+    /// the icon opens the container's first webview view in the sidebar.
+    pub activity: Vec<ActivityItem>,
+    /// Sidebar view-header buttons from `contributes.menus."view/title"`:
+    /// `(view id, button)` — shown when that view is active in the sidebar.
+    pub view_buttons: Vec<(String, TitleButton)>,
+    /// View ids contributed to `viewsContainers.secondarySidebar` — these dock in
+    /// aether's RIGHT panel (VSCode's auxiliary bar).
+    pub secondary_views: Vec<String>,
+}
+
+/// One extension activity-bar icon (VSCode's viewsContainers.activitybar).
+#[derive(Clone)]
+pub struct ActivityItem {
+    pub title: String,
+    /// Absolute path to the container icon (usually SVG).
+    pub icon: PathBuf,
+    /// The first view registered under this container.
+    pub view_id: String,
+    /// True when that view is a webview ("type": "webview") — tree views (the
+    /// default) aren't renderable yet.
+    pub is_webview: bool,
+    /// Container `when` clause (context keys via setContext) — Claude Code gates
+    /// its two containers on doesNotSupportSecondarySidebar/sessionsListEnabled.
+    pub when: String,
 }
 
 /// One `editor/title` toolbar button an extension contributes (VSCode shows these
@@ -350,6 +375,8 @@ pub struct TitleButton {
     pub when: String,
     /// Absolute path to the button's icon (dark variant), when it's a file.
     pub icon: Option<PathBuf>,
+    /// Codicon name when the icon is a `$(name)` token instead of a file.
+    pub codicon: Option<String>,
     /// Command title — tooltip/fallback.
     pub title: String,
 }
@@ -385,6 +412,7 @@ pub fn discover(dirs: &[PathBuf]) -> Vec<ExtInfo> {
                 s.to_string()
             };
             let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("ext").to_string();
+            let display_name = localize(v.get("displayName").and_then(|n| n.as_str()).unwrap_or(&name));
             let activation_events = v
                 .get("activationEvents")
                 .and_then(|a| a.as_array())
@@ -413,11 +441,13 @@ pub fn discover(dirs: &[PathBuf]) -> Vec<ExtInfo> {
                         .flatten()
                         .filter_map(|view| {
                             let id = view.get("id")?.as_str()?.to_string();
+                            // Empty view name (Cline does this) → the extension's
+                            // displayName, so the palette row is findable by name.
                             let name = localize(
                                 view.get("name")
                                     .and_then(|n| n.as_str())
                                     .filter(|n| !n.is_empty())
-                                    .unwrap_or(&id),
+                                    .unwrap_or(&display_name),
                             );
                             Some((id, name))
                         })
@@ -443,9 +473,13 @@ pub fn discover(dirs: &[PathBuf]) -> Vec<ExtInfo> {
                                 .pointer("/contributes/commands")
                                 .and_then(|c| c.as_array())
                                 .and_then(|arr| arr.iter().find(|c| c.get("command").and_then(|x| x.as_str()) == Some(&command)));
-                            let icon = cmd_def
+                            let raw_icon = cmd_def
                                 .and_then(|c| c.get("icon"))
-                                .and_then(|i| i.get("dark").and_then(|d| d.as_str()).or_else(|| i.as_str()))
+                                .and_then(|i| i.get("dark").and_then(|d| d.as_str()).or_else(|| i.as_str()));
+                            let codicon = raw_icon
+                                .and_then(|s| s.strip_prefix("$(").and_then(|x| x.strip_suffix(')')))
+                                .map(String::from);
+                            let icon = raw_icon
                                 .filter(|s| !s.starts_with("$("))
                                 .map(|rel| p.join(rel.trim_start_matches("./")));
                             let title = localize(
@@ -454,12 +488,93 @@ pub fn discover(dirs: &[PathBuf]) -> Vec<ExtInfo> {
                                     .and_then(|t| t.as_str())
                                     .unwrap_or(&command),
                             );
-                            Some(TitleButton { command, when, icon, title })
+                            Some(TitleButton { command, when, icon, codicon, title })
                         })
                         .collect()
                 })
                 .unwrap_or_default();
-            out.push(ExtInfo { path: p, name, activation_events, commands, views, title_buttons });
+            // Activity-bar containers → icon + the container's first view.
+            let activity = v
+                .pointer("/contributes/viewsContainers/activitybar")
+                .and_then(|a| a.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|c| {
+                            let cid = c.get("id")?.as_str()?;
+                            let title = localize(c.get("title").and_then(|t| t.as_str()).unwrap_or(cid));
+                            let icon = p.join(
+                                c.get("icon")?.as_str()?.trim_start_matches("./"),
+                            );
+                            // First view in this container (views is keyed by container id).
+                            let first = v
+                                .pointer(&format!("/contributes/views/{}", cid.replace('~', "~0").replace('/', "~1")))
+                                .and_then(|vs| vs.as_array())
+                                .and_then(|vs| vs.first())?;
+                            let view_id = first.get("id").and_then(|id| id.as_str())?.to_string();
+                            let is_webview = first.get("type").and_then(|t| t.as_str()) == Some("webview");
+                            let when = c.get("when").and_then(|w| w.as_str()).unwrap_or("").to_string();
+                            Some(ActivityItem { title, icon, view_id, when, is_webview })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            // view/title buttons (sidebar view header row, e.g. Cline's +/history/gear).
+            let view_buttons = v
+                .pointer("/contributes/menus/view~1title")
+                .and_then(|m| m.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| {
+                            let command = item.get("command")?.as_str()?.to_string();
+                            if item.get("group").and_then(|g| g.as_str()).map_or(true, |g| !g.starts_with("navigation")) {
+                                return None;
+                            }
+                            let when = item.get("when").and_then(|w| w.as_str()).unwrap_or("");
+                            // `view == <id>` — the view whose header shows this button.
+                            let view_id = when
+                                .split("&&")
+                                .find_map(|t| t.trim().strip_prefix("view ==").map(|v| v.trim().to_string()))?;
+                            let cmd_def = v
+                                .pointer("/contributes/commands")
+                                .and_then(|c| c.as_array())
+                                .and_then(|arr| arr.iter().find(|c| c.get("command").and_then(|x| x.as_str()) == Some(&command)));
+                            let raw_icon = cmd_def
+                                .and_then(|c| c.get("icon"))
+                                .and_then(|i| i.get("dark").and_then(|d| d.as_str()).or_else(|| i.as_str()));
+                            let codicon = raw_icon
+                                .and_then(|s| s.strip_prefix("$(").and_then(|x| x.strip_suffix(')')))
+                                .map(String::from);
+                            let icon = raw_icon
+                                .filter(|s| !s.starts_with("$("))
+                                .map(|rel| p.join(rel.trim_start_matches("./")));
+                            let title = localize(
+                                cmd_def.and_then(|c| c.get("title")).and_then(|t| t.as_str()).unwrap_or(&command),
+                            );
+                            Some((view_id, TitleButton { command, when: String::new(), icon, codicon, title }))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let secondary_views = v
+                .pointer("/contributes/viewsContainers/secondarySidebar")
+                .and_then(|a| a.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|c| c.get("id").and_then(|i| i.as_str()))
+                        .filter_map(|cid| {
+                            v.pointer(&format!("/contributes/views/{}", cid.replace('~', "~0").replace('/', "~1")))
+                                .and_then(|vs| vs.as_array())
+                                .map(|vs| {
+                                    vs.iter()
+                                        .filter_map(|view| view.get("id").and_then(|i| i.as_str()).map(String::from))
+                                        .collect::<Vec<_>>()
+                                })
+                        })
+                        .flatten()
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push(ExtInfo { path: p, name, activation_events, commands, views, title_buttons, activity, view_buttons, secondary_views });
         }
     }
     out

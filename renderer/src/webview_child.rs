@@ -140,9 +140,9 @@ impl ChildWebview {
             .with_url(PAGE_URL)
             .build_as_child(window)
             .map_err(|e| e.to_string())?;
-        // The view exists as soon as it's built — tell the App to open its tab
-        // (the Linux host reports `ready` once its GTK window is up).
-        emit(json!({"event": "ready", "xid": 0}));
+        // NOTE: no `ready` emit here — WKWebView construction can spin a nested
+        // runloop, draining the event before the caller has even stored this
+        // handle. The App emits `ready` itself after pushing the handle.
         Ok(ChildWebview {
             instance_id,
             view_id: view_id.to_string(),

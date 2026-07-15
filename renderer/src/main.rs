@@ -55,6 +55,8 @@ mod nav;
 mod macos_menu;
 #[cfg(target_os = "macos")]
 mod macos_launcher;
+#[cfg(target_os = "macos")]
+mod macos_urls;
 mod perf;
 mod update;
 mod media;
@@ -204,6 +206,8 @@ pub(crate) enum SidebarView {
     SourceControl,
     Debug,
     Extensions,
+    /// An extension's activity-bar container (index into App::ext_activity_items).
+    ExtView(usize),
 }
 
 /// What a modal dialog confirms.
@@ -568,6 +572,20 @@ pub(crate) struct App {
     /// Document versions already sent to the extension host (uri → version), so we send
     /// `didOpen` once and `didChange` only when the text actually changes.
     pub(crate) ext_doc_versions: std::collections::HashMap<String, i32>,
+    /// Debounce probe for ext-host doc sync: last unsynced (version, seen-at).
+    pub(crate) ext_doc_probe: std::collections::HashMap<String, (i32, Instant)>,
+    /// Extension `setContext` keys — evaluated by editor/title when-clauses.
+    pub(crate) ext_context: std::collections::HashMap<String, serde_json::Value>,
+    /// View ids requested to open in the SIDEBAR (activity-bar click) — consumed
+    /// when their webview reports ready.
+    pub(crate) webview_sidebar_pending: std::collections::HashSet<String>,
+    /// Where each webview instance is docked: 0 = editor tab, 1 = left sidebar,
+    /// 2 = right panel (VSCode's secondary sidebar).
+    pub(crate) webview_targets: std::collections::HashMap<i64, u8>,
+    /// View ids that must dock in the RIGHT panel when their webview readies.
+    pub(crate) webview_right_pending: std::collections::HashSet<String>,
+    /// Per-instance last-applied (x, y, w, h, visible) — skip redundant syncs.
+    pub(crate) webview_rects: std::collections::HashMap<i64, (i32, i32, u32, u32, bool)>,
     /// Discovered runnable extensions and which have already been activated (so an
     /// `onLanguage` extension fires once, when a matching file first opens).
     pub(crate) ext_registry: Vec<exthost::ExtInfo>,
@@ -803,6 +821,12 @@ impl App {
             ext_hover_providers: Vec::new(),
             ext_hover_req: None,
             ext_doc_versions: std::collections::HashMap::new(),
+            ext_doc_probe: std::collections::HashMap::new(),
+            ext_context: std::collections::HashMap::new(),
+            webview_sidebar_pending: std::collections::HashSet::new(),
+            webview_targets: std::collections::HashMap::new(),
+            webview_right_pending: std::collections::HashSet::new(),
+            webview_rects: std::collections::HashMap::new(),
             ext_registry: Vec::new(),
             ext_activated: std::collections::HashSet::new(),
             ext_status_items: Vec::new(),
@@ -959,7 +983,10 @@ impl App {
             changed = true;
         }
 
-        let new_activity = layout.activity_rects().iter().position(|r| r.contains(p));
+        let new_activity = layout
+            .activity_rects_ext(self.ext_activity_items().len())
+            .iter()
+            .position(|r| r.contains(p));
         if new_activity != self.hovered_activity {
             self.hovered_activity = new_activity;
             changed = true;
@@ -1576,7 +1603,9 @@ impl App {
         } else if self.active_webview().is_some() && self.webview_rel(p.0, p.1).is_some() {
             // Webview pane: mirror the PAGE's cursor (reported on hover changes).
             self.webview_cursor
-        } else if self.ext_title_buttons().iter().any(|(r, ..)| r.contains(p)) {
+        } else if self.ext_title_buttons().iter().any(|(r, ..)| r.contains(p))
+            || self.ext_view_buttons().iter().any(|(r, ..)| r.contains(p))
+        {
             CursorIcon::Pointer
         } else if let Some(c) = chat_cursor {
             c
@@ -1678,7 +1707,14 @@ impl App {
             if let Some(i) = new_titlebtn {
                 g.titlebar_btns[i].cursor()
             } else if let Some(i) = new_activity {
-                g.activity_btns[i].cursor()
+                // Slots: 0..5 built-ins, 5..5+n extension icons, then account/gear.
+                let n_ext = self.ext_activity_items().len();
+                if i >= 5 && i < 5 + n_ext {
+                    CursorIcon::Pointer
+                } else {
+                    let btn = if i < 5 { i } else { i - n_ext };
+                    g.activity_btns.get(btn).map(|b| b.cursor()).unwrap_or(CursorIcon::Pointer)
+                }
             } else if new_close.is_some() {
                 g.tab_close_btn.cursor()
             } else if new_tab.is_some() {
@@ -1825,6 +1861,9 @@ impl App {
             SidebarView::SourceControl => "scm",
             SidebarView::Debug => "debug",
             SidebarView::Extensions => "extensions",
+            // Ext containers aren't persisted (registry order can change between
+            // runs) — restore lands on the explorer.
+            SidebarView::ExtView(_) => "explorer",
         }
     }
 
@@ -4436,7 +4475,7 @@ impl App {
         if when.trim().is_empty() {
             return true;
         }
-        let Some(lang) = self.active_doc_lang() else { return false };
+        let lang = self.active_doc_lang(); // lazy: context-key terms don't need a doc
         when.split("&&").all(|term| {
             let t = term.trim();
             let (key, op, val) = if let Some((k, v)) = t.split_once("==") {
@@ -4446,17 +4485,25 @@ impl App {
             } else if let Some((k, v)) = t.split_once("=~") {
                 (k.trim(), "=~", v.trim())
             } else {
-                return false;
+                // Bare (possibly negated) context key set via `setContext`.
+                let (neg, k) = t.strip_prefix('!').map_or((false, t), |k| (true, k.trim()));
+                let truthy = self
+                    .ext_context
+                    .get(k)
+                    .map(|v| v.as_bool().unwrap_or(!v.is_null()))
+                    .unwrap_or(false);
+                return truthy != neg;
             };
             if key != "editorLangId" && key != "resourceLangId" {
                 return false;
             }
+            let Some(lang) = lang.as_deref() else { return false };
             match op {
                 "==" => lang == val.trim_matches('\''),
                 "!=" => lang != val.trim_matches('\''),
                 _ => {
                     let re = val.trim_start_matches('/').trim_end_matches('/');
-                    fancy_regex::Regex::new(re).ok().map_or(false, |r| r.is_match(&lang).unwrap_or(false))
+                    fancy_regex::Regex::new(re).ok().map_or(false, |r| r.is_match(lang).unwrap_or(false))
                 }
             }
         })
@@ -4464,7 +4511,9 @@ impl App {
 
     /// The extension title-bar buttons applicable to the active editor, with their
     /// tab-strip rects (right-aligned): `(rect, command, icon path, title)`.
-    pub(crate) fn ext_title_buttons(&self) -> Vec<(widgets::Rect, String, Option<std::path::PathBuf>, String)> {
+    pub(crate) fn ext_title_buttons(
+        &self,
+    ) -> Vec<(widgets::Rect, String, Option<std::path::PathBuf>, Option<char>, String)> {
         let l = self.layout();
         if l.tab_strip.h <= 0.0 {
             return Vec::new();
@@ -4474,11 +4523,12 @@ impl App {
         let mut x = l.tab_strip.x + l.tab_strip.w - s - theme::zpx(4.0);
         for e in &self.ext_registry {
             for b in &e.title_buttons {
-                if b.icon.is_none() || !self.eval_when(&b.when) {
+                let glyph = b.codicon.as_deref().and_then(crate::codicon_names::codicon);
+                if (b.icon.is_none() && glyph.is_none()) || !self.eval_when(&b.when) {
                     continue;
                 }
                 let rect = widgets::Rect { x, y: l.tab_strip.y, w: s, h: l.tab_strip.h };
-                out.push((rect, b.command.clone(), b.icon.clone(), b.title.clone()));
+                out.push((rect, b.command.clone(), b.icon.clone(), glyph, b.title.clone()));
                 x -= s;
             }
         }
@@ -4534,52 +4584,83 @@ impl App {
         }
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
-            let Some((instance, _)) = self.webview_dock else { return };
-            let tab = self.workspace.documents.iter().position(|d| d.webview == Some(instance));
-            let Some(tab) = tab else {
-                // Tab closed → dispose the webview like VSCode does.
-                self.webview_dock = None;
-                self.webview_dock_rect = None;
-                self.webviews.retain(|w| w.instance_id != instance);
-                if let Some(h) = self.ext_host.as_ref() {
-                    h.notify("webview/disposed", serde_json::json!({ "instanceId": instance }));
-                }
-                return;
-            };
-            // The NSView is composited ABOVE our surface, so hide it whenever an
-            // editor overlay (menu, palette, dialog, context menu) must draw over
-            // the pane — and whenever its tab isn't the active one.
+            // Every webview instance is a child NSView composited ABOVE our surface.
+            // Sync each one's bounds + visibility: exactly one (the active tab's, or
+            // the selected sidebar view's) may be visible; everything else hides.
             let overlay_open = self.open_menu.is_some()
                 || self.ctx_menu.is_some()
                 || self.palette.active
                 || self.dialog.is_some()
-                || self.feedback_form.is_some()
-                // Extension detail page renders in the editor area WITHOUT switching
-                // the active tab — the webview must yield to it.
-                || self.detail.open_extension.is_some();
-            let active = self.workspace.active == Some(tab) && !overlay_open;
+                || self.feedback_form.is_some();
             let l = self.layout();
-            let x = l.gutter.x.min(l.editor_text.x);
-            let w = (l.editor_text.x + l.editor_text.w) - x;
-            // WKWebView already renders at the display's scale factor — only apply
-            // the USER-zoom component (ui_zoom tracks physical px; the page tracks
-            // logical points), or the page ends up double-scaled on retina.
             let sf = self.gpu.as_ref().map(|g| g.window.scale_factor()).unwrap_or(1.0);
+            let win_h = self.gpu.as_ref().map(|g| g.config.height).unwrap_or(0);
+            // WKWebView already renders at the display's scale factor — only apply
+            // the USER-zoom component, or the page double-scales on retina.
             let zoom = theme::ui_zoom() as f64 / sf;
-            let rect = (
-                if active { (zoom * 100.0) as i32 } else { i32::MIN },
-                l.editor_text.y as i32,
-                w as u32,
-                l.editor_text.h as u32,
-            );
-            if self.webview_dock_rect == Some(rect) {
-                return;
+            let sidebar_view_id: Option<String> = match self.sidebar_view {
+                SidebarView::ExtView(i) if self.sidebar_visible => {
+                    self.ext_activity_items().get(i).map(|a| a.view_id.clone())
+                }
+                _ => None,
+            };
+            let editor_region = {
+                let x = l.gutter.x.min(l.editor_text.x);
+                widgets::Rect {
+                    x,
+                    y: l.editor_text.y,
+                    w: (l.editor_text.x + l.editor_text.w) - x,
+                    h: l.editor_text.h,
+                }
+            };
+            let mut disposed: Vec<i64> = Vec::new();
+            for w in &self.webviews {
+                // No target yet ⇒ `ready` hasn't processed — leave it alone (it was
+                // getting disposed here before its tab even existed).
+                let Some(target) = self.webview_targets.get(&w.instance_id).copied() else {
+                    continue;
+                };
+                let (region, showing) = if target == 1 {
+                    (l.panel_region(), sidebar_view_id.as_deref() == Some(w.view_id.as_str()))
+                } else if target == 2 {
+                    let hdr = theme::zpx(28.0);
+                    let r = widgets::Rect {
+                        x: l.right_sidebar.x,
+                        y: l.right_sidebar.y + hdr,
+                        w: l.right_sidebar.w,
+                        h: (l.right_sidebar.h - hdr).max(0.0),
+                    };
+                    (r, self.right_sidebar_visible && l.right_sidebar.w > 0.0)
+                } else {
+                    let tab = self.workspace.documents.iter().position(|d| d.webview == Some(w.instance_id));
+                    if tab.is_none() {
+                        disposed.push(w.instance_id); // tab closed → dispose below
+                        continue;
+                    }
+                    // Extension detail page renders in the editor area WITHOUT
+                    // switching the active tab — the webview must yield to it.
+                    let showing = self.workspace.active == tab && self.detail.open_extension.is_none();
+                    (editor_region, showing)
+                };
+                let visible = showing && !overlay_open;
+                let entry = (region.x as i32, region.y as i32, region.w as u32, region.h as u32, visible);
+                if self.webview_rects.get(&w.instance_id) == Some(&entry) {
+                    continue;
+                }
+                self.webview_rects.insert(w.instance_id, entry);
+                w.set_bounds(entry.0, entry.1, entry.2.max(1), entry.3.max(1), zoom, win_h);
+                w.set_visible(visible);
             }
-            self.webview_dock_rect = Some(rect);
-            if let Some(wv) = self.webviews.iter().find(|w| w.instance_id == instance) {
-                let win_h = self.gpu.as_ref().map(|g| g.config.height).unwrap_or(0);
-                wv.set_bounds(x as i32, l.editor_text.y as i32, rect.2, rect.3, zoom, win_h);
-                wv.set_visible(active);
+            for iid in disposed {
+                self.webviews.retain(|w| w.instance_id != iid);
+                self.webview_targets.remove(&iid);
+                self.webview_rects.remove(&iid);
+                if self.webview_dock.map_or(false, |(i, _)| i == iid) {
+                    self.webview_dock = None;
+                }
+                if let Some(h) = self.ext_host.as_ref() {
+                    h.notify("webview/disposed", serde_json::json!({ "instanceId": iid }));
+                }
             }
         }
     }
@@ -4675,9 +4756,74 @@ impl App {
         s
     }
 
+    /// Extension activity-bar items (icon + the container's first webview view),
+    /// in registry order.
+    pub(crate) fn ext_activity_items(&self) -> Vec<exthost::ActivityItem> {
+        self.ext_registry
+            .iter()
+            .flat_map(|e| e.activity.iter())
+            .filter(|a| self.eval_when(&a.when))
+            .cloned()
+            .collect()
+    }
+
+    /// View-header buttons for the ACTIVE sidebar extension view, right-aligned in
+    /// the sidebar header: `(rect, command, codicon glyph, title)`.
+    pub(crate) fn ext_view_buttons(&self) -> Vec<(widgets::Rect, String, Option<char>, String)> {
+        let SidebarView::ExtView(i) = self.sidebar_view else { return Vec::new() };
+        if !self.sidebar_visible {
+            return Vec::new();
+        }
+        let Some(item) = self.ext_activity_items().get(i).cloned() else { return Vec::new() };
+        let l = self.layout();
+        let hdr = l.sidebar_header_rect();
+        let s = theme::zpx(24.0);
+        let mut x = l.sidebar.x + l.sidebar.w - s - theme::zpx(6.0);
+        let mut out = Vec::new();
+        for e in &self.ext_registry {
+            for (vid, b) in &e.view_buttons {
+                if *vid != item.view_id {
+                    continue;
+                }
+                let glyph = b.codicon.as_deref().and_then(crate::codicon_names::codicon);
+                if glyph.is_none() && b.icon.is_none() {
+                    continue;
+                }
+                let rect = widgets::Rect { x, y: hdr.y, w: s, h: hdr.h };
+                out.push((rect, b.command.clone(), glyph, b.title.clone()));
+                x -= s;
+            }
+        }
+        out
+    }
+
+    /// Open an extension view docked in the SIDEBAR (activity-bar click).
+    fn open_ext_webview_sidebar(&mut self, view_id: &str) {
+        self.webview_sidebar_pending.insert(view_id.to_string());
+        // Already open? Mark the existing instance sidebar-docked.
+        if let Some(iid) = self.webviews.iter().find(|w| w.view_id == view_id).map(|w| w.instance_id) {
+            self.webview_targets.insert(iid, 1);
+            self.sync_webview_dock();
+            return;
+        }
+        self.open_ext_webview(view_id);
+    }
+
     /// Open (or focus) an extension webview view: spawn a webview-host process and ask
     /// the extension's provider to populate it.
     fn open_ext_webview(&mut self, view_id: &str) {
+        // secondarySidebar views (e.g. Claude's chat) dock in the right panel.
+        if self.ext_registry.iter().any(|e| e.secondary_views.iter().any(|v| v == view_id)) {
+            self.webview_right_pending.insert(view_id.to_string());
+            // Already open? Just re-dock + reveal.
+            if let Some(iid) = self.webviews.iter().find(|w| w.view_id == view_id).map(|w| w.instance_id) {
+                self.webview_targets.insert(iid, 2);
+                self.right_sidebar_visible = true;
+                self.sync_webview_dock();
+                self.redraw();
+                return;
+            }
+        }
         if self.webviews.iter().any(|w| w.view_id == view_id) {
             return; // already open (separate window — the WM handles focus)
         }
@@ -4697,6 +4843,18 @@ impl App {
             return;
         };
         self.webviews.push(wv);
+        // In-process backends have no host process to report readiness — emit it
+        // ourselves now that the handle is stored (see ChildWebview::create).
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            let _ = self.worker_tx.send(crate::marketplace::WorkerMsg::WebviewEvent {
+                instance: iid,
+                value: serde_json::json!({ "event": "ready", "xid": 0 }),
+            });
+            if let Some(p) = self.proxy.as_ref() {
+                let _ = p.send_event(());
+            }
+        }
         if let Some(h) = self.ext_host.as_ref() {
             h.request("webview/resolve", serde_json::json!({ "viewId": view_id, "instanceId": iid }));
         }
@@ -4823,7 +4981,19 @@ impl App {
                     let roots: Vec<std::path::PathBuf> =
                         self.ext_registry.iter().map(|e| e.path.clone()).collect();
                     match self.spawn_webview(&vtype, iid, &title, &roots) {
-                        Some(wv) => self.webviews.push(wv),
+                        Some(wv) => {
+                            self.webviews.push(wv);
+                            #[cfg(any(target_os = "macos", target_os = "windows"))]
+                            {
+                                let _ = self.worker_tx.send(crate::marketplace::WorkerMsg::WebviewEvent {
+                                    instance: iid,
+                                    value: serde_json::json!({ "event": "ready", "xid": 0 }),
+                                });
+                                if let Some(p) = self.proxy.as_ref() {
+                                    let _ = p.send_event(());
+                                }
+                            }
+                        }
                         None => self.show_toast("Couldn't start the webview host."),
                     }
                 }
@@ -4883,7 +5053,15 @@ impl App {
                         self.open_ext_webview(&vid);
                     }
                 } else if cmd == "setContext" {
-                    // Context keys aren't modeled — fine to ignore.
+                    // Store the context key — editor/title when-clauses test these
+                    // (e.g. Claude's accept/reject buttons on viewingProposedDiff).
+                    let args = params.get("args").and_then(|a| a.as_array());
+                    if let Some([key, value, ..]) = args.map(|a| a.as_slice()) {
+                        if let Some(k) = key.as_str() {
+                            self.ext_context.insert(k.to_string(), value.clone());
+                            self.redraw(); // buttons may appear/disappear
+                        }
+                    }
                 }
                 if let (Some(id), Some(h)) = (id.as_ref(), self.ext_host.as_ref()) {
                     h.respond(id, serde_json::Value::Null);
@@ -5567,6 +5745,18 @@ impl App {
                 }
             }
             Command::ColorTheme => self.open_theme_picker(None),
+            Command::OpenUrl => {
+                // Manual deep-link entry (OAuth fallback pages say "Open URL" and
+                // give a copy button): read the aether:// url from the clipboard.
+                let url = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok()).unwrap_or_default();
+                let url = url.trim().to_string();
+                if url.starts_with("aether://") {
+                    let _ = self.worker_tx.send(WorkerMsg::OpenUrl(url));
+                    self.show_toast("URL delivered to extensions.");
+                } else {
+                    self.show_toast("Clipboard doesn't contain an aether:// URL.");
+                }
+            }
             Command::ToggleLineComment => self.doc_edit(|d, fs| d.toggle_line_comment(fs)),
             Command::ToggleBlockComment => self.doc_edit(|d, fs| d.toggle_block_comment(fs)),
             Command::MoveLineUp => self.doc_edit(|d, fs| d.move_lines(false, fs)),
@@ -6405,6 +6595,22 @@ impl App {
             return;
         }
         let first = !self.ext_doc_versions.contains_key(&uri);
+        // Debounce changes (not the first open): each sync serializes the WHOLE
+        // document — doing that on every idle tick during an edit burst (typing,
+        // paste) janks the editor on large files. Wait for ~200ms of quiet.
+        if !first {
+            match self.ext_doc_probe.get(&uri) {
+                Some((v, at)) if *v == version => {
+                    if at.elapsed() < Duration::from_millis(200) {
+                        return; // still settling
+                    }
+                }
+                _ => {
+                    self.ext_doc_probe.insert(uri.clone(), (version, Instant::now()));
+                    return;
+                }
+            }
+        }
         let text = d.rope.to_string();
         self.ext_doc_versions.insert(uri.clone(), version);
         if let Some(h) = self.ext_host.as_ref() {
@@ -6970,7 +7176,14 @@ impl App {
             }
         }
         // Extension editor-title buttons (right end of the tab strip).
-        for (rect, command, _, _) in self.ext_title_buttons() {
+        for (rect, command, ..) in self.ext_title_buttons() {
+            if rect.contains((x, y)) {
+                self.run_ext_command(&command);
+                return;
+            }
+        }
+        // Extension view-header buttons (sidebar header, e.g. Cline's + / gear).
+        for (rect, command, ..) in self.ext_view_buttons() {
             if rect.contains((x, y)) {
                 self.run_ext_command(&command);
                 return;
@@ -7667,15 +7880,17 @@ impl App {
             return;
         }
 
-        if let Some(idx) = layout.activity_rects().iter().position(|r| r.contains((x, y))) {
-            // 0 = Explorer, 4 = Extensions. Clicking the active view's icon toggles
-            // the sidebar; clicking another switches to it (and shows the sidebar).
+        let n_ext_activity = self.ext_activity_items().len();
+        if let Some(idx) = layout.activity_rects_ext(n_ext_activity).iter().position(|r| r.contains((x, y))) {
+            // 0 = Explorer, 4 = Extensions, 5.. = extension containers. Clicking the
+            // active view's icon toggles the sidebar; another switches to it.
             let view = match idx {
                 0 => Some(SidebarView::Explorer),
                 1 => Some(SidebarView::Search),
                 2 => Some(SidebarView::SourceControl),
                 3 => Some(SidebarView::Debug),
                 4 => Some(SidebarView::Extensions),
+                i if i >= 5 && i < 5 + n_ext_activity => Some(SidebarView::ExtView(i - 5)),
                 _ => None,
             };
             if let Some(v) = view {
@@ -7700,6 +7915,18 @@ impl App {
                 } else {
                     self.sidebar_view = v;
                     self.sidebar_visible = true;
+                    // Extension container: open (or re-dock) its view in the sidebar.
+                    if let SidebarView::ExtView(i) = v {
+                        if let Some(item) = self.ext_activity_items().get(i).cloned() {
+                            if item.is_webview {
+                                self.open_ext_webview_sidebar(&item.view_id);
+                            } else {
+                                self.show_toast(
+                                    "This extension uses tree views — not supported in Aether yet.",
+                                );
+                            }
+                        }
+                    }
                 }
                 // Switching views clears any prior input focus.
                 self.set_ext_filter_focus(false);
@@ -7711,10 +7938,10 @@ impl App {
                 }
                 self.redraw();
             }
-            // Bottom gear (idx 6): the "Manage" menu, VSCode-style.
-            if idx == 6 {
+            // Bottom gear (last cell): the "Manage" menu, VSCode-style.
+            if idx == 6 + n_ext_activity {
                 use menus::MenuCmd;
-                let r = layout.activity_rects()[6];
+                let r = layout.activity_rects_ext(n_ext_activity)[idx];
                 let items = vec![
                     CtxEntry::key("Command Palette…", CtxAction::Palette, "Ctrl+Shift+P"),
                     CtxEntry::sep(),
@@ -10616,6 +10843,18 @@ impl ApplicationHandler for App {
                         }
                         self.sync_ext_host_docs();
                     }
+                    if let Ok(uri) = std::env::var("AETHER_TEST_URI") {
+                        // Delay so extensions finish activating + registering handlers.
+                        let tx = self.worker_tx.clone();
+                        let proxy = self.proxy.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_secs(4));
+                            let _ = tx.send(WorkerMsg::OpenUrl(uri));
+                            if let Some(p) = proxy {
+                                let _ = p.send_event(());
+                            }
+                        });
+                    }
                     if let Ok(cmd) = std::env::var("AETHER_TEST_CMD") {
                         let proxy = self.proxy.clone();
                         // Give activation a beat, then run on the main loop via redraw pump.
@@ -10630,6 +10869,13 @@ impl ApplicationHandler for App {
                     }
                 }
                 WorkerMsg::ExtHostMsg { value } => self.handle_ext_host_msg(value),
+                WorkerMsg::OpenUrl(url) => {
+                    // aether:// deep link (e.g. an OAuth callback) → extensions'
+                    // registered uri handlers.
+                    if let Some(h) = self.ext_host.as_ref() {
+                        h.notify("window/handleUri", serde_json::json!({ "uri": url }));
+                    }
+                }
                 WorkerMsg::WebviewEvent { instance, value } => {
                     match value.get("event").and_then(|e| e.as_str()) {
                         // Page → extension (acquireVsCodeApi().postMessage).
@@ -10674,14 +10920,27 @@ impl ApplicationHandler for App {
                             }
                             self.webview_dock = Some((instance, xid));
                             self.webview_dock_rect = None; // force a size sync
-                            let title = self
+                            let (title, view_id) = self
                                 .webviews
                                 .iter()
                                 .find(|w| w.instance_id == instance)
-                                .map(|w| w.title.clone())
-                                .unwrap_or_else(|| "Webview".into());
-                            if let Some(g) = self.gpu.as_mut() {
-                                self.workspace.open_webview(title, instance, &mut g.font_system);
+                                .map(|w| (w.title.clone(), w.view_id.clone()))
+                                .unwrap_or_else(|| ("Webview".into(), String::new()));
+                            // Route the view: left sidebar (activity bar), right
+                            // panel (secondarySidebar), or an editor tab.
+                            let target = if self.webview_sidebar_pending.remove(&view_id) {
+                                1u8
+                            } else if self.webview_right_pending.remove(&view_id) {
+                                self.right_sidebar_visible = true;
+                                2
+                            } else {
+                                0
+                            };
+                            self.webview_targets.insert(instance, target);
+                            if target == 0 {
+                                if let Some(g) = self.gpu.as_mut() {
+                                    self.workspace.open_webview(title, instance, &mut g.font_system);
+                                }
                             }
                             self.sync_webview_dock();
                             self.redraw();
@@ -11320,6 +11579,8 @@ impl ApplicationHandler for App {
                 // Spawn the Node extension host (no-op if Node or the host script is
                 // missing). It connects back asynchronously → WorkerMsg::ExtHostReady.
                 if self.ext_host.is_none() {
+                    #[cfg(target_os = "macos")]
+                    macos_urls::install(self.worker_tx.clone(), self.proxy.clone());
                     self.ext_host = exthost::ExtHost::start(&self.cwd, self.worker_tx.clone(), self.proxy.clone());
                     // Extensions silently doing nothing is confusing — say WHY. (The
                     // host script missing only happens in broken installs; Node

@@ -45,6 +45,7 @@ rpc.on_method('command/invoke', (p) => dispatch.invokeCommand(p));
 rpc.on_method('webview/resolve', (p) => dispatch.resolveWebview(p));
 rpc.on_method('webview/message', (p) => dispatch.webviewMessage(p));
 rpc.on_method('webview/disposed', (p) => dispatch.webviewDisposed(p));
+rpc.on_method('window/handleUri', (p) => dispatch.handleUri(p));
 
 const sock = net.connect(port, '127.0.0.1', () => {
   rpc.attach(sock);

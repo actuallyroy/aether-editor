@@ -413,8 +413,11 @@ pub(crate) fn image_ctrl_cells(region: Rect) -> [Rect; 4] {
 pub(crate) fn render(app: &mut App) -> Result<()> {
     // Refresh the selection-occurrence highlight before borrowing gpu (needs &mut app).
     app.recompute_selection_highlight();
-    // Snapshot extension title-bar buttons before gpu borrows app mutably.
+    // Snapshot extension title-bar buttons + activity items before gpu borrows app.
     let ext_title_buttons = app.ext_title_buttons();
+    let ext_activity: Vec<crate::exthost::ActivityItem> = app.ext_activity_items();
+    let ext_view_buttons = app.ext_view_buttons();
+    let ext_activity_titles: Vec<String> = ext_activity.iter().map(|a| a.title.clone()).collect();
     let Some(gpu) = app.gpu.as_mut() else {
         return Ok(());
     };
@@ -619,13 +622,17 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
 
         // Sidebar header — title depends on the active view.
         let header = match app.sidebar_view {
-            SidebarView::Extensions => "EXTENSIONS",
-            SidebarView::Search => "SEARCH",
-            SidebarView::SourceControl => "SOURCE CONTROL",
-            SidebarView::Debug => "RUN AND DEBUG",
-            SidebarView::Explorer => "EXPLORER",
+            SidebarView::Extensions => "EXTENSIONS".to_string(),
+            SidebarView::Search => "SEARCH".to_string(),
+            SidebarView::SourceControl => "SOURCE CONTROL".to_string(),
+            SidebarView::Debug => "RUN AND DEBUG".to_string(),
+            SidebarView::Explorer => "EXPLORER".to_string(),
+            SidebarView::ExtView(i) => ext_activity_titles
+                .get(i)
+                .map(|t| t.to_uppercase())
+                .unwrap_or_else(|| "EXTENSION".to_string()),
         };
-        gpu.ui.sidebar_header.set(fs, header, theme::UI_FAMILY());
+        gpu.ui.sidebar_header.set(fs, &header, theme::UI_FAMILY());
 
         // Extension detail page text (works for local + marketplace extensions).
         if let Some(v) = open_ext_view(app.detail.open_extension, &app.extensions, &app.ext_remote) {
@@ -1164,7 +1171,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
 
     // Activity bar bg + hover (hover rect == the button rect).
     bg_quads.push(layout.activity_bar.quad(theme::ACTIVITY_BAR_BG()));
-    let act_rects = layout.activity_rects();
+    let act_rects = layout.activity_rects_ext(ext_activity.len());
     if let Some(idx) = app.hovered_activity {
         bg_quads.push(act_rects[idx].quad(theme::ACTIVITY_BAR_ACTIVE()));
     }
@@ -1341,24 +1348,43 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // Extension editor-title buttons at the right end of the tab strip (VSCode's
     // editor/title navigation group — e.g. MPE's "open preview to the side").
     if draw_tabs {
-        for (rect, _cmd, icon, _title) in ext_title_buttons.iter().cloned() {
-            let Some(path) = icon else { continue };
-            let key = format!("title-btn:{}", path.display());
-            let uv = gpu.icon_atlas.get(&key).or_else(|| {
-                let bytes = std::fs::read(&path).ok()?;
-                if path.extension().and_then(|e| e.to_str()) == Some("svg") {
-                    gpu.icon_atlas.load_svg_bytes(&gpu.queue, &key, &bytes)
-                } else {
-                    gpu.icon_atlas.load_bytes(&gpu.queue, &key, &bytes)
-                }
-            });
-            if let Some(uv) = uv {
-                let s = theme::zpx(18.0);
-                tab_img_icons.push(crate::icon::IconInstance {
-                    rect: [rect.x + (rect.w - s) * 0.5, rect.y + (rect.h - s) * 0.5, s, s],
-                    uv,
+        for (rect, _cmd, icon, glyph, _title) in ext_title_buttons.iter() {
+            if let Some(path) = icon {
+                let key = format!("title-btn:{}", path.display());
+                let uv = gpu.icon_atlas.get(&key).or_else(|| {
+                    let bytes = std::fs::read(path).ok()?;
+                    if path.extension().and_then(|e| e.to_str()) == Some("svg") {
+                        gpu.icon_atlas.load_svg_bytes(&gpu.queue, &key, &bytes)
+                    } else {
+                        gpu.icon_atlas.load_bytes(&gpu.queue, &key, &bytes)
+                    }
                 });
+                if let Some(uv) = uv {
+                    let s = theme::zpx(18.0);
+                    tab_img_icons.push(crate::icon::IconInstance {
+                        rect: [rect.x + (rect.w - s) * 0.5, rect.y + (rect.h - s) * 0.5, s, s],
+                        uv,
+                    });
+                }
+            } else if let Some(g) = glyph {
+                // Create the codicon label now (before `gpu.ui` is borrowed for
+                // text areas); it's PUSHED later, once `areas` exists.
+                if !gpu.ui.title_btn_icons.contains_key(g) {
+                    let fs = &mut gpu.font_system;
+                    let mut l = crate::widgets::TextLabel::new(fs, 40.0, rect.h);
+                    l.set(fs, &g.to_string(), theme::ICON_FAMILY);
+                    gpu.ui.title_btn_icons.insert(*g, l);
+                }
             }
+        }
+    }
+    for (rect, _cmd, glyph, _title) in ext_view_buttons.iter() {
+        let Some(g) = glyph else { continue };
+        if !gpu.ui.title_btn_icons.contains_key(g) {
+            let fs = &mut gpu.font_system;
+            let mut l = crate::widgets::TextLabel::new(fs, 40.0, rect.h);
+            l.set(fs, &g.to_string(), theme::ICON_FAMILY);
+            gpu.ui.title_btn_icons.insert(*g, l);
         }
     }
     for (i, tab) in tab_rects.iter().enumerate() {
@@ -2475,6 +2501,24 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
 
     let ui = &gpu.ui;
     let mut areas: Vec<TextArea> = Vec::new();
+    // Codicon editor-title buttons (e.g. Claude's $(check)/$(discard)): cached
+    // one-char labels in the codicon font, centered in their tab-strip slots.
+    if draw_tabs {
+        for (rect, _cmd, _icon, glyph, _title) in ext_title_buttons.iter() {
+            let Some(label) = glyph.as_ref().and_then(|g| ui.title_btn_icons.get(g)) else { continue };
+            let x = rect.x + (rect.w - label.width()) * 0.5;
+            label.push_in(x, *rect, *rect, theme::TAB_FG_INACTIVE(), &mut areas);
+        }
+    }
+    // Sidebar view-header buttons (view/title): codicon glyphs right-aligned in
+    // the header row of the active extension view.
+    if app.sidebar_visible {
+        for (rect, _cmd, glyph, _title) in ext_view_buttons.iter() {
+            let Some(label) = glyph.as_ref().and_then(|g| ui.title_btn_icons.get(g)) else { continue };
+            let x = rect.x + (rect.w - label.width()) * 0.5;
+            label.push_in(x, *rect, *rect, theme::FG_DIM(), &mut areas);
+        }
+    }
     // README image draw rects (collected during the detail-page text draw, drawn in
     // a clipped media pass after the main pass).
     let mut detail_img_rects: Vec<(String, Rect)> = Vec::new();
@@ -2517,15 +2561,38 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     }
 
     // Activity-bar icons — IconButton widgets at their cell rects.
-    let act_rects = layout.activity_rects();
+    let n_ext_act = ext_activity.len();
+    let act_rects = layout.activity_rects_ext(n_ext_act);
     let active_act = active_activity_idx(app.sidebar_visible, app.sidebar_view);
     for (i, btn) in gpu.activity_btns.iter().enumerate() {
-        let color = if Some(i) == active_act {
+        // Built-ins keep slots 0..5; the bottom pair (account, gear) shifts past
+        // the extension icons.
+        let slot = if i < 5 { i } else { i + n_ext_act };
+        let color = if Some(slot) == active_act {
             theme::ACTIVITY_ICON_ACTIVE()
         } else {
             theme::ACTIVITY_ICON_FG()
         };
-        btn.draw(act_rects[i], color, &mut areas);
+        btn.draw(act_rects[slot], color, &mut areas);
+    }
+    // Extension activity icons (atlas SVGs), slots 5..5+n.
+    for (i, item) in ext_activity.iter().enumerate() {
+        let key = format!("activity:{}", item.icon.display());
+        let uv = gpu.icon_atlas.get(&key).or_else(|| {
+            let bytes = std::fs::read(&item.icon).ok()?;
+            if item.icon.extension().and_then(|e| e.to_str()) == Some("svg") {
+                gpu.icon_atlas.load_svg_bytes(&gpu.queue, &key, &bytes)
+            } else {
+                gpu.icon_atlas.load_bytes(&gpu.queue, &key, &bytes)
+            }
+        });
+        if let (Some(uv), Some(r)) = (uv, act_rects.get(5 + i)) {
+            let s = theme::zpx(24.0);
+            tab_img_icons.push(crate::icon::IconInstance {
+                rect: [r.x + (r.w - s) * 0.5, r.y + (r.h - s) * 0.5, s, s],
+                uv,
+            });
+        }
     }
     // Source Control badge number, centered in the pill drawn in the quad phase.
     let scm_count = app.source_control.as_ref().map_or(0, |s| s.change_count());
