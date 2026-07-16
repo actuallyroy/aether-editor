@@ -606,6 +606,9 @@ pub(crate) struct App {
     pub(crate) ext_tree_rev: u64,
     /// Hovered row in the active extension tree view (hover bg + guides).
     pub(crate) ext_tree_hover: Option<usize>,
+    /// Label-paths that were expanded before a tree refresh — re-expanded as
+    /// their rows reappear (didChange wipes handles, VSCode keeps expansion).
+    pub(crate) ext_tree_reexpand: std::collections::HashMap<String, std::collections::HashSet<Vec<String>>>,
     /// Per-instance last-applied (x, y, w, h, visible) — skip redundant syncs.
     pub(crate) webview_rects: std::collections::HashMap<i64, (i32, i32, u32, u32, bool)>,
     /// Discovered runnable extensions and which have already been activated (so an
@@ -854,6 +857,7 @@ impl App {
             ext_tree_dirty: false,
             ext_tree_rev: 0,
             ext_tree_hover: None,
+            ext_tree_reexpand: std::collections::HashMap::new(),
             webview_rects: std::collections::HashMap::new(),
             ext_registry: Vec::new(),
             ext_activated: std::collections::HashSet::new(),
@@ -4866,6 +4870,24 @@ impl App {
         out
     }
 
+    /// Label path of `rows[i]` (ancestor labels by depth) — expansion identity
+    /// across refreshes, where handles regenerate.
+    fn ext_tree_label_path(rows: &[ExtTreeRow], i: usize) -> Vec<String> {
+        let mut path = vec![rows[i].label.clone()];
+        let mut depth = rows[i].depth;
+        for j in (0..i).rev() {
+            if rows[j].depth < depth {
+                path.push(rows[j].label.clone());
+                depth = rows[j].depth;
+                if depth == 0 {
+                    break;
+                }
+            }
+        }
+        path.reverse();
+        path
+    }
+
     /// Request one level of an extension tree view (parent handle 0 = roots).
     fn request_tree_children(&mut self, view_id: &str, parent: u64) {
         if let Some(h) = self.ext_host.as_ref() {
@@ -5082,6 +5104,19 @@ impl App {
             Some("tree/didChange") => {
                 if let Some(vid) = params.get("viewId").and_then(|v| v.as_str()) {
                     let vid = vid.to_string();
+                    // Remember what was expanded (by label path) so the refreshed
+                    // tree re-expands to the same shape instead of collapsing.
+                    if let Some(rows) = self.ext_trees.get(&vid) {
+                        let mut set: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
+                        for (i, r) in rows.iter().enumerate() {
+                            if r.expanded {
+                                set.insert(Self::ext_tree_label_path(rows, i));
+                            }
+                        }
+                        if !set.is_empty() {
+                            self.ext_tree_reexpand.insert(vid.clone(), set);
+                        }
+                    }
                     self.ext_trees.remove(&vid);
                     self.ext_tree_dirty = true; self.ext_tree_rev += 1;
                     if let SidebarView::ExtView(i) = self.sidebar_view {
@@ -5241,9 +5276,10 @@ impl App {
                         if std::env::var("AETHER_DEBUG_TREE").is_ok() {
                             eprintln!("[tree-dbg] response parent={parent} items={}", items.len());
                         }
-                        let rows = self.ext_trees.entry(vid).or_default();
-                        if parent == 0 {
+                        let rows = self.ext_trees.entry(vid.clone()).or_default();
+                        let new_range = if parent == 0 {
                             *rows = items;
+                            0..rows.len()
                         } else if let Some(pi) = rows.iter().position(|r| r.handle == parent) {
                             let depth = rows[pi].depth + 1;
                             rows[pi].expanded = true;
@@ -5251,7 +5287,27 @@ impl App {
                             for r in &mut items {
                                 r.depth = depth;
                             }
+                            let n = items.len();
                             rows.splice(pi + 1..pi + 1, items);
+                            pi + 1..pi + 1 + n
+                        } else {
+                            0..0
+                        };
+                        // Re-expand rows that were open before the last refresh.
+                        let mut to_expand: Vec<(String, u64)> = Vec::new();
+                        if let Some(set) = self.ext_tree_reexpand.get(&vid) {
+                            let rows = &self.ext_trees[&vid];
+                            for i in new_range {
+                                let r = &rows[i];
+                                if r.collapsible > 0 && !r.expanded
+                                    && set.contains(&Self::ext_tree_label_path(rows, i))
+                                {
+                                    to_expand.push((vid.clone(), r.handle));
+                                }
+                            }
+                        }
+                        for (v, h) in to_expand {
+                            self.request_tree_children(&v, h);
                         }
                         self.ext_tree_dirty = true; self.ext_tree_rev += 1;
                         self.redraw();

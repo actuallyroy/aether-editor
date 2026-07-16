@@ -102,8 +102,12 @@ fn find_server(cwd: &std::path::Path) -> Option<(u16, String)> {
         }
         let Ok(text) = std::fs::read_to_string(&path) else { continue };
         let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
-        // Only consider Aether's own lockfiles (VS Code etc. also write here).
-        if v.get("ideName").and_then(|n| n.as_str()) != Some("Aether") {
+        // Only consider Aether's own lockfiles. ideName alone is spoofable-by-
+        // accident: the Claude Code extension (running inside aether) writes its
+        // own 12-tool server's lock with the HOST's ideName.
+        if v.get("ideName").and_then(|n| n.as_str()) != Some("Aether")
+            || v.get("aetherNative").and_then(|b| b.as_bool()) != Some(true)
+        {
             continue;
         }
         let Some(port) = path.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse::<u16>().ok()) else {

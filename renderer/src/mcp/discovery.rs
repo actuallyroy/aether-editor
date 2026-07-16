@@ -34,6 +34,10 @@ pub fn write_lock(port: u16, workspace: &Path, token: &str) -> Option<PathBuf> {
         "pid": std::process::id(),
         "workspaceFolders": [workspace.to_string_lossy()],
         "ideName": "Aether",
+        // Distinguishes aether's OWN server from extensions' servers running
+        // inside aether (the Claude Code extension writes locks with the host's
+        // ideName — the proxy must never route to those).
+        "aetherNative": true,
         "transport": "ws",
         "runningInWindows": cfg!(windows),
         "authToken": token,
