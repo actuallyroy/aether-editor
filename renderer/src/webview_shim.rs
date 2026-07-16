@@ -2,6 +2,62 @@
 // and the in-process macOS webview): acquireVsCodeApi, VSCode theme variables,
 // insecure-context polyfills, console/error forwarding, and cursor reporting.
 
+/// JS defining `window.__AETHER_THEME__` from aether's LIVE theme, injected
+/// before the shim so webview CSS variables match the editor (VSCode derives
+/// these from the active theme; the shim's literals are only the fallback).
+pub fn theme_vars_js() -> String {
+    fn hex4(c: [f32; 4]) -> String {
+        format!("#{:02x}{:02x}{:02x}", (c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8)
+    }
+    fn hexg(c: glyphon::Color) -> String {
+        let [r, g, b, _] = c.as_rgba();
+        format!("#{r:02x}{g:02x}{b:02x}")
+    }
+    fn hexw(c: wgpu::Color) -> String {
+        format!("#{:02x}{:02x}{:02x}", (c.r * 255.0) as u8, (c.g * 255.0) as u8, (c.b * 255.0) as u8)
+    }
+    use crate::theme as th;
+    let editor_bg = hexw(th::BG_EDITOR());
+    let fg = hexg(th::FG_TEXT());
+    let dim = hexg(th::FG_DIM());
+    let side = hex4(th::PANEL_BG());
+    let tabs = hex4(th::TAB_BAR_BG());
+    let status = hex4(th::STATUS_BAR_BG());
+    let accent = hex4(th::ACCENT());
+    let hover = hex4(th::TREE_HOVER());
+    let input = hex4(th::PALETTE_INPUT_BG());
+    let widget = hex4(th::PALETTE_BG());
+    let vars = serde_json::json!({
+        "editor-background": editor_bg,
+        "panel-background": editor_bg,
+        "editor-foreground": fg,
+        "foreground": fg,
+        "descriptionForeground": dim,
+        "disabledForeground": dim,
+        "icon-foreground": fg,
+        "sideBar-background": side,
+        "sideBar-foreground": fg,
+        "editorGroupHeader-tabsBackground": tabs,
+        "tab-inactiveBackground": tabs,
+        "tab-activeBackground": editor_bg,
+        "statusBar-background": status,
+        "focusBorder": accent,
+        "button-background": accent,
+        "button-hoverBackground": accent,
+        "textLink-foreground": accent,
+        "textLink-activeForeground": accent,
+        "list-hoverBackground": hover,
+        "list-activeSelectionBackground": hover,
+        "input-background": input,
+        "dropdown-background": input,
+        "editorWidget-background": widget,
+        "quickInput-background": widget,
+        "menu-background": widget,
+        "notifications-background": widget,
+    });
+    format!("window.__AETHER_THEME__ = {vars};")
+}
+
 pub const VSCODE_API_SHIM: &str = r#"
 (function () {
   let state;
@@ -14,7 +70,7 @@ pub const VSCODE_API_SHIM: &str = r#"
   };
   // VSCode injects theme classes + --vscode-* CSS variables into every webview;
   // extension UIs are unstyled (white-on-white) without them. Dark+ defaults.
-  const VARS = {
+  const __AETHER_DEFAULT_VARS__ = {
     'font-family': "'Segoe UI', Ubuntu, 'Droid Sans', sans-serif",
     'font-size': '13px',
     'font-weight': 'normal',
@@ -110,6 +166,7 @@ pub const VSCODE_API_SHIM: &str = r#"
     'banner-background': '#04395e',
     'banner-foreground': '#cccccc',
   };
+  const VARS = Object.assign({}, __AETHER_DEFAULT_VARS__, window.__AETHER_THEME__ || {});
   function applyTheme() {
     const root = document.documentElement;
     for (const [k, v] of Object.entries(VARS)) root.style.setProperty('--vscode-' + k, v);

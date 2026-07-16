@@ -89,10 +89,12 @@ pub fn run() -> anyhow::Result<()> {
     )));
 
     // ---- webview ----
+    let theme_js = init.get("themeJs").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let webview = {
         let page_html_proto = page_html.clone();
         use wry::WebViewBuilderExtUnix;
         wry::WebViewBuilder::new()
+            .with_initialization_script(&theme_js)
             .with_initialization_script(VSCODE_API_SHIM)
             .with_ipc_handler(move |req| {
                 // acquireVsCodeApi().postMessage(data) lands here (JSON string body).

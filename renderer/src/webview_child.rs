@@ -63,6 +63,7 @@ impl ChildWebview {
         let roots = roots.to_vec();
         let page_html_proto = page_html.clone();
         let webview = wry::WebViewBuilder::new()
+            .with_initialization_script(&crate::webview_shim::theme_vars_js())
             .with_initialization_script(VSCODE_API_SHIM)
             .with_visible(false)
             .with_ipc_handler({

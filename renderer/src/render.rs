@@ -1028,10 +1028,16 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     gpu.ui.terminal_panes.push(b);
                 }
                 let to_attr = |c: [f32; 4]| {
+                    // The ANSI palette is authored in sRGB, but glyphon linearizes
+                    // glyph colors in its shader and our surface is non-sRGB — mid
+                    // grays (Codex's dim banner text, SGR 2 ghosts) came out nearly
+                    // invisible. Pre-encode with the inverse curve so the displayed
+                    // value matches the palette's intent.
+                    let enc = |v: f32| v.max(0.0).powf(1.0 / 2.2);
                     Attrs::new().family(Family::Name(theme::MONO_FAMILY())).color(glyphon::Color::rgba(
-                        (c[0] * 255.0) as u8,
-                        (c[1] * 255.0) as u8,
-                        (c[2] * 255.0) as u8,
+                        (enc(c[0]) * 255.0) as u8,
+                        (enc(c[1]) * 255.0) as u8,
+                        (enc(c[2]) * 255.0) as u8,
                         255,
                     ))
                 };
@@ -1288,6 +1294,18 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             if let Some(idx) = app.hovered_tree {
                 if let Some(rr) = clip_row(gpu.ui.sidebar.row_rect(tr, idx)) {
                     bg_quads.push(rr.quad(theme::TREE_HOVER()));
+                }
+            }
+            // Extension tree views: hover-row bg + indent guides (quad phase —
+            // pushing these later, after the quad upload, drew nothing).
+            if let crate::SidebarView::ExtView(ei) = app.sidebar_view {
+                if ext_activity.get(ei).map_or(false, |a| !a.is_webview) {
+                    if let Some(idx) = app.ext_tree_hover {
+                        if let Some(rr) = clip_row(gpu.ui.ext_tree_list.row_rect(tr, idx)) {
+                            bg_quads.push(rr.quad(theme::TREE_HOVER()));
+                        }
+                    }
+                    gpu.ui.ext_tree_list.draw_guides(tr, tr.y, now, &mut bg_quads);
                 }
             }
             // Drag-and-drop target folder highlight (while dragging a tree entry).
@@ -2638,11 +2656,19 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     }
     // Extension activity icons (atlas SVGs), slots 5..5+n.
     for (i, (_stable, item)) in ext_activity_visible.iter().enumerate() {
-        let key = format!("activity:{}", item.icon.display());
+        // Monochrome, VSCode-style: the SVG is an alpha mask tinted with the
+        // activity-bar foreground so every icon matches the built-ins.
+        let fg = theme::ACTIVITY_ICON_FG();
+        let tint = [
+            (fg.as_rgba()[0]) as u8,
+            (fg.as_rgba()[1]) as u8,
+            (fg.as_rgba()[2]) as u8,
+        ];
+        let key = format!("activity:{}:{:?}", item.icon.display(), tint);
         let uv = gpu.icon_atlas.get(&key).or_else(|| {
             let bytes = std::fs::read(&item.icon).ok()?;
             if item.icon.extension().and_then(|e| e.to_str()) == Some("svg") {
-                gpu.icon_atlas.load_svg_bytes(&gpu.queue, &key, &bytes)
+                gpu.icon_atlas.load_svg_tinted(&gpu.queue, &key, &bytes, Some(tint))
             } else {
                 gpu.icon_atlas.load_bytes(&gpu.queue, &key, &bytes)
             }

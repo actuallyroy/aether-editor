@@ -252,6 +252,8 @@ impl WebviewProc {
             "embed": embed,
             "shm": shm_path.to_string_lossy(),
             "roots": roots.iter().map(|r| r.to_string_lossy()).collect::<Vec<_>>(),
+            // Live theme → webview CSS variables (matches VSCode's behavior).
+            "themeJs": crate::webview_shim::theme_vars_js(),
         });
         let mut line = init.to_string();
         line.push('\n');

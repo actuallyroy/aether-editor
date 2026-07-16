@@ -199,6 +199,12 @@ impl IconAtlas {
     /// Rasterize an SVG (extension toolbar/tab icons ship as SVG) at 2× the draw
     /// size and pack into the atlas.
     pub fn load_svg_bytes(&mut self, queue: &Queue, key: &str, bytes: &[u8]) -> Option<[f32; 4]> {
+        self.load_svg_tinted(queue, key, bytes, None)
+    }
+
+    /// Rasterize an SVG, optionally recoloring it as an alpha MASK in `tint`
+    /// (VSCode renders activity-bar icons monochrome this way).
+    pub fn load_svg_tinted(&mut self, queue: &Queue, key: &str, bytes: &[u8], tint: Option<[u8; 3]>) -> Option<[f32; 4]> {
         if let Some(uv) = self.slots.get(key) {
             return Some(*uv);
         }
@@ -210,7 +216,21 @@ impl IconAtlas {
         let (w, h) = ((size.width() * scale).ceil() as u32, (size.height() * scale).ceil() as u32);
         let mut pm = tiny_skia::Pixmap::new(w.max(1), h.max(1))?;
         resvg::render(&tree, tiny_skia::Transform::from_scale(scale, scale), &mut pm.as_mut());
-        let img = image::RgbaImage::from_raw(pm.width(), pm.height(), pm.take())?;
+        let mut data = pm.take();
+        if let Some([r, g, b]) = tint {
+            // Alpha mask: constant tint color, source alpha (STRAIGHT — the icon
+            // pipeline uses ALPHA_BLENDING). Linearize the tint to match glyphon,
+            // which gamma-converts glyph colors in its shader — the activity bar's
+            // built-in icons are glyphs, and these must match them exactly.
+            let lin = |c: u8| (((c as f32 / 255.0).powf(2.2)) * 255.0).round() as u8;
+            let (r, g, b) = (lin(r), lin(g), lin(b));
+            for px in data.chunks_exact_mut(4) {
+                px[0] = r;
+                px[1] = g;
+                px[2] = b;
+            }
+        }
+        let img = image::RgbaImage::from_raw(w.max(1), h.max(1), data)?;
         self.add_image(queue, key, image::DynamicImage::ImageRgba8(img))
     }
 

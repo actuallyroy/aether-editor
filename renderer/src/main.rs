@@ -604,6 +604,8 @@ pub(crate) struct App {
     pub(crate) ext_tree_dirty: bool,
     /// Bumped on every tree mutation — part of the list-shape cache key.
     pub(crate) ext_tree_rev: u64,
+    /// Hovered row in the active extension tree view (hover bg + guides).
+    pub(crate) ext_tree_hover: Option<usize>,
     /// Per-instance last-applied (x, y, w, h, visible) — skip redundant syncs.
     pub(crate) webview_rects: std::collections::HashMap<i64, (i32, i32, u32, u32, bool)>,
     /// Discovered runnable extensions and which have already been activated (so an
@@ -851,6 +853,7 @@ impl App {
             ext_tree_reqs: std::collections::HashMap::new(),
             ext_tree_dirty: false,
             ext_tree_rev: 0,
+            ext_tree_hover: None,
             webview_rects: std::collections::HashMap::new(),
             ext_registry: Vec::new(),
             ext_activated: std::collections::HashSet::new(),
@@ -1043,6 +1046,39 @@ impl App {
             }
             if g.ui.sidebar.set_hover_row(if in_tree { self.hovered_tree } else { None }) {
                 changed = true;
+            }
+        }
+        // Extension tree views: same hover-reveal treatment as the explorer.
+        {
+            let ext_tree_sel = match self.sidebar_view {
+                SidebarView::ExtView(i) if self.sidebar_visible => {
+                    self.ext_activity_items().get(i).filter(|a| !a.is_webview).cloned()
+                }
+                _ => None,
+            };
+            let in_ext_tree = ext_tree_sel.is_some() && layout.tree_region().contains(p);
+            let hover = if in_ext_tree {
+                let count = ext_tree_sel
+                    .as_ref()
+                    .and_then(|it| self.ext_trees.get(&it.view_id))
+                    .map_or(0, |r| r.len());
+                self.gpu
+                    .as_ref()
+                    .and_then(|g| g.ui.ext_tree_list.row_at(layout.tree_region(), p, count))
+            } else {
+                None
+            };
+            if self.ext_tree_hover != hover {
+                self.ext_tree_hover = hover;
+                changed = true;
+            }
+            if let Some(g) = self.gpu.as_mut() {
+                if g.ui.ext_tree_list.set_guides_hovered(in_ext_tree) {
+                    changed = true;
+                }
+                if g.ui.ext_tree_list.set_hover_row(hover) {
+                    changed = true;
+                }
             }
         }
 
@@ -5202,6 +5238,9 @@ impl App {
                                     .collect()
                             })
                             .unwrap_or_default();
+                        if std::env::var("AETHER_DEBUG_TREE").is_ok() {
+                            eprintln!("[tree-dbg] response parent={parent} items={}", items.len());
+                        }
                         let rows = self.ext_trees.entry(vid).or_default();
                         if parent == 0 {
                             *rows = items;
@@ -7318,9 +7357,20 @@ impl App {
             }
         }
         // Extension tree view rows: expand/collapse containers, run leaf commands.
+        if std::env::var("AETHER_DEBUG_TREE").is_ok() {
+            let l = self.layout();
+            let tr = l.tree_region();
+            eprintln!("[tree-dbg] press p=({x},{y}) vis={} ext={} tr=({},{},{},{})",
+                self.sidebar_visible, matches!(self.sidebar_view, SidebarView::ExtView(_)),
+                tr.x, tr.y, tr.w, tr.h);
+        }
         if self.sidebar_visible {
             if let SidebarView::ExtView(vi) = self.sidebar_view {
                 let item = self.ext_activity_items().get(vi).cloned();
+                if std::env::var("AETHER_DEBUG_TREE").is_ok() {
+                    eprintln!("[tree-dbg] vi={vi} n={} item={:?}", self.ext_activity_items().len(),
+                        item.as_ref().map(|a| (a.view_id.clone(), a.is_webview)));
+                }
                 if let Some(item) = item.filter(|a| !a.is_webview) {
                     let layout = self.layout();
                     let tr = layout.tree_region();
