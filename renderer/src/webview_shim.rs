@@ -7,7 +7,19 @@
 /// these from the active theme; the shim's literals are only the fallback).
 pub fn theme_vars_js() -> String {
     fn hex4(c: [f32; 4]) -> String {
-        format!("#{:02x}{:02x}{:02x}", (c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8)
+        // Alpha-aware: theme overlay colors (hover, selection) are translucent —
+        // dropping alpha turned a 6%-white hover into SOLID white.
+        if c[3] < 0.999 {
+            format!(
+                "rgba({},{},{},{:.3})",
+                (c[0] * 255.0) as u8,
+                (c[1] * 255.0) as u8,
+                (c[2] * 255.0) as u8,
+                c[3]
+            )
+        } else {
+            format!("#{:02x}{:02x}{:02x}", (c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8)
+        }
     }
     fn hexg(c: glyphon::Color) -> String {
         let [r, g, b, _] = c.as_rgba();

@@ -1763,7 +1763,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 (la - 1, s, e)
             });
             for run in d.buffer.layout_runs() {
-                let line = run.line_i;
+                let line = run.line_i + d.buf_first_line();
                 if line >= nlines || d.is_line_hidden(line) {
                     continue;
                 }
@@ -1801,7 +1801,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 if levels == 0 {
                     continue;
                 }
-                let y = layout.editor_text.y + theme::EDITOR_PAD() + run.line_top - d.scroll_y() - foff(line);
+                let y = layout.editor_text.y + theme::EDITOR_PAD() + run.line_top + d.buf_offset_px() - d.scroll_y() - foff(line);
                 if let Some((qy, qh)) = clip_v(y, run.line_height) {
                     for k in 0..levels {
                         let gx = (ex0 + theme::EDITOR_PAD() + (k * unit) as f32 * char_w - d.scroll_x()).round();
@@ -1914,8 +1914,9 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 let hi_line = d.rope.byte_to_line(hi);
                 let lo_col = s - d.rope.line_to_byte(lo_line);
                 let hi_col = hi - d.rope.line_to_byte(hi_line);
+                // Large docs shape a sliding window: run lines/tops are window-relative.
                 for run in d.buffer.layout_runs() {
-                    let line = run.line_i;
+                    let line = run.line_i + d.buf_first_line();
                     if line < lo_line || line > hi_line || d.is_line_hidden(line) {
                         continue;
                     }
@@ -1930,7 +1931,8 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     };
                     let (xs, xe) = x_range_in_run(&run, cs, ce);
                     let w = (xe - xs).max(2.0);
-                    let my = layout.editor_text.y + theme::EDITOR_PAD() + run.line_top - d.scroll_y() - foff(line);
+                    let my =
+                        layout.editor_text.y + theme::EDITOR_PAD() + run.line_top + d.buf_offset_px() - d.scroll_y() - foff(line);
                     let mx = layout.editor_text.x + theme::EDITOR_PAD() + xs - d.scroll_x();
                     if let (Some((qy, qh)), Some((x0, cw))) = (clip_v(my, run.line_height), clip_h(mx, w)) {
                         bg_quads.push(Quad::new(x0, qy, cw, qh, theme::FIND_MATCH()));
@@ -1946,8 +1948,9 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             let hi_line = d.rope.byte_to_line(hi);
             let lo_col = lo - d.rope.line_to_byte(lo_line);
             let hi_col = hi - d.rope.line_to_byte(hi_line);
+            // Window-relative run lines/tops (see match highlights above).
             for run in d.buffer.layout_runs() {
-                let line = run.line_i;
+                let line = run.line_i + d.buf_first_line();
                 if line < lo_line || line > hi_line || d.is_line_hidden(line) {
                     continue;
                 }
@@ -1962,7 +1965,8 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 };
                 let (xs, xe) = x_range_in_run(&run, col_start, col_end);
                 let w = (xe - xs).max(2.0);
-                let sel_y = layout.editor_text.y + theme::EDITOR_PAD() + run.line_top - d.scroll_y() - foff(line);
+                let sel_y =
+                    layout.editor_text.y + theme::EDITOR_PAD() + run.line_top + d.buf_offset_px() - d.scroll_y() - foff(line);
                 let sx = layout.editor_text.x + theme::EDITOR_PAD() + xs - d.scroll_x();
                 if let (Some((qy, qh)), Some((x0, cw))) = (clip_v(sel_y, run.line_height), clip_h(sx, w)) {
                     bg_quads.push(Quad::new(x0, qy, cw, qh, theme::SELECTION()));
@@ -1982,12 +1986,13 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     }
                     let col = pos - d.rope.line_to_byte(line);
                     for run in d.buffer.layout_runs() {
-                        if run.line_i != line {
+                        if run.line_i + d.buf_first_line() != line {
                             continue;
                         }
                         let (xs, xe) = x_range_in_run(&run, col, col + 1);
                         let w = (xe - xs).max(2.0);
-                        let by = layout.editor_text.y + theme::EDITOR_PAD() + run.line_top - d.scroll_y() - foff(line);
+                        let by =
+                            layout.editor_text.y + theme::EDITOR_PAD() + run.line_top + d.buf_offset_px() - d.scroll_y() - foff(line);
                         let bx = layout.editor_text.x + theme::EDITOR_PAD() + xs - d.scroll_x();
                         // Clip horizontally to the editor: when scrolled right, a
                         // bracket left of the viewport must not bleed into the gutter/sidebar.
@@ -2024,7 +2029,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     _ => theme::DIAGNOSTIC_INFO(),
                 };
                 for run in d.buffer.layout_runs() {
-                    let line = run.line_i;
+                    let line = run.line_i + d.buf_first_line();
                     if line < lo_line || line > hi_line || d.is_line_hidden(line) {
                         continue;
                     }
@@ -2039,7 +2044,8 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     };
                     let (xs, xe) = x_range_in_run(&run, col_start, col_end);
                     let w = (xe - xs).max(3.0 * uz);
-                    let line_y = layout.editor_text.y + theme::EDITOR_PAD() + run.line_top - d.scroll_y() - foff(line);
+                    let line_y =
+                        layout.editor_text.y + theme::EDITOR_PAD() + run.line_top + d.buf_offset_px() - d.scroll_y() - foff(line);
                     let under_y = line_y + run.line_height - 2.0 * uz;
                     let ux = layout.editor_text.x + theme::EDITOR_PAD() + xs - d.scroll_x();
                     let in_x = ux + w > layout.editor_text.x && ux < layout.editor_text.x + layout.editor_text.w;
@@ -2059,14 +2065,14 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             // Right edge of the line-number column (between numbers and text), VSCode-style.
             let bx = g.x + g.w - bw;
             for run in d.buffer.layout_runs() {
-                let line = run.line_i;
+                let line = run.line_i + d.buf_first_line();
                 if d.is_line_hidden(line) {
                     continue;
                 }
                 let Some(&(_, kind)) = d.gutter_changes.iter().find(|(l, _)| *l == line) else {
                     continue;
                 };
-                let line_y = layout.editor_text.y + theme::EDITOR_PAD() + run.line_top - d.scroll_y() - foff(line);
+                let line_y = layout.editor_text.y + theme::EDITOR_PAD() + run.line_top + d.buf_offset_px() - d.scroll_y() - foff(line);
                 let (color, top, h) = match kind {
                     Change::Added => (theme::GUTTER_ADD(), line_y, run.line_height),
                     Change::Modified => (theme::GUTTER_MOD(), line_y, run.line_height),
@@ -2084,11 +2090,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             let g = layout.gutter;
             let dot = theme::zpx(9.0);
             for run in d.buffer.layout_runs() {
-                let line = run.line_i;
+                let line = run.line_i + d.buf_first_line();
                 if d.is_line_hidden(line) {
                     continue;
                 }
-                let line_y = layout.editor_text.y + theme::EDITOR_PAD() + run.line_top - d.scroll_y() - foff(line);
+                let line_y = layout.editor_text.y + theme::EDITOR_PAD() + run.line_top + d.buf_offset_px() - d.scroll_y() - foff(line);
                 if d.execution_line == Some(line) {
                     if let Some((qy, qh)) = clip_v(line_y, run.line_height) {
                         bg_quads.push(Quad::new(layout.editor_text.x, qy, layout.editor_text.w, qh, theme::EXECUTION_LINE_BG()));
@@ -2114,7 +2120,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             let inc_bg = [0.20, 0.42, 0.74, 0.16]; // blue, content
             let inc_hi = [0.20, 0.42, 0.74, 0.34]; // blue, the >>>>>>> line
             for run in d.buffer.layout_runs() {
-                let line = run.line_i;
+                let line = run.line_i + d.buf_first_line();
                 if d.is_line_hidden(line) {
                     continue;
                 }
@@ -2132,7 +2138,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     }
                 });
                 if let Some(col) = tint {
-                    let line_y = layout.editor_text.y + theme::EDITOR_PAD() + run.line_top - d.scroll_y() - foff(line);
+                    let line_y = layout.editor_text.y + theme::EDITOR_PAD() + run.line_top + d.buf_offset_px() - d.scroll_y() - foff(line);
                     if let Some((qy, qh)) = clip_v(line_y, run.line_height) {
                         bg_quads.push(Quad::new(layout.editor_text.x, qy, layout.editor_text.w, qh, col));
                     }
@@ -3080,7 +3086,8 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             });
             if !on_marker && blame_text(d, app.git_user.as_deref(), now_unix()).is_some() {
                 let cur = d.head_line_col().0;
-                let line_w = d.buffer.layout_runs().find(|r| r.line_i == cur).map(|r| r.line_w).unwrap_or(0.0);
+                let line_w =
+                    d.buffer.layout_runs().find(|r| r.line_i + d.buf_first_line() == cur).map(|r| r.line_w).unwrap_or(0.0);
                 let (ltop, lh2) = d.line_visual_bounds(cur);
                 let off2 = lh * d.hidden_above(cur) as f32 - lh * d.ghost_above(cur) as f32;
                 let line_y = et.y + theme::EDITOR_PAD() + ltop - d.scroll_y() - off2;
@@ -3101,7 +3108,9 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     et.y + theme::EDITOR_PAD() + ltop - d.scroll_y() - off
                 };
                 // dim text after a marker line's content (e.g. the "(Current Change)" hint).
-                let line_w = |line: usize| d.buffer.layout_runs().find(|r| r.line_i == line).map(|r| r.line_w).unwrap_or(0.0);
+                let line_w = |line: usize| {
+                    d.buffer.layout_runs().find(|r| r.line_i + d.buf_first_line() == line).map(|r| r.line_w).unwrap_or(0.0)
+                };
                 for (st, _, en) in d.conflicts() {
                     let ghost_y = row_y(st) - lh; // reserved row above the marker
                     if ghost_y >= et.y && ghost_y + lh <= et.y + et.h {

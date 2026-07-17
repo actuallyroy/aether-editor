@@ -185,7 +185,11 @@ fn shape_window(buffer: &mut Buffer, fs: &mut FontSystem, text: &str, count: usi
     buffer.set_wrap(fs, Wrap::None);
     buffer.set_size(fs, None, Some((count as f32 + 2.0) * theme::LINE_HEIGHT() + 200.0));
     let mono = Attrs::new().family(Family::Name(theme::MONO_FAMILY()));
-    buffer.set_text(fs, text, mono, Shaping::Basic);
+    // Advanced, not Basic: Basic (shape_skip) emits glyphs whose start/end are
+    // word-relative, but Buffer::hit slices run.text with them as line-relative —
+    // clicks map to the wrong column and panic on multibyte text (SIGABRT in
+    // mouse_down, which can't unwind).
+    buffer.set_text(fs, text, mono, Shaping::Advanced);
     buffer.shape_until_scroll(fs, false);
 }
 
@@ -3413,6 +3417,35 @@ mod tests {
         let b = d.rope.line_to_byte(225_000);
         let (_, y, _) = d.byte_visual(b);
         assert_eq!(y, 225_000.0 * theme::LINE_HEIGHT());
+    }
+
+    // Click hit-testing in a windowed large file must agree with a fully-shaped
+    // small doc. Regression: Shaping::Basic emitted word-relative glyph indices,
+    // so hit() mapped clicks to the wrong column (near line start) and panicked
+    // slicing multibyte text (SIGABRT inside AppKit mouse_down).
+    #[test]
+    fn large_file_click_hit_matches_layout() {
+        let mut fs = glyphon::FontSystem::new();
+        let line = "line 12345 some wörds here to click on with extra text padding\n";
+        let mut d = Document::new(Some(std::path::PathBuf::from("t.txt")), line.repeat(11_500), &mut fs);
+        assert!(d.large, "11.5k lines must be large mode");
+        d.ensure_window(&mut fs, 9_000, 50);
+        let lh = theme::LINE_HEIGHT();
+        // Reference: the same content in a small (fully shaped, Advanced) doc.
+        let small = Document::new(Some(std::path::PathBuf::from("s.txt")), line.repeat(20), &mut fs);
+        for x in [0.0f32, 60.0, 200.0, 320.0] {
+            let target = 9_010usize;
+            let buf_y = d.expand_visual_y(target as f32 * lh + lh * 0.5) - d.buf_offset_px();
+            let hit = d.buffer.hit(x, buf_y).expect("hit inside window");
+            assert_eq!(hit.line + d.buf_first_line(), target, "x={x}: wrong line");
+            let small_hit = small.buffer.hit(x, 5.0 * lh + lh * 0.5).expect("small hit");
+            assert_eq!(hit.index, small_hit.index, "x={x}: windowed column disagrees with full shaping");
+            // The mapped byte must round-trip through caret geometry to ~x.
+            let byte = d.rope.line_to_byte(target) + hit.index;
+            let (vx, vy, _) = d.byte_visual(byte);
+            assert_eq!(vy, target as f32 * lh);
+            assert!((vx - x).abs() < 12.0, "x={x}: caret drawn at {vx}");
+        }
     }
 
     // Large-file mode invariants that must hold at normal sizes too: small docs

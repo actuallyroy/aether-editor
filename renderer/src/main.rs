@@ -4656,7 +4656,10 @@ impl App {
                 || self.ctx_menu.is_some()
                 || self.palette.active
                 || self.dialog.is_some()
-                || self.feedback_form.is_some();
+                || self.feedback_form.is_some()
+                // The settings editor is a full modal — the webview must yield
+                // (NSViews composite ABOVE everything aether draws).
+                || self.settings_editor.open;
             let l = self.layout();
             let sf = self.gpu.as_ref().map(|g| g.window.scale_factor()).unwrap_or(1.0);
             let win_h = self.gpu.as_ref().map(|g| g.config.height).unwrap_or(0);
@@ -12165,6 +12168,29 @@ fn copy_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
 
 fn main() -> Result<()> {
     env_logger::init();
+    // GUI launches have no visible stderr, so panic messages vanish (crash reports
+    // only show "abort() called"). Log every panic + backtrace to ~/.aether/panic.log
+    // before the default hook runs, so crashes stay diagnosable in the field.
+    {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if let Some(home) = std::env::var_os("HOME") {
+                let dir = std::path::PathBuf::from(home).join(".aether");
+                let _ = std::fs::create_dir_all(&dir);
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("panic.log")) {
+                    use std::io::Write;
+                    let _ = writeln!(
+                        f,
+                        "[{:?}] aether {} panic: {info}\n{}",
+                        std::time::SystemTime::now(),
+                        env!("CARGO_PKG_VERSION"),
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                }
+            }
+            default_hook(info);
+        }));
+    }
     // Pty-host mode: this process is the detached daemon that owns terminal PTYs so
     // they survive GUI restarts. It never opens a window — just runs the event loop.
     if std::env::args().any(|a| a == "--pty-host") {
