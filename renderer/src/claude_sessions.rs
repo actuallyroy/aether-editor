@@ -125,12 +125,12 @@ impl ClaudeWatcher {
 }
 
 /// Encode an absolute path the way Claude Code names its project transcript dir:
-/// every `/`, space and `.` becomes `-` (e.g. `/Users/me/My Proj` →
-/// `-Users-me-My-Proj`).
+/// every non-alphanumeric char becomes `-` (underscores too: `/Users/dq_amit/x` →
+/// `-Users-dq-amit-x`).
 fn encode_cwd(cwd: &Path) -> String {
     cwd.to_string_lossy()
         .chars()
-        .map(|c| if c == '/' || c == ' ' || c == '.' { '-' } else { c })
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect()
 }
 

@@ -37,6 +37,26 @@ impl Selection {
     }
 }
 
+/// Column (box) selection: Alt/Option+drag. Endpoints are `(line, char_col)`;
+/// per-line byte ranges are derived on demand (clamped to each line's length).
+#[derive(Clone, Copy)]
+pub struct BoxSel {
+    pub anchor: (usize, usize),
+    pub head: (usize, usize),
+}
+
+impl BoxSel {
+    /// `(lo_line, hi_line, lo_col, hi_col)` — normalized corners.
+    pub fn bounds(&self) -> (usize, usize, usize, usize) {
+        (
+            self.anchor.0.min(self.head.0),
+            self.anchor.0.max(self.head.0),
+            self.anchor.1.min(self.head.1),
+            self.anchor.1.max(self.head.1),
+        )
+    }
+}
+
 #[derive(Clone)]
 pub enum EditOp {
     Insert(String),
@@ -60,10 +80,19 @@ pub struct Document {
     pub name: String,
     pub rope: Rope,
     pub sel: Selection,
+    /// Column (box) selection, active while Some. Cleared by any normal caret
+    /// placement (`place`) or click without Alt.
+    pub box_sel: Option<BoxSel>,
+    /// Extra carets (multi-cursor, Alt/Option+click) as byte offsets, besides
+    /// `sel.head`. Sorted ascending, deduped. Cleared by any normal placement.
+    pub extra_carets: Vec<usize>,
     pub scroll: ScrollView, // owns the editor scroll offset + scrollbars (per tab)
     pub dirty: bool,
     history: Vec<Edit>,
     future: Vec<Edit>,
+    /// Multi-cursor snapshots per undo group: group id → (extra carets before the
+    /// edit, extra carets after). Undo/redo restore them so cursors survive Ctrl+Z.
+    group_carets: std::collections::HashMap<u64, (Vec<usize>, Vec<usize>)>,
     next_group: u64,    // id for the next undo group (see `Edit::group`)
     pending_stop: bool, // force the next edit into a fresh undo group
     force_join: bool,   // glue the next edit to the current group (replace-selection typing)
@@ -373,9 +402,12 @@ impl Document {
             name,
             rope,
             sel: Selection::caret(0),
+            box_sel: None,
+            extra_carets: Vec::new(),
             scroll: ScrollView::new(ScrollOpts::both()),
             dirty: false,
             history: Vec::new(),
+            group_carets: std::collections::HashMap::new(),
             next_group: 0,
             pending_stop: true,
             force_join: false,
@@ -557,9 +589,12 @@ impl Document {
             name,
             rope: Rope::new(),
             sel: Selection::caret(0),
+            box_sel: None,
+            extra_carets: Vec::new(),
             scroll: ScrollView::new(ScrollOpts::both()),
             dirty: false,
             history: Vec::new(),
+            group_carets: std::collections::HashMap::new(),
             next_group: 0,
             pending_stop: true,
             force_join: false,
@@ -672,9 +707,12 @@ impl Document {
             name: visible.title.clone(),
             rope: Rope::from_str(&visible.left_text),
             sel: Selection::caret(0),
+            box_sel: None,
+            extra_carets: Vec::new(),
             scroll: ScrollView::new(ScrollOpts::both()),
             dirty: false,
             history: Vec::new(),
+            group_carets: std::collections::HashMap::new(),
             next_group: 0,
             pending_stop: true,
             force_join: false,
@@ -2007,6 +2045,8 @@ impl Document {
         if self.read_only {
             return;
         }
+        self.box_sel = None; // a normal insert (typing/paste) leaves column-select mode
+        self.extra_carets.clear();
         if !self.sel.is_empty() {
             self.delete_selection_no_reshape();
             // The delete + insert came from one keystroke (typing over a selection):
@@ -2104,6 +2144,7 @@ impl Document {
     }
 
     pub fn undo(&mut self, fs: &mut FontSystem) -> bool {
+        self.box_sel = None;
         if self.read_only {
             return false;
         }
@@ -2131,6 +2172,9 @@ impl Document {
             self.future.push(edit);
         }
         self.pending_stop = true; // typing after an undo starts a fresh group
+        // A multi-cursor edit group restores its carets (as they were BEFORE the
+        // edit — valid positions in the restored text); other groups collapse.
+        self.extra_carets = self.group_carets.get(&group).map(|(b, _)| b.clone()).unwrap_or_default();
         self.dirty = true;
         // The text changed: language servers need a didChange like any edit.
         self.version += 1;
@@ -2140,6 +2184,7 @@ impl Document {
     }
 
     pub fn redo(&mut self, fs: &mut FontSystem) -> bool {
+        self.box_sel = None;
         if self.read_only {
             return false;
         }
@@ -2160,6 +2205,7 @@ impl Document {
             self.history.push(edit);
         }
         self.pending_stop = true;
+        self.extra_carets = self.group_carets.get(&group).map(|(_, a)| a.clone()).unwrap_or_default();
         self.dirty = true;
         self.version += 1;
         self.lsp_dirty = true;
@@ -2233,11 +2279,255 @@ impl Document {
     }
 
     pub fn place(&mut self, byte: usize, extend: bool) {
+        self.box_sel = None; // any normal caret placement leaves column-select mode
+        self.extra_carets.clear();
         self.sel.head = byte;
         if !extend {
             self.sel.anchor = byte;
         }
         self.sel.desired_col = None;
+    }
+
+    // ---- Column (box) selection ----
+
+    /// `(line, char_col)` of an absolute byte offset.
+    pub fn line_col_of(&self, byte: usize) -> (usize, usize) {
+        let b = byte.min(self.rope.len_bytes());
+        let line = self.rope.byte_to_line(b);
+        let col = self.rope.byte_to_char(b) - self.rope.line_to_char(line);
+        (line, col)
+    }
+
+    /// Char length of `line` excluding its line break.
+    fn line_content_chars(&self, line: usize) -> usize {
+        let l = self.rope.line(line);
+        let mut n = l.len_chars();
+        let mut chars = l.chars_at(n);
+        while let Some(c) = chars.prev() {
+            if c == '\n' || c == '\r' {
+                n -= 1;
+            } else {
+                break;
+            }
+        }
+        n
+    }
+
+    /// Absolute byte of `(line, char_col)`, clamped to the line's content end.
+    pub fn byte_at_line_col(&self, line: usize, col: usize) -> usize {
+        let line = line.min(self.rope.len_lines().saturating_sub(1));
+        let col = col.min(self.line_content_chars(line));
+        self.rope.char_to_byte(self.rope.line_to_char(line) + col)
+    }
+
+    /// Per-line `(lo, hi)` byte ranges of the box selection (clamped to each
+    /// line's content; a line shorter than `lo_col` yields an empty range at its end).
+    pub fn box_ranges(&self) -> Vec<(usize, usize)> {
+        let Some(bs) = self.box_sel else { return Vec::new() };
+        let (l0, l1, c0, c1) = bs.bounds();
+        (l0..=l1.min(self.rope.len_lines().saturating_sub(1)))
+            .map(|l| (self.byte_at_line_col(l, c0), self.byte_at_line_col(l, c1)))
+            .collect()
+    }
+
+    /// The box selection's text: one entry per line, joined with '\n'.
+    pub fn box_selected_text(&self) -> Option<String> {
+        let ranges = self.box_ranges();
+        if ranges.is_empty() || ranges.iter().all(|(lo, hi)| lo == hi) {
+            return None;
+        }
+        Some(ranges.iter().map(|&(lo, hi)| self.slice_str(lo, hi)).collect::<Vec<_>>().join("\n"))
+    }
+
+    /// Type into the box selection: per line, replace the selected span with `s`
+    /// (bottom-up so earlier byte offsets stay valid). One undo group. The box
+    /// collapses to a caret column after the typed text.
+    pub fn box_insert(&mut self, s: &str, fs: &mut FontSystem) {
+        if self.read_only {
+            return;
+        }
+        let Some(bs) = self.box_sel else { return };
+        let (l0, l1, c0, _) = bs.bounds();
+        let ranges = self.box_ranges();
+        self.break_undo_group();
+        let mut first = true;
+        for &(lo, hi) in ranges.iter().rev() {
+            self.sel = Selection { anchor: lo, head: hi, desired_col: None };
+            if lo != hi {
+                if !first {
+                    self.force_join = true;
+                }
+                self.delete_selection_no_reshape();
+                first = false;
+            }
+            // Everything after the group's first push glues into one undo step.
+            if !first {
+                self.force_join = true;
+            }
+            let head = self.sel.head;
+            self.push_and_apply(EditOp::Insert(s.to_string()), head, Selection::caret(head + s.len()));
+            first = false;
+        }
+        self.reshape(fs);
+        self.break_undo_group();
+        let col = c0 + s.chars().count();
+        self.box_sel = Some(BoxSel { anchor: (l0, col), head: (l1, col) });
+        self.sel = Selection::caret(self.byte_at_line_col(l1, col));
+    }
+
+    // ---- Multi-cursor (Alt/Option+click extra carets) ----
+
+    /// Toggle an extra caret at `byte` (Alt/Option+click). Clicking an existing
+    /// caret removes it; clicking elsewhere adds one. The primary caret stays.
+    pub fn toggle_caret(&mut self, byte: usize) {
+        self.box_sel = None;
+        if byte == self.sel.head {
+            return;
+        }
+        if let Some(i) = self.extra_carets.iter().position(|&c| c == byte) {
+            self.extra_carets.remove(i);
+            return;
+        }
+        self.extra_carets.push(byte);
+        self.extra_carets.sort_unstable();
+        self.extra_carets.dedup();
+    }
+
+    /// All caret positions (primary + extras), ascending, deduped.
+    fn all_carets(&self) -> Vec<usize> {
+        let mut cs = self.extra_carets.clone();
+        cs.push(self.sel.head);
+        cs.sort_unstable();
+        cs.dedup();
+        cs
+    }
+
+    /// Type at every caret (multi-cursor): insert `s` at each position as ONE undo
+    /// group. Edits apply bottom-up so earlier offsets stay valid; carets advance
+    /// past their own insert plus the shifts from inserts below them.
+    pub fn multi_insert(&mut self, s: &str, fs: &mut FontSystem) {
+        if self.read_only || self.extra_carets.is_empty() {
+            return;
+        }
+        let carets = self.all_carets();
+        let primary = self.sel.head;
+        self.break_undo_group();
+        let mut first = true;
+        for &p in carets.iter().rev() {
+            if !first {
+                self.force_join = true;
+            }
+            self.sel = Selection::caret(p);
+            self.push_and_apply(EditOp::Insert(s.to_string()), p, Selection::caret(p + s.len()));
+            first = false;
+        }
+        self.reshape(fs);
+        self.break_undo_group();
+        // Ascending: caret i lands at p_i + len·(i+1).
+        let new_pos =
+            |p: usize| -> usize { p + s.len() * (carets.iter().filter(|&&c| c <= p).count()) };
+        let before = std::mem::take(&mut self.extra_carets);
+        self.extra_carets = carets.iter().filter(|&&c| c != primary).map(|&c| new_pos(c)).collect();
+        self.sel = Selection::caret(new_pos(primary));
+        if let Some(g) = self.history.last().map(|e| e.group) {
+            self.group_carets.insert(g, (before, self.extra_carets.clone()));
+        }
+    }
+
+    /// Backspace at every caret: delete one char left of each (skipping carets at
+    /// byte 0), as ONE undo group.
+    pub fn multi_backspace(&mut self, fs: &mut FontSystem) {
+        if self.read_only || self.extra_carets.is_empty() {
+            return;
+        }
+        let carets = self.all_carets();
+        let primary = self.sel.head;
+        // Per-caret deleted length (char immediately left), ascending order.
+        let del_len: Vec<usize> = carets
+            .iter()
+            .map(|&p| {
+                if p == 0 {
+                    return 0;
+                }
+                let ci = self.rope.byte_to_char(p);
+                p - self.rope.char_to_byte(ci - 1)
+            })
+            .collect();
+        self.break_undo_group();
+        let mut edited = false;
+        for (i, &p) in carets.iter().enumerate().rev() {
+            let l = del_len[i];
+            if l == 0 {
+                continue;
+            }
+            self.sel = Selection { anchor: p - l, head: p, desired_col: None };
+            if edited {
+                self.force_join = true;
+            }
+            self.delete_selection_no_reshape();
+            edited = true;
+        }
+        if edited {
+            self.reshape(fs);
+        }
+        self.break_undo_group();
+        let new_pos = |p: usize| -> usize {
+            let shift: usize =
+                carets.iter().zip(&del_len).filter(|(&c, _)| c <= p).map(|(_, &l)| l).sum();
+            p - shift
+        };
+        let before = std::mem::take(&mut self.extra_carets);
+        self.extra_carets = carets.iter().filter(|&&c| c != primary).map(|&c| new_pos(c)).collect();
+        self.extra_carets.dedup();
+        self.sel = Selection::caret(new_pos(primary));
+        if edited {
+            if let Some(g) = self.history.last().map(|e| e.group) {
+                self.group_carets.insert(g, (before, self.extra_carets.clone()));
+            }
+        }
+    }
+
+    /// Backspace in box mode: a non-empty box deletes its spans; an empty (caret
+    /// column) box deletes one char left of the column on every line that has one.
+    pub fn box_backspace(&mut self, fs: &mut FontSystem) {
+        if self.read_only {
+            return;
+        }
+        let Some(bs) = self.box_sel else { return };
+        let (l0, l1, c0, c1) = bs.bounds();
+        let empty = c0 == c1;
+        if empty && c0 == 0 {
+            return;
+        }
+        self.break_undo_group();
+        let mut edited = false;
+        for l in (l0..=l1.min(self.rope.len_lines().saturating_sub(1))).rev() {
+            let (lo, hi) = if empty {
+                if self.line_content_chars(l) < c0 {
+                    continue; // line too short — nothing left of the column
+                }
+                (self.byte_at_line_col(l, c0 - 1), self.byte_at_line_col(l, c0))
+            } else {
+                (self.byte_at_line_col(l, c0), self.byte_at_line_col(l, c1))
+            };
+            if lo == hi {
+                continue;
+            }
+            self.sel = Selection { anchor: lo, head: hi, desired_col: None };
+            if edited {
+                self.force_join = true; // glue per-line deletes into one undo step
+            }
+            self.delete_selection_no_reshape();
+            edited = true;
+        }
+        self.force_join = false;
+        if edited {
+            self.reshape(fs);
+        }
+        self.break_undo_group();
+        let col = if empty { c0 - 1 } else { c0 };
+        self.box_sel = Some(BoxSel { anchor: (l0, col), head: (l1, col) });
+        self.sel = Selection::caret(self.byte_at_line_col(l1, col));
     }
 
     pub fn move_left(&mut self, extend: bool) {
@@ -2354,6 +2644,8 @@ impl Document {
     }
 
     pub fn select_word(&mut self, byte: usize) {
+        self.box_sel = None;
+        self.extra_carets.clear();
         let total = self.rope.len_chars();
         if total == 0 {
             return;
@@ -2463,6 +2755,8 @@ impl Document {
 
     /// Select the whole line under `byte`, including its trailing newline.
     pub fn select_line(&mut self, byte: usize) {
+        self.box_sel = None;
+        self.extra_carets.clear();
         let line = self.rope.byte_to_line(byte.min(self.rope.len_bytes()));
         let start = self.rope.line_to_byte(line);
         let end = if line + 1 < self.rope.len_lines() {
@@ -2476,6 +2770,8 @@ impl Document {
     }
 
     pub fn select_all(&mut self) {
+        self.box_sel = None;
+        self.extra_carets.clear();
         self.sel.anchor = 0;
         self.sel.head = self.rope.len_bytes();
         self.sel.desired_col = None;
@@ -3446,6 +3742,73 @@ mod tests {
             assert_eq!(vy, target as f32 * lh);
             assert!((vx - x).abs() < 12.0, "x={x}: caret drawn at {vx}");
         }
+    }
+
+    // Column (box) selection: per-line ranges, copy text, typed replacement as one
+    // undo step, and column backspace.
+    #[test]
+    fn box_selection_ops() {
+        let mut fs = glyphon::FontSystem::new();
+        let mut d = doc("alpha\nbeta\ngamma\n", &mut fs);
+        d.box_sel = Some(BoxSel { anchor: (0, 1), head: (2, 3) });
+        assert_eq!(d.box_selected_text().as_deref(), Some("lp\net\nam"));
+        // Typing replaces each line's span; box collapses to a caret column.
+        d.box_insert("X", &mut fs);
+        assert_eq!(d.text(), "aXha\nbXa\ngXma\n");
+        let bs = d.box_sel.unwrap();
+        assert_eq!((bs.anchor, bs.head), ((0, 2), (2, 2)));
+        // One undo restores all three lines.
+        d.undo(&mut fs);
+        assert_eq!(d.text(), "alpha\nbeta\ngamma\n");
+        assert!(d.box_sel.is_none(), "undo leaves box mode");
+        // Column backspace: empty box deletes one char left of the column per line.
+        d.box_sel = Some(BoxSel { anchor: (0, 2), head: (2, 2) });
+        d.box_backspace(&mut fs);
+        assert_eq!(d.text(), "apha\nbta\ngmma\n");
+        d.undo(&mut fs);
+        assert_eq!(d.text(), "alpha\nbeta\ngamma\n");
+        // Lines shorter than the column are skipped by backspace.
+        let mut d2 = doc("ab\nlonger\n", &mut fs);
+        d2.box_sel = Some(BoxSel { anchor: (0, 4), head: (1, 4) });
+        d2.box_backspace(&mut fs);
+        assert_eq!(d2.text(), "ab\nloner\n");
+    }
+
+    // Multi-cursor: Alt+click toggling, typing at every caret as one undo step,
+    // and multi-backspace with correct offset shifting.
+    #[test]
+    fn multi_cursor_ops() {
+        let mut fs = glyphon::FontSystem::new();
+        let mut d = doc("one\ntwo\nthree\n", &mut fs);
+        d.place(2, false); // primary inside "one"
+        d.toggle_caret(6); // inside "two"
+        d.toggle_caret(12); // inside "three"
+        assert_eq!(d.extra_carets, vec![6, 12]);
+        d.toggle_caret(12); // toggle off
+        assert_eq!(d.extra_carets, vec![6]);
+        d.toggle_caret(12);
+        // Type at all three carets.
+        d.multi_insert("X", &mut fs);
+        assert_eq!(d.text(), "onXe\ntwXo\nthreXe\n");
+        assert_eq!(d.sel.head, 3); // primary advanced past its own insert
+        assert_eq!(d.extra_carets, vec![8, 15]);
+        // One undo reverts all three inserts AND restores the cursors.
+        d.undo(&mut fs);
+        assert_eq!(d.text(), "one\ntwo\nthree\n");
+        assert_eq!(d.extra_carets, vec![6, 12], "carets survive undo");
+        // Redo re-applies the edit and restores the advanced carets.
+        d.redo(&mut fs);
+        assert_eq!(d.text(), "onXe\ntwXo\nthreXe\n");
+        assert_eq!(d.extra_carets, vec![8, 15], "carets survive redo");
+        d.undo(&mut fs);
+        // Multi-backspace deletes one char left of each caret.
+        d.place(2, false);
+        d.toggle_caret(6);
+        d.toggle_caret(12);
+        d.multi_backspace(&mut fs);
+        assert_eq!(d.text(), "oe\nto\nthre\n");
+        assert_eq!(d.sel.head, 1);
+        assert_eq!(d.extra_carets, vec![4, 9]);
     }
 
     // Large-file mode invariants that must hold at normal sizes too: small docs

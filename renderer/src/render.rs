@@ -1974,6 +1974,38 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             }
         }
 
+        // Column (box) selection: per-line span quads + a caret bar on every line
+        // at the head column (Alt/Option+drag). Only visible lines are mapped.
+        if let Some(bs) = d.box_sel {
+            let (l0, l1, c0, c1) = bs.bounds();
+            let lh = theme::LINE_HEIGHT().max(1.0);
+            let first = (d.scroll_y() / lh) as usize;
+            let last = first + (layout.editor_text.h / lh) as usize + 2;
+            let head_col = bs.head.1;
+            for line in l0.max(first)..=l1.min(last).min(d.rope.len_lines().saturating_sub(1)) {
+                let b_lo = d.byte_at_line_col(line, c0);
+                let b_hi = d.byte_at_line_col(line, c1);
+                let (x_lo, ly, lh2) = d.byte_visual(b_lo);
+                let (x_hi, _, _) = d.byte_visual(b_hi);
+                let y = layout.editor_text.y + theme::EDITOR_PAD() + ly - d.scroll_y() - foff(line);
+                if b_hi > b_lo {
+                    let sx = layout.editor_text.x + theme::EDITOR_PAD() + x_lo - d.scroll_x();
+                    if let (Some((qy, qh)), Some((qx, qw))) = (clip_v(y, lh2), clip_h(sx, (x_hi - x_lo).max(2.0))) {
+                        bg_quads.push(Quad::new(qx, qy, qw, qh, theme::SELECTION()));
+                    }
+                }
+                // Caret bar at the head column (clamped to the line's end, like the span).
+                if app.cursor_blink_on && !d.read_only && !modal_open && !app.find.focused {
+                    let (cx, _, _) = d.byte_visual(d.byte_at_line_col(line, head_col));
+                    let bx = layout.editor_text.x + theme::EDITOR_PAD() + cx - d.scroll_x();
+                    let bar_in = bx >= layout.editor_text.x && bx < layout.editor_text.x + layout.editor_text.w;
+                    if let Some((qy, qh)) = clip_v(y, lh2).filter(|_| bar_in) {
+                        fg_quads.push(Quad::new(bx, qy, theme::CURSOR_WIDTH(), qh, theme::CURSOR()));
+                    }
+                }
+            }
+        }
+
         // Matching-bracket highlight (VSCode editorBracketMatch): when the caret
         // sits beside a bracket, box both that bracket and its match — faint fill
         // plus a 1px outline. Skipped in diffs/read-only views (no caret there).
@@ -2164,6 +2196,21 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     qh,
                     theme::CURSOR(),
                 ));
+            }
+        }
+
+        // Extra carets (multi-cursor): a bar at each Alt-click caret, same blink
+        // phase as the primary.
+        if !d.extra_carets.is_empty() && app.cursor_blink_on && !d.read_only && !modal_open && !app.find.focused {
+            for &b in &d.extra_carets {
+                let (cx, cy, ch) = d.byte_visual(b);
+                let line = d.rope.byte_to_line(b.min(d.rope.len_bytes()));
+                let y0 = layout.editor_text.y + theme::EDITOR_PAD() + cy - d.scroll_y() - foff(line);
+                let x0 = layout.editor_text.x + theme::EDITOR_PAD() + cx - d.scroll_x();
+                let bar_in = x0 >= layout.editor_text.x && x0 < layout.editor_text.x + layout.editor_text.w;
+                if let Some((qy, qh)) = clip_v(y0, ch).filter(|_| bar_in) {
+                    fg_quads.push(Quad::new(x0, qy, theme::CURSOR_WIDTH(), qh, theme::CURSOR()));
+                }
             }
         }
 
@@ -2362,13 +2409,18 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 if let Some((a, b)) = pane.sel {
                     let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
                     let (cols, rows) = pane.term.dims();
+                    // Box selection: every covered row gets the same column span.
+                    let (bc0, bc1) = (a.1.min(b.1), a.1.max(b.1));
                     for r in 0..rows {
                         let abs = top_line + r;
                         if abs < lo.0 || abs > hi.0 {
                             continue;
                         }
-                        let c0 = if abs == lo.0 { lo.1 } else { 0 };
-                        let c1 = if abs == hi.0 { hi.1 } else { cols };
+                        let (c0, c1) = if pane.sel_box {
+                            (bc0, bc1.max(bc0 + 1))
+                        } else {
+                            (if abs == lo.0 { lo.1 } else { 0 }, if abs == hi.0 { hi.1 } else { cols })
+                        };
                         if c1 <= c0 {
                             continue;
                         }

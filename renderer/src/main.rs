@@ -7051,7 +7051,14 @@ impl App {
     }
 
     fn copy(&mut self) {
-        let Some(text) = self.workspace.active_doc().and_then(|d| d.selected_text()) else {
+        // A visible (non-empty) normal selection always wins; the box (column)
+        // selection is only the source when there's no normal selection — a stale
+        // box must never shadow what the user actually highlighted.
+        let Some(text) = self
+            .workspace
+            .active_doc()
+            .and_then(|d| d.selected_text().or_else(|| d.box_selected_text()))
+        else {
             return;
         };
         let n = text.len();
@@ -7933,7 +7940,7 @@ impl App {
         } else {
             1
         };
-        if self.terminal.content_press((x, y), &layout, self.terminal_cell_w, term_clicks) {
+        if self.terminal.content_press((x, y), &layout, self.terminal_cell_w, term_clicks, self.mods.alt_key()) {
             self.redraw();
             return;
         }
@@ -8721,8 +8728,9 @@ impl App {
                 self.redraw();
                 return;
             }
+            let alt = self.mods.alt_key();
             if let Some(d) = self.workspace.active_doc_mut() {
-                self.editor.on_press(d, &layout, x, y, extend, consecutive);
+                self.editor.on_press(d, &layout, x, y, extend, consecutive, alt);
             }
             self.redraw();
             return;
@@ -9085,7 +9093,7 @@ impl App {
             }
             return;
         }
-        if (self.editor.dragging || self.editor.text_move.is_some()) && self.mouse_pressed {
+        if (self.editor.dragging || self.editor.box_drag || self.editor.text_move.is_some()) && self.mouse_pressed {
             let layout = self.layout();
             if let Some(d) = self.workspace.active_doc_mut() {
                 if self.editor.on_drag(d, &layout, x, y) {
@@ -10338,6 +10346,97 @@ impl App {
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // Multi-cursor mode (Alt/Option+click extra carets): typing/backspace apply
+        // at every caret; Escape or any caret motion (`place`) collapses to one.
+        if !d.extra_carets.is_empty() {
+            match event.logical_key.as_ref() {
+                Key::Named(NamedKey::Escape) => {
+                    d.extra_carets.clear();
+                    self.redraw();
+                    return;
+                }
+                Key::Named(NamedKey::Backspace) if !ctrl => {
+                    d.multi_backspace(&mut gpu.font_system);
+                    self.last_edit = Instant::now();
+                    self.redraw();
+                    return;
+                }
+                Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Tab) => {
+                    d.extra_carets.clear(); // structural keys collapse to one caret
+                }
+                _ => {
+                    if !ctrl {
+                        if let Some(t) = event.text.as_ref().map(|t| t.to_string()) {
+                            if !t.is_empty() && !t.chars().any(|c| c.is_control()) {
+                                d.multi_insert(&t, &mut gpu.font_system);
+                                self.last_edit = Instant::now();
+                                self.redraw();
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Column (box) selection mode: typing/backspace edit every line of the box;
+        // Escape (or any caret motion via `place`) leaves the mode.
+        if d.box_sel.is_some() {
+            match event.logical_key.as_ref() {
+                Key::Named(NamedKey::Escape) => {
+                    d.box_sel = None;
+                    self.redraw();
+                    return;
+                }
+                Key::Named(NamedKey::Backspace) if !ctrl => {
+                    d.box_backspace(&mut gpu.font_system);
+                    self.last_edit = Instant::now();
+                    self.redraw();
+                    return;
+                }
+                Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Tab) => {
+                    d.box_sel = None; // structural keys collapse to a normal caret
+                }
+                _ => {
+                    if !ctrl {
+                        if let Some(t) = event.text.as_ref().map(|t| t.to_string()) {
+                            if !t.is_empty() && !t.chars().any(|c| c.is_control()) {
+                                d.box_insert(&t, &mut gpu.font_system);
+                                self.last_edit = Instant::now();
+                                self.redraw();
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Cmd/Ctrl+Alt+Up/Down: add a cursor above/below (VSCode). Grows a zero-width
+        // column selection from the caret — every line gets a caret bar and typing /
+        // backspace applies to all of them.
+        if ctrl && self.mods.alt_key() {
+            if let Key::Named(k @ (NamedKey::ArrowUp | NamedKey::ArrowDown)) = event.logical_key.as_ref() {
+                let (line, col) = d.line_col_of(d.sel.head);
+                let bs = *d
+                    .box_sel
+                    .get_or_insert(crate::document::BoxSel { anchor: (line, col), head: (line, col) });
+                let (hl, hc) = bs.head;
+                let nh = if k == NamedKey::ArrowUp {
+                    hl.saturating_sub(1)
+                } else {
+                    (hl + 1).min(d.rope.len_lines().saturating_sub(1))
+                };
+                if let Some(b) = d.box_sel.as_mut() {
+                    b.head = (nh, hc);
+                }
+                d.sel = document::Selection::caret(d.byte_at_line_col(nh, hc));
+                self.ensure_cursor_visible();
+                self.redraw();
+                return;
             }
         }
 
@@ -11693,10 +11792,18 @@ impl ApplicationHandler for App {
                 self.term_last_blink = now;
                 changed = true;
             }
+            // The editor caret keeps blinking while the terminal panel is open (it
+            // used to pin solid here, which read as "cursor not blinking").
+            if settings::current().editor_cursor_blink
+                && now.duration_since(self.last_blink) >= Duration::from_millis(theme::BLINK_MS)
+            {
+                self.cursor_blink_on = !self.cursor_blink_on;
+                self.last_blink = now;
+                changed = true;
+            }
             if changed {
                 self.redraw();
             }
-            self.cursor_blink_on = true;
             // Only hold the fast output-batching tick while bytes are actively arriving;
             // the 30ms cadence coalesces a burst into ~33fps. Once output goes quiet,
             // fall back to the cursor-blink cadence and let the pty reader's waker nudge

@@ -17,6 +17,41 @@ if (!port) {
   process.exit(2);
 }
 
+// Block extension writes to ~/.claude/ide: the Claude Code extension advertises its
+// own 12-tool MCP server there with the HOST's identity ("Aether" + the GUI pid),
+// which collides with aether's native 22-tool lock — external clients (claude CLI
+// /ide picker, aether --mcp proxy) then route to the wrong, poorer server. Aether
+// writes its own lock natively; extensions must not.
+{
+  const fs = require('fs');
+  const path = require('path');
+  const os = require('os');
+  const ideDir = path.join(os.homedir(), '.claude', 'ide') + path.sep;
+  const blocked = (p) => {
+    try { return typeof p === 'string' && path.resolve(p).startsWith(ideDir.slice(0, -1)); } catch (_) { return false; }
+  };
+  for (const name of ['writeFileSync', 'writeFile', 'createWriteStream']) {
+    const orig = fs[name];
+    fs[name] = function (p, ...rest) {
+      if (blocked(p)) {
+        console.error(`[ext-host] blocked extension ${name} to ${p} (IDE locks are aether-owned)`);
+        if (name === 'writeFile' && typeof rest[rest.length - 1] === 'function') return rest[rest.length - 1](null);
+        if (name === 'createWriteStream') return new (require('stream').Writable)({ write(c, e, cb) { cb(); } });
+        return undefined;
+      }
+      return orig.call(this, p, ...rest);
+    };
+  }
+  const origPromises = fs.promises.writeFile;
+  fs.promises.writeFile = function (p, ...rest) {
+    if (blocked(p)) {
+      console.error(`[ext-host] blocked extension promises.writeFile to ${p} (IDE locks are aether-owned)`);
+      return Promise.resolve();
+    }
+    return origPromises.call(this, p, ...rest);
+  };
+}
+
 const rpc = new Rpc();
 const { vscode, dispatch } = createVscode(rpc);
 installVscodeModule(vscode);

@@ -108,24 +108,12 @@ fn find_server(cwd: &std::path::Path) -> Option<(u16, String)> {
         if v.get("ideName").and_then(|n| n.as_str()) != Some("Aether") {
             continue;
         }
-        // Pre-marker aether versions don't write aetherNative — fall back to
-        // checking the lock owner's process: extensions' servers run in node.
+        // Only the marker is trustworthy: the Claude Code extension (inside aether)
+        // writes its own 12-tool server's lock with the HOST's ideName AND the host
+        // GUI's pid (the shim reports the host process), so no process-based
+        // heuristic can tell them apart. Marker-less locks are never routed to.
         if v.get("aetherNative").and_then(|b| b.as_bool()) != Some(true) {
-            let owner_is_node = v
-                .get("pid")
-                .and_then(|p| p.as_u64())
-                .map(|pid| {
-                    std::process::Command::new("ps")
-                        .args(["-o", "comm=", "-p", &pid.to_string()])
-                        .output()
-                        .ok()
-                        .map(|o| String::from_utf8_lossy(&o.stdout).contains("node"))
-                        .unwrap_or(true) // dead/unknown owner → don't trust it
-                })
-                .unwrap_or(true);
-            if owner_is_node {
-                continue;
-            }
+            continue;
         }
         let Some(port) = path.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse::<u16>().ok()) else {
             continue;

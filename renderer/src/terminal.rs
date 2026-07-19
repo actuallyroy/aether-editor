@@ -29,6 +29,9 @@ pub struct Pane {
     /// coordinates (`scrollback ++ live`). `None` when there's no selection.
     pub sel: Option<(TermPos, TermPos)>,
     pub sel_dragging: bool,
+    /// The selection is rectangular (Alt/Option+drag): per line, the same column
+    /// span `min(a.1,b.1)..max(a.1,b.1)` instead of a flowing range.
+    pub sel_box: bool,
     /// A command to type into this shell once its daemon id is bound (used to
     /// auto-run `claude --resume …` in a restored session). Cleared after sending.
     pub pending_cmd: Option<String>,
@@ -52,6 +55,7 @@ impl Pane {
             shaped_top: None,
             sel: None,
             sel_dragging: false,
+            sel_box: false,
             pending_cmd: None,
         }
     }
@@ -59,13 +63,14 @@ impl Pane {
     /// The selected text, trimmed of trailing whitespace per line. None if empty.
     pub fn selection_text(&self) -> Option<String> {
         let (a, b) = self.sel?;
-        let s = self.term.selection_text(a, b);
+        let s = if self.sel_box { self.term.selection_text_box(a, b) } else { self.term.selection_text(a, b) };
         (!s.is_empty()).then_some(s)
     }
 
     /// Clear any selection (e.g. on new keyboard input). Returns true if there was one.
     pub fn clear_selection(&mut self) -> bool {
         self.sel_dragging = false;
+        self.sel_box = false;
         self.sel.take().is_some()
     }
 }
@@ -1061,6 +1066,25 @@ impl Terminal {
             let seg: String = chars[c0..c1].iter().collect();
             out.push_str(seg.trim_end());
             if line != hi.0 {
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// Rectangular (column) selection text: every line gets the SAME column span
+    /// `min(a.1,b.1)..max(a.1,b.1)`, trailing whitespace trimmed per line.
+    pub fn selection_text_box(&self, a: (usize, usize), b: (usize, usize)) -> String {
+        let (l0, l1) = (a.0.min(b.0), a.0.max(b.0));
+        let (c0, c1) = (a.1.min(b.1), a.1.max(b.1));
+        let mut out = String::new();
+        for line in l0..=l1 {
+            let chars = self.line_chars(line);
+            let s = c0.min(chars.len());
+            let e = c1.min(chars.len()).max(s);
+            let seg: String = chars[s..e].iter().collect();
+            out.push_str(seg.trim_end());
+            if line != l1 {
                 out.push('\n');
             }
         }

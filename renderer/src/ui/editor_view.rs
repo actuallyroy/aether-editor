@@ -24,6 +24,8 @@ pub struct EditorView {
     pub click_count: u32,
     /// In-flight drag-move of the current selection (None = not dragging text).
     pub text_move: Option<TextMove>,
+    /// A column (box) selection drag is in progress (Alt/Option held on press).
+    pub box_drag: bool,
 }
 
 impl EditorView {
@@ -69,7 +71,27 @@ impl EditorView {
 
     /// Editor mouse-press: place the caret, then word/line/document-select on
     /// consecutive clicks (cycling). `consecutive` = within the double-click window.
-    pub fn on_press(&mut self, doc: &mut Document, layout: &Layout, x: f32, y: f32, extend: bool, consecutive: bool) {
+    /// `alt` starts a column (box) selection instead (VSCode Option/Alt+drag).
+    pub fn on_press(&mut self, doc: &mut Document, layout: &Layout, x: f32, y: f32, extend: bool, consecutive: bool, alt: bool) {
+        if alt && !consecutive {
+            if let Some(b) = Self::byte_at(doc, layout, x, y) {
+                if extend {
+                    // Shift+Alt+drag: column (box) selection.
+                    let lc = doc.line_col_of(b);
+                    doc.box_sel = Some(crate::document::BoxSel { anchor: lc, head: lc });
+                    doc.sel = crate::document::Selection::caret(b);
+                    self.box_drag = true;
+                } else {
+                    // Alt+click: toggle an extra caret (multi-cursor).
+                    doc.toggle_caret(b);
+                    self.box_drag = false;
+                }
+                self.dragging = false;
+                self.text_move = None;
+                self.click_count = 1;
+                return;
+            }
+        }
         // A fresh single click INSIDE the current selection arms a drag-move of that
         // text. Caret placement defers to release so the selection isn't destroyed
         // before the user can drag it.
@@ -114,6 +136,17 @@ impl EditorView {
             }
             return false;
         }
+        if self.box_drag {
+            if let Some(b) = Self::byte_at(doc, layout, x, y) {
+                let lc = doc.line_col_of(b);
+                if let Some(bs) = doc.box_sel.as_mut() {
+                    bs.head = lc;
+                    doc.sel = crate::document::Selection::caret(b);
+                    return true;
+                }
+            }
+            return false;
+        }
         if !self.dragging {
             return false;
         }
@@ -123,6 +156,7 @@ impl EditorView {
 
     pub fn on_release(&mut self) {
         self.dragging = false;
+        self.box_drag = false;
     }
 
     /// Scroll the document so the caret's line stays within the editor viewport.

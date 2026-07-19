@@ -818,7 +818,7 @@ impl TerminalPanel {
     /// Press in the terminal content/header: tab list (× kills / row switches), pane
     /// focus, or a header icon-button action. Returns true if consumed. Clicking
     /// outside the panel while visible just drops focus (not consumed).
-    pub fn content_press(&mut self, pt: (f32, f32), layout: &Layout, cell_w: f32, clicks: u32) -> bool {
+    pub fn content_press(&mut self, pt: (f32, f32), layout: &Layout, cell_w: f32, clicks: u32, alt: bool) -> bool {
         if !self.visible {
             return false;
         }
@@ -868,6 +868,7 @@ impl TerminalPanel {
                             _ => {
                                 pane.sel = Some(((line, col), (line, col)));
                                 pane.sel_dragging = true;
+                                pane.sel_box = alt; // Alt/Option+drag = column selection
                                 self.click_cell = Some((line, col));
                             }
                         }
