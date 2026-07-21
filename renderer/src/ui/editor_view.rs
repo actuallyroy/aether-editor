@@ -26,6 +26,12 @@ pub struct EditorView {
     pub text_move: Option<TextMove>,
     /// A column (box) selection drag is in progress (Alt/Option held on press).
     pub box_drag: bool,
+    /// Plain Alt+press, undecided: `(byte, press_pos)`. Movement past a threshold
+    /// upgrades it to a box drag; releasing in place toggles an extra caret.
+    pub alt_pending: Option<(usize, (f32, f32))>,
+    /// Ctrl+press, undecided: `(byte, press_pos)`. Movement past a threshold adds a
+    /// selection region and drags it; releasing in place goes to definition.
+    pub ctrl_pending: Option<(usize, (f32, f32))>,
 }
 
 impl EditorView {
@@ -72,18 +78,44 @@ impl EditorView {
     /// Editor mouse-press: place the caret, then word/line/document-select on
     /// consecutive clicks (cycling). `consecutive` = within the double-click window.
     /// `alt` starts a column (box) selection instead (VSCode Option/Alt+drag).
-    pub fn on_press(&mut self, doc: &mut Document, layout: &Layout, x: f32, y: f32, extend: bool, consecutive: bool, alt: bool) {
+    pub fn on_press(
+        &mut self,
+        doc: &mut Document,
+        layout: &Layout,
+        x: f32,
+        y: f32,
+        extend: bool,
+        consecutive: bool,
+        alt: bool,
+        add_region: bool,
+    ) {
+        // Ctrl+press, deferred: a DRAG keeps the current selection and grows a new
+        // region (multi-select); a clean CLICK goes to the symbol's definition.
+        if add_region && !alt && !consecutive {
+            if let Some(b) = Self::byte_at(doc, layout, x, y) {
+                self.ctrl_pending = Some((b, (x, y)));
+                self.dragging = false;
+                self.box_drag = false;
+                self.alt_pending = None;
+                self.text_move = None;
+                self.click_count = 1;
+                return;
+            }
+        }
         if alt && !consecutive {
             if let Some(b) = Self::byte_at(doc, layout, x, y) {
                 if extend {
-                    // Shift+Alt+drag: column (box) selection.
+                    // Shift+Alt+drag: column (box) selection immediately.
                     let lc = doc.line_col_of(b);
                     doc.box_sel = Some(crate::document::BoxSel { anchor: lc, head: lc });
                     doc.sel = crate::document::Selection::caret(b);
                     self.box_drag = true;
+                    self.alt_pending = None;
                 } else {
-                    // Alt+click: toggle an extra caret (multi-cursor).
-                    doc.toggle_caret(b);
+                    // Plain Alt: defer — a drag becomes a column selection, a clean
+                    // release toggles an extra caret (multi-cursor). Both live on
+                    // Option, like users expect from VSCode's Alt gestures.
+                    self.alt_pending = Some((b, (x, y)));
                     self.box_drag = false;
                 }
                 self.dragging = false;
@@ -136,12 +168,36 @@ impl EditorView {
             }
             return false;
         }
+        // Undecided Ctrl press: upgrade to an added region once the pointer moves.
+        if let Some((b0, at)) = self.ctrl_pending {
+            if (x - at.0).abs() > 3.0 * theme::ui_zoom() || (y - at.1).abs() > 3.0 * theme::ui_zoom() {
+                doc.add_region(b0);
+                self.ctrl_pending = None;
+                self.dragging = true;
+            } else {
+                return false;
+            }
+        }
+        // Undecided Alt press: upgrade to a column selection once the pointer moves.
+        if let Some((b0, at)) = self.alt_pending {
+            if (x - at.0).abs() > 3.0 * theme::ui_zoom() || (y - at.1).abs() > 3.0 * theme::ui_zoom() {
+                let lc = doc.line_col_of(b0);
+                doc.box_sel = Some(crate::document::BoxSel { anchor: lc, head: lc });
+                doc.sel = crate::document::Selection::caret(b0);
+                self.alt_pending = None;
+                self.box_drag = true;
+            } else {
+                return false;
+            }
+        }
         if self.box_drag {
             if let Some(b) = Self::byte_at(doc, layout, x, y) {
                 let lc = doc.line_col_of(b);
                 if let Some(bs) = doc.box_sel.as_mut() {
                     bs.head = lc;
-                    doc.sel = crate::document::Selection::caret(b);
+                    // Live-materialize into the multi-cursor model so every
+                    // downstream behavior shares the one code path.
+                    doc.materialize_box();
                     return true;
                 }
             }
@@ -154,9 +210,26 @@ impl EditorView {
         true
     }
 
-    pub fn on_release(&mut self) {
+    /// Release: a still-pending Alt press (no drag) toggles an extra caret; a
+    /// still-pending Ctrl press returns its byte — the caller runs Go to Definition.
+    pub fn on_release(&mut self, doc: Option<&mut Document>) -> Option<usize> {
+        let mut goto_def = None;
+        if let Some(d) = doc {
+            if let Some((b, _)) = self.alt_pending.take() {
+                d.toggle_caret(b);
+            }
+            if let Some((b, _)) = self.ctrl_pending.take() {
+                goto_def = Some(b);
+            }
+            if self.box_drag {
+                d.box_sel = None; // gesture over; the materialized selections remain
+            }
+        }
+        self.alt_pending = None;
+        self.ctrl_pending = None;
         self.dragging = false;
         self.box_drag = false;
+        goto_def
     }
 
     /// Scroll the document so the caret's line stays within the editor viewport.

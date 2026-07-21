@@ -321,6 +321,10 @@ pub struct ServerSpec {
     pub pull_semantic: bool,
     /// Serve `textDocument/completion` from this server (rust-analyzer, tsserver, …).
     pub completion: bool,
+    /// Serve hover / definition / references / implementation / symbols from this
+    /// server. False for pure linters (ESLint) — otherwise they'd shadow the real
+    /// language server in routing and every navigation request would come back empty.
+    pub navigation: bool,
 }
 
 /// Whether a server's pushed diagnostics should be applied (looked up by name).
@@ -355,6 +359,7 @@ pub const ESLINT: ServerSpec = ServerSpec {
     push_diagnostics: false,
     pull_semantic: false,
     completion: false, // ESLint is a linter — no completion
+    navigation: false, // ...and no hover/goto — tsserver owns navigation for JS/TS
 };
 
 pub const TYPESCRIPT: ServerSpec = ServerSpec {
@@ -367,6 +372,7 @@ pub const TYPESCRIPT: ServerSpec = ServerSpec {
     push_diagnostics: false, // ignore TS push diagnostics so they don't clobber ESLint
     pull_semantic: true,
     completion: true,
+    navigation: true,
 };
 
 pub const RUST_ANALYZER: ServerSpec = ServerSpec {
@@ -384,6 +390,7 @@ pub const RUST_ANALYZER: ServerSpec = ServerSpec {
     push_diagnostics: true,
     pull_semantic: true,
     completion: true,
+    navigation: true,
 };
 
 fn empty_init(_root: &Path) -> Value {
@@ -482,7 +489,9 @@ fn resolve_node_uncached() -> Option<String> {
 
 /// Locate the globally-installed `typescript-language-server` CLI entry
 /// (`lib/cli.mjs`), launched with node. Probes the standard npm-global roots.
-pub fn typescript_ls_cli() -> Option<PathBuf> {
+/// Candidate npm GLOBAL roots (`<prefix>/lib/node_modules`) across system,
+/// npm-global, nvm and fnm installs — newest node versions first.
+fn npm_global_roots() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
     #[cfg(windows)]
     if let Some(appdata) = std::env::var_os("APPDATA") {
@@ -494,10 +503,27 @@ pub fn typescript_ls_cli() -> Option<PathBuf> {
             roots.push(PathBuf::from(p));
         }
         if let Some(home) = std::env::var_os("HOME") {
-            roots.push(PathBuf::from(home).join(".npm-global/lib/node_modules"));
+            let home = PathBuf::from(home);
+            roots.push(home.join(".npm-global/lib/node_modules"));
+            // nvm / fnm installs put the npm global root inside the active node
+            // version's prefix (same scan as `resolve_node`) — newest first.
+            for base in [home.join(".nvm/versions/node"), home.join(".fnm/node-versions")] {
+                if let Ok(entries) = std::fs::read_dir(&base) {
+                    let mut vers: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+                    vers.sort();
+                    for v in vers.into_iter().rev() {
+                        roots.push(v.join("lib/node_modules"));
+                        roots.push(v.join("installation/lib/node_modules"));
+                    }
+                }
+            }
         }
     }
-    for r in roots {
+    roots
+}
+
+pub fn typescript_ls_cli() -> Option<PathBuf> {
+    for r in npm_global_roots() {
         let p = r.join("typescript-language-server").join("lib").join("cli.mjs");
         if p.exists() {
             return Some(p);
@@ -508,8 +534,29 @@ pub fn typescript_ls_cli() -> Option<PathBuf> {
 
 /// `initializationOptions` for typescript-language-server (minimal; it auto-detects
 /// tsserver from the workspace or its bundled copy).
-pub fn ts_init_options(_root: &Path) -> Value {
-    json!({ "hostInfo": "aether", "preferences": {} })
+pub fn ts_init_options(root: &Path) -> Value {
+    let mut opts = json!({ "hostInfo": "aether", "preferences": {} });
+    // typescript-language-server only auto-detects `typescript` from the WORKSPACE
+    // node_modules; without it the server exits ("Could not find a valid TypeScript
+    // installation"). Point it at the global install when the workspace has none.
+    if !root.join("node_modules").join("typescript").exists() {
+        if let Some(lib) = global_typescript_lib() {
+            opts["tsserver"] = json!({ "path": lib.to_string_lossy() });
+        }
+    }
+    opts
+}
+
+/// The global `typescript/lib` dir (tsserver.js home), scanning the same npm
+/// global roots as `typescript_ls_cli`.
+pub fn global_typescript_lib() -> Option<PathBuf> {
+    for r in npm_global_roots() {
+        let p = r.join("typescript").join("lib");
+        if p.join("tsserver.js").exists() {
+            return Some(p);
+        }
+    }
+    None
 }
 
 /// Resolve the `rust-analyzer` binary: PATH, ~/.cargo/bin, rustup, common dirs.
@@ -994,7 +1041,7 @@ impl LspManager {
     pub fn request_hover(&mut self, lang: &str, uri: &str, line: u32, character: u32) -> Option<i64> {
         let name = registry()
             .iter()
-            .find(|s| s.languages.contains(&lang) && self.clients.iter().any(|c| c.server == s.name))
+            .find(|s| s.navigation && s.languages.contains(&lang) && self.clients.iter().any(|c| c.server == s.name))
             .map(|s| s.name)?;
         Some(self.client_mut(name)?.request_hover(uri, line, character))
     }
@@ -1004,7 +1051,7 @@ impl LspManager {
     pub fn request_locations(&mut self, lang: &str, uri: &str, line: u32, character: u32, kind: LocKind) -> bool {
         let Some(name) = registry()
             .iter()
-            .find(|s| s.languages.contains(&lang) && self.clients.iter().any(|c| c.server == s.name))
+            .find(|s| s.navigation && s.languages.contains(&lang) && self.clients.iter().any(|c| c.server == s.name))
             .map(|s| s.name)
         else {
             return false;
@@ -1017,6 +1064,17 @@ impl LspManager {
         false
     }
 
+    /// Fire a SILENT definition probe (ctrl-hover link affordance): same request as
+    /// `request_locations` but NOT registered in `loc_pending`, so the response
+    /// never triggers navigation — the caller matches the returned id itself.
+    pub fn probe_definition(&mut self, lang: &str, uri: &str, line: u32, character: u32) -> Option<i64> {
+        let name = registry()
+            .iter()
+            .find(|s| s.navigation && s.languages.contains(&lang) && self.clients.iter().any(|c| c.server == s.name))
+            .map(|s| s.name)?;
+        Some(self.client_mut(name)?.request_at(LocKind::Definition, uri, line, character))
+    }
+
     /// Fire a workspace-symbol query, preferring the server for `lang` but falling
     /// back to any running client (the palette's `#` mode works without a focused
     /// doc of that language).
@@ -1024,7 +1082,7 @@ impl LspManager {
         let preferred = lang.and_then(|l| {
             registry()
                 .iter()
-                .find(|s| s.languages.contains(&l) && self.clients.iter().any(|c| c.server == s.name))
+                .find(|s| s.navigation && s.languages.contains(&l) && self.clients.iter().any(|c| c.server == s.name))
                 .map(|s| s.name)
         });
         let Some(client) = (match preferred {
@@ -1047,9 +1105,11 @@ impl LspManager {
     /// Format the whole document (or just `range`) on whatever running server
     /// serves `lang`. Returns false when no server is up.
     pub fn request_formatting(&mut self, lang: &str, uri: &str, range: Option<(u32, u32, u32, u32)>) -> bool {
+        // Same routing rule as navigation: a pure linter (ESLint) must not shadow
+        // the real language server for formatting requests.
         let Some(name) = registry()
             .iter()
-            .find(|s| s.languages.contains(&lang) && self.clients.iter().any(|c| c.server == s.name))
+            .find(|s| s.navigation && s.languages.contains(&lang) && self.clients.iter().any(|c| c.server == s.name))
             .map(|s| s.name)
         else {
             return false;
@@ -1449,6 +1509,17 @@ fn handle_server_message(server: &'static str, msg: &Value, reply_tx: &Sender<Ve
         // ---- Responses to our requests ----
         (None, Some(id)) => {
             let result = msg.get("result");
+            if std::env::var_os("AETHER_DEBUG_LSP").is_some() {
+                let shape = match result {
+                    None => format!("error={:?}", msg.get("error")),
+                    Some(Value::Null) => "null".to_string(),
+                    Some(r) => {
+                        let keys: Vec<&str> = r.as_object().map(|o| o.keys().map(|k| k.as_str()).collect()).unwrap_or_default();
+                        format!("keys={keys:?} arr={}", r.is_array())
+                    }
+                };
+                eprintln!("[lsp-dbg] response id={id} {shape}");
+            }
             if let Some(caps) = result.and_then(|r| r.get("capabilities")) {
                 // initialize response → finish the handshake; carry the semantic-tokens
                 // legend (token-type names) so App can decode token reports.

@@ -957,6 +957,22 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             gpu.ui.peek_title.set(fs, &header, theme::UI_FAMILY());
         }
 
+        // Inline references peek: same zone chrome, one row per reference.
+        if let Some(pk) = app.ref_peek.as_ref() {
+            let key = (pk.text.len(), pk.anchor_line, theme::shape_epoch() as u64);
+            if app.peek_shaped_key != Some(key) {
+                let attrs = Attrs::new().family(Family::Name(theme::MONO_FAMILY()));
+                gpu.ui.peek.set_metrics(fs, glyphon::Metrics::new(theme::FONT_SIZE(), theme::LINE_HEIGHT()));
+                let n = pk.text.lines().count().max(1) as f32;
+                gpu.ui.peek.set_size(fs, Some(8000.0), Some(n * theme::LINE_HEIGHT() + 200.0));
+                gpu.ui.peek.set_text(fs, &pk.text, attrs, Shaping::Advanced);
+                gpu.ui.peek.shape_until_scroll(fs, false);
+                gpu.ui.peek_close.reshape(fs);
+                app.peek_shaped_key = Some(key);
+            }
+            gpu.ui.peek_title.set(fs, &pk.title, theme::UI_FAMILY());
+        }
+
         // Source Control change-count badge text (capped at 99+).
         let scm_count = app.source_control.as_ref().map_or(0, |s| s.change_count());
         if scm_count > 0 {
@@ -1941,9 +1957,13 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             }
         }
 
-        // Selection quads.
-        if !d.sel.is_empty() {
-            let (lo, hi) = d.sel.range();
+        // Selection quads (primary + any extra multi-cursor regions).
+        let sel_ranges: Vec<(usize, usize)> = std::iter::once(&d.sel)
+            .chain(d.extra_sels.iter())
+            .map(|s| s.range())
+            .filter(|(lo, hi)| hi > lo)
+            .collect();
+        for &(lo, hi) in &sel_ranges {
             let lo_line = d.rope.byte_to_line(lo);
             let hi_line = d.rope.byte_to_line(hi);
             let lo_col = lo - d.rope.line_to_byte(lo_line);
@@ -1970,38 +1990,6 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 let sx = layout.editor_text.x + theme::EDITOR_PAD() + xs - d.scroll_x();
                 if let (Some((qy, qh)), Some((x0, cw))) = (clip_v(sel_y, run.line_height), clip_h(sx, w)) {
                     bg_quads.push(Quad::new(x0, qy, cw, qh, theme::SELECTION()));
-                }
-            }
-        }
-
-        // Column (box) selection: per-line span quads + a caret bar on every line
-        // at the head column (Alt/Option+drag). Only visible lines are mapped.
-        if let Some(bs) = d.box_sel {
-            let (l0, l1, c0, c1) = bs.bounds();
-            let lh = theme::LINE_HEIGHT().max(1.0);
-            let first = (d.scroll_y() / lh) as usize;
-            let last = first + (layout.editor_text.h / lh) as usize + 2;
-            let head_col = bs.head.1;
-            for line in l0.max(first)..=l1.min(last).min(d.rope.len_lines().saturating_sub(1)) {
-                let b_lo = d.byte_at_line_col(line, c0);
-                let b_hi = d.byte_at_line_col(line, c1);
-                let (x_lo, ly, lh2) = d.byte_visual(b_lo);
-                let (x_hi, _, _) = d.byte_visual(b_hi);
-                let y = layout.editor_text.y + theme::EDITOR_PAD() + ly - d.scroll_y() - foff(line);
-                if b_hi > b_lo {
-                    let sx = layout.editor_text.x + theme::EDITOR_PAD() + x_lo - d.scroll_x();
-                    if let (Some((qy, qh)), Some((qx, qw))) = (clip_v(y, lh2), clip_h(sx, (x_hi - x_lo).max(2.0))) {
-                        bg_quads.push(Quad::new(qx, qy, qw, qh, theme::SELECTION()));
-                    }
-                }
-                // Caret bar at the head column (clamped to the line's end, like the span).
-                if app.cursor_blink_on && !d.read_only && !modal_open && !app.find.focused {
-                    let (cx, _, _) = d.byte_visual(d.byte_at_line_col(line, head_col));
-                    let bx = layout.editor_text.x + theme::EDITOR_PAD() + cx - d.scroll_x();
-                    let bar_in = bx >= layout.editor_text.x && bx < layout.editor_text.x + layout.editor_text.w;
-                    if let Some((qy, qh)) = clip_v(y, lh2).filter(|_| bar_in) {
-                        fg_quads.push(Quad::new(bx, qy, theme::CURSOR_WIDTH(), qh, theme::CURSOR()));
-                    }
                 }
             }
         }
@@ -2078,11 +2066,59 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     let w = (xe - xs).max(3.0 * uz);
                     let line_y =
                         layout.editor_text.y + theme::EDITOR_PAD() + run.line_top + d.buf_offset_px() - d.scroll_y() - foff(line);
-                    let under_y = line_y + run.line_height - 2.0 * uz;
+                    let under_y = line_y + run.line_height - 3.0 * uz;
                     let ux = layout.editor_text.x + theme::EDITOR_PAD() + xs - d.scroll_x();
                     let in_x = ux + w > layout.editor_text.x && ux < layout.editor_text.x + layout.editor_text.w;
-                    if let Some((qy, qh)) = clip_v(under_y, 2.0 * uz).filter(|_| in_x) {
-                        fg_quads.push(Quad::new(ux, qy, w, qh, color));
+                    if clip_v(under_y, 3.0 * uz).filter(|_| in_x).is_some() {
+                        // VSCode-style squiggle: a triangle wave built from short
+                        // vertical quads. λ ≈ 4px, amplitude ≈ 1.5px (zoom-scaled).
+                        let step = 1.0_f32.max(uz).round();
+                        let wavelen = 7.0 * uz;
+                        let amp = 1.75 * uz;
+                        let thick = 1.2 * uz;
+                        let (ex_lo, ex_hi) = (layout.editor_text.x, layout.editor_text.x + layout.editor_text.w);
+                        let mut sx = ux;
+                        while sx < ux + w {
+                            // Triangle wave phase 0..1 across a wavelength.
+                            let ph = ((sx - ux) / wavelen).fract();
+                            let tri = if ph < 0.5 { ph * 2.0 } else { 2.0 - ph * 2.0 };
+                            let sy = under_y + tri * amp;
+                            let seg_w = step.min(ux + w - sx);
+                            if sx + seg_w > ex_lo && sx < ex_hi {
+                                if let Some((qy, qh)) = clip_v(sy, thick) {
+                                    fg_quads.push(Quad::new(sx.max(ex_lo), qy, seg_w.min(ex_hi - sx.max(ex_lo)), qh, color));
+                                }
+                            }
+                            sx += step;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Ctrl/Cmd-hover goto-definition affordance: underline the token under the
+        // pointer (drawn like a 1px flat "link" line at the text baseline).
+        if let Some((lo, hi)) = app.ctrl_link {
+            if hi > lo {
+                let line = d.rope.byte_to_line(lo.min(d.rope.len_bytes()));
+                if !d.is_line_hidden(line) {
+                    let lo_col = lo - d.rope.line_to_byte(line);
+                    let hi_col = hi - d.rope.line_to_byte(line);
+                    for run in d.buffer.layout_runs() {
+                        if run.line_i + d.buf_first_line() != line {
+                            continue;
+                        }
+                        let (xs, xe) = x_range_in_run(&run, lo_col, hi_col);
+                        let w = (xe - xs).max(2.0);
+                        let ly = layout.editor_text.y + theme::EDITOR_PAD() + run.line_top + d.buf_offset_px()
+                            - d.scroll_y()
+                            - foff(line);
+                        let uy = ly + run.line_height - 2.0 * theme::ui_zoom();
+                        let ux = layout.editor_text.x + theme::EDITOR_PAD() + xs - d.scroll_x();
+                        let in_x = ux + w > layout.editor_text.x && ux < layout.editor_text.x + layout.editor_text.w;
+                        if let Some((qy, qh)) = clip_v(uy, 1.2 * theme::ui_zoom()).filter(|_| in_x) {
+                            fg_quads.push(Quad::new(ux, qy, w, qh, theme::ACCENT()));
+                        }
                     }
                 }
             }
@@ -2201,8 +2237,8 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
 
         // Extra carets (multi-cursor): a bar at each Alt-click caret, same blink
         // phase as the primary.
-        if !d.extra_carets.is_empty() && app.cursor_blink_on && !d.read_only && !modal_open && !app.find.focused {
-            for &b in &d.extra_carets {
+        if !d.extra_sels.is_empty() && app.cursor_blink_on && !d.read_only && !modal_open && !app.find.focused {
+            for b in d.extra_sels.iter().map(|s| s.head) {
                 let (cx, cy, ch) = d.byte_visual(b);
                 let line = d.rope.byte_to_line(b.min(d.rope.len_bytes()));
                 let y0 = layout.editor_text.y + theme::EDITOR_PAD() + cy - d.scroll_y() - foff(line);
@@ -4419,6 +4455,90 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             gpu.quad_renderer.render_fg(&mut pass);
         }
         gpu.queue.submit(Some(encf.finish()));
+    }
+
+    // ---- Inline references peek (own opaque pass, mirrors the gutter peek) ----
+    if let Some(pk) = app.ref_peek.as_ref() {
+        if let Some(d) = app.workspace.active_doc() {
+            let rows = pk.locs.len();
+            let gm = peek_geom(d, pk.anchor_line, &layout, rows);
+            let lh = gm.lh;
+            let scroll = pk.scroll.clamp(0.0, gm.max_scroll);
+            let z = gm.zone;
+            let c = gm.content;
+            let mut pq: Vec<Quad> = Vec::new();
+            pq.push(Quad::new(z.x, z.y, z.w, z.h, theme::PANEL_BG()));
+            pq.push(Quad::new(gm.header.x, gm.header.y, gm.header.w, gm.header.h, theme::SIDEBAR_BG()));
+            // Selected-row highlight.
+            {
+                let ry = c.y + pk.selected as f32 * lh - scroll;
+                let top = ry.max(c.y);
+                let bot = (ry + lh).min(c.y + c.h);
+                if bot > top {
+                    pq.push(Quad::new(c.x, top, c.w, bot - top, theme::SELECTION()));
+                }
+            }
+            if gm.max_scroll > 0.0 {
+                let track_h = c.h;
+                let thumb_h = (track_h * (c.h / (c.h + gm.max_scroll))).max(theme::zpx(24.0));
+                let ty = c.y + (track_h - thumb_h) * (scroll / gm.max_scroll);
+                pq.push(Rect { x: z.x + z.w - theme::zpx(6.0), y: ty, w: theme::zpx(4.0), h: thumb_h }
+                    .rounded_quad(theme::SCROLLBAR_THUMB(), theme::zpx(2.0)));
+            }
+            let border = theme::SEARCH_BORDER();
+            let fq = vec![
+                Quad::new(z.x, z.y, z.w, 1.0, border),
+                Quad::new(z.x, z.y + gm.header.h - 1.0, z.w, 1.0, border),
+                Quad::new(z.x, z.y + z.h - 1.0, z.w, 1.0, border),
+            ];
+            gpu.quad_renderer.prepare(&gpu.device, &gpu.queue, &pq, &fq, (cfg_w, cfg_h));
+            let mut pareas: Vec<TextArea> = Vec::new();
+            gpu.ui.peek_title.push(z.x + theme::zpx(10.0), gm.header, theme::FG_TEXT(), &mut pareas);
+            gpu.ui.peek_close.draw_center(gm.close, theme::FG_DIM(), &mut pareas);
+            pareas.push(TextArea {
+                buffer: &gpu.ui.peek,
+                left: c.x + theme::zpx(8.0),
+                top: c.y - scroll,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: c.x as i32,
+                    top: c.y as i32,
+                    right: (c.x + c.w) as i32,
+                    bottom: (c.y + c.h) as i32,
+                },
+                default_color: theme::FG_TEXT(),
+                custom_glyphs: &[],
+            });
+            gpu.text_renderer.prepare(
+                &gpu.device,
+                &gpu.queue,
+                &mut gpu.font_system,
+                &mut gpu.atlas,
+                &gpu.viewport,
+                pareas,
+                &mut gpu.swash_cache,
+            )?;
+            let mut encr = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("aether-refpeek-pass"),
+            });
+            {
+                let mut pass = encr.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("aether-refpeek"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                gpu.quad_renderer.render_bg(&mut pass);
+                gpu.text_renderer.render(&gpu.atlas, &gpu.viewport, &mut pass)?;
+                gpu.quad_renderer.render_fg(&mut pass);
+            }
+            gpu.queue.submit(Some(encr.finish()));
+        }
     }
 
     // ---- Inline gutter-diff peek (own pass so it draws OPAQUELY over the code) ----

@@ -318,6 +318,18 @@ pub(crate) enum CtxAction {
 
 /// An open inline gutter-diff peek (VSCode-style "Peek Changes"): a scrollable,
 /// embedded unified-diff of the whole file, hanging under the clicked line.
+/// Inline references peek (Ctrl+click at a definition): every usage listed with
+/// its code line; click / Enter jumps. Reuses the gutter-peek zone chrome.
+pub(crate) struct RefPeek {
+    pub anchor_line: usize,
+    pub doc_version: i32,
+    pub title: String,
+    pub text: String, // one row per reference: "rel/path:line   code"
+    pub locs: Vec<lsp::LspLocation>,
+    pub selected: usize,
+    pub scroll: f32,
+}
+
 pub(crate) struct GutterPeek {
     pub anchor_line: usize, // editor line the zone hangs under
     pub doc_version: i32,   // doc version when opened (an edit dismisses it)
@@ -437,6 +449,20 @@ pub(crate) struct App {
     /// render each frame) so the input handlers can hit-test / wheel-scroll it.
     pub(crate) lsp_hover_scroll: f32,
     pub(crate) lsp_hover_rect: Option<crate::widgets::Rect>,
+    /// Ctrl/Cmd-hover link affordance: byte range of the token under the pointer
+    /// while the goto-definition modifier is held — set ONLY once a definition
+    /// probe confirmed the jump goes somewhere (underline + pointer cursor).
+    pub(crate) ctrl_link: Option<(usize, usize)>,
+    /// Ctrl+click at a definition site chains: Implementation, then (if that's
+    /// empty or lands in place) the symbol's next reference. These mark the chain
+    /// so responses route to a silent jump instead of dialogs/pickers.
+    pub(crate) goto_impl_fallback: bool,
+    pub(crate) refs_jump_next: bool,
+    /// In-flight ctrl-hover definition probe: (request id, token range).
+    pub(crate) ctrl_probe: Option<(i64, (usize, usize))>,
+    /// Last token range whose probe came back empty (no definition) — suppresses
+    /// refiring while the pointer stays on it.
+    pub(crate) ctrl_link_miss: Option<(usize, usize)>,
     pub(crate) hovered_activity: Option<usize>,
     pub(crate) hovered_titlebtn: Option<usize>,
     pub(crate) hovered_search: bool,
@@ -485,6 +511,7 @@ pub(crate) struct App {
     /// Inline gutter-diff peek (VSCode-style): the change-bar that was clicked opens
     /// a panel showing the hunk's original (HEAD) lines below that line.
     pub(crate) gutter_peek: Option<GutterPeek>,
+    pub(crate) ref_peek: Option<RefPeek>,
     /// Identity of the peek body last shaped into the GPU buffer, so we re-shape the
     /// (potentially huge) whole-file diff only when it changes — not every frame.
     pub(crate) peek_shaped_key: Option<(usize, usize, u64)>,
@@ -768,6 +795,11 @@ impl App {
             lsp_hover_at: None,
             lsp_hover_scroll: 0.0,
             lsp_hover_rect: None,
+            ctrl_link: None,
+            ctrl_probe: None,
+            goto_impl_fallback: false,
+            refs_jump_next: false,
+            ctrl_link_miss: None,
             hovered_activity: None,
             hovered_titlebtn: None,
             hovered_search: false,
@@ -795,6 +827,7 @@ impl App {
             commit_tip: None,
             blame_pending: None,
             gutter_peek: None,
+            ref_peek: None,
             peek_shaped_key: None,
             tab_tip: None,
             icon_tip: None,
@@ -1393,6 +1426,46 @@ impl App {
         } else {
             None
         };
+        // Ctrl/Cmd-hover: underline the token under the pointer + pointer cursor
+        // (goto-definition affordance, like VSCode). Editor text only.
+        let link_mod_held = self.mods.control_key() || (cfg!(target_os = "macos") && self.mods.super_key());
+        let target = if ed_inside && link_mod_held {
+            self.workspace.active_doc().and_then(|d| {
+                d.language_id()?;
+                let b = ui::editor_view::EditorView::byte_at(d, &layout, p.0, p.1)?;
+                d.word_at(b)
+            })
+        } else {
+            None
+        };
+        match target {
+            None => {
+                self.ctrl_probe = None;
+                self.ctrl_link_miss = None;
+                if self.ctrl_link.take().is_some() {
+                    changed = true;
+                }
+            }
+            Some(r) => {
+                let known = self.ctrl_link == Some(r)
+                    || self.ctrl_probe.map_or(false, |(_, pr)| pr == r)
+                    || self.ctrl_link_miss == Some(r);
+                if !known {
+                    // New token: drop the old underline, probe whether a definition
+                    // exists — the affordance appears only on a positive answer.
+                    if self.ctrl_link.take().is_some() {
+                        changed = true;
+                    }
+                    let probe = self.workspace.active_doc().and_then(|d| {
+                        let uri = d.uri()?;
+                        let lang = d.language_id()?;
+                        let (line, col) = d.lsp_pos(r.0);
+                        self.lsp.probe_definition(lang, &uri, line, col)
+                    });
+                    self.ctrl_probe = probe.map(|id| (id, r));
+                }
+            }
+        }
         // Keep the card up while the pointer is over it (or in the small bridge gap).
         let over_lsp_card = self.lsp_hover_rect.map_or(false, |card| {
             let m = theme::zpx(20.0);
@@ -1654,6 +1727,21 @@ impl App {
             CursorIcon::Pointer
         } else if let Some(c) = over_overlay {
             c
+        } else if self.lsp_hover.is_some()
+            && self.lsp_hover_rect.map_or(false, |card| {
+                let pad = theme::zpx(12.0);
+                let inner = crate::widgets::Rect { x: card.x + pad, y: card.y + pad, w: card.w - pad * 2.0, h: card.h - pad * 2.0 };
+                card.contains(p)
+                    && self.gpu.as_ref().map_or(false, |g| {
+                        g.ui.lsp_hover_md.link_geometry(inner, self.lsp_hover_scroll, &|_| None).iter().any(|(r, _)| r.contains(p))
+                    })
+            })
+        {
+            // A markdown link inside the hover card is clickable.
+            CursorIcon::Pointer
+        } else if self.ctrl_link.is_some() {
+            // Ctrl/Cmd-hover over a symbol: it's a jump link.
+            CursorIcon::Pointer
         } else if self.sidebar_split.is_dragging() || over_handle {
             self.sidebar_split.cursor()
         } else if self.right_split.is_dragging() || over_right_handle {
@@ -3119,6 +3207,12 @@ impl App {
                 self.gutter_peek = None;
             }
         }
+        if let Some(pk) = self.ref_peek.as_ref() {
+            let stale = self.workspace.active_doc().map_or(true, |d| d.version != pk.doc_version);
+            if stale {
+                self.ref_peek = None;
+            }
+        }
     }
 
     /// Off-thread: read HEAD's version of `path` and post it back as the gutter
@@ -3832,9 +3926,27 @@ impl App {
                 }
             }
         }
+        // A freshly opened doc has empty scroll metrics (they're set during render),
+        // so scroll_to_y would clamp to 0 and the target line lands off-screen.
+        // Prime them with the doc's line count before revealing the caret.
+        let layout = self.layout();
+        if let Some(d) = self.workspace.active_doc_mut() {
+            let content_h = d.rope.len_lines() as f32 * theme::LINE_HEIGHT() + theme::EDITOR_PAD() * 2.0;
+            d.scroll.set_metrics(layout.editor_text, (0.0, content_h));
+            // A jump CENTERS the target line (VSCode revealInCenter) — minimal
+            // reveal would leave it hugging the bottom edge. Already-visible lines
+            // stay put (no jarring recenter when the target is on screen).
+            let (cur_line, _) = d.head_line_col();
+            let cursor_top = cur_line as f32 * theme::LINE_HEIGHT();
+            let view_h = layout.editor_text.h - theme::EDITOR_PAD() * 2.0;
+            let sy = d.scroll_y();
+            let visible = cursor_top >= sy && cursor_top + theme::LINE_HEIGHT() <= sy + view_h;
+            if !visible {
+                d.scroll.scroll_to_y((cursor_top - view_h * 0.5).max(0.0));
+            }
+        }
         // Inline blame is fetched lazily for whichever doc is active (covers opens,
         // tab switches, and session restore uniformly — see `maybe_request_blame`).
-        self.ensure_cursor_visible();
         self.redraw();
     }
 
@@ -6035,11 +6147,18 @@ impl App {
     /// Fire a Go-to / references request for the caret position. The response
     /// arrives as `WorkerMsg::LspLocations` and lands in `apply_locations`.
     fn lsp_goto(&mut self, kind: lsp::LocKind) {
+        // Resolve against the CURRENT text — the debounced didChange may lag, and a
+        // stale doc makes the server resolve positions in old content (jumps land
+        // in the wrong place, and the at-definition chain misfires).
+        self.flush_doc_to_lsp();
         let Some(d) = self.workspace.active_doc() else { return };
         let (Some(uri), Some(lang)) = (d.uri(), d.language_id()) else {
             return self.show_info_dialog("No language server for this file type.");
         };
         let (line, col) = d.lsp_pos(d.caret_byte());
+        if std::env::var_os("AETHER_DEBUG_LSP").is_some() {
+            eprintln!("[lsp-dbg] goto {kind:?} uri={uri} {line}:{col}");
+        }
         if !self.lsp.request_locations(lang, &uri, line, col, kind) {
             self.show_info_dialog("The language server isn't running yet.");
         }
@@ -6222,9 +6341,71 @@ impl App {
         }
     }
 
+    /// Build + show the inline references peek under the current caret line.
+    fn open_ref_peek(&mut self, locs: Vec<lsp::LspLocation>) {
+        let Some(d) = self.workspace.active_doc() else { return };
+        let anchor_line = d.head_line_col().0;
+        let doc_version = d.version;
+        let cur_uri = d.uri();
+        let cur_line = anchor_line as u32;
+        // One row per reference: "rel/path:line   <code>". Snippets come from the
+        // open doc when loaded, otherwise straight from disk.
+        let snippet = |l: &lsp::LspLocation| -> String {
+            let Some(path) = lsp::uri_to_path(&l.uri) else { return String::new() };
+            if let Some(doc) = self.workspace.documents.iter().find(|d| d.path.as_deref() == Some(path.as_path())) {
+                if (l.line as usize) < doc.rope.len_lines() {
+                    return doc.rope.line(l.line as usize).to_string().trim_end().to_string();
+                }
+            }
+            std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|t| t.lines().nth(l.line as usize).map(|s| s.to_string()))
+                .unwrap_or_default()
+        };
+        let rows: Vec<String> = locs
+            .iter()
+            .map(|l| {
+                let path = lsp::uri_to_path(&l.uri).unwrap_or_default();
+                let rel = path.strip_prefix(&self.cwd).unwrap_or(&path).to_string_lossy().into_owned();
+                format!("{rel}:{}   {}", l.line + 1, snippet(l).trim_start())
+            })
+            .collect();
+        let selected = locs
+            .iter()
+            .position(|l| !(cur_uri.as_deref() == Some(l.uri.as_str()) && l.line == cur_line))
+            .unwrap_or(0);
+        self.gutter_peek = None; // the zone chrome is shared — one peek at a time
+        self.ref_peek = Some(RefPeek {
+            anchor_line,
+            doc_version,
+            title: format!("{} reference{}", locs.len(), if locs.len() == 1 { "" } else { "s" }),
+            text: rows.join("\n"),
+            locs,
+            selected,
+            scroll: 0.0,
+        });
+        self.redraw();
+    }
+
+    /// Jump to reference `i` of the open peek and dismiss it.
+    fn ref_peek_jump(&mut self, i: usize) {
+        let Some(pk) = self.ref_peek.take() else { return };
+        if let Some(l) = pk.locs.get(i) {
+            self.nav.mark(&self.workspace);
+            if let Some(p) = lsp::uri_to_path(&l.uri) {
+                self.open_file_at(p, l.line as usize + 1, l.character as usize);
+            }
+        }
+        self.redraw();
+    }
+
     /// Handle a definition/references/symbol response: jump straight to a single
     /// target, open a picker for several, and feed `#` palette queries.
     fn apply_locations(&mut self, kind: lsp::LocKind, locs: Vec<lsp::LspLocation>) {
+        if std::env::var_os("AETHER_DEBUG_LSP").is_some() {
+            let brief: Vec<String> = locs.iter().take(3).map(|l| format!("{}:{}", l.uri, l.line)).collect();
+            eprintln!("[lsp-dbg] locations {kind:?} n={} {:?}", locs.len(), brief);
+        }
         // Palette `#` mode: replace the list with the latest symbol results.
         if kind == lsp::LocKind::WorkspaceSymbol {
             if self.palette.active && self.palette.mode == commands::PaletteMode::WorkspaceSymbols {
@@ -6234,10 +6415,46 @@ impl App {
             }
             return;
         }
+        let at_pos = |app: &Self, uri: &str, line: u32| {
+            app.workspace
+                .active_doc()
+                .map_or(false, |d| d.uri().as_deref() == Some(uri) && d.lsp_pos(d.caret_byte()).0 == line)
+        };
+        // Chain fallback: Implementation came back empty or in-place after an
+        // at-definition click — hop to the symbol's next reference instead.
+        if kind == lsp::LocKind::Implementation
+            && std::mem::take(&mut self.goto_impl_fallback)
+            && (locs.is_empty() || at_pos(self, &locs[0].uri, locs[0].line))
+        {
+            self.refs_jump_next = true;
+            self.lsp_goto(lsp::LocKind::References);
+            return;
+        }
+        // At-definition references: open an inline PEEK under the clicked line —
+        // every usage with its code line; the user picks where to land.
+        if kind == lsp::LocKind::References && std::mem::take(&mut self.refs_jump_next) {
+            if locs.is_empty() {
+                self.show_info_dialog("No references found.");
+                return;
+            }
+            self.open_ref_peek(locs);
+            return;
+        }
         match (locs.len(), kind) {
             (0, _) => self.show_info_dialog(&format!("No {} found.", kind.label())),
-            (1, k) if k != lsp::LocKind::References => {
+            // Definition/implementation jump straight to the FIRST target even with
+            // several results (overloads etc.) — no picker popup mid-navigation.
+            // References keep the list (browsing them is the whole point).
+            (_, k) if k != lsp::LocKind::References => {
                 let l = &locs[0];
+                // Already AT the definition (target == caret line in this file):
+                // chain onward — Implementation, then next reference — like VSCode;
+                // clicking a definition should take you somewhere, not bounce in place.
+                if k == lsp::LocKind::Definition && at_pos(self, &l.uri, l.line) {
+                    self.goto_impl_fallback = true;
+                    self.lsp_goto(lsp::LocKind::Implementation);
+                    return;
+                }
                 self.nav.mark(&self.workspace);
                 if let Some(p) = lsp::uri_to_path(&l.uri) {
                     self.open_file_at(p, l.line as usize + 1, l.character as usize);
@@ -7054,11 +7271,9 @@ impl App {
         // A visible (non-empty) normal selection always wins; the box (column)
         // selection is only the source when there's no normal selection — a stale
         // box must never shadow what the user actually highlighted.
-        let Some(text) = self
-            .workspace
-            .active_doc()
-            .and_then(|d| d.selected_text().or_else(|| d.box_selected_text()))
-        else {
+        let Some(text) = self.workspace.active_doc().and_then(|d| {
+            d.multi_selected_text().or_else(|| d.selected_text())
+        }) else {
             return;
         };
         let n = text.len();
@@ -7290,12 +7505,8 @@ impl App {
             return;
         }
         if let (Some(g), Some(d)) = (self.gpu.as_mut(), self.workspace.active_doc_mut()) {
-            for &(s, e) in matches.iter().rev() {
-                d.sel.anchor = s;
-                d.sel.head = e;
-                d.sel.desired_col = None;
-                d.insert_str(&repl, &mut g.font_system);
-            }
+            // One undo step for the whole Replace All (was one per occurrence).
+            d.replace_ranges(&matches, &repl, &mut g.font_system);
         }
         self.recompute_find();
         self.refresh_source_control();
@@ -7412,6 +7623,32 @@ impl App {
             if let Some((instance, _)) = self.webview_dock {
                 if let Some(wv) = self.webviews.iter().find(|w| w.instance_id == instance) {
                     wv.focus_parent();
+                }
+            }
+        }
+        // A click inside the LSP hover card: open a markdown link under the pointer
+        // (e.g. "issue #341" in JSDoc); any other spot inside the card is inert.
+        if self.lsp_hover.is_some() {
+            if let Some(card) = self.lsp_hover_rect {
+                if card.contains((x, y)) {
+                    let pad = theme::zpx(12.0);
+                    let inner = crate::widgets::Rect {
+                        x: card.x + pad,
+                        y: card.y + pad,
+                        w: card.w - pad * 2.0,
+                        h: card.h - pad * 2.0,
+                    };
+                    let url = self.gpu.as_ref().and_then(|g| {
+                        g.ui.lsp_hover_md
+                            .link_geometry(inner, self.lsp_hover_scroll, &|_| None)
+                            .into_iter()
+                            .find(|(r, _)| r.contains((x, y)))
+                            .map(|(_, u)| u)
+                    });
+                    if let Some(url) = url {
+                        open_url(&url);
+                    }
+                    return; // the card consumes the click either way
                 }
             }
         }
@@ -8507,6 +8744,33 @@ impl App {
 
         // Inline gutter-diff peek interactions: close / prev / next buttons, or a
         // click outside the zone dismisses it (before any editor handling).
+        if self.ref_peek.is_some() {
+            let rows = self.ref_peek.as_ref().unwrap().locs.len();
+            let gm = self
+                .workspace
+                .active_doc()
+                .map(|d| render::peek_geom(d, self.ref_peek.as_ref().unwrap().anchor_line, &layout, rows));
+            if let Some(gm) = gm {
+                if gm.close.contains((x, y)) {
+                    self.ref_peek = None;
+                    self.redraw();
+                    return;
+                }
+                if gm.content.contains((x, y)) {
+                    let pk = self.ref_peek.as_ref().unwrap();
+                    let idx = ((y - gm.content.y + pk.scroll) / gm.lh).floor() as usize;
+                    if idx < pk.locs.len() {
+                        self.ref_peek_jump(idx);
+                    }
+                    return;
+                }
+                if gm.zone.contains((x, y)) {
+                    return; // header strip etc. — swallow
+                }
+                self.ref_peek = None; // outside: dismiss, let the click fall through
+                self.redraw();
+            }
+        }
         if self.gutter_peek.is_some() {
             let rows = self.gpu.as_ref().map_or(0, |g| g.ui.peek.layout_runs().count());
             let gm = self
@@ -8657,6 +8921,7 @@ impl App {
 
         if layout.editor_text.contains((x, y)) {
             self.gutter_peek = None; // clicking into the code closes an open diff peek
+            self.ref_peek = None;
             self.set_ext_filter_focus(false); // editor takes keyboard focus
             // Clicking the editor moves focus off the find widget (it stays open, but
             // typing now goes to the editor — like VSCode).
@@ -8729,8 +8994,9 @@ impl App {
                 return;
             }
             let alt = self.mods.alt_key();
+            let add_region = self.mods.control_key() || (cfg!(target_os = "macos") && self.mods.super_key());
             if let Some(d) = self.workspace.active_doc_mut() {
-                self.editor.on_press(d, &layout, x, y, extend, consecutive, alt);
+                self.editor.on_press(d, &layout, x, y, extend, consecutive, alt, add_region);
             }
             self.redraw();
             return;
@@ -9093,7 +9359,13 @@ impl App {
             }
             return;
         }
-        if (self.editor.dragging || self.editor.box_drag || self.editor.text_move.is_some()) && self.mouse_pressed {
+        if (self.editor.dragging
+            || self.editor.box_drag
+            || self.editor.alt_pending.is_some()
+            || self.editor.ctrl_pending.is_some()
+            || self.editor.text_move.is_some())
+            && self.mouse_pressed
+        {
             let layout = self.layout();
             if let Some(d) = self.workspace.active_doc_mut() {
                 if self.editor.on_drag(d, &layout, x, y) {
@@ -9281,7 +9553,21 @@ impl App {
                 }
             }
         }
-        self.editor.on_release();
+        if let Some(b) = self.editor.on_release(self.workspace.active_doc_mut()) {
+            // Ctrl+click (no drag): jump to the definition of the clicked symbol.
+            // Drop any hover card — the jump makes it stale on the spot.
+            self.lsp_hover = None;
+            self.lsp_hover_rect = None;
+            self.lsp_hover_dwell = None;
+            self.lsp_hover_req = None;
+            self.lsp_hover_at = None;
+            self.hover_tip = None;
+            self.hover_pending = None;
+            if let Some(d) = self.workspace.active_doc_mut() {
+                d.place(b, false);
+            }
+            self.exec_command(Command::GotoDefinition);
+        }
         self.text_drag = None;
         self.find_drag = None;
         self.image_drag_last = None;
@@ -9457,6 +9743,23 @@ impl App {
         self.hover_tip = None;
         self.hover_pending = None;
         let layout = self.layout();
+        // References peek: wheel over the zone scrolls its rows.
+        if self.ref_peek.is_some() {
+            if let Some(d) = self.workspace.active_doc() {
+                let rows = self.ref_peek.as_ref().unwrap().locs.len();
+                let gm = render::peek_geom(d, self.ref_peek.as_ref().unwrap().anchor_line, &layout, rows);
+                if gm.zone.contains(p) {
+                    let mut moved = false;
+                    if let Some(pk) = self.ref_peek.as_mut() {
+                        let before = pk.scroll;
+                        pk.scroll = (pk.scroll - dy).clamp(0.0, gm.max_scroll);
+                        moved = pk.scroll != before;
+                    }
+                    self.redraw();
+                    return moved;
+                }
+            }
+        }
         // Inline gutter-diff peek: wheel over the zone scrolls its diff body.
         if self.gutter_peek.is_some() {
             let rows = self.gpu.as_ref().map_or(0, |g| g.ui.peek.layout_runs().count());
@@ -9815,6 +10118,41 @@ impl App {
         }
 
         // Escape closes an open inline gutter-diff peek first.
+        if self.ref_peek.is_some() {
+            match event.logical_key.as_ref() {
+                Key::Named(NamedKey::Escape) => {
+                    self.ref_peek = None;
+                    self.redraw();
+                    return;
+                }
+                Key::Named(k @ (NamedKey::ArrowUp | NamedKey::ArrowDown)) => {
+                    if let Some(pk) = self.ref_peek.as_mut() {
+                        let n = pk.locs.len().max(1);
+                        pk.selected = if k == NamedKey::ArrowDown {
+                            (pk.selected + 1) % n
+                        } else {
+                            (pk.selected + n - 1) % n
+                        };
+                        // Keep the selection in the scrolled view.
+                        let lh = theme::LINE_HEIGHT();
+                        let sel_y = pk.selected as f32 * lh;
+                        if sel_y < pk.scroll {
+                            pk.scroll = sel_y;
+                        } else if sel_y + lh > pk.scroll + 14.0 * lh {
+                            pk.scroll = sel_y + lh - 14.0 * lh;
+                        }
+                    }
+                    self.redraw();
+                    return;
+                }
+                Key::Named(NamedKey::Enter) => {
+                    let i = self.ref_peek.as_ref().map_or(0, |pk| pk.selected);
+                    self.ref_peek_jump(i);
+                    return;
+                }
+                _ => {}
+            }
+        }
         if self.gutter_peek.is_some() && matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape)) {
             self.gutter_peek = None;
             self.redraw();
@@ -10349,12 +10687,20 @@ impl App {
             }
         }
 
-        // Multi-cursor mode (Alt/Option+click extra carets): typing/backspace apply
-        // at every caret; Escape or any caret motion (`place`) collapses to one.
-        if !d.extra_carets.is_empty() {
+        // A bare modifier press (Ctrl/Cmd/Shift/Alt) is not an edit or a motion —
+        // bail before anything below scrolls the view back to the caret.
+        if matches!(
+            event.logical_key.as_ref(),
+            Key::Named(NamedKey::Control | NamedKey::Shift | NamedKey::Alt | NamedKey::Super | NamedKey::Meta)
+        ) {
+            return;
+        }
+        // Multi-cursor mode (extra selections): typing/backspace apply at every
+        // cursor, arrows move/extend every cursor; Escape collapses to one.
+        if !d.extra_sels.is_empty() {
             match event.logical_key.as_ref() {
                 Key::Named(NamedKey::Escape) => {
-                    d.extra_carets.clear();
+                    d.extra_sels.clear();
                     self.redraw();
                     return;
                 }
@@ -10364,47 +10710,30 @@ impl App {
                     self.redraw();
                     return;
                 }
+                Key::Named(NamedKey::Delete) if !ctrl => {
+                    d.multi_delete_forward(&mut gpu.font_system);
+                    self.last_edit = Instant::now();
+                    self.redraw();
+                    return;
+                }
+                Key::Named(k @ (NamedKey::ArrowLeft | NamedKey::ArrowRight)) if !ctrl && !self.mods.alt_key() => {
+                    d.multi_move_horiz(k == NamedKey::ArrowRight, extend);
+                    self.redraw();
+                    return;
+                }
+                Key::Named(k @ (NamedKey::ArrowUp | NamedKey::ArrowDown)) if !ctrl && !self.mods.alt_key() => {
+                    d.multi_move_vert(k == NamedKey::ArrowDown, extend);
+                    self.redraw();
+                    return;
+                }
                 Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Tab) => {
-                    d.extra_carets.clear(); // structural keys collapse to one caret
+                    d.extra_sels.clear(); // structural keys collapse to one caret
                 }
                 _ => {
                     if !ctrl {
                         if let Some(t) = event.text.as_ref().map(|t| t.to_string()) {
                             if !t.is_empty() && !t.chars().any(|c| c.is_control()) {
                                 d.multi_insert(&t, &mut gpu.font_system);
-                                self.last_edit = Instant::now();
-                                self.redraw();
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Column (box) selection mode: typing/backspace edit every line of the box;
-        // Escape (or any caret motion via `place`) leaves the mode.
-        if d.box_sel.is_some() {
-            match event.logical_key.as_ref() {
-                Key::Named(NamedKey::Escape) => {
-                    d.box_sel = None;
-                    self.redraw();
-                    return;
-                }
-                Key::Named(NamedKey::Backspace) if !ctrl => {
-                    d.box_backspace(&mut gpu.font_system);
-                    self.last_edit = Instant::now();
-                    self.redraw();
-                    return;
-                }
-                Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Tab) => {
-                    d.box_sel = None; // structural keys collapse to a normal caret
-                }
-                _ => {
-                    if !ctrl {
-                        if let Some(t) = event.text.as_ref().map(|t| t.to_string()) {
-                            if !t.is_empty() && !t.chars().any(|c| c.is_control()) {
-                                d.box_insert(&t, &mut gpu.font_system);
                                 self.last_edit = Instant::now();
                                 self.redraw();
                                 return;
@@ -10433,7 +10762,7 @@ impl App {
                 if let Some(b) = d.box_sel.as_mut() {
                     b.head = (nh, hc);
                 }
-                d.sel = document::Selection::caret(d.byte_at_line_col(nh, hc));
+                d.materialize_box(); // carets flow through the one multi-cursor path
                 self.ensure_cursor_visible();
                 self.redraw();
                 return;
@@ -11156,6 +11485,20 @@ impl ApplicationHandler for App {
                     self.redraw();
                 }
                 WorkerMsg::LspLocations { id, locs } => {
+                    // Ctrl-hover probe result: confirm/deny the link affordance —
+                    // never navigate from a probe.
+                    if let Some((pid, range)) = self.ctrl_probe {
+                        if pid == id {
+                            self.ctrl_probe = None;
+                            if locs.is_empty() {
+                                self.ctrl_link_miss = Some(range);
+                            } else {
+                                self.ctrl_link = Some(range);
+                                self.redraw();
+                            }
+                            continue;
+                        }
+                    }
                     if let Some(kind) = self.lsp.take_locations(id) {
                         self.apply_locations(kind, locs);
                     }
@@ -11189,13 +11532,28 @@ impl ApplicationHandler for App {
                     if self.lsp.is_current_completion(id) && !items.is_empty() {
                         if let Some((req_id, prefix_start)) = self.completion_req {
                             if req_id == id {
-                                self.completion.set_items(completion::from_lsp(items), prefix_start);
+                                // Filter/rank against what's actually typed —
+                                // tsserver sends the whole scope unfiltered.
+                                let prefix = self
+                                    .workspace
+                                    .active_doc()
+                                    .map(|d| {
+                                        let caret = d.caret_byte();
+                                        let text = d.text();
+                                        text.get(prefix_start..caret).unwrap_or("").to_string()
+                                    })
+                                    .unwrap_or_default();
+                                self.completion
+                                    .set_items(completion::filter_rank(completion::from_lsp(items), &prefix), prefix_start);
                                 self.redraw();
                             }
                         }
                     }
                 }
                 WorkerMsg::LspHover { id, markdown } => {
+                    if std::env::var_os("AETHER_DEBUG_LSP").is_some() {
+                        eprintln!("[lsp-dbg] hover reply id={id} len={} req={:?}", markdown.len(), self.lsp_hover_req.map(|r| r.0));
+                    }
                     // Only accept the reply to the newest in-flight hover request, and
                     // only if the pointer is still on that token (req not cleared).
                     if let Some((req_id, hx, hy)) = self.lsp_hover_req {
@@ -11658,7 +12016,11 @@ impl ApplicationHandler for App {
                 let uri = doc.and_then(|d| d.uri());
                 let lang = doc.and_then(|d| d.language_id());
                 if let (Some(uri), Some(lang)) = (uri.as_ref(), lang) {
-                    if let Some(id) = self.lsp.request_hover(lang, uri, line, col) {
+                    let id = self.lsp.request_hover(lang, uri, line, col);
+                    if std::env::var_os("AETHER_DEBUG_LSP").is_some() {
+                        eprintln!("[lsp-dbg] hover fire lang={lang} {line}:{col} -> id={id:?}");
+                    }
+                    if let Some(id) = id {
                         self.lsp_hover_req = Some((id, hx, hy));
                     }
                 }
@@ -12053,6 +12415,15 @@ impl ApplicationHandler for App {
                 // stationary pointer — refresh so it appears/clears without moving.
                 if self.terminal.visible {
                     self.redraw();
+                }
+                // Same for the editor's ctrl-hover link underline: re-run the hover
+                // logic at the current pointer so it appears/clears immediately.
+                let link_mod = self.mods.control_key() || (cfg!(target_os = "macos") && self.mods.super_key());
+                if !link_mod && self.ctrl_link.take().is_some() {
+                    self.redraw();
+                } else if link_mod {
+                    let (mx, my) = (self.mouse_pos.x as f32, self.mouse_pos.y as f32);
+                    self.on_mouse_move(mx, my);
                 }
             }
             WindowEvent::Resized(size) => {

@@ -288,8 +288,10 @@ impl Markdown {
                         st.heading = Some(level);
                     }
                     Tag::CodeBlock(_) => {
+                        // Code fences are their own block — the inter-block gap
+                        // separates them (blank filler lines read as huge gaps).
+                        flush(&mut spans, &mut self.blocks, fs, base_m, &mut cur_links, block_gap());
                         st.code = true;
-                        spans.push(("\n".into(), base));
                     }
                     Tag::Link { dest_url, .. } => {
                         st.link = true;
@@ -339,7 +341,10 @@ impl Markdown {
                         flush(&mut spans, &mut self.blocks, fs, m, &mut cur_links, head_bot_gap());
                         st.heading = None;
                     }
-                    TagEnd::CodeBlock => { st.code = false; spans.push(("\n".into(), base)); }
+                    TagEnd::CodeBlock => {
+                        st.code = false;
+                        flush(&mut spans, &mut self.blocks, fs, base_m, &mut cur_links, block_gap());
+                    }
                     TagEnd::Link => {
                         st.link = false;
                         if let Some((s, url)) = link_open.take() {
@@ -350,12 +355,22 @@ impl Markdown {
                         }
                     }
                     TagEnd::Image => image_depth = image_depth.saturating_sub(1),
-                    TagEnd::List(_) => { list_stack.pop(); if list_stack.is_empty() { spans.push(("\n".into(), base)); } }
+                    TagEnd::List(_) => {
+                        list_stack.pop();
+                        if list_stack.is_empty() {
+                            flush(&mut spans, &mut self.blocks, fs, base_m, &mut cur_links, para_gap());
+                        }
+                    }
                     // Flush each item as its own block so the inter-block gap separates
                     // bullets (a single '\n' packed them with no breathing room).
                     TagEnd::Item => flush(&mut spans, &mut self.blocks, fs, base_m, &mut cur_links, list_gap()),
-                    TagEnd::BlockQuote(_) => { st.quote = false; spans.push(("\n".into(), base)); }
-                    TagEnd::Paragraph => spans.push(("\n\n".into(), base)),
+                    TagEnd::BlockQuote(_) => {
+                        st.quote = false;
+                        flush(&mut spans, &mut self.blocks, fs, base_m, &mut cur_links, para_gap());
+                    }
+                    // Each paragraph is its own block: para_gap separates them (a
+                    // fraction of a line) instead of a full blank line.
+                    TagEnd::Paragraph => flush(&mut spans, &mut self.blocks, fs, base_m, &mut cur_links, para_gap()),
                     TagEnd::TableHead | TagEnd::TableRow => {}
                     TagEnd::Table => {
                         in_table = false;
@@ -598,5 +613,29 @@ impl Markdown {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // TEMP: inspect block structure for a tsserver-style hover markdown.
+    #[test]
+    fn hover_markdown_blocks_tmp() {
+        let mut fs = FontSystem::new();
+        let src = "```typescript\n(property) chalk.Chalk.green: chalk.Chalk (...text: unknown[]) => string (+1 overload)\n```\n\nUse a template string.\n\n*@remarks* — Template literals are unsupported for nested calls (see issue #341)\n\n*@example*\n\n```ts\nimport chalk = require('chalk');\n\nlog(chalk`\nCPU: {red 90%}\n`);\n```\n";
+        let mut md = Markdown::new(&mut fs);
+        md.set(&mut fs, "k", src, 600.0);
+        for (i, b) in md.blocks.iter().enumerate() {
+            match b {
+                Block::Text { height, gap, buffer, .. } => {
+                    eprintln!("block {i}: Text h={height:.1} gap={gap:.1} lines={}", buffer.lines.len());
+                }
+                Block::Table { height, gap, .. } => eprintln!("block {i}: Table h={height:.1} gap={gap:.1}"),
+                Block::Image { url } => eprintln!("block {i}: Image {url}"),
+            }
+        }
+        eprintln!("total height = {}", md.content_height(&|_| None));
     }
 }

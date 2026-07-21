@@ -140,6 +140,48 @@ pub fn from_lsp(items: Vec<crate::lsp::CompletionItem>) -> Vec<Item> {
         .collect()
 }
 
+/// Filter + rank LSP completion items against the typed prefix. Servers like
+/// tsserver return the ENTIRE scope unfiltered (they expect client-side filtering),
+/// so without this the popup shows an alphabetical global dump. Ranking: exact
+/// case-sensitive prefix < case-insensitive prefix < subsequence (fuzzy) — stable
+/// within each tier, so the server's own relevance order is preserved.
+pub fn filter_rank(items: Vec<Item>, prefix: &str) -> Vec<Item> {
+    if prefix.is_empty() {
+        return items;
+    }
+    let lower = prefix.to_lowercase();
+    let is_subseq = |label: &str| -> bool {
+        let mut it = label.to_lowercase().chars().collect::<Vec<_>>().into_iter();
+        'outer: for pc in lower.chars() {
+            for lc in it.by_ref() {
+                if lc == pc {
+                    continue 'outer;
+                }
+            }
+            return false;
+        }
+        true
+    };
+    let mut ranked: Vec<(u8, usize, Item)> = items
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, it)| {
+            let tier = if it.label.starts_with(prefix) {
+                0
+            } else if it.label.to_lowercase().starts_with(&lower) {
+                1
+            } else if is_subseq(&it.label) {
+                2
+            } else {
+                return None;
+            };
+            Some((tier, i, it))
+        })
+        .collect();
+    ranked.sort_by_key(|(tier, i, _)| (*tier, *i));
+    ranked.into_iter().map(|(_, _, it)| it).collect()
+}
+
 /// Byte offset where the identifier prefix ending at `caret` begins, or None if the
 /// caret isn't right after a word character (so nothing to complete).
 pub fn word_prefix(text: &str, caret: usize) -> Option<usize> {
