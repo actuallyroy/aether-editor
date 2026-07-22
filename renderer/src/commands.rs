@@ -301,6 +301,7 @@ pub struct FindBarState {
     pub opts: crate::search::SearchOpts,    // case / whole-word / regex
     pub matches: Vec<(usize, usize)>,       // byte ranges of matches in the active doc
     pub index: Option<usize>,               // current match within `matches`
+    pub key: Option<(usize, i32)>,          // (doc index, doc version) the matches were computed for
 }
 
 impl FindBarState {
@@ -313,6 +314,7 @@ impl FindBarState {
             opts: crate::search::SearchOpts::default(),
             matches: Vec::new(),
             index: None,
+            key: None,
         }
     }
 }

@@ -7403,9 +7403,26 @@ impl App {
     /// Rebuild the match list for the current query + options against the active
     /// doc, refresh the count, and select the match at/after the caret.
     fn recompute_find(&mut self) {
+        self.recompute_find_inner(true);
+    }
+
+    /// Matches are stale when the doc was edited or the tab switched since the
+    /// last search. Refresh without moving the caret.
+    fn refresh_find_if_stale(&mut self) {
+        let key = self.workspace.active.zip(self.workspace.active_doc().map(|d| d.version));
+        if key != self.find.key {
+            self.recompute_find_inner(false);
+        }
+    }
+
+    /// Re-run the search; `select` also jumps the doc selection to the nearest
+    /// match (query edits / widget open). Stale-refresh after doc edits passes
+    /// false so typing in the editor doesn't teleport the caret.
+    fn recompute_find_inner(&mut self, select: bool) {
         let query = self.gpu.as_ref().map(|g| g.ui.find.query.text().to_string()).unwrap_or_default();
         self.find.matches.clear();
         self.find.index = None;
+        self.find.key = self.workspace.active.zip(self.workspace.active_doc().map(|d| d.version));
         let (text, caret) = match self.workspace.active_doc() {
             Some(d) => (d.rope.to_string(), d.sel.head),
             None => {
@@ -7429,7 +7446,9 @@ impl App {
             if !self.find.matches.is_empty() {
                 let idx = self.find.matches.iter().position(|&(s, _)| s >= caret).unwrap_or(0);
                 self.find.index = Some(idx);
-                self.select_find_match(idx);
+                if select {
+                    self.select_find_match(idx);
+                }
             }
         }
         self.update_find_count();
@@ -7466,6 +7485,7 @@ impl App {
     }
 
     fn find_step(&mut self, forward: bool) {
+        self.refresh_find_if_stale();
         if self.find.matches.is_empty() {
             self.recompute_find();
         }
@@ -7483,6 +7503,7 @@ impl App {
 
     /// Replace the current match with the replace field's text, then advance.
     fn replace_current(&mut self) {
+        self.refresh_find_if_stale();
         let Some(i) = self.find.index else { return };
         let Some(&(s, e)) = self.find.matches.get(i) else { return };
         let repl = self.gpu.as_ref().map(|g| g.ui.find.replace.text().to_string()).unwrap_or_default();
@@ -7499,6 +7520,7 @@ impl App {
 
     /// Replace every match (back-to-front so earlier byte offsets stay valid).
     fn replace_all(&mut self) {
+        self.refresh_find_if_stale();
         let repl = self.gpu.as_ref().map(|g| g.ui.find.replace.text().to_string()).unwrap_or_default();
         let matches = self.find.matches.clone();
         if matches.is_empty() {
@@ -12557,6 +12579,12 @@ impl ApplicationHandler for App {
                 self.redraw();
             }
             WindowEvent::RedrawRequested => {
+                // Find matches are byte offsets into the doc they were computed
+                // for; edits or a tab switch make them stale (highlights drift
+                // onto the wrong text). Refresh without moving the caret.
+                if self.find.active {
+                    self.refresh_find_if_stale();
+                }
                 if let Err(e) = time_ui!("render", render::render(self)) {
                     eprintln!("render: {e}");
                 }
