@@ -569,8 +569,30 @@ fn xterm256(n: u8) -> [f32; 4] {
     }
 }
 
+/// A handful of "symbol, not emoji" codepoints (`⏺` U+23FA and friends — Claude
+/// Code's own status bullets and spinner glyphs are the common offenders) that
+/// `unicode-width` correctly scores as 1 cell, but macOS renders through Apple
+/// Color Emoji as a colorful glyph roughly 2 cells wide. That overflow desyncs the
+/// text-shaping advance from the grid's per-cell background/selection quads (the
+/// selection highlight visibly skews after one of these). Swap each for a plain
+/// glyph carried by ordinary monospace/code fonts — same meaning, no color-font
+/// fallback, width assumption actually holds.
+fn plain_glyph(c: char) -> char {
+    match c {
+        '\u{23FA}' | '\u{2B24}' => '\u{25CF}', // ⏺ / ⬤ record/status bullet → ● (BLACK CIRCLE)
+        '\u{25EF}' | '\u{2B55}' => '\u{25CB}', // ⭕/◯ hollow bullet → ○ (WHITE CIRCLE)
+        '\u{2714}' | '\u{2705}' => '\u{2713}', // ✔/✅ heavy check → ✓ (CHECK MARK)
+        '\u{2716}' | '\u{274C}' => '\u{2717}', // ✖/❌ heavy cross → ✗ (BALLOT X)
+        '\u{26A0}' => '\u{0021}',              // ⚠ warning → ! (no plain-glyph equivalent)
+        _ => c,
+    }
+}
+
 impl Perform for Grid {
     fn print(&mut self, c: char) {
+        // Emoji-presentation-by-default symbols first (see `plain_glyph`) — must
+        // happen before the width lookup below since it's keyed on the substitute.
+        let c = plain_glyph(c);
         // Display width in cells: wide glyphs (CJK, emoji, ⏵-style symbols — all
         // over Claude Code's UI) take TWO. Getting this wrong desyncs every wrap
         // and every relative cursor move the app computes from the real widths,

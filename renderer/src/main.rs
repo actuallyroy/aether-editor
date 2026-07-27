@@ -334,25 +334,63 @@ pub(crate) struct GutterPeek {
     pub anchor_line: usize, // editor line the zone hangs under
     pub doc_version: i32,   // doc version when opened (an edit dismisses it)
     pub title: String,      // header: "<file> · Working Tree"
-    pub text: String,       // the unified-diff body (one line per row)
+    pub text: String,       // the unified-diff body (one line per row) — just the focused hunk
     pub kinds: Vec<diff::RowKind>, // per body row, for +/- background coloring
-    pub hunk_rows: Vec<usize>,     // body-row index of each change run (nav + count)
-    pub change_idx: usize,  // which hunk the click landed in (for "N of M")
+    pub fname: String,      // kept to rebuild the header on next/prev nav
+    pub lines: Vec<(String, diff::RowKind)>, // every row in the file's diff (not just the shown hunk)
+    pub spans: Vec<(usize, usize)>, // [start, end) into `lines` for each change run
+    pub change_idx: usize,  // which hunk is currently shown (for "N of M")
     pub scroll: f32,        // vertical scroll within the zone (px)
 }
 
-/// Build the scrollable peek body from a single-file working-tree `Diff`. Renders a
-/// unified view — `<old> <new> <±> <content>` per row — and records each change run
-/// (hunk) so the zone can show "N of M" and scroll to the clicked one.
+/// Rows of context kept around a hunk when it's shown in isolation — clamped so it
+/// never eats into a neighboring hunk's own context.
+const PEEK_CONTEXT: usize = 3;
+
+impl GutterPeek {
+    /// Slice `self.lines` down to `self.spans[self.change_idx]` plus up to
+    /// `PEEK_CONTEXT` rows of padding on each side (clamped against the neighboring
+    /// hunk), and rebuild `text`/`kinds`/`title`/`scroll` from that window. Called
+    /// on open and on next/prev navigation — the isolated view is the point (a
+    /// clicked change bar means "show me this change", not the whole file's diff).
+    fn focus_hunk(&mut self) {
+        let Some(&(s, e)) = self.spans.get(self.change_idx) else { return };
+        let prev_end = self.change_idx.checked_sub(1).and_then(|i| self.spans.get(i)).map(|&(_, pe)| pe).unwrap_or(0);
+        let next_start = self.spans.get(self.change_idx + 1).map(|&(ns, _)| ns).unwrap_or(self.lines.len());
+        let win_s = s.saturating_sub(PEEK_CONTEXT).max(prev_end);
+        let win_e = (e + PEEK_CONTEXT).min(next_start).min(self.lines.len());
+        let mut text = String::new();
+        let mut kinds = Vec::new();
+        for (line, kind) in &self.lines[win_s..win_e] {
+            text.push_str(line);
+            text.push('\n');
+            kinds.push(*kind);
+        }
+        self.text = text;
+        self.kinds = kinds;
+        self.title = format!(
+            "{} · Working Tree   {} of {} change{}",
+            self.fname,
+            self.change_idx + 1,
+            self.spans.len(),
+            if self.spans.len() == 1 { "" } else { "s" }
+        );
+        self.scroll = 0.0;
+    }
+}
+
+/// Build the scrollable peek body from a single-file `Diff` (vs HEAD). Renders a
+/// unified view — `<old> <new> <±> <content>` per row — and isolates the single
+/// hunk under the clicked gutter line; next/prev navigation swaps in a different
+/// hunk without recomputing the diff.
 fn build_file_peek(df: &diff::Diff, fname: String, clicked_line: usize, doc_version: i32) -> GutterPeek {
     use diff::RowKind;
     let lefts: Vec<&str> = df.left_text.split('\n').collect();
     let rights: Vec<&str> = df.right_text.split('\n').collect();
     let clicked_new = (clicked_line + 1) as u32;
     let num = |n: Option<u32>| n.map(|v| v.to_string()).unwrap_or_default();
-    let mut text = String::new();
-    let mut kinds: Vec<RowKind> = Vec::new();
-    let mut hunk_rows: Vec<usize> = Vec::new();
+    let mut lines: Vec<(String, RowKind)> = Vec::new();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
     let mut prev_changed = false;
     let mut change_idx = 0;
     for (i, row) in df.rows.iter().enumerate() {
@@ -363,31 +401,33 @@ fn build_file_peek(df: &diff::Diff, fname: String, clicked_line: usize, doc_vers
             _ => continue, // skip Hunk/Gap/File separators
         };
         let changed = matches!(row.kind, RowKind::Add | RowKind::Del);
-        if changed && !prev_changed {
-            hunk_rows.push(kinds.len());
+        if changed {
+            if !prev_changed {
+                spans.push((lines.len(), lines.len()));
+            }
+            spans.last_mut().unwrap().1 = lines.len() + 1;
         }
         // The hunk owning the clicked new-side line becomes the focused one.
         if changed && row.right == Some(clicked_new) {
-            change_idx = hunk_rows.len().saturating_sub(1);
+            change_idx = spans.len().saturating_sub(1);
         }
-        text.push_str(&format!("{:>5} {:>5} {} {}\n", num(row.left), num(row.right), sign, content));
-        kinds.push(row.kind);
+        lines.push((format!("{:>5} {:>5} {} {}", num(row.left), num(row.right), sign, content), row.kind));
         prev_changed = changed;
     }
-    // Scroll so the focused hunk sits a couple of rows from the top.
-    let lh = theme::LINE_HEIGHT();
-    let target = hunk_rows.get(change_idx).copied().unwrap_or(0);
-    let scroll = ((target as f32 - 2.0) * lh).max(0.0);
-    GutterPeek {
+    let mut pk = GutterPeek {
         anchor_line: clicked_line,
         doc_version,
-        title: format!("{fname} · Working Tree"),
-        text,
-        kinds,
-        hunk_rows,
+        title: String::new(),
+        text: String::new(),
+        kinds: Vec::new(),
+        fname,
+        lines,
+        spans,
         change_idx,
-        scroll,
-    }
+        scroll: 0.0,
+    };
+    pk.focus_hunk();
+    pk
 }
 
 // Trackpad momentum (fling) tuning. The gesture itself is applied directly; these only
@@ -3177,7 +3217,7 @@ impl App {
         // an empty baseline and paints every line "added" (#gutter-on-no-git).
         let repo = git::repo_root_opt(&self.cwd);
         let in_repo = matches!((self.workspace.active_doc().and_then(|d| d.path.as_ref()), repo.as_ref()),
-            (Some(p), Some(root)) if p.starts_with(root));
+            (Some(p), Some(root)) if p.starts_with(root) && !self.workspace.tree.is_path_ignored(p));
         let need = in_repo && matches!(self.workspace.active_doc(), Some(d)
             if !d.diff_base_requested
                 && d.path.is_some()
@@ -8808,15 +8848,14 @@ impl App {
                 if gm.prev.contains((x, y)) || gm.next.contains((x, y)) {
                     let fwd = gm.next.contains((x, y));
                     if let Some(pk) = self.gutter_peek.as_mut() {
-                        let n = pk.hunk_rows.len();
+                        let n = pk.spans.len();
                         if n > 0 {
                             pk.change_idx = if fwd {
                                 (pk.change_idx + 1) % n
                             } else {
                                 (pk.change_idx + n - 1) % n
                             };
-                            let target = pk.hunk_rows[pk.change_idx];
-                            pk.scroll = ((target as f32 - 2.0) * gm.lh).clamp(0.0, gm.max_scroll);
+                            pk.focus_hunk();
                         }
                     }
                     self.redraw();
@@ -8856,7 +8895,7 @@ impl App {
                 let root = git::repo_root(&self.cwd);
                 let rel = abs.strip_prefix(&root).unwrap_or(&abs).to_string_lossy().replace('\\', "/");
                 let untracked = git::head_blob(&root, &rel).is_none();
-                let df = diff::compute(&self.cwd, &rel, false, untracked);
+                let df = diff::compute_vs_head(&self.cwd, &rel, untracked);
                 let fname = rel.rsplit('/').next().unwrap_or(&rel).to_string();
                 self.gutter_peek = Some(build_file_peek(&df, fname, line, ver));
                 self.redraw();
@@ -11869,6 +11908,17 @@ impl ApplicationHandler for App {
                     // Off-thread `git status --ignored` result: hide/dim ignored files
                     // in the tree (gen-gated against a workspace switch) and redraw.
                     self.workspace.tree.apply_ignored(gen, set);
+                    // This can land after a doc already opened and (racily) fetched a
+                    // gutter baseline before we knew it was ignored — drop it now so
+                    // the "everything added" bar disappears (#gutter-on-no-git).
+                    if let Some(p) = self.workspace.active_doc().and_then(|d| d.path.clone()) {
+                        if self.workspace.tree.is_path_ignored(&p) {
+                            if let Some(d) = self.workspace.active_doc_mut() {
+                                d.diff_base = None;
+                                d.gutter_changes.clear();
+                            }
+                        }
+                    }
                     self.redraw();
                 }
                 WorkerMsg::ScmData { gen, branch, changes, merge_state, entries } => {
@@ -11888,12 +11938,18 @@ impl ApplicationHandler for App {
                     }
                 }
                 WorkerMsg::DiffBase { path, base } => {
-                    if let Some(d) = self.workspace.documents.iter_mut().find(|d| d.path.as_deref() == Some(path.as_path())) {
-                        // Empty baseline for an uncommitted file → every line is "added".
-                        d.diff_base = Some(base.unwrap_or_default().lines().map(|l| l.to_string()).collect());
-                        d.gutter_version = -1; // force a recompute against the new baseline
-                        d.refresh_gutter_marks();
-                        self.redraw();
+                    // The ignored-set fetch and this baseline fetch race independently;
+                    // if ignore-status lands second it says "skip" but this message may
+                    // already be in flight. Re-check here so a since-confirmed-ignored
+                    // file never gets an "everything added" baseline (#gutter-on-no-git).
+                    if !self.workspace.tree.is_path_ignored(&path) {
+                        if let Some(d) = self.workspace.documents.iter_mut().find(|d| d.path.as_deref() == Some(path.as_path())) {
+                            // Empty baseline for an uncommitted file → every line is "added".
+                            d.diff_base = Some(base.unwrap_or_default().lines().map(|l| l.to_string()).collect());
+                            d.gutter_version = -1; // force a recompute against the new baseline
+                            d.refresh_gutter_marks();
+                            self.redraw();
+                        }
                     }
                 }
                 // ---- Debug adapter events ----

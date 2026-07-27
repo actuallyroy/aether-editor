@@ -952,9 +952,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 gpu.ui.peek_next.reshape(fs);
                 app.peek_shaped_key = Some(key);
             }
-            let n = pk.hunk_rows.len().max(1);
-            let header = format!("{}   {} of {} change{}", pk.title, pk.change_idx + 1, n, if n == 1 { "" } else { "s" });
-            gpu.ui.peek_title.set(fs, &header, theme::UI_FAMILY());
+            gpu.ui.peek_title.set(fs, &pk.title, theme::UI_FAMILY());
         }
 
         // Inline references peek: same zone chrome, one row per reference.

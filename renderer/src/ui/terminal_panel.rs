@@ -1295,16 +1295,24 @@ fn resolve_against(base: &std::path::Path, tok: &str) -> Option<String> {
     abs.exists().then(|| abs.to_string_lossy().into_owned())
 }
 
+/// A bracket/quote is a token boundary alongside whitespace — so a path or URL
+/// wrapped in a call expression or log decoration (`Write(docs/foo.txt)`,
+/// `[link](url)`, `"path/to/file"`) resolves to just the inner token instead of
+/// dragging the wrapper along and failing the on-disk existence check.
+fn is_boundary(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '"' | '\'')
+}
+
 fn word_bounds(chars: &[char], col: usize) -> (usize, usize) {
-    if col >= chars.len() || chars[col].is_whitespace() {
+    if col >= chars.len() || is_boundary(chars[col]) {
         return (col, col + 1);
     }
     let mut s = col;
-    while s > 0 && !chars[s - 1].is_whitespace() {
+    while s > 0 && !is_boundary(chars[s - 1]) {
         s -= 1;
     }
     let mut e = col + 1;
-    while e < chars.len() && !chars[e].is_whitespace() {
+    while e < chars.len() && !is_boundary(chars[e]) {
         e += 1;
     }
     (s, e)

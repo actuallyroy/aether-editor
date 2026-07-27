@@ -128,6 +128,26 @@ pub fn compute(root: &Path, path: &str, staged: bool, untracked: bool) -> Diff {
     diff
 }
 
+/// The gutter change-bar peek uses this: staged + unstaged changes combined against
+/// HEAD, matching the baseline the gutter marks themselves are computed from
+/// (`Document::refresh_gutter_marks`). Using working-tree-vs-index there instead (like
+/// `compute`) shows "No changes" for a file whose edits are fully staged, even though
+/// the gutter mark (rightly) still shows a change bar.
+pub fn compute_vs_head(root: &Path, path: &str, untracked: bool) -> Diff {
+    let name = file_name(path).to_string();
+    if untracked {
+        return whole_file_as_added(root, path, &name);
+    }
+    let title = format!("{name} (Working Tree)");
+    let ctx = format!("-U{FULL_CONTEXT}");
+    let raw = git(root, &["diff", "--no-color", &ctx, "HEAD", "--", path]).unwrap_or_default();
+    let mut b = Builder::new(title);
+    b.parse_into(&raw);
+    let mut diff = b.finish();
+    diff.collapse_unchanged();
+    diff
+}
+
 /// The diff a single commit introduced for one file (`git show <hash> -- path`),
 /// shown as a read-only tab. Full context + collapsible gaps like `compute`.
 pub fn compute_commit(root: &Path, path: &str, hash: &str) -> Diff {
