@@ -57,6 +57,59 @@ impl BoxSel {
     }
 }
 
+/// Next id handed out for an untitled doc's synthetic `untitled:` URI.
+static NEXT_UNTITLED_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+fn next_untitled_id() -> u64 {
+    NEXT_UNTITLED_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// (display name, extension) pairs offered by the status-bar language picker —
+/// VSCode's "Change Language Mode". `""` is Plain Text (no extension). Order is
+/// what the quick-pick shows.
+pub const LANGUAGE_TABLE: &[(&str, &str)] = &[
+    ("Plain Text", ""),
+    ("JavaScript", "js"),
+    ("TypeScript", "ts"),
+    ("JavaScript React", "jsx"),
+    ("TypeScript React", "tsx"),
+    ("JSON", "json"),
+    ("HTML", "html"),
+    ("CSS", "css"),
+    ("SCSS", "scss"),
+    ("Markdown", "md"),
+    ("Python", "py"),
+    ("Rust", "rs"),
+    ("Go", "go"),
+    ("Java", "java"),
+    ("C", "c"),
+    ("C++", "cpp"),
+    ("C#", "cs"),
+    ("Ruby", "rb"),
+    ("PHP", "php"),
+    ("Shell Script", "sh"),
+    ("YAML", "yaml"),
+    ("TOML", "toml"),
+    ("SQL", "sql"),
+    ("XML", "xml"),
+];
+
+/// Display name for a language-mode extension (`""` → "Plain Text"), matching
+/// `LANGUAGE_TABLE`'s labels; falls back to the extension itself, uppercased, for
+/// anything not in the table (mirrors what the status bar showed before the table
+/// existed, e.g. a `.lock` file still reads "LOCK").
+pub fn language_display_name(ext: &str) -> String {
+    LANGUAGE_TABLE
+        .iter()
+        .find(|(_, e)| e.eq_ignore_ascii_case(ext))
+        .map(|(name, _)| name.to_string())
+        .unwrap_or_else(|| if ext.is_empty() { "Plain Text".to_string() } else { ext.to_uppercase() })
+}
+
+/// The extension for a language-mode display name (reverse of `language_display_name`).
+pub fn language_ext_for_name(name: &str) -> Option<&'static str> {
+    LANGUAGE_TABLE.iter().find(|(n, _)| *n == name).map(|(_, e)| *e)
+}
+
 #[derive(Clone)]
 pub enum EditOp {
     Insert(String),
@@ -101,6 +154,10 @@ pub struct Document {
     pub buffer: Buffer,
     lang: Lang,
     pub ext: String,
+    /// Stable id for an untitled (no-path) doc's synthetic `untitled:` URI — every
+    /// untitled buffer is named "Untitled" so the name alone can't disambiguate
+    /// multiple open ones. Meaningless once the doc has a real path.
+    pub untitled_id: u64,
     wrap_width: Option<f32>, // Some(w) when word-wrap is on (wraps at w px)
     eol: String,             // this file's actual line ending ("\n" or "\r\n")
     pub read_only: bool,     // diff views (and future previews) reject edits
@@ -399,6 +456,7 @@ impl Document {
                 .unwrap_or_else(|| "Untitled".into()),
             None => "Untitled".into(),
         };
+        let untitled_id = if path.is_none() { next_untitled_id() } else { 0 };
         let mut doc = Self {
             path,
             name,
@@ -417,6 +475,7 @@ impl Document {
             buffer,
             lang,
             ext,
+            untitled_id,
             wrap_width,
             eol,
             read_only: false,
@@ -604,6 +663,7 @@ impl Document {
             buffer,
             lang: Lang::PlainText,
             ext: String::new(),
+            untitled_id: 0,
             wrap_width: None,
             eol: "\n".to_string(),
             read_only: true,
@@ -722,6 +782,7 @@ impl Document {
             buffer,
             lang: Lang::PlainText,
             ext: String::new(),
+            untitled_id: 0,
             wrap_width: None,
             eol: "\n".to_string(),
             read_only: true,
@@ -1897,9 +1958,17 @@ impl Document {
         self.hl_dirty_from = self.hl_dirty_from.min(edited_line);
     }
 
-    /// `file://` URI for this document, if it has a path.
+    /// `file://` URI for this document, or a synthetic `untitled:` one (VSCode's own
+    /// scheme for no-path buffers) so an untitled doc can still be synced to the
+    /// extension host and used with e.g. an extension-registered formatter
+    /// (`read_only` placeholder docs — diff/graph/info views — opt out: `untitled_id`
+    /// is 0 for those and they have no real content worth formatting anyway).
     pub fn uri(&self) -> Option<String> {
-        self.path.as_deref().map(crate::lsp::path_to_uri)
+        match self.path.as_deref() {
+            Some(p) => Some(crate::lsp::path_to_uri(p)),
+            None if self.untitled_id > 0 => Some(format!("untitled:Untitled-{}", self.untitled_id)),
+            None => None,
+        }
     }
 
     /// LSP language id (e.g. "javascript"), if a server serves this file type.
@@ -2242,6 +2311,19 @@ impl Document {
         self.ext = ext;
         self.path = Some(path);
         self.hl_dirty_from = 0;
+        self.reshape(fs);
+    }
+
+    /// Explicit "Change Language Mode" (status-bar language cell) — re-derives
+    /// syntax highlighting/comment tokens/LSP language id from `ext` without
+    /// touching `path`/`name`, so it works on an untitled buffer with no path yet.
+    pub fn set_language(&mut self, ext: &str, fs: &mut FontSystem) {
+        let ext = ext.to_ascii_lowercase();
+        self.lang = Lang::from_ext(&ext);
+        self.hl = crate::highlight::Highlighter::new(&ext);
+        self.ext = ext;
+        self.hl_dirty_from = 0;
+        self.lsp_dirty = true;
         self.reshape(fs);
     }
 

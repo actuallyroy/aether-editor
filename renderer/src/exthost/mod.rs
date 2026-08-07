@@ -37,7 +37,7 @@ impl ExtHost {
     /// Spawn the Node host for `root` and start the accept/reader thread. Returns None if
     /// Node isn't available or the host script can't be located. The connection completes
     /// asynchronously — the App gets `WorkerMsg::ExtHostReady` once the host handshakes.
-    pub fn start(root: &Path, tx: Sender<WorkerMsg>, proxy: Option<EventLoopProxy<()>>) -> Option<ExtHost> {
+    pub fn start(root: &Path, gen: u64, tx: Sender<WorkerMsg>, proxy: Option<EventLoopProxy<()>>) -> Option<ExtHost> {
         let node = crate::lsp::resolve_node()?;
         let script = host_script()?;
         let listener = TcpListener::bind(("127.0.0.1", 0)).ok()?;
@@ -86,7 +86,7 @@ impl ExtHost {
                     let mut line = String::new();
                     match reader.read_line(&mut line) {
                         Ok(0) | Err(_) => {
-                            let _ = tx.send(WorkerMsg::ExtHostExited);
+                            let _ = tx.send(WorkerMsg::ExtHostExited { gen });
                             wake(&proxy);
                             break;
                         }
@@ -139,12 +139,12 @@ impl ExtHost {
     }
 
     // ---- convenience wrappers for the first-slice methods ----
-    pub fn init(&self, root: &Path) {
+    pub fn init(&self, root: &Path, settings: &std::collections::HashMap<String, Value>) {
         // ALWAYS absolute: a relative root ("." from `aether .`) poisons every
         // uri extensions derive from the workspace — directory-walk loops in
         // MPE/crossnote never terminate on relative paths (dirname('.') == '.').
         let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        let mut params = json!({ "root": root.to_string_lossy() });
+        let mut params = json!({ "root": root.to_string_lossy(), "settings": settings });
         if let Some(rg) = bundled_ripgrep() {
             params["rgPath"] = json!(rg.to_string_lossy());
         }
@@ -169,6 +169,12 @@ impl ExtHost {
         self.request(
             "hover/provide",
             json!({ "providerId": provider_id, "uri": uri, "line": line, "character": character }),
+        )
+    }
+    pub fn request_format(&self, provider_id: i64, uri: &str, tab_size: usize, insert_spaces: bool) -> i64 {
+        self.request(
+            "format/provide",
+            json!({ "providerId": provider_id, "uri": uri, "tabSize": tab_size, "insertSpaces": insert_spaces }),
         )
     }
     pub fn did_change_active(&self, uri: &str, language_id: &str) {

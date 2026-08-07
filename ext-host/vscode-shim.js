@@ -26,6 +26,9 @@ class Hover {
 class Disposable {
   constructor(fn) { this._fn = fn; }
   dispose() { if (this._fn) { this._fn(); this._fn = null; } }
+  static from(...disposables) {
+    return new Disposable(() => { for (const d of disposables) { try { d?.dispose(); } catch (_) {} } });
+  }
 }
 class Uri {
   constructor(scheme, authority, path, query, fragment) {
@@ -77,6 +80,70 @@ class Selection extends Range {
   }
 }
 class ThemeIcon { constructor(id, color) { this.id = id; this.color = color; } }
+// Core LSP-conversion value types — vscode-languageclient's protocolConverter
+// (used by most LSP-based extensions, e.g. Gemini Code Assist's language client)
+// builds every diagnostic/symbol/link/hint through these; missing any one of them
+// throws "Class extends value undefined" at require-time and aborts the whole
+// extension's activate() before it registers anything (#gemini-blank-panel).
+class Location {
+  constructor(uri, rangeOrPosition) { this.uri = uri; this.range = rangeOrPosition instanceof Range ? rangeOrPosition : new Range(rangeOrPosition, rangeOrPosition); }
+}
+class LocationLink {
+  constructor(targetUri, targetRange, targetSelectionRange, originSelectionRange) {
+    this.targetUri = targetUri; this.targetRange = targetRange;
+    this.targetSelectionRange = targetSelectionRange; this.originSelectionRange = originSelectionRange;
+  }
+}
+class TextEdit {
+  constructor(range, newText) { this.range = range; this.newText = newText; }
+  static replace(range, newText) { return new TextEdit(range, newText); }
+  static insert(position, newText) { return new TextEdit(new Range(position, position), newText); }
+  static delete(range) { return new TextEdit(range, ''); }
+  static setEndOfLine() { return new TextEdit(new Range(new Position(0, 0), new Position(0, 0)), ''); }
+}
+class Diagnostic {
+  constructor(range, message, severity) { this.range = range; this.message = message; this.severity = severity ?? 0; }
+}
+class DocumentLink {
+  constructor(range, target) { this.range = range; this.target = target; }
+}
+class CodeAction {
+  constructor(title, kind) { this.title = title; this.kind = kind; }
+}
+class SymbolInformation {
+  constructor(name, kind, containerNameOrRange, locationOrUri) {
+    this.name = name; this.kind = kind;
+    if (locationOrUri) { this.containerName = containerNameOrRange; this.location = new Location(locationOrUri, containerNameOrRange); }
+    else { this.containerName = ''; this.location = containerNameOrRange; }
+  }
+}
+class DocumentSymbol {
+  constructor(name, detail, kind, range, selectionRange) {
+    this.name = name; this.detail = detail; this.kind = kind;
+    this.range = range; this.selectionRange = selectionRange; this.children = [];
+  }
+}
+class FoldingRange {
+  constructor(start, end, kind) { this.start = start; this.end = end; this.kind = kind; }
+}
+class SelectionRange {
+  constructor(range, parent) { this.range = range; this.parent = parent; }
+}
+class CallHierarchyItem {
+  constructor(kind, name, detail, uri, range, selectionRange) {
+    this.kind = kind; this.name = name; this.detail = detail;
+    this.uri = uri; this.range = range; this.selectionRange = selectionRange; this.tags = [];
+  }
+}
+class TypeHierarchyItem {
+  constructor(kind, name, detail, uri, range, selectionRange) {
+    this.kind = kind; this.name = name; this.detail = detail;
+    this.uri = uri; this.range = range; this.selectionRange = selectionRange; this.tags = [];
+  }
+}
+class InlayHint {
+  constructor(position, label, kind) { this.position = position; this.label = label; this.kind = kind; }
+}
 class CancellationTokenSource {
   constructor() {
     const ev = new VsEvent();
@@ -88,6 +155,26 @@ class CancellationTokenSource {
 }
 class RelativePattern {
   constructor(base, pattern) { this.base = (base && base.fsPath) || String(base); this.pattern = pattern; }
+}
+class CancellationError extends Error {
+  constructor() { super('Canceled'); this.name = 'Canceled'; }
+}
+
+/// Split (options?, ...items) apart from a showXMessage rest-args array: an options
+/// object is a plain (non-array) object, everything else is a button label (string
+/// or MessageItem `{title}`).
+function splitMessageArgs(message, rest) {
+  const flat = rest.flat();
+  let modal = false;
+  const items = [];
+  for (const it of flat) {
+    if (it && typeof it === 'object' && !Array.isArray(it) && typeof it.title !== 'string') {
+      modal = !!it.modal;
+    } else {
+      items.push(typeof it === 'string' ? it : it.title);
+    }
+  }
+  return { message, items, modal };
 }
 
 function contentsToMarkdown(contents) {
@@ -188,6 +275,7 @@ function createVscode(rpc) {
   // ---- hover providers + commands (called back BY aether) ----
   let nextProviderId = 1;
   const hoverProviders = new Map(); // providerId -> {selector, provider}
+  const formattingProviders = new Map(); // providerId -> {selector, provider}
   const commands = new Map();       // command -> callback
   const uriHandlers = [];           // window.registerUriHandler handlers (deep links)
   // Tree views: viewId -> { provider, elems: handle->element, cmds: handle->command, next }
@@ -333,10 +421,36 @@ function createVscode(rpc) {
     DiagnosticSeverity: { Error: 0, Warning: 1, Information: 2, Hint: 3 },
     TextEditorRevealType: { Default: 0, InCenter: 1, InCenterIfOutsideViewport: 2, AtTop: 3 },
     OverviewRulerLane: { Left: 1, Center: 2, Right: 4, Full: 7 },
+    DecorationRangeBehavior: { OpenOpen: 0, ClosedClosed: 1, OpenClosed: 2, ClosedOpen: 3 },
+    LanguageStatusSeverity: { Information: 0, Warning: 1, Error: 2 },
     FileType: { Unknown: 0, File: 1, Directory: 2, SymbolicLink: 64 },
     TreeItemCollapsibleState: { None: 0, Collapsed: 1, Expanded: 2 },
     TreeItem: class TreeItem { constructor(label, state) { this.label = label; this.collapsibleState = state || 0; } },
     CodeLens: class CodeLens { constructor(range, command) { this.range = range; this.command = command; } },
+    CompletionItem: class CompletionItem {
+      constructor(label, kind) { this.label = label; this.kind = kind; }
+    },
+    CompletionItemKind: {
+      Text: 0, Method: 1, Function: 2, Constructor: 3, Field: 4, Variable: 5, Class: 6,
+      Interface: 7, Module: 8, Property: 9, Unit: 10, Value: 11, Enum: 12, Keyword: 13,
+      Snippet: 14, Color: 15, File: 16, Reference: 17, Folder: 18, EnumMember: 19,
+      Constant: 20, Struct: 21, Event: 22, Operator: 23, TypeParameter: 24,
+      User: 25, Issue: 26,
+    },
+    CompletionItemTag: { Deprecated: 1 },
+    CompletionTriggerKind: { Invoke: 0, TriggerCharacter: 1, TriggerForIncompleteCompletions: 2 },
+    CancellationError,
+    Location, LocationLink, TextEdit, Diagnostic, DocumentLink, CodeAction,
+    SymbolInformation, DocumentSymbol, FoldingRange, SelectionRange,
+    CallHierarchyItem, TypeHierarchyItem, InlayHint,
+    SymbolKind: {
+      File: 0, Module: 1, Namespace: 2, Package: 3, Class: 4, Method: 5, Property: 6,
+      Field: 7, Constructor: 8, Enum: 9, Interface: 10, Function: 11, Variable: 12,
+      Constant: 13, String: 14, Number: 15, Boolean: 16, Array: 17, Object: 18,
+      Key: 19, Null: 20, EnumMember: 21, Struct: 22, Event: 23, Operator: 24, TypeParameter: 25,
+    },
+    FoldingRangeKind: { Comment: 1, Imports: 2, Region: 3 },
+    InlayHintKind: { Type: 1, Parameter: 2 },
     NotebookCellOutputItem: class NotebookCellOutputItem {
       constructor(data, mime) { this.data = data; this.mime = mime; }
       static text(s, mime) { return new this(Buffer.from(String(s)), mime || 'text/plain'); }
@@ -358,12 +472,17 @@ function createVscode(rpc) {
     },
 
     window: {
-      showInformationMessage: (message, ...items) =>
-        rpc.request('window/showInformationMessage', { message, items: items.flat() }),
-      showErrorMessage: (message, ...items) =>
-        rpc.request('window/showErrorMessage', { message, items: items.flat() }),
-      showWarningMessage: (message, ...items) =>
-        rpc.request('window/showWarningMessage', { message, items: items.flat() }),
+      // Real signature is (message, options?, ...items) — options is only present
+      // if the first arg after message is a non-string object ({modal, detail}).
+      // Splitting it out here matters: leaving it in `items` shows a literal
+      // "[object Object]"-shaped button (e.g. Gemini's `{"modal":true}` alongside
+      // "Reload") instead of the actual button labels.
+      showInformationMessage: (message, ...rest) =>
+        rpc.request('window/showInformationMessage', splitMessageArgs(message, rest)),
+      showErrorMessage: (message, ...rest) =>
+        rpc.request('window/showErrorMessage', splitMessageArgs(message, rest)),
+      showWarningMessage: (message, ...rest) =>
+        rpc.request('window/showWarningMessage', splitMessageArgs(message, rest)),
       showQuickPick: (items, options) =>
         Promise.resolve(items).then((list) =>
           rpc.request('window/showQuickPick', {
@@ -377,6 +496,51 @@ function createVscode(rpc) {
         rpc.request('window/showInputBox', {
           prompt: (options && options.prompt) || '', value: (options && options.value) || '',
         }).then((v) => (v == null ? undefined : v)),
+      // The imperative QuickPick object (as opposed to the one-shot showQuickPick
+      // promise above) — extensions build it up (title/items/placeholder) then call
+      // .show(). No incremental/live-filter UI on aether's side yet, so `.show()`
+      // is backed by the same modal dialog as showQuickPick; good enough for
+      // extensions (Gemini Code Assist's own startup is the known one) that just
+      // need the object to exist and its events to eventually fire.
+      createQuickPick: () => {
+        const selChange = new VsEvent();
+        const activeChange = new VsEvent();
+        const accept = new VsEvent();
+        const hide = new VsEvent();
+        const valueChange = new VsEvent();
+        const triggerButton = new VsEvent();
+        const qp = {
+          items: [], selectedItems: [], activeItems: [],
+          placeholder: '', title: undefined, value: '',
+          canSelectMany: false, ignoreFocusOut: false,
+          matchOnDescription: false, matchOnDetail: false,
+          busy: false, enabled: true, step: undefined, totalSteps: undefined, buttons: [],
+          onDidChangeSelection: selChange.event,
+          onDidChangeActive: activeChange.event,
+          onDidAccept: accept.event,
+          onDidHide: hide.event,
+          onDidChangeValue: valueChange.event,
+          onDidTriggerButton: triggerButton.event,
+          show() {
+            const list = qp.items || [];
+            rpc.request('window/showQuickPick', {
+              items: list.map((it) => (typeof it === 'string' ? it : it.label)),
+              placeHolder: qp.placeholder || '',
+            }).then((picked) => {
+              const found = picked == null ? undefined : list.find((it) => (typeof it === 'string' ? it : it.label) === picked);
+              qp.selectedItems = found ? [found] : [];
+              qp.activeItems = qp.selectedItems;
+              activeChange.fire(qp.activeItems);
+              selChange.fire(qp.selectedItems);
+              if (found) accept.fire();
+              hide.fire();
+            });
+          },
+          hide() { hide.fire(); },
+          dispose() {},
+        };
+        return qp;
+      },
       createStatusBarItem: (alignment, priority) => makeStatusBarItem(alignment, priority),
       // Custom editors (webview-as-file-editor) aren't wired into aether yet —
       // register a no-op so activation doesn't crash (MPE registers one it only
@@ -546,7 +710,16 @@ function createVscode(rpc) {
           get: (key, dflt) => { const v = lookup(key); return v === undefined ? dflt : v; },
           has: (key) => lookup(key) !== undefined,
           inspect: (key) => ({ key: full(key), defaultValue: configDefaults[full(key)] }),
-          update: (key, value) => { ws.settings[full(key)] = value; return Promise.resolve(); },
+          update: (key, value) => {
+            ws.settings[full(key)] = value;
+            // Otherwise this only lives in THIS process's memory — a later
+            // restart (extensions sometimes ask for one right after an update,
+            // e.g. Gemini Code Assist's http.systemCertificatesNode) starts a
+            // fresh host with none of it, so the setting silently reverts and
+            // the extension re-prompts forever (#gemini-reload-loop).
+            rpc.notify('workspace/didUpdateConfiguration', { key: full(key), value });
+            return Promise.resolve();
+          },
         };
         // VSCode also exposes settings as PROPERTIES of the config object
         // (`getConfiguration('todo-tree.general').tagGroups`) — materialize every
@@ -703,7 +876,19 @@ function createVscode(rpc) {
       registerDefinitionProvider: () => new Disposable(() => {}),
       registerCodeLensProvider: () => new Disposable(() => {}),
       registerCodeActionsProvider: () => new Disposable(() => {}),
-      registerDocumentFormattingEditProvider: () => new Disposable(() => {}),
+      registerDocumentFormattingEditProvider: (selector, provider) => {
+        const providerId = nextProviderId++;
+        const langs = (Array.isArray(selector) ? selector : [selector]).map((s) =>
+          typeof s === 'string' ? s : (s && s.language) || '*');
+        formattingProviders.set(providerId, { selector: langs, provider });
+        rpc.notify('languages/registerFormattingProvider', { providerId, selector: langs });
+        return new Disposable(() => formattingProviders.delete(providerId));
+      },
+      // Range-formatting isn't wired to Format Selection yet (only whole-document
+      // Format Document is), but the provider must still register successfully —
+      // Prettier's own registerGlobal() throws synchronously (killing activation
+      // entirely) if this isn't at least a function.
+      registerDocumentRangeFormattingEditProvider: () => new Disposable(() => {}),
       registerDocumentLinkProvider: () => new Disposable(() => {}),
       registerInlineCompletionItemProvider: () => new Disposable(() => {}),
       onDidChangeDiagnostics: () => new Disposable(() => {}),
@@ -711,6 +896,11 @@ function createVscode(rpc) {
       setTextDocumentLanguage: (doc) => Promise.resolve(doc),
       match: () => 0,
       createDiagnosticCollection: () => ({ set: () => {}, delete: () => {}, clear: () => {}, dispose: () => {} }),
+      createLanguageStatusItem: (id, selector) => ({
+        id, selector, name: '', text: '', detail: '', severity: 0,
+        command: undefined, accessibilityInformation: undefined, busy: false,
+        dispose: () => {},
+      }),
     },
   };
 
@@ -772,6 +962,19 @@ function createVscode(rpc) {
         range = [r.start.line, r.start.character, r.end.line, r.end.character];
       }
       return { contents, range };
+    },
+    async provideFormatting({ providerId, uri, tabSize, insertSpaces }) {
+      const entry = formattingProviders.get(providerId);
+      if (!entry) return null;
+      const doc = docs.get(uri);
+      if (!doc) return null;
+      const opts = { tabSize: tabSize || 2, insertSpaces: insertSpaces !== false };
+      const res = await entry.provider.provideDocumentFormattingEdits(doc, opts, { isCancellationRequested: false });
+      if (!Array.isArray(res)) return null;
+      return res.map((e) => ({
+        range: [e.range.start.line, e.range.start.character, e.range.end.line, e.range.end.character],
+        newText: e.newText,
+      }));
     },
     // aether asks the provider to populate a fresh webview instance.
     async resolveWebview({ viewId, instanceId }) {

@@ -38,15 +38,23 @@ async function activateExtension(extPath, hostLog, dispatch) {
       let data = {};
       try { data = JSON.parse(fs.readFileSync(p, 'utf8')); } catch (_) {}
       const flush = () => { try { fs.writeFileSync(p, JSON.stringify(data)); } catch (_) {} };
+      // Only real vscode.SecretStorage has onDidChange, but firing it here for all
+      // three stores is harmless (no listener attaches unless the real API has it).
+      // Without this, `secrets.store()` succeeds but nothing tells the extension a
+      // secret changed — Gemini Code Assist's OAuth flow writes the token fine,
+      // then never re-checks login state, leaving the UI stuck on "Sign in" even
+      // though auth genuinely succeeded (#gemini-signin-stuck).
+      const listeners = new Set();
+      const fireChange = (key) => { for (const fn of listeners) { try { fn({ key }); } catch (_) {} } };
       return {
         get: (k, d) => (k in data ? data[k] : d),
-        update: (k, v) => { if (v === undefined) delete data[k]; else data[k] = v; flush(); return Promise.resolve(); },
+        update: (k, v) => { if (v === undefined) delete data[k]; else data[k] = v; flush(); fireChange(k); return Promise.resolve(); },
         keys: () => Object.keys(data),
         setKeysForSync: () => {},
         // secrets API shape rides on the same store:
-        store: (k, v) => { data[k] = v; flush(); return Promise.resolve(); },
-        delete: (k) => { delete data[k]; flush(); return Promise.resolve(); },
-        onDidChange: () => ({ dispose: () => {} }),
+        store: (k, v) => { data[k] = v; flush(); fireChange(k); return Promise.resolve(); },
+        delete: (k) => { delete data[k]; flush(); fireChange(k); return Promise.resolve(); },
+        onDidChange: (fn) => { listeners.add(fn); return { dispose: () => listeners.delete(fn) }; },
       };
     };
     const context = {

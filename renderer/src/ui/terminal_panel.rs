@@ -903,14 +903,16 @@ impl TerminalPanel {
     /// Map a point inside pane `rect` to a `(line, col)` in that pane's combined
     /// buffer. Mirrors the cell geometry used by the renderer (8px/4px insets).
     /// The URL under the terminal cell at `pt`, if any (for Ctrl/Cmd+click open).
-    pub fn url_at(&self, pt: (f32, f32), layout: &Layout, cell_w: f32) -> Option<String> {
-        self.url_span_at(pt, layout, cell_w).map(|(_, url)| url)
+    pub fn url_at(&self, pt: (f32, f32), layout: &Layout, cell_w: f32) -> Option<(String, Option<u32>, Option<u32>)> {
+        self.url_span_at(pt, layout, cell_w).map(|(_, url, line, col)| (url, line, col))
     }
 
     /// The URL under `pt` plus the screen rects of its cells — one rect per row the
     /// link spans (a hard-wrapped URL occupies several rows) for the Ctrl-hover
-    /// underline highlight.
-    pub fn url_span_at(&self, pt: (f32, f32), layout: &Layout, cell_w: f32) -> Option<(Vec<Rect>, String)> {
+    /// underline highlight. `line`/`col` (1-based) come from a stack-trace-style
+    /// `path:line[:col]` or `path:line-line` suffix on a filesystem path; always
+    /// `None` for a URL or a bare path.
+    pub fn url_span_at(&self, pt: (f32, f32), layout: &Layout, cell_w: f32) -> Option<(Vec<Rect>, String, Option<u32>, Option<u32>)> {
         if !self.visible {
             return None;
         }
@@ -966,8 +968,13 @@ impl TerminalPanel {
         // Prefer the shell's live cwd (OSC 7) for resolving relative paths, falling
         // back to the workspace root the terminal was opened in.
         let base = pane.term.cwd().unwrap_or(&self.cwd);
-        let url = url_token_at(&chars, col)
-            .or_else(|| path_token_at(&chars, col).and_then(|p| resolve_against(base, &p)))?;
+        let (url, line_no, col_no) = if let Some(u) = url_token_at(&chars, col) {
+            (u, None, None)
+        } else {
+            let (tok, l, c) = path_token_at(&chars, col)?;
+            let resolved = resolve_against(base, &tok)?;
+            (resolved, l, c)
+        };
         // On-screen cell span: the whitespace-delimited token minus trailing
         // punctuation (which `url_token_at` also trims). Every joined row above the
         // last contributes exactly `cols` chars, so a joined index maps uniformly to
@@ -994,7 +1001,7 @@ impl TerminalPanel {
                 rects.push(Rect { x: x0, y: y0, w: (ce - cs) as f32 * cell_w, h: line_h });
             }
         }
-        Some((rects, url))
+        Some((rects, url, line_no, col_no))
     }
 
     fn cell_at(rect: Rect, pt: (f32, f32), cell_w: f32, pane: &terminal::Pane) -> (usize, usize) {
@@ -1256,13 +1263,46 @@ fn url_token_at(chars: &[char], col: usize) -> Option<String> {
 /// relative (`./…`, `../…`), and any token containing a `/` separator. Trailing
 /// prose punctuation is trimmed. URLs are intentionally excluded (handled by
 /// `url_token_at`).
-fn path_token_at(chars: &[char], col: usize) -> Option<String> {
+/// A path-like token under `col`, plus a trailing `:LINE`, `:LINE:COL`, or
+/// `:LINE-LINE` suffix if present (stack-trace/lint-output style, e.g.
+/// `contentScripts/util.js:2-41` or `src/foo.ts:10:4`) — split off so the
+/// EXISTENCE check runs against the real path, not `foo.js:2-41` which never
+/// exists on disk and silently failed the whole link (#terminal-lineno-links).
+/// Returns (path, line, col); line/col are 1-based, matching editor conventions.
+fn path_token_at(chars: &[char], col: usize) -> Option<(String, Option<u32>, Option<u32>)> {
     if col >= chars.len() || chars[col].is_whitespace() {
         return None;
     }
     let (s, e) = word_bounds(chars, col);
     let mut tok: String = chars[s..e].iter().collect::<String>().trim_end_matches('\0').to_string();
-    tok = tok.trim_end_matches(|c| matches!(c, '.' | ',' | ';' | ':' | ')' | ']' | '}' | '>' | '"' | '\'')).to_string();
+    tok = tok.trim_end_matches(|c| matches!(c, '.' | ',' | ';' | ')' | ']' | '}' | '>' | '"' | '\'')).to_string();
+    // Strip a trailing line[:col] / line-line suffix. Try `:L:C` first (more
+    // specific), then `:L` alone (with an optional `-L2` range, whose end we
+    // don't need — landing on the start line matches editor "go to" behavior).
+    let mut line = None;
+    let mut col_out = None;
+    if let Some((head, tail)) = tok.rsplit_once(':').map(|(a, b)| (a.to_string(), b.to_string())) {
+        if let Ok(c) = tail.parse::<u32>() {
+            if let Some((path2, l)) = head.rsplit_once(':').map(|(a, b)| (a.to_string(), b.to_string())) {
+                if let Ok(l) = l.parse::<u32>() {
+                    tok = path2;
+                    line = Some(l);
+                    col_out = Some(c);
+                }
+            }
+            if line.is_none() {
+                tok = head;
+                line = Some(c);
+            }
+        } else if let Some(start) = tail.split('-').next() {
+            if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit() || c == '-') {
+                if let Ok(l) = start.parse::<u32>() {
+                    tok = head;
+                    line = Some(l);
+                }
+            }
+        }
+    }
     let low = tok.to_lowercase();
     if low.starts_with("http://") || low.starts_with("https://") || low.starts_with("file://") || low.starts_with("www.") {
         return None;
@@ -1276,7 +1316,7 @@ fn path_token_at(chars: &[char], col: usize) -> Option<String> {
     if !looks_path || tok.len() < 2 {
         return None;
     }
-    Some(tok)
+    Some((tok, line, col_out))
 }
 
 /// Resolve a path-like token against `base` into an absolute path that exists on

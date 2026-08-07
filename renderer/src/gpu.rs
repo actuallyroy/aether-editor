@@ -33,7 +33,9 @@ pub struct UiBuffers {
     pub status_right: TextLabel,
     pub ext_status: Vec<(i64, Option<TextLabel>, TextLabel)>, // extension status-bar items (id, codicon, label)
     pub toast_labels: Vec<TextLabel>, // bottom-right toast notification texts
+    pub toast_button_labels: Vec<Vec<TextLabel>>, // per-toast button labels (parallel to app.toasts)
     pub encoding: TextLabel, // status-bar encoding label (clickable → encoding picker)
+    pub lang_label: TextLabel, // status-bar language label (clickable → language-mode picker)
     pub breadcrumbs: crate::ui::breadcrumbs::Breadcrumbs, // path bar below the tab strip
     pub branch_icon: TextLabel, // status-bar git-branch glyph (codicon)
     pub branch: TextLabel,      // status-bar current branch name (clickable)
@@ -262,7 +264,9 @@ impl GpuState {
             status_right: TextLabel::new(&mut font_system, 4000.0, theme::STATUS_BAR_HEIGHT()),
             ext_status: Vec::new(),
             toast_labels: Vec::new(),
+            toast_button_labels: Vec::new(),
             encoding: TextLabel::new(&mut font_system, 400.0, theme::STATUS_BAR_HEIGHT()),
+            lang_label: TextLabel::new(&mut font_system, 400.0, theme::STATUS_BAR_HEIGHT()),
             breadcrumbs: crate::ui::breadcrumbs::Breadcrumbs::new(&mut font_system),
             branch_icon: TextLabel::new(&mut font_system, 32.0, theme::STATUS_BAR_HEIGHT()),
             branch: TextLabel::new(&mut font_system, 600.0, theme::STATUS_BAR_HEIGHT()),

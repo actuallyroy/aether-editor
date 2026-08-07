@@ -5,9 +5,22 @@
 'use strict';
 
 const net = require('net');
+const path = require('path');
+const { pathToFileURL } = require('url');
 const { Rpc } = require('./rpc');
 const { createVscode } = require('./vscode-shim');
 const { installVscodeModule, activateExtension, deactivateExtension } = require('./activation');
+
+// ESM-bundled extensions (esbuild `"type": "module"` output) use `import ... from
+// "vscode"`, which the plain `Module._load` patch below can't intercept — that
+// only covers CommonJS `require()`. Register a loader hook so ESM imports of
+// "vscode" resolve too (see esm-loader.mjs for how it stays bridged to the same
+// live shim singleton). Must happen before any extension activates.
+try {
+  require('module').register(pathToFileURL(path.join(__dirname, 'esm-loader.mjs')).href, pathToFileURL(__filename).href);
+} catch (e) {
+  console.error('[ext-host] ESM loader hook registration failed (ESM-bundled extensions, e.g. Prettier, may not activate):', e.message);
+}
 
 const port = parseInt(process.argv[2], 10);
 const token = process.argv[3] || '';
@@ -85,6 +98,46 @@ rpc.on_method('host/init', (p) => {
       p.appRoot = appRoot;
     } catch (e) { console.error('[ext-host] ripgrep approot setup failed:', e.message); }
   }
+  // Best-effort: some extensions (Gemini Code Assist is the known one) hard-require
+  // `node-pty` from the VSCode-shaped appRoot and throw during activate() if it's
+  // missing — which aborts activation before the extension registers anything, so
+  // its whole panel stays blank. Provision it once in the background using the SAME
+  // node/npm ext-host is running under, so the prebuilt native binary matches this
+  // Node's ABI. Fire-and-forget: extensions that don't need node-pty are unaffected;
+  // ones that do simply find it ready on a later activation once install finishes.
+  try {
+    const fs = require('fs');
+    const path = require('path');
+    const os = require('os');
+    const { execFile } = require('child_process');
+    const appRoot = p.appRoot || path.join(os.homedir(), '.aether', 'approot');
+    const ptyDir = path.join(appRoot, 'node_modules', 'node-pty');
+    const marker = path.join(appRoot, '.node-pty-install-attempted');
+    if (!fs.existsSync(path.join(ptyDir, 'package.json')) && !fs.existsSync(marker)) {
+      fs.mkdirSync(appRoot, { recursive: true });
+      fs.writeFileSync(marker, String(Date.now()));
+      const npmNextToNode = path.join(path.dirname(process.execPath), process.platform === 'win32' ? 'npm.cmd' : 'npm');
+      const npmBin = fs.existsSync(npmNextToNode) ? npmNextToNode : 'npm';
+      execFile(npmBin, ['install', '--no-audit', '--no-fund', 'node-pty'], { cwd: appRoot }, (err) => {
+        if (err) {
+          console.error('[ext-host] node-pty provisioning failed (extensions needing it, e.g. Gemini Code Assist, won\'t activate):', err.message);
+          return;
+        }
+        // npm's default `allow-scripts` policy blocks node-pty's postinstall (which
+        // would chmod these itself), leaving its prebuilt `spawn-helper` non-executable
+        // — every pty spawn then fails with "posix_spawnp failed" even though the
+        // require() succeeds. Fix the bit ourselves since we can't rely on the script.
+        try {
+          const prebuildsDir = path.join(ptyDir, 'prebuilds');
+          for (const plat of fs.readdirSync(prebuildsDir)) {
+            const helper = path.join(prebuildsDir, plat, 'spawn-helper');
+            if (fs.existsSync(helper)) fs.chmodSync(helper, 0o755);
+          }
+        } catch (_) { /* best-effort */ }
+        console.error('[ext-host] node-pty provisioned for extension use');
+      });
+    }
+  } catch (e) { console.error('[ext-host] node-pty provisioning setup failed:', e.message); }
   dispatch.setWorkspace(p);
 });
 rpc.on_method('workspace/didChangeConfiguration', (p) => dispatch.setWorkspace(p));
@@ -95,6 +148,7 @@ rpc.on_method('workspace/didChangeTextDocument', (p) => dispatch.didChange(p));
 rpc.on_method('workspace/didSaveTextDocument', (p) => dispatch.didSave(p));
 rpc.on_method('editor/didChangeActive', (p) => dispatch.didChangeActive(p));
 rpc.on_method('hover/provide', (p) => dispatch.provideHover(p));
+rpc.on_method('format/provide', (p) => dispatch.provideFormatting(p));
 rpc.on_method('command/invoke', (p) => dispatch.invokeCommand(p));
 rpc.on_method('webview/resolve', (p) => dispatch.resolveWebview(p));
 rpc.on_method('webview/message', (p) => dispatch.webviewMessage(p));

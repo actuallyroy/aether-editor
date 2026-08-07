@@ -324,6 +324,35 @@ pub fn ensure_icon_async() {
 /// persistently (one per folder) so the one-time TCC folder-access grant sticks across
 /// reopens; we only reap bundles for folders that have been moved/deleted, never live ones.
 /// Each entry in `launchers/` is an `<id>` dir holding one `<name>.app`.
+/// Re-hardlink every existing per-folder launcher bundle to `real_exe` (the just-updated
+/// canonical binary). Without this, a launcher bundle only picks up an update lazily, the
+/// next time its folder is opened (`ensure_bundle` → `relink_if_stale` re-checks then) — so
+/// a project window left open across an update keeps running the old build even after
+/// restart, until the user happens to reopen it through Open Folder again. Called right
+/// after an update installs, so every project window is current the next time it restarts,
+/// not just the one the update happened to run from (#update-only-updates-one-instance).
+pub fn relink_all_launchers(real_exe: &Path) {
+    let Ok(entries) = std::fs::read_dir(launchers_dir()) else {
+        return;
+    };
+    for id_entry in entries.flatten() {
+        let id_dir = id_entry.path();
+        if !id_dir.is_dir() {
+            continue;
+        }
+        let Ok(bundles) = std::fs::read_dir(&id_dir) else {
+            continue;
+        };
+        for b in bundles.flatten() {
+            let bundle = b.path();
+            if bundle.extension().map_or(false, |e| e == "app") {
+                let exe_dst = bundle.join("Contents/MacOS/aether");
+                let _ = relink_if_stale(real_exe, &exe_dst);
+            }
+        }
+    }
+}
+
 pub fn sweep_stale() {
     let Ok(entries) = std::fs::read_dir(launchers_dir()) else {
         return;

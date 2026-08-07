@@ -184,9 +184,15 @@ fn download_and_run_installer() -> Result<(), Box<dyn std::error::Error>> {
 /// whole .app is refreshed from the release DMG instead.
 #[cfg(target_os = "macos")]
 pub fn is_app_bundle_install() -> bool {
-    std::env::current_exe()
-        .map(|p| p.to_string_lossy().contains("/Aether.app/Contents/MacOS/"))
-        .unwrap_or(false)
+    // Check the CANONICAL binary, not `current_exe()` — a window opened via Open Folder
+    // runs from a per-folder launcher bundle (`.../launchers/<id>/<Folder>.app/...`), whose
+    // path never contains "/Aether.app/", so this used to say "not a bundle install" and
+    // fall through to a plain self-replace that only patched that one hardlinked copy,
+    // leaving the real install (and every other project window) on the old version
+    // (#update-only-updates-one-instance).
+    crate::macos_launcher::canonical_exe()
+        .to_string_lossy()
+        .contains("/Aether.app/Contents/MacOS/")
 }
 #[cfg(not(target_os = "macos"))]
 pub fn is_app_bundle_install() -> bool {
@@ -219,8 +225,10 @@ fn install_dmg() -> Result<(), Box<dyn std::error::Error>> {
     let mut f = std::fs::File::create(&tmp)?;
     std::io::copy(&mut reader, &mut f)?;
     drop(f);
-    // The installed app's location (…/Aether.app/Contents/MacOS/aether → the .app).
-    let exe = std::env::current_exe()?;
+    // The installed app's location (…/Aether.app/Contents/MacOS/aether → the .app). Use
+    // the canonical binary, not `current_exe()` — from a per-folder launcher-bundle window
+    // that would resolve to the throwaway `<Folder>.app`, not the real Aether.app.
+    let exe = crate::macos_launcher::canonical_exe();
     let app = exe
         .ancestors()
         .find(|p| p.extension().map_or(false, |e| e == "app"))
@@ -253,6 +261,12 @@ fn install_dmg() -> Result<(), Box<dyn std::error::Error>> {
     })();
     let _ = std::process::Command::new("hdiutil").args(["detach", "-quiet"]).arg(&mount).status();
     let _ = std::fs::remove_file(&tmp);
+    if result.is_ok() {
+        // Every other project window's launcher bundle hardlinks the OLD binary until it
+        // happens to reopen through Open Folder — relink them now so they're current the
+        // next time they restart too, not just this window (#update-only-updates-one-instance).
+        crate::macos_launcher::relink_all_launchers(&exe);
+    }
     result
 }
 

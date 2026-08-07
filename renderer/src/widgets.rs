@@ -849,6 +849,50 @@ impl TextInput {
         j
     }
 
+    /// Byte index of the start of the word before `i` (Ctrl+Left / Ctrl+Backspace):
+    /// skip trailing whitespace, then skip the run of non-whitespace before it.
+    fn prev_word_boundary(&self, i: usize) -> usize {
+        let mut chars: Vec<(usize, char)> = self.text[..i].char_indices().collect();
+        let mut j = i;
+        while let Some(&(idx, c)) = chars.last() {
+            if !c.is_whitespace() {
+                break;
+            }
+            j = idx;
+            chars.pop();
+        }
+        while let Some(&(idx, c)) = chars.last() {
+            if c.is_whitespace() {
+                break;
+            }
+            j = idx;
+            chars.pop();
+        }
+        j
+    }
+
+    /// Byte index of the end of the word after `i` (Ctrl+Right / Ctrl+Delete):
+    /// skip leading whitespace, then skip the run of non-whitespace after it.
+    fn next_word_boundary(&self, i: usize) -> usize {
+        let mut it = self.text[i..].char_indices().peekable();
+        let mut j = i;
+        while let Some(&(off, c)) = it.peek() {
+            if !c.is_whitespace() {
+                break;
+            }
+            j = i + off + c.len_utf8();
+            it.next();
+        }
+        while let Some(&(off, c)) = it.peek() {
+            if c.is_whitespace() {
+                break;
+            }
+            j = i + off + c.len_utf8();
+            it.next();
+        }
+        j
+    }
+
     // ---- editing ----
 
     pub fn insert(&mut self, fs: &mut FontSystem, s: &str) {
@@ -877,6 +921,26 @@ impl TextInput {
         self.reshape(fs);
     }
 
+    /// Ctrl+Backspace: delete the word before the caret (or the selection, if any).
+    pub fn backspace_word(&mut self, fs: &mut FontSystem) {
+        if !self.delete_selection() {
+            let p = self.prev_word_boundary(self.caret);
+            self.text.replace_range(p..self.caret, "");
+            self.caret = p;
+            self.anchor = p;
+        }
+        self.reshape(fs);
+    }
+
+    /// Ctrl+Delete: delete the word after the caret (or the selection, if any).
+    pub fn delete_forward_word(&mut self, fs: &mut FontSystem) {
+        if !self.delete_selection() {
+            let n = self.next_word_boundary(self.caret);
+            self.text.replace_range(self.caret..n, "");
+        }
+        self.reshape(fs);
+    }
+
     // ---- navigation (extend = hold Shift to grow the selection) ----
 
     pub fn move_left(&mut self, extend: bool) {
@@ -896,6 +960,22 @@ impl TextInput {
         } else {
             self.caret = self.next_boundary(self.caret);
         }
+        if !extend {
+            self.anchor = self.caret;
+        }
+    }
+
+    /// Ctrl+Left / Cmd+Left(Option on mac): jump the caret to the previous word start.
+    pub fn move_word_left(&mut self, extend: bool) {
+        self.caret = self.prev_word_boundary(self.caret);
+        if !extend {
+            self.anchor = self.caret;
+        }
+    }
+
+    /// Ctrl+Right / Option+Right: jump the caret to the next word end.
+    pub fn move_word_right(&mut self, extend: bool) {
+        self.caret = self.next_word_boundary(self.caret);
         if !extend {
             self.anchor = self.caret;
         }
@@ -3672,6 +3752,22 @@ pub(crate) fn edit_input(
                         }
                     }
                     return Some(false);
+                }
+                KeyCode::ArrowLeft => {
+                    input.move_word_left(shift);
+                    return Some(false);
+                }
+                KeyCode::ArrowRight => {
+                    input.move_word_right(shift);
+                    return Some(false);
+                }
+                KeyCode::Backspace => {
+                    input.backspace_word(fs);
+                    return Some(true);
+                }
+                KeyCode::Delete => {
+                    input.delete_forward_word(fs);
+                    return Some(true);
                 }
                 _ => return None,
             }

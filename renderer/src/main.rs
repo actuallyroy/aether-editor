@@ -330,6 +330,16 @@ pub(crate) struct RefPeek {
     pub scroll: f32,
 }
 
+pub(crate) struct Toast {
+    pub msg: String,
+    pub spawned: Instant,
+    pub buttons: Vec<String>,
+    /// The RPC request id to answer once a button is clicked (or the toast is
+    /// dismissed) — `showXMessage` calls with items are a request the extension is
+    /// awaiting the answer to, not a fire-and-forget notification.
+    pub request_id: Option<serde_json::Value>,
+}
+
 pub(crate) struct GutterPeek {
     pub anchor_line: usize, // editor line the zone hangs under
     pub doc_version: i32,   // doc version when opened (an edit dismisses it)
@@ -645,6 +655,31 @@ pub(crate) struct App {
     /// the hover-provider ids the host has registered (so we know to ask it on hover).
     pub(crate) ext_host: Option<exthost::ExtHost>,
     pub(crate) ext_hover_providers: Vec<i64>,
+    /// Extension-registered document formatters (`registerDocumentFormattingEditProvider`)
+    /// — (provider id, language selector). Prettier and similar formatter-only
+    /// extensions aren't LSP servers, so Format Document must check these too, not
+    /// just `self.lsp` (#prettier-not-working).
+    pub(crate) ext_format_providers: Vec<(i64, Vec<String>)>,
+    /// The in-flight extension-formatter request (id, doc uri) — its response
+    /// applies the returned edits to whichever doc still has that uri open.
+    pub(crate) ext_format_pending: Option<(i64, String)>,
+    /// Bumped every time a new ext-host process is spawned (initial start or a
+    /// restart) — lets `WorkerMsg::ExtHostExited` tell whether it's reporting the
+    /// CURRENT host dying (act on it) or a stale message from a previous host a
+    /// restart already replaced (ignore it, see `restart_ext_host`).
+    pub(crate) ext_host_gen: u64,
+    /// The sidebar webview view (if any) that was showing when `restart_ext_host`
+    /// tore down all webviews — re-opened once its extension re-registers the same
+    /// view id, so a restart (e.g. Gemini's own "Reload" after enabling a setting)
+    /// doesn't leave the sidebar panel permanently blank.
+    pub(crate) ext_view_reopen_pending: Option<String>,
+    /// Extension `getConfiguration().update()` writes — otherwise they only live in
+    /// the ext-host Node process's in-memory `ws.settings` and vanish on any
+    /// restart, so a setting like Gemini's `http.systemCertificatesNode` reverts
+    /// the moment its own "Reload" restarts the host, which re-triggers the same
+    /// "please enable this setting" prompt forever (#gemini-reload-loop). Replayed
+    /// into `host/init`'s settings payload on every (re)start.
+    pub(crate) ext_settings: std::collections::HashMap<String, serde_json::Value>,
     /// In-flight extension-host hover request (id, anchor x, y) — its result feeds the
     /// same hover card as LSP hover.
     pub(crate) ext_hover_req: Option<(i64, f32, f32)>,
@@ -688,12 +723,18 @@ pub(crate) struct App {
     pub(crate) ext_status_dirty: bool,
     /// Last uri sent as `editor/didChangeActive` (so it's sent once per switch).
     pub(crate) ext_last_active: Option<String>,
-    /// Toast notifications (message, shown-at) — bottom-right cards, VSCode-style,
-    /// auto-expiring. Used for extension messages (info/warning/error).
-    pub(crate) toasts: Vec<(String, Instant)>,
+    /// Toast notifications — bottom-right cards, VSCode-style. Plain ones (no
+    /// buttons) auto-expire; ones with buttons (extension showXMessage items,
+    /// e.g. Gemini Code Assist's "Reload") stay until a button is clicked, since
+    /// the extension is awaiting that answer — auto-expiring them silently
+    /// resolves as "dismissed" and drops the user's chance to act on it.
+    pub(crate) toasts: Vec<Toast>,
     /// Debug harness: pending AETHER_TEST_CMD command + when to fire it.
     pub(crate) ext_test_cmd: Option<(String, Instant)>,
     pub(crate) toasts_dirty: bool,
+    /// Screen rects of each toast's buttons, refreshed every render — (toast index,
+    /// button index, rect). Hit-tested in `on_mouse_press`.
+    pub(crate) toast_button_rects: Vec<(usize, usize, crate::widgets::Rect)>,
     /// Live extension webviews (each a `--webview-host` process) and the webview
     /// view ids extensions have registered providers for.
     pub(crate) webviews: Vec<WebviewHandle>,
@@ -917,6 +958,11 @@ impl App {
             lsp: lsp::LspManager::new(),
             ext_host: None,
             ext_hover_providers: Vec::new(),
+            ext_format_providers: Vec::new(),
+            ext_format_pending: None,
+            ext_host_gen: 0,
+            ext_view_reopen_pending: None,
+            ext_settings: std::collections::HashMap::new(),
             ext_hover_req: None,
             ext_doc_versions: std::collections::HashMap::new(),
             ext_doc_probe: std::collections::HashMap::new(),
@@ -939,6 +985,7 @@ impl App {
             ext_last_active: None,
             toasts: Vec::new(),
             toasts_dirty: false,
+            toast_button_rects: Vec::new(),
             ext_test_cmd: None,
             webviews: Vec::new(),
             next_webview_id: 1,
@@ -1937,6 +1984,12 @@ impl App {
                 && render::encoding_cell(layout.status_bar, g.ui.encoding.width()).contains(p)
             {
                 // Status-bar encoding cell: clickable (opens the encoding picker).
+                CursorIcon::Pointer
+            } else if self.workspace.active_doc().is_some() && {
+                let left_of_x = render::encoding_cell(layout.status_bar, g.ui.encoding.width()).x;
+                render::lang_cell(layout.status_bar, g.ui.lang_label.width(), left_of_x).contains(p)
+            } {
+                // Status-bar language cell: clickable (opens the language-mode picker).
                 CursorIcon::Pointer
             } else if layout.status_bar.contains(p) && g.ui.branch.width() > 0.0 && {
                 // Status-bar branch indicator: clickable (geometry matches render.rs).
@@ -4754,14 +4807,52 @@ impl App {
 
     /// Show a bottom-right toast notification (auto-expires; see about_to_wait).
     fn show_toast(&mut self, msg: &str) {
+        self.show_toast_with_buttons(msg, Vec::new(), None);
+    }
+
+    /// Show a bottom-right toast, optionally with clickable buttons (an extension's
+    /// `showXMessage(msg, ...items)` — clicking one answers `request_id` with that
+    /// item; with no buttons this behaves exactly like `show_toast`.
+    fn show_toast_with_buttons(&mut self, msg: &str, buttons: Vec<String>, request_id: Option<serde_json::Value>) {
         if msg.trim().is_empty() {
             return;
         }
-        self.toasts.push((msg.to_string(), Instant::now()));
+        self.toasts.push(Toast { msg: msg.to_string(), spawned: Instant::now(), buttons, request_id });
         if self.toasts.len() > 4 {
-            self.toasts.remove(0); // keep the stack shallow
+            let dropped = self.toasts.remove(0); // keep the stack shallow
+            if let (Some(id), Some(h)) = (dropped.request_id, self.ext_host.as_ref()) {
+                h.respond(&id, serde_json::Value::Null);
+            }
         }
         self.toasts_dirty = true;
+        self.redraw();
+    }
+
+    /// Aether's closest equivalent to VSCode's "reload window": extensions ask for
+    /// it after a settings change needs a restart to take effect (e.g. Gemini Code
+    /// Assist's http.systemCertificatesNode toggle). There's no whole-app window to
+    /// reload, so this restarts just the extension host — kill the current process
+    /// and all its registered state, respawn, and let `ExtHostReady` re-run
+    /// init/discover/activate for a clean start.
+    fn restart_ext_host(&mut self) {
+        // Remember the sidebar webview view we're about to blank out, if any, so
+        // it can be reopened once its extension re-registers the same view id.
+        if let SidebarView::ExtView(i) = self.sidebar_view {
+            self.ext_view_reopen_pending = self.ext_activity_items().get(i).map(|a| a.view_id.clone());
+        }
+        self.ext_host = None; // Drop kills the child process
+        self.ext_hover_providers.clear();
+        self.ext_context.clear();
+        self.ext_trees.clear();
+        self.ext_registry.clear();
+        self.ext_activated.clear();
+        self.ext_status_items.clear();
+        self.ext_webview_views.clear();
+        self.webviews.clear(); // each Drop tears down its webview-host process
+        self.webview_dock = None;
+        self.ext_host_gen += 1;
+        self.ext_host = exthost::ExtHost::start(&self.cwd, self.ext_host_gen, self.worker_tx.clone(), self.proxy.clone());
+        self.show_toast("Reloading extensions…");
         self.redraw();
     }
 
@@ -5184,11 +5275,23 @@ impl App {
                 let msg = params.get("message").and_then(|v| v.as_str()).unwrap_or("");
                 eprintln!("[exthost:{lvl}] {msg}");
             }
-            Some("window/showInformationMessage") | Some("window/showErrorMessage") => {
+            Some("window/showInformationMessage") | Some("window/showErrorMessage") | Some("window/showWarningMessage") => {
                 let msg = params.get("message").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                self.show_toast(&msg);
-                if let (Some(id), Some(h)) = (id.as_ref(), self.ext_host.as_ref()) {
-                    h.respond(id, serde_json::Value::Null);
+                let items: Vec<String> = params
+                    .get("items")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                if items.is_empty() {
+                    self.show_toast(&msg);
+                    if let (Some(id), Some(h)) = (id.as_ref(), self.ext_host.as_ref()) {
+                        h.respond(id, serde_json::Value::Null);
+                    }
+                } else {
+                    // Answered when the user clicks a button (see toast_button_rects
+                    // hit-testing in on_mouse_press) — not immediately, since the
+                    // extension is awaiting which item (if any) was picked.
+                    self.show_toast_with_buttons(&msg, items, id);
                 }
             }
             Some("languages/registerHoverProvider") => {
@@ -5198,12 +5301,15 @@ impl App {
                     }
                 }
             }
-            Some("window/showWarningMessage") => {
-                let msg = params.get("message").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                self.show_toast(&msg);
-                // No button UI yet — resolve with "no item picked".
-                if let (Some(id), Some(h)) = (id.as_ref(), self.ext_host.as_ref()) {
-                    h.respond(id, serde_json::Value::Null);
+            Some("languages/registerFormattingProvider") => {
+                if let Some(pid) = params.get("providerId").and_then(|v| v.as_i64()) {
+                    let selector: Vec<String> = params
+                        .get("selector")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                        .unwrap_or_default();
+                    self.ext_format_providers.retain(|(id, _)| *id != pid);
+                    self.ext_format_providers.push((pid, selector));
                 }
             }
             Some("window/showQuickPick") | Some("window/showInputBox") => {
@@ -5286,6 +5392,10 @@ impl App {
                 if let Some(vid) = params.get("viewId").and_then(|v| v.as_str()) {
                     if !self.ext_webview_views.iter().any(|v| v == vid) {
                         self.ext_webview_views.push(vid.to_string());
+                    }
+                    if self.ext_view_reopen_pending.as_deref() == Some(vid) {
+                        self.ext_view_reopen_pending = None;
+                        self.open_ext_webview_sidebar(vid);
                     }
                 }
             }
@@ -5370,6 +5480,8 @@ impl App {
                     if let Some(vid) = self.ext_webview_views.first().cloned() {
                         self.open_ext_webview(&vid);
                     }
+                } else if cmd == "workbench.action.reloadWindow" {
+                    self.restart_ext_host();
                 } else if cmd == "setContext" {
                     // Store the context key — editor/title when-clauses test these
                     // (e.g. Claude's accept/reject buttons on viewingProposedDiff).
@@ -5383,6 +5495,14 @@ impl App {
                 }
                 if let (Some(id), Some(h)) = (id.as_ref(), self.ext_host.as_ref()) {
                     h.respond(id, serde_json::Value::Null);
+                }
+            }
+            Some("workspace/didUpdateConfiguration") => {
+                // Persist so it survives an ext-host restart (see `ext_settings` doc
+                // comment) — replayed into the next `host/init` settings payload.
+                if let Some(k) = params.get("key").and_then(|v| v.as_str()) {
+                    let v = params.get("value").cloned().unwrap_or(serde_json::Value::Null);
+                    self.ext_settings.insert(k.to_string(), v);
                 }
             }
             Some("workspace/getConfiguration") => {
@@ -5485,6 +5605,42 @@ impl App {
                                 self.lsp_hover_scroll = 0.0;
                             }
                         }
+                    }
+                }
+                // Extension formatter result (Prettier etc.) — apply like an LSP
+                // formatting response, to whichever doc still has this uri open.
+                if let (Some(resp_id), Some((req_id, uri))) =
+                    (value.get("id").and_then(|v| v.as_i64()), self.ext_format_pending.clone())
+                {
+                    if resp_id == req_id {
+                        self.ext_format_pending = None;
+                        let edits: Vec<lsp::TextEdit> = value
+                            .get("result")
+                            .and_then(|r| r.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|e| {
+                                        let r = e.get("range")?.as_array()?;
+                                        let new_text = e.get("newText")?.as_str()?.to_string();
+                                        Some(lsp::TextEdit {
+                                            start_line: r.first()?.as_u64()? as u32,
+                                            start_char: r.get(1)?.as_u64()? as u32,
+                                            end_line: r.get(2)?.as_u64()? as u32,
+                                            end_char: r.get(3)?.as_u64()? as u32,
+                                            new_text,
+                                        })
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if edits.is_empty() {
+                            self.show_info_dialog("Already formatted.");
+                        } else if let Some(gpu) = self.gpu.as_mut() {
+                            if let Some(d) = self.workspace.documents.iter_mut().find(|d| d.uri().as_deref() == Some(uri.as_str())) {
+                                d.apply_text_edits(&edits, &mut gpu.font_system);
+                            }
+                        }
+                        self.redraw();
                     }
                 }
             }
@@ -5633,6 +5789,14 @@ impl App {
                 let enc = encoding::static_label(label);
                 if let (Some(g), Some(d)) = (self.gpu.as_mut(), self.workspace.active_doc_mut()) {
                     d.reopen_with_encoding(enc, &mut g.font_system);
+                }
+                self.redraw();
+            }
+            commands::PickKind::SetLanguage => {
+                if let Some(ext) = document::language_ext_for_name(label) {
+                    if let (Some(g), Some(d)) = (self.gpu.as_mut(), self.workspace.active_doc_mut()) {
+                        d.set_language(ext, &mut g.font_system);
+                    }
                 }
                 self.redraw();
             }
@@ -6209,21 +6373,49 @@ impl App {
     fn lsp_format(&mut self, selection_only: bool) {
         self.flush_doc_to_lsp(); // format against the current text, not the debounce
         let Some(d) = self.workspace.active_doc() else { return };
-        let (Some(uri), Some(lang)) = (d.uri(), d.language_id()) else {
+        // `d.uri()` covers untitled buffers too (synthetic `untitled:` scheme) so an
+        // extension formatter can run on them; a real LSP server still needs a path.
+        let Some(uri) = d.uri() else {
             return self.show_info_dialog("No language server for this file type.");
         };
-        let range = if selection_only {
-            if d.sel.is_empty() {
-                return self.show_info_dialog("Select some text to format first.");
-            }
+        let lang_id = d.language_id().map(String::from);
+        let ext = d.ext.clone();
+        let sel_empty = d.sel.is_empty();
+        let sel_range = if selection_only && !sel_empty {
             let (lo, hi) = d.sel.range();
-            let (sl, sc) = d.lsp_pos(lo);
-            let (el, ec) = d.lsp_pos(hi);
-            Some((sl, sc, el, ec))
+            Some((d.lsp_pos(lo), d.lsp_pos(hi)))
         } else {
             None
         };
-        if !self.lsp.request_formatting(lang, &uri, range) {
+        // Extension-registered formatters (Prettier and similar) aren't LSP servers,
+        // so they don't show up in `self.lsp` at all — check these first. Only for
+        // whole-document format: no extension range-formatting support yet.
+        if !selection_only {
+            let ext_lang = lang_id.clone().unwrap_or_else(|| match ext.as_str() {
+                "md" | "markdown" => "markdown".into(),
+                "txt" | "" => "plaintext".into(),
+                other => other.to_string(),
+            });
+            let provider = self
+                .ext_format_providers
+                .iter()
+                .find(|(_, sel)| sel.iter().any(|s| s == "*" || s.eq_ignore_ascii_case(&ext_lang)))
+                .map(|&(pid, _)| pid);
+            if let (Some(pid), Some(h)) = (provider, self.ext_host.as_ref()) {
+                let s = crate::settings::current();
+                let id = h.request_format(pid, &uri, s.editor_tab_size, s.editor_insert_spaces);
+                self.ext_format_pending = Some((id, uri));
+                return;
+            }
+        }
+        if selection_only && sel_empty {
+            return self.show_info_dialog("Select some text to format first.");
+        }
+        let Some(lang) = lang_id else {
+            return self.show_info_dialog("No language server for this file type.");
+        };
+        let range = sel_range.map(|((sl, sc), (el, ec))| (sl, sc, el, ec));
+        if !self.lsp.request_formatting(&lang, &uri, range) {
             self.show_info_dialog("The language server isn't running yet.");
         }
     }
@@ -6295,6 +6487,27 @@ impl App {
     }
 
     /// Open a branch quick-pick (Checkout / Delete) listing local branches.
+    /// Open the "Change Language Mode" quick-pick (status-bar language click).
+    fn open_language_pick(&mut self) {
+        if self.workspace.active_doc().is_none() {
+            return;
+        }
+        let cur = self.workspace.active_doc().map(|d| d.ext.clone()).unwrap_or_default();
+        let items: Vec<commands::PickItem> = document::LANGUAGE_TABLE
+            .iter()
+            .map(|(label, ext)| {
+                let detail = if ext.eq_ignore_ascii_case(&cur) { "current" } else { "" };
+                commands::PickItem::new(*label, detail)
+            })
+            .collect();
+        self.palette.open_quick_pick(commands::PickKind::SetLanguage, items);
+        if let Some(g) = self.gpu.as_mut() {
+            g.ui.palette_input.set_text(&mut g.font_system, "");
+            g.ui.palette_input.focus(true);
+        }
+        self.redraw();
+    }
+
     /// Open the "Reopen with Encoding" quick-pick (status-bar encoding click).
     fn open_encoding_pick(&mut self) {
         if self.workspace.active_doc().and_then(|d| d.path.as_ref()).is_none() {
@@ -6658,7 +6871,7 @@ impl App {
         // Re-scope the extension host's workspace (workspaceFolders/rootPath) so
         // extensions (e.g. Claude Code) see the newly opened folder.
         if let Some(h) = self.ext_host.as_ref() {
-            h.init(&self.cwd);
+            h.init(&self.cwd, &self.ext_settings);
         }
         self.persist_state(); // remember this folder for the next launch
         self.start_fs_watcher(); // watch the new workspace root
@@ -7678,6 +7891,21 @@ impl App {
     }
 
     fn on_mouse_press(&mut self, x: f32, y: f32) {
+        // Toast buttons float above everything else — check first. Clicking one
+        // answers the extension's showXMessage request with that item and removes
+        // just that toast (others keep waiting).
+        if let Some(&(toast_idx, btn_idx, _)) = self.toast_button_rects.iter().find(|(_, _, r)| r.contains((x, y))) {
+            if toast_idx < self.toasts.len() {
+                let t = self.toasts.remove(toast_idx);
+                if let (Some(id), Some(h)) = (t.request_id, self.ext_host.as_ref()) {
+                    let answer = t.buttons.get(btn_idx).cloned();
+                    h.respond(&id, answer.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
+                }
+                self.toasts_dirty = true;
+                self.redraw();
+            }
+            return;
+        }
         // macOS/Windows: a click on aether's own UI must pull keyboard focus back
         // from the webview child view, or typing keeps landing in the page.
         #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -8215,7 +8443,7 @@ impl App {
         // a selection).
         let link_mod = self.mods.control_key() || (cfg!(target_os = "macos") && self.mods.super_key());
         if link_mod {
-            if let Some(target) = self.terminal.url_at((x, y), &layout, self.terminal_cell_w) {
+            if let Some((target, line, col)) = self.terminal.url_at((x, y), &layout, self.terminal_cell_w) {
                 let low = target.to_lowercase();
                 if low.starts_with("http://") || low.starts_with("https://") || low.starts_with("file://") {
                     open_url(&target);
@@ -8227,7 +8455,9 @@ impl App {
                         self.open_palette_with(&target);
                     } else {
                         self.nav.mark(&self.workspace);
-                        self.open_file_at(path, 1, 0);
+                        // A stack-trace-style `path:line[:col]` suffix (e.g.
+                        // "contentScripts/util.js:2-41") jumps straight to it.
+                        self.open_file_at(path, line.unwrap_or(1) as usize, col.map(|c| c.saturating_sub(1)).unwrap_or(0) as usize);
                     }
                 }
                 return;
@@ -8423,11 +8653,22 @@ impl App {
                 self.open_encoding_pick();
                 return;
             }
+            // Language cell (left of encoding): open the language-mode picker.
+            let lang_hit = self.workspace.active_doc().is_some()
+                && self.gpu.as_ref().map_or(false, |g| {
+                    let left_of_x = render::encoding_cell(layout.status_bar, g.ui.encoding.width()).x;
+                    render::lang_cell(layout.status_bar, g.ui.lang_label.width(), left_of_x).contains((x, y))
+                });
+            if lang_hit {
+                self.open_language_pick();
+                return;
+            }
             // Extension status-bar items (geometry mirrors render.rs).
             if let Some(g) = self.gpu.as_ref() {
                 if !g.ui.ext_status.is_empty() {
                     let right_anchor = if self.workspace.active_doc().is_some() {
-                        render::encoding_cell(layout.status_bar, g.ui.encoding.width()).x
+                        let left_of_x = render::encoding_cell(layout.status_bar, g.ui.encoding.width()).x;
+                        render::lang_cell(layout.status_bar, g.ui.lang_label.width(), left_of_x).x
                     } else {
                         render::zoom_ctrl_cells(layout.status_bar)[0].x
                     };
@@ -11347,12 +11588,16 @@ impl ApplicationHandler for App {
             const TOAST_TTL: std::time::Duration = std::time::Duration::from_secs(6);
             let now = Instant::now();
             let before = self.toasts.len();
-            self.toasts.retain(|(_, t)| now.duration_since(*t) < TOAST_TTL);
+            // A toast with buttons is a pending question the extension is awaiting
+            // an answer to — auto-expiring it would silently answer "dismissed"
+            // and take away the user's chance to click Reload/whatever (the bug
+            // this whole button UI was built to fix). Only plain toasts expire.
+            self.toasts.retain(|t| !t.buttons.is_empty() || now.duration_since(t.spawned) < TOAST_TTL);
             if self.toasts.len() != before {
                 self.toasts_dirty = true;
                 self.redraw();
             }
-            if let Some(next) = self.toasts.iter().map(|(_, t)| *t + TOAST_TTL).min() {
+            if let Some(next) = self.toasts.iter().filter(|t| t.buttons.is_empty()).map(|t| t.spawned + TOAST_TTL).min() {
                 el.set_control_flow(ControlFlow::WaitUntil(next));
             }
         }
@@ -11632,7 +11877,7 @@ impl ApplicationHandler for App {
                     // Handshake done: tell the host our workspace, discover extensions,
                     // and activate the ones whose activationEvents fire now.
                     if let Some(h) = self.ext_host.as_ref() {
-                        h.init(&self.cwd);
+                        h.init(&self.cwd, &self.ext_settings);
                     }
                     let mut dirs = Vec::new();
                     if let Some(d) = exthost::bundled_extensions_dir() {
@@ -11847,9 +12092,11 @@ impl ApplicationHandler for App {
                         _ => {} // "ready" needs no action — commands queue in the pipe
                     }
                 }
-                WorkerMsg::ExtHostExited => {
-                    self.ext_host = None;
-                    self.ext_hover_providers.clear();
+                WorkerMsg::ExtHostExited { gen } => {
+                    if gen == self.ext_host_gen {
+                        self.ext_host = None;
+                        self.ext_hover_providers.clear();
+                    }
                 }
                 WorkerMsg::LspExited { server } => self.lsp.drop_server(server),
                 WorkerMsg::LspLog { server, message } => {
@@ -12440,7 +12687,7 @@ impl ApplicationHandler for App {
                 if self.ext_host.is_none() {
                     #[cfg(target_os = "macos")]
                     macos_urls::install(self.worker_tx.clone(), self.proxy.clone());
-                    self.ext_host = exthost::ExtHost::start(&self.cwd, self.worker_tx.clone(), self.proxy.clone());
+                    self.ext_host = exthost::ExtHost::start(&self.cwd, self.ext_host_gen, self.worker_tx.clone(), self.proxy.clone());
                     // Extensions silently doing nothing is confusing — say WHY. (The
                     // host script missing only happens in broken installs; Node
                     // missing is common on fresh machines.)

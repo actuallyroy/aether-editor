@@ -346,6 +346,16 @@ pub(crate) fn encoding_cell(status: Rect, label_w: f32) -> Rect {
     Rect { x: zoom_left - pad - w, y: status.y, w, h: status.h }
 }
 
+/// Language-mode cell (clickable → Change Language Mode), sitting just left of the
+/// encoding cell — `left_of_x` is that cell's (or, with no doc open, the zoom
+/// controls') left edge.
+pub(crate) fn lang_cell(status: Rect, label_w: f32, left_of_x: f32) -> Rect {
+    let z = theme::ui_zoom();
+    let pad = 8.0 * z;
+    let w = label_w + 12.0 * z;
+    Rect { x: left_of_x - pad - w, y: status.y, w, h: status.h }
+}
+
 /// Content width of one extension status-bar item (icon + gap + text).
 pub(crate) fn ext_status_item_w(icon: &Option<crate::widgets::TextLabel>, label: &crate::widgets::TextLabel) -> f32 {
     label.width() + icon.as_ref().map_or(0.0, |i| i.width() + theme::zpx(5.0))
@@ -762,19 +772,6 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "Untitled".into());
             let dirty = if d.dirty { " ●" } else { "" };
-            let lang: String = d
-                .path
-                .as_ref()
-                .and_then(|p| p.extension())
-                .map(|e| match e.to_string_lossy().as_ref() {
-                    "rs" => "Rust".to_string(),
-                    "md" => "Markdown".to_string(),
-                    "toml" | "lock" => "TOML".to_string(),
-                    "json" => "JSON".to_string(),
-                    "wgsl" => "WGSL".to_string(),
-                    other => other.to_uppercase(),
-                })
-                .unwrap_or_else(|| "Plain Text".to_string());
             // Reflect the live settings so the status bar updates when they change.
             let s = crate::settings::current();
             let indent = if s.editor_insert_spaces {
@@ -785,17 +782,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             // EOL reflects the FILE's actual line ending, not the global setting.
             let eol = if d.eol() == "\r\n" { "CRLF" } else { "LF" };
             let autosave = if s.files_auto_save { "    Auto Save" } else { "" };
+            // Language sits in its own clickable cell (see the status-bar draw pass),
+            // like encoding, so a click can open the language-mode picker.
             (
                 format!(" {}{}", path, dirty),
-                format!(
-                    "Ln {}, Col {}    {}    {}    {}{}    ",
-                    line + 1,
-                    col + 1,
-                    indent,
-                    eol,
-                    lang,
-                    autosave,
-                ),
+                format!("Ln {}, Col {}    {}    {}{}    ", line + 1, col + 1, indent, eol, autosave),
             )
         } else {
             ("Aether".to_string(), String::new())
@@ -803,16 +794,29 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         // The encoding sits in its own clickable cell (see the status-bar draw pass).
         let encoding_label = app.workspace.active_doc().map(|d| d.encoding).unwrap_or("UTF-8");
         gpu.ui.encoding.set(fs, encoding_label, theme::UI_FAMILY());
+        // Language sits in its own clickable cell too (Change Language Mode).
+        if let Some(d) = app.workspace.active_doc() {
+            let lang = crate::document::language_display_name(&d.ext);
+            gpu.ui.lang_label.set(fs, &lang, theme::UI_FAMILY());
+        }
         // Extension status-bar items (e.g. Live Server's "Go Live") — rebuild the
         // labels only when the host pushed a change.
         // Toast texts (bottom-right notifications) — rebuilt on change.
         if app.toasts_dirty {
             app.toasts_dirty = false;
             gpu.ui.toast_labels.clear();
-            for (msg, _) in &app.toasts {
+            gpu.ui.toast_button_labels.clear();
+            for t in &app.toasts {
                 let mut l = crate::widgets::TextLabel::new(fs, 420.0 * theme::ui_zoom(), theme::zpx(20.0));
-                l.set(fs, msg, theme::UI_FAMILY());
+                l.set(fs, &t.msg, theme::UI_FAMILY());
                 gpu.ui.toast_labels.push(l);
+                let mut blabels = Vec::new();
+                for b in &t.buttons {
+                    let mut bl = crate::widgets::TextLabel::new(fs, 200.0 * theme::ui_zoom(), theme::zpx(18.0));
+                    bl.set(fs, b, theme::UI_FAMILY());
+                    blabels.push(bl);
+                }
+                gpu.ui.toast_button_labels.push(blabels);
             }
         }
         // Extension tree view rows (rebuilt when the tree data changes).
@@ -2553,7 +2557,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         let link_mod = app.mods.control_key() || (cfg!(target_os = "macos") && app.mods.super_key());
         if link_mod {
             let mp = (app.mouse_pos.x as f32, app.mouse_pos.y as f32);
-            if let Some((rects, _)) = app.terminal.url_span_at(mp, &layout, app.terminal_cell_w) {
+            if let Some((rects, ..)) = app.terminal.url_span_at(mp, &layout, app.terminal_cell_w) {
                 for r in rects {
                     bg_quads.push(Quad::new(r.x, r.y, r.w, r.h, theme::LINK_BG()));
                     fg_quads.push(Quad::new(r.x, r.y + r.h - theme::zpx(2.0), r.w, theme::zpx(1.5), theme::LINK()));
@@ -3287,7 +3291,20 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     } else {
         None
     };
-    let right_anchor = enc_cell.map(|c| c.x).unwrap_or(zoom_cells[0].x);
+    // Language cell (clickable → Change Language Mode) sits just left of encoding.
+    let lang_cell_rect = if app.workspace.active_doc().is_some() {
+        let left_of_x = enc_cell.map(|c| c.x).unwrap_or(zoom_cells[0].x);
+        let cell = lang_cell(layout.status_bar, ui.lang_label.width(), left_of_x);
+        let pt = (app.mouse_pos.x as f32, app.mouse_pos.y as f32);
+        if cell.contains(pt) {
+            bg_quads.push(cell.quad(theme::MENU_HOVER()));
+        }
+        ui.lang_label.push(cell.x + (cell.w - ui.lang_label.width()) * 0.5, cell, sfg, &mut areas);
+        Some(cell)
+    } else {
+        None
+    };
+    let right_anchor = lang_cell_rect.or(enc_cell).map(|c| c.x).unwrap_or(zoom_cells[0].x);
     ui.status_right
         .draw_right(layout.status_bar, 8.0 + (layout.status_bar.x + layout.status_bar.w - right_anchor), sfg, &mut areas);
     // Extension status-bar items sit left of the right-hand status info, each in a
@@ -4316,14 +4333,24 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         let pad = theme::zpx(14.0);
         let radius = theme::zpx(8.0);
         let gap = theme::zpx(10.0);
-        let card_h = theme::zpx(44.0);
+        let msg_h = theme::zpx(44.0);
+        let btn_row_h = theme::zpx(34.0);
+        let btn_gap = theme::zpx(8.0);
         let right = cfg_w as f32 - theme::zpx(16.0);
         // Stack upward from just above the status bar.
         let mut bottom = cfg_h as f32 - theme::STATUS_BAR_HEIGHT() - theme::zpx(16.0);
         let mut tq: Vec<Quad> = Vec::new();
         let mut tareas: Vec<TextArea> = Vec::new();
-        for l in gpu.ui.toast_labels.iter().rev() {
-            let card_w = (l.width() + pad * 2.0).min(460.0 * z);
+        app.toast_button_rects.clear();
+        let n = gpu.ui.toast_labels.len();
+        for (rev_i, l) in gpu.ui.toast_labels.iter().enumerate().rev() {
+            let toast_idx = rev_i; // index into app.toasts / toast_button_labels (same order)
+            let blabels = gpu.ui.toast_button_labels.get(toast_idx).map(Vec::as_slice).unwrap_or(&[]);
+            let has_buttons = !blabels.is_empty();
+            let card_h = msg_h + if has_buttons { btn_row_h } else { 0.0 };
+            let btn_w = blabels.iter().map(|b| b.width() + pad * 2.0).fold(0.0f32, f32::max).max(theme::zpx(60.0));
+            let content_w = l.width().max(btn_w * blabels.len() as f32 + btn_gap * blabels.len().saturating_sub(1) as f32);
+            let card_w = (content_w + pad * 2.0).clamp(180.0 * z, 460.0 * z);
             let card = Rect { x: right - card_w, y: bottom - card_h, w: card_w, h: card_h };
             // Soft shadow + border ring + fill (matches the hover card styling).
             for i in 1..=4 {
@@ -4335,9 +4362,25 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             tq.push(Rect { x: card.x - 1.0, y: card.y - 1.0, w: card.w + 2.0, h: card.h + 2.0 }
                 .rounded_quad(theme::PALETTE_BORDER(), radius + 1.0));
             tq.push(card.rounded_quad(theme::PALETTE_BG(), radius));
-            l.push_in(card.x + pad, card, card, theme::FG_TEXT(), &mut tareas);
+            let msg_rect = Rect { x: card.x, y: card.y, w: card.w, h: msg_h };
+            l.push_in(card.x + pad, msg_rect, msg_rect, theme::FG_TEXT(), &mut tareas);
+            if has_buttons {
+                let row_y = card.y + msg_h;
+                let total_w = btn_w * blabels.len() as f32 + btn_gap * blabels.len().saturating_sub(1) as f32;
+                let mut bx = card.x + card.w - pad - total_w;
+                for (bi, bl) in blabels.iter().enumerate() {
+                    let brect = Rect { x: bx, y: row_y + theme::zpx(2.0), w: btn_w, h: btn_row_h - theme::zpx(8.0) };
+                    tq.push(brect.rounded_quad(theme::ACCENT(), theme::zpx(5.0)));
+                    let text_rect = Rect { x: brect.x, y: brect.y, w: brect.w, h: brect.h };
+                    let tx = brect.x + (brect.w - bl.width()) * 0.5;
+                    bl.push_in(tx, text_rect, text_rect, glyphon::Color::rgba(255, 255, 255, 255), &mut tareas);
+                    app.toast_button_rects.push((toast_idx, bi, brect));
+                    bx += btn_w + btn_gap;
+                }
+            }
             bottom = card.y - gap;
         }
+        let _ = n;
         gpu.quad_renderer.prepare(&gpu.device, &gpu.queue, &tq, &[], (cfg_w, cfg_h));
         gpu.text_renderer.prepare(
             &gpu.device,

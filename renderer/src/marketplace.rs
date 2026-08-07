@@ -71,7 +71,11 @@ pub enum WorkerMsg {
     /// An aether:// deep link from the OS (OAuth callbacks) — forwarded to extensions.
     OpenUrl(String),
     ExtHostMsg { value: serde_json::Value },                   // an inbound JSON-RPC message from the host
-    ExtHostExited,
+    /// `gen` is the host generation that died (see `App::ext_host_gen`) — a restart
+    /// (extensions' own workbench.action.reloadWindow) kills the old process and
+    /// immediately spawns a new one; without this check the OLD process's delayed
+    /// exit notification would race in and null out the brand-new `ext_host`.
+    ExtHostExited { gen: u64 },
     /// An event line from a webview-host process (ready / message / closed).
     WebviewEvent { instance: i64, value: serde_json::Value },                                             // the Node host connection closed
     LspLocations { id: i64, locs: Vec<crate::lsp::LspLocation> }, // definition/references/symbol response

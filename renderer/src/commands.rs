@@ -103,6 +103,7 @@ pub enum PickKind {
     DeleteBranch, // git: delete the picked branch
     AttachProcess, // debug: attach to the picked running process (by PID)
     ReopenEncoding, // reopen the active file decoded with the picked text encoding
+    SetLanguage,    // status-bar language cell: set the active doc's language mode
 }
 
 /// One row in a quick-pick list (dynamic, unlike the fixed `COMMANDS`).
