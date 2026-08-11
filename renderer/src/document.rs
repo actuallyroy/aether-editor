@@ -1956,6 +1956,15 @@ impl Document {
         // Highlight: re-tokenize only from the edited line forward on the next reshape.
         let edited_line = self.rope.byte_to_line(at_byte.min(self.rope.len_bytes()));
         self.hl_dirty_from = self.hl_dirty_from.min(edited_line);
+        // Layer-2 semantic tokens are byte ranges from the LSP's LAST response —
+        // an edit shifts every byte after it, so those ranges now point at the
+        // wrong text (classic symptom: a freshly pasted/typed block shows stale,
+        // wrong, or missing colors until the next semantic-tokens response lands,
+        // sometimes a very visible multi-line block after a big paste). Layer-1
+        // (syntect/tree-sitter) recovers immediately since it's recomputed from
+        // the live text above; dropping the stale overlay is strictly better than
+        // painting it over the freshly-correct Layer-1 colors.
+        self.semantic.clear();
     }
 
     /// `file://` URI for this document, or a synthetic `untitled:` one (VSCode's own

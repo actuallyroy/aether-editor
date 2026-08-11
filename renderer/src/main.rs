@@ -735,6 +735,9 @@ pub(crate) struct App {
     /// Screen rects of each toast's buttons, refreshed every render — (toast index,
     /// button index, rect). Hit-tested in `on_mouse_press`.
     pub(crate) toast_button_rects: Vec<(usize, usize, crate::widgets::Rect)>,
+    /// Each toast's dismiss ("×") button rect, refreshed every render — (toast
+    /// index, rect). Hit-tested in `on_mouse_press` alongside the action buttons.
+    pub(crate) toast_close_rects: Vec<(usize, crate::widgets::Rect)>,
     /// Live extension webviews (each a `--webview-host` process) and the webview
     /// view ids extensions have registered providers for.
     pub(crate) webviews: Vec<WebviewHandle>,
@@ -986,6 +989,7 @@ impl App {
             toasts: Vec::new(),
             toasts_dirty: false,
             toast_button_rects: Vec::new(),
+            toast_close_rects: Vec::new(),
             ext_test_cmd: None,
             webviews: Vec::new(),
             next_webview_id: 1,
@@ -1802,7 +1806,12 @@ impl App {
                 let line = d.visible_index_to_line((vy / theme::LINE_HEIGHT()).max(0.0) as usize);
                 d.gutter_changes.iter().any(|(l, _)| *l == line)
             });
-        let new_cursor = if self.settings_editor.open {
+        let new_cursor = if self.toast_button_rects.iter().any(|(_, _, r)| r.contains(p))
+            || self.toast_close_rects.iter().any(|(_, r)| r.contains(p))
+        {
+            // Toasts float above everything — their buttons/dismiss win first.
+            CursorIcon::Pointer
+        } else if self.settings_editor.open {
             // The Settings modal owns the whole screen — resolve its cursor here so
             // background regions (editor I-beam, etc.) can't bleed through.
             self.settings_cursor(p)
@@ -7906,6 +7915,19 @@ impl App {
             }
             return;
         }
+        // Toast dismiss ("×"): drop it — answer null if the extension was
+        // awaiting a button pick, same as if it had auto-expired.
+        if let Some(&(toast_idx, _)) = self.toast_close_rects.iter().find(|(_, r)| r.contains((x, y))) {
+            if toast_idx < self.toasts.len() {
+                let t = self.toasts.remove(toast_idx);
+                if let (Some(id), Some(h)) = (t.request_id, self.ext_host.as_ref()) {
+                    h.respond(&id, serde_json::Value::Null);
+                }
+                self.toasts_dirty = true;
+                self.redraw();
+            }
+            return;
+        }
         // macOS/Windows: a click on aether's own UI must pull keyboard focus back
         // from the webview child view, or typing keeps landing in the page.
         #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -8503,6 +8525,19 @@ impl App {
                 self.on_find_press((x, y), &fl, double);
                 self.redraw();
                 return;
+            }
+            // A click anywhere else (sidebar, terminal, other panels — not just the
+            // editor, which already had its own case below) moves keyboard focus off
+            // the find widget. Without this, Focus::Find kept winning the focus
+            // precedence forever after the first click into find, so typing kept
+            // landing in the find box no matter what else you clicked
+            // (#find-steals-focus).
+            if self.find.focused {
+                self.find.focused = false;
+                if let Some(g) = self.gpu.as_mut() {
+                    g.ui.find.query.focus(false);
+                    g.ui.find.replace.focus(false);
+                }
             }
         }
 

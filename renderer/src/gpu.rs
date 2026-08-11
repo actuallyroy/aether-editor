@@ -34,6 +34,7 @@ pub struct UiBuffers {
     pub ext_status: Vec<(i64, Option<TextLabel>, TextLabel)>, // extension status-bar items (id, codicon, label)
     pub toast_labels: Vec<TextLabel>, // bottom-right toast notification texts
     pub toast_button_labels: Vec<Vec<TextLabel>>, // per-toast button labels (parallel to app.toasts)
+    pub toast_close: TextLabel, // shared "×" dismiss glyph, positioned per-card at draw time
     pub encoding: TextLabel, // status-bar encoding label (clickable → encoding picker)
     pub lang_label: TextLabel, // status-bar language label (clickable → language-mode picker)
     pub breadcrumbs: crate::ui::breadcrumbs::Breadcrumbs, // path bar below the tab strip
@@ -265,6 +266,11 @@ impl GpuState {
             ext_status: Vec::new(),
             toast_labels: Vec::new(),
             toast_button_labels: Vec::new(),
+            toast_close: {
+                let mut l = TextLabel::new(&mut font_system, 24.0, 24.0);
+                l.set(&mut font_system, "\u{d7}", theme::UI_FAMILY());
+                l
+            },
             encoding: TextLabel::new(&mut font_system, 400.0, theme::STATUS_BAR_HEIGHT()),
             lang_label: TextLabel::new(&mut font_system, 400.0, theme::STATUS_BAR_HEIGHT()),
             breadcrumbs: crate::ui::breadcrumbs::Breadcrumbs::new(&mut font_system),

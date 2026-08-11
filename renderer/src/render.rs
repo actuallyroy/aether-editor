@@ -4328,6 +4328,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
 
     // ---- Toast notifications (bottom-right, VSCode-style, auto-expiring) ----
     if !app.toasts.is_empty() && !gpu.ui.toast_labels.is_empty() {
+        // Re-shape on zoom change (`set` no-ops otherwise — same text/family/epoch).
+        {
+            let fs = &mut gpu.font_system;
+            gpu.ui.toast_close.set(fs, "\u{d7}", theme::UI_FAMILY());
+        }
         let (cfg_w, cfg_h) = (gpu.config.width, gpu.config.height);
         let z = theme::ui_zoom();
         let pad = theme::zpx(14.0);
@@ -4342,6 +4347,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         let mut tq: Vec<Quad> = Vec::new();
         let mut tareas: Vec<TextArea> = Vec::new();
         app.toast_button_rects.clear();
+        app.toast_close_rects.clear();
         let n = gpu.ui.toast_labels.len();
         for (rev_i, l) in gpu.ui.toast_labels.iter().enumerate().rev() {
             let toast_idx = rev_i; // index into app.toasts / toast_button_labels (same order)
@@ -4349,7 +4355,8 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             let has_buttons = !blabels.is_empty();
             let card_h = msg_h + if has_buttons { btn_row_h } else { 0.0 };
             let btn_w = blabels.iter().map(|b| b.width() + pad * 2.0).fold(0.0f32, f32::max).max(theme::zpx(60.0));
-            let content_w = l.width().max(btn_w * blabels.len() as f32 + btn_gap * blabels.len().saturating_sub(1) as f32);
+            let close_w = theme::zpx(22.0);
+            let content_w = (l.width() + close_w).max(btn_w * blabels.len() as f32 + btn_gap * blabels.len().saturating_sub(1) as f32);
             let card_w = (content_w + pad * 2.0).clamp(180.0 * z, 460.0 * z);
             let card = Rect { x: right - card_w, y: bottom - card_h, w: card_w, h: card_h };
             // Soft shadow + border ring + fill (matches the hover card styling).
@@ -4364,6 +4371,18 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             tq.push(card.rounded_quad(theme::PALETTE_BG(), radius));
             let msg_rect = Rect { x: card.x, y: card.y, w: card.w, h: msg_h };
             l.push_in(card.x + pad, msg_rect, msg_rect, theme::FG_TEXT(), &mut tareas);
+            // Dismiss ("×") button, top-right of the card.
+            let close_rect = Rect { x: card.x + card.w - close_w - theme::zpx(8.0), y: card.y + theme::zpx(6.0), w: close_w, h: close_w };
+            let pt = (app.mouse_pos.x as f32, app.mouse_pos.y as f32);
+            let close_color = if close_rect.contains(pt) { theme::FG_TEXT() } else { theme::STATUS_BAR_FG() };
+            gpu.ui.toast_close.push_in(
+                close_rect.x + (close_rect.w - gpu.ui.toast_close.width()) * 0.5,
+                close_rect,
+                close_rect,
+                close_color,
+                &mut tareas,
+            );
+            app.toast_close_rects.push((toast_idx, close_rect));
             if has_buttons {
                 let row_y = card.y + msg_h;
                 let total_w = btn_w * blabels.len() as f32 + btn_gap * blabels.len().saturating_sub(1) as f32;

@@ -573,6 +573,7 @@ mod tests {
             "incremental highlight too slow: {inc_time:?} vs full {full:?}"
         );
     }
+
 }
 
 
