@@ -1019,6 +1019,14 @@ impl TerminalPanel {
 
     /// Continue a text selection drag in whichever pane is selecting. Returns true if
     /// a selection drag was active (so the caller redraws).
+    /// Whether a pane in the active group is mid text-selection-drag — drives the
+    /// idle-tick re-invocation of `selection_drag` so auto-scroll continues while
+    /// the pointer rests past the edge without moving (a real mouse-move event
+    /// only fires on actual movement).
+    pub fn any_pane_dragging(&self) -> bool {
+        self.groups.get(self.active).map_or(false, |g| g.panes.iter().any(|p| p.sel_dragging))
+    }
+
     pub fn selection_drag(&mut self, pt: (f32, f32), layout: &Layout, cell_w: f32) -> bool {
         if !self.visible {
             return false;
@@ -1034,6 +1042,30 @@ impl TerminalPanel {
         }
         let Some(i) = target else { return false };
         let rect = rects.get(i).copied().unwrap_or(content);
+        // Auto-scroll: dragging past the pane's top/bottom edge scrolls the
+        // scrollback (VSCode/terminal convention) so a selection can extend past
+        // whatever's currently visible — previously the point was just clamped
+        // into the pane with no scrolling at all, so an overflowing selection was
+        // stuck. Speed scales with how far past the edge the pointer is.
+        if let Some(g) = self.groups.get_mut(self.active) {
+            if let Some(p) = g.panes.get_mut(i) {
+                let line_h = theme::LINE_HEIGHT();
+                let over_top = rect.y - pt.1;
+                let over_bottom = pt.1 - (rect.y + rect.h);
+                let speed = if over_top > 0.0 {
+                    Some((over_top * 0.5).clamp(line_h * 0.3, line_h * 3.0))
+                } else if over_bottom > 0.0 {
+                    Some(-(over_bottom * 0.5).clamp(line_h * 0.3, line_h * 3.0))
+                } else {
+                    None
+                };
+                if let Some(dy) = speed {
+                    if p.scroll.on_wheel(0.0, dy) {
+                        p.dirty = true;
+                    }
+                }
+            }
+        }
         // Clamp the point into the pane so dragging past an edge selects to it.
         let clamped = (
             pt.0.clamp(rect.x, rect.x + rect.w - 1.0),

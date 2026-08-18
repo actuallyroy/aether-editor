@@ -2864,6 +2864,45 @@ impl Document {
         Some((self.rope.char_to_byte(start), self.rope.char_to_byte(end)))
     }
 
+    /// The `http(s)://`/`www.` URL under `byte`, if any — for Ctrl/Cmd+click to
+    /// open it in the browser (any file, LSP or not: a URL in a comment, a plain
+    /// .txt/.md file, a JSON string, whatever). `word_at`'s identifier-only
+    /// boundary can't span a URL's `.`/`:`/`/`, so this uses whitespace (plus a
+    /// few wrapping/prose delimiters) as the only boundary, matching the
+    /// terminal's own link-token detection.
+    pub fn url_at(&self, byte: usize) -> Option<(usize, usize, String)> {
+        let total = self.rope.len_chars();
+        if total == 0 {
+            return None;
+        }
+        let mut ci = self.rope.byte_to_char(byte.min(self.rope.len_bytes()));
+        if ci >= total {
+            ci = total - 1;
+        }
+        let is_boundary = |c: char| c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '"' | '\'');
+        if is_boundary(self.rope.char(ci)) {
+            return None;
+        }
+        let mut start = ci;
+        while start > 0 && !is_boundary(self.rope.char(start - 1)) {
+            start -= 1;
+        }
+        let mut end = ci;
+        while end < total && !is_boundary(self.rope.char(end)) {
+            end += 1;
+        }
+        let raw = self.rope.slice(start..end).to_string();
+        let trimmed = raw.trim_end_matches(|c| matches!(c, '.' | ',' | ';' | ':' | ')' | ']' | '}' | '>' | '"' | '\''));
+        let low = trimmed.to_lowercase();
+        let is_url = low.starts_with("http://") || low.starts_with("https://") || low.starts_with("www.");
+        if !is_url || trimmed.len() < 5 {
+            return None;
+        }
+        let end = start + trimmed.chars().count(); // shrink past any trimmed trailing punctuation
+        let url = if low.starts_with("www.") { format!("https://{trimmed}") } else { trimmed.to_string() };
+        Some((self.rope.char_to_byte(start), self.rope.char_to_byte(end), url))
+    }
+
     pub fn select_word(&mut self, byte: usize) {
         self.box_sel = None;
         self.extra_sels.clear();

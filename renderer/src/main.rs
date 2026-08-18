@@ -1520,40 +1520,61 @@ impl App {
         // Ctrl/Cmd-hover: underline the token under the pointer + pointer cursor
         // (goto-definition affordance, like VSCode). Editor text only.
         let link_mod_held = self.mods.control_key() || (cfg!(target_os = "macos") && self.mods.super_key());
-        let target = if ed_inside && link_mod_held {
+        // A URL under the pointer wins immediately (no probe needed — unlike a
+        // goto-definition target, "is this a link" doesn't depend on the LSP being
+        // up, or even present at all: a URL in a plain .txt/.md file or a comment
+        // in an unsupported language couldn't ctrl-click before).
+        let url_hit = if ed_inside && link_mod_held {
             self.workspace.active_doc().and_then(|d| {
-                d.language_id()?;
                 let b = ui::editor_view::EditorView::byte_at(d, &layout, p.0, p.1)?;
-                d.word_at(b)
+                d.url_at(b).map(|(s, e, _)| (s, e))
             })
         } else {
             None
         };
-        match target {
-            None => {
-                self.ctrl_probe = None;
-                self.ctrl_link_miss = None;
-                if self.ctrl_link.take().is_some() {
-                    changed = true;
-                }
+        if let Some(r) = url_hit {
+            self.ctrl_probe = None;
+            self.ctrl_link_miss = None;
+            if self.ctrl_link != Some(r) {
+                self.ctrl_link = Some(r);
+                changed = true;
             }
-            Some(r) => {
-                let known = self.ctrl_link == Some(r)
-                    || self.ctrl_probe.map_or(false, |(_, pr)| pr == r)
-                    || self.ctrl_link_miss == Some(r);
-                if !known {
-                    // New token: drop the old underline, probe whether a definition
-                    // exists — the affordance appears only on a positive answer.
+        } else {
+            let target = if ed_inside && link_mod_held {
+                self.workspace.active_doc().and_then(|d| {
+                    d.language_id()?;
+                    let b = ui::editor_view::EditorView::byte_at(d, &layout, p.0, p.1)?;
+                    d.word_at(b)
+                })
+            } else {
+                None
+            };
+            match target {
+                None => {
+                    self.ctrl_probe = None;
+                    self.ctrl_link_miss = None;
                     if self.ctrl_link.take().is_some() {
                         changed = true;
                     }
-                    let probe = self.workspace.active_doc().and_then(|d| {
-                        let uri = d.uri()?;
-                        let lang = d.language_id()?;
-                        let (line, col) = d.lsp_pos(r.0);
-                        self.lsp.probe_definition(lang, &uri, line, col)
-                    });
-                    self.ctrl_probe = probe.map(|id| (id, r));
+                }
+                Some(r) => {
+                    let known = self.ctrl_link == Some(r)
+                        || self.ctrl_probe.map_or(false, |(_, pr)| pr == r)
+                        || self.ctrl_link_miss == Some(r);
+                    if !known {
+                        // New token: drop the old underline, probe whether a definition
+                        // exists — the affordance appears only on a positive answer.
+                        if self.ctrl_link.take().is_some() {
+                            changed = true;
+                        }
+                        let probe = self.workspace.active_doc().and_then(|d| {
+                            let uri = d.uri()?;
+                            let lang = d.language_id()?;
+                            let (line, col) = d.lsp_pos(r.0);
+                            self.lsp.probe_definition(lang, &uri, line, col)
+                        });
+                        self.ctrl_probe = probe.map(|id| (id, r));
+                    }
                 }
             }
         }
@@ -9891,6 +9912,16 @@ impl App {
             }
         }
         if let Some(b) = self.editor.on_release(self.workspace.active_doc_mut()) {
+            // Ctrl+click on a URL (any file — comment, .txt, .md, JSON string,
+            // LSP or not) opens it in the browser instead of goto-definition.
+            let url = self.workspace.active_doc().and_then(|d| d.url_at(b)).map(|(_, _, u)| u);
+            if let Some(url) = url {
+                open_url(&url);
+                self.text_drag = None;
+                self.find_drag = None;
+                self.image_drag_last = None;
+                return;
+            }
             // Ctrl+click (no drag): jump to the definition of the clicked symbol.
             // Drop any hover card — the jump makes it stale on the spot.
             self.lsp_hover = None;
@@ -11606,6 +11637,18 @@ impl ApplicationHandler for App {
                     self.webview_frame_at.unwrap_or_else(Instant::now) + FRAME,
                 ));
             }
+        }
+        // Keep auto-scrolling a terminal text-selection drag while the pointer
+        // rests past the pane's edge without moving — a real mouse-move event
+        // only fires on actual movement, so without this the scroll would stop
+        // dead the instant the hand stops jiggling (#terminal-select-autoscroll).
+        if self.mouse_pressed && self.terminal.any_pane_dragging() {
+            let layout = self.layout();
+            let p = (self.mouse_pos.x as f32, self.mouse_pos.y as f32);
+            if self.terminal.selection_drag(p, &layout, self.terminal_cell_w) {
+                self.redraw();
+            }
+            el.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(50)));
         }
         // Expire toast notifications (~6s), waking again for the next expiry. This runs
         // BEFORE the terminal-key scheduling so a sooner key deadline wins the WaitUntil.
