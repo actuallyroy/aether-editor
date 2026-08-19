@@ -132,6 +132,13 @@ fn resource_group() -> String {
 // caches its bearer token.
 static KEY_CACHE: Mutex<Option<(String, Instant)>> = Mutex::new(None);
 fn get_api_key() -> Result<String, String> {
+    // Release binaries already bake this same resource's key in for `ai.rs`'s
+    // commit-message feature (`AETHER_AZURE_API_KEY`, a GitHub Actions secret via
+    // `option_env!`) — reuse it so shipped installs don't need the Azure CLI at
+    // all. Only local dev builds (no baked key, no env var) fall through to `az`.
+    if let Some(key) = crate::ai::api_key() {
+        return Ok(key);
+    }
     if let Ok(guard) = KEY_CACHE.lock() {
         if let Some((k, fetched)) = guard.as_ref() {
             if fetched.elapsed() < Duration::from_secs(45 * 60) {

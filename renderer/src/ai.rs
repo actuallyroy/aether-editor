@@ -52,7 +52,7 @@ fn api_version() -> String {
 /// at compile time (`option_env!`); a runtime env var overrides it for local dev.
 /// When present, key auth is used and the Azure CLI is not needed — so the shipped
 /// app works out of the box. `None` ⇒ fall back to the `az` bearer-token flow.
-fn api_key() -> Option<String> {
+pub(crate) fn api_key() -> Option<String> {
     std::env::var("AETHER_AZURE_API_KEY")
         .ok()
         .or_else(|| option_env!("AETHER_AZURE_API_KEY").map(str::to_string))
