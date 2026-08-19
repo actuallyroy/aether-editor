@@ -213,6 +213,9 @@ jobs:
           <key>CFBundlePackageType</key><string>APPL</string>
           <key>CFBundleIconFile</key><string>icon</string>
           <key>LSMinimumSystemVersion</key><string>11.0</string>
+          <!-- Without this key macOS denies mic access silently (no TCC prompt at
+               all) — live voice chat would connect fine but capture only silence. -->
+          <key>NSMicrophoneUsageDescription</key><string>Aether uses your microphone for live voice chat with the AI assistant.</string>
           <key>CFBundleURLTypes</key>
           <array>
             <dict>
