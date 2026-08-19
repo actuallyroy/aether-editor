@@ -69,8 +69,21 @@ pub fn clean_stale_locks() {
     }
 }
 
+/// Every `*.lock` file path currently in the discovery dir (stale-entry cleanup is the
+/// caller's job — see `clean_stale_locks`). Used by `mcp::remote` to find other running
+/// Aether windows to control by voice.
+pub fn list_locks() -> Vec<PathBuf> {
+    let Some(dir) = ide_dir() else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("lock"))
+        .collect()
+}
+
 /// Whether `pid` is a live process (best-effort; never reaps a live window's lock).
-fn pid_alive(pid: u64) -> bool {
+pub(crate) fn pid_alive(pid: u64) -> bool {
     #[cfg(unix)]
     {
         // `kill -0` exits 0 if the process exists and is signalable, non-zero otherwise.

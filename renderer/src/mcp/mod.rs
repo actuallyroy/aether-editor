@@ -24,6 +24,7 @@ pub mod agents;
 pub mod discovery;
 pub mod proxy;
 pub mod relevance;
+pub mod remote;
 pub mod server;
 pub mod tools;
 

@@ -4860,10 +4860,17 @@ impl App {
     }
 
     /// Start a live voice call (mic click). A no-op if one is already running.
+    /// Only one voice call is meant to be live across ALL open Aether windows at
+    /// once (talking to two at the same time makes no sense) — so stop any other
+    /// window's call first, over the same localhost MCP channel Claude Code uses
+    /// to control this window (see `mcp::remote`).
     fn ensure_voice_session(&mut self) {
         let Some(c) = self.chat.as_mut() else { return };
         if c.voice.is_some() {
             return;
+        }
+        for win in mcp::remote::list_windows(std::process::id()) {
+            let _ = mcp::remote::call_remote(&win, "stopVoice", serde_json::json!({}), std::time::Duration::from_millis(500));
         }
         c.voice = Some(crate::voice::start(self.worker_tx.clone(), self.proxy.clone(), self.mcp_req_tx.clone()));
     }

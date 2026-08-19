@@ -170,6 +170,32 @@ pub fn list() -> Value {
             },"required":["name"]}),
         ),
         tool(
+            "listWindows",
+            "List every OTHER running Aether window (each editing a different workspace), \
+             found via the same discovery mechanism Claude Code uses to connect. Returns \
+             each window's `pid` (pass to controlWindow/stopWindowVoice) and its workspace \
+             path. Use this to find/control a different Aether window from this one.",
+            json!({"type":"object","properties":{}}),
+        ),
+        tool(
+            "controlWindow",
+            "Run any other Aether MCP tool (openFile, closeEditor, gitStatus, insertText, \
+             searchWorkspace, etc.) against a DIFFERENT Aether window instead of this one — \
+             full remote control, same tool names/args as calling them locally. Get `pid` \
+             from listWindows first.",
+            json!({"type":"object","properties":{
+                "pid":{"type":"number","description":"Target window's pid, from listWindows"},
+                "tool":{"type":"string","description":"Tool name to run there (e.g. \"openFile\", \"gitStatus\")"},
+                "arguments":{"type":"object","description":"Arguments for that tool, same shape as calling it directly"}
+            },"required":["pid","tool"]}),
+        ),
+        tool(
+            "stopVoice",
+            "Stop THIS window's own active voice call, if any (no-op if none is active). To \
+             stop another window's call, use controlWindow with tool: \"stopVoice\".",
+            json!({"type":"object","properties":{}}),
+        ),
+        tool(
             "closeEditor",
             "Close an editor tab. Target by `filePath` (matches the end of the path) or \
              `index`; omit both to close the active tab. Unsaved changes prompt the normal \
@@ -570,6 +596,35 @@ pub fn execute(app: &mut crate::App, name: &str, args: &Value) -> Result<Value, 
             let idx = target_tab(app, args)?;
             app.terminal.rename_tab(idx, name);
             Ok(json!({ "ok": true, "id": app.terminal.tab_id(idx) }))
+        }
+
+        "listWindows" => {
+            let windows: Vec<Value> = crate::mcp::remote::list_windows(std::process::id())
+                .into_iter()
+                .map(|w| json!({ "pid": w.pid, "workspace": w.workspace }))
+                .collect();
+            Ok(json!({ "windows": windows }))
+        }
+
+        "controlWindow" => {
+            let pid = args.get("pid").and_then(|p| p.as_u64()).ok_or("controlWindow requires pid")?;
+            let tool_name = args.get("tool").and_then(|t| t.as_str()).ok_or("controlWindow requires tool")?;
+            let tool_args = args.get("arguments").cloned().unwrap_or(json!({}));
+            let win = crate::mcp::remote::list_windows(std::process::id())
+                .into_iter()
+                .find(|w| w.pid == pid)
+                .ok_or_else(|| format!("no running window with pid {pid}"))?;
+            crate::mcp::remote::call_remote(&win, tool_name, tool_args, std::time::Duration::from_secs(15))
+        }
+
+        "stopVoice" => {
+            if let Some(c) = app.chat.as_mut() {
+                if let Some(v) = c.voice.take() {
+                    v.stop();
+                }
+            }
+            app.redraw();
+            Ok(json!({ "ok": true }))
         }
 
         "closeEditor" => {

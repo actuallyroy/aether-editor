@@ -59,7 +59,11 @@ text, check the current selection and diagnostics, view and stage git changes, c
 (save, find, format, go to definition, toggle panels, and more), and manage integrated terminals (open one, \
 send commands, read output). When the user asks you to do something in the editor, use the tools — don't just \
 describe how they'd do it themselves. Keep spoken replies short and conversational; this is a voice call, not \
-a chat transcript.";
+a chat transcript.\n\n\
+You can also see and control OTHER open Aether windows (each usually a different project/workspace) — call \
+listWindows to see what's open, then controlWindow with a window's pid plus any tool name/arguments (openFile, \
+gitStatus, closeEditor, searchWorkspace, etc.) to run it there instead of here. If the user's request is about \
+a different project than the one you're in, check listWindows rather than assuming it isn't possible.";
 
 const API_VERSION: &str = "2024-10-01-preview";
 const SAMPLE_RATE: u32 = 24_000; // required wire format for the Realtime API
