@@ -52,6 +52,12 @@ jobs:
       # (tree-sitter grammars, QuickJS via rquickjs).
       - name: Install Linux dependencies
         if: matrix.os == 'ubuntu-22.04'
+        env:
+          # needrestart (an apt post-install hook on recent Ubuntu images) prompts
+          # interactively asking which services to restart, hanging a non-interactive
+          # CI shell indefinitely — 'a' (auto-restart, no prompt) skips that.
+          DEBIAN_FRONTEND: noninteractive
+          NEEDRESTART_MODE: a
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
