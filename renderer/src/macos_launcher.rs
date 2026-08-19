@@ -114,9 +114,13 @@ fn ensure_bundle(folder: &Path, real_exe: &Path) -> std::io::Result<PathBuf> {
 
     // Reuse an existing bundle as-is. Regenerating its Info.plist/icon on every open would
     // make macOS treat it as a brand-new app and re-prompt for Desktop/Documents access;
-    // building the identity-bearing files exactly once keeps that grant sticky.
+    // building the identity-bearing files exactly once keeps that grant sticky. Patching in
+    // NEW usage-description keys (see `patch_launcher_plist`) is safe alongside that — the
+    // bundle identifier/executable stay put, so folder-access grants aren't disturbed; only
+    // the newly-declared permission (mic) gets its own fresh, correctly-triggered prompt.
     if bundle.join("Contents/Info.plist").exists() {
         write_launch(&bundle, folder, real_exe); // keep folder/real_exe current (TCC-neutral)
+        patch_launcher_plist(&bundle);
         return Ok(bundle);
     }
 
@@ -149,6 +153,7 @@ fn ensure_bundle(folder: &Path, real_exe: &Path) -> std::io::Result<PathBuf> {
          \t<key>CFBundleShortVersionString</key><string>{ver}</string>\n\
          \t<key>LSMinimumSystemVersion</key><string>11.0</string>\n\
          \t<key>NSHighResolutionCapable</key><true/>\n\
+         \t<key>NSMicrophoneUsageDescription</key><string>Aether uses your microphone for live voice chat with the AI assistant.</string>\n\
          </dict>\n</plist>\n",
         name = xml_escape(&name),
         id = bundle_id(folder),
@@ -168,6 +173,40 @@ fn write_launch(bundle: &Path, folder: &Path, real_exe: &Path) {
         real_exe: real_exe.to_string_lossy().into_owned(),
     };
     let _ = std::fs::write(launch_info_path(bundle), serde_json::to_string(&info).unwrap_or_default());
+}
+
+/// Idempotently patch newly-added usage-description keys into an EXISTING launcher
+/// bundle's `Info.plist` and bump its version string — added after the fact (older
+/// launcher bundles predate `NSMicrophoneUsageDescription`, so live voice chat silently
+/// got no mic access at all: no usage string means no TCC prompt, just a hard deny).
+/// Only touches keys that don't change the bundle's identity (id/executable stay put),
+/// so it doesn't disturb any already-granted folder-access permission.
+fn patch_launcher_plist(bundle: &Path) {
+    let path = bundle.join("Contents/Info.plist");
+    let Ok(mut plist) = std::fs::read_to_string(&path) else { return };
+    let mut changed = false;
+    if !plist.contains("NSMicrophoneUsageDescription") {
+        plist = plist.replacen(
+            "</dict>\n</plist>",
+            "\t<key>NSMicrophoneUsageDescription</key><string>Aether uses your microphone for live voice chat with the AI assistant.</string>\n</dict>\n</plist>",
+            1,
+        );
+        changed = true;
+    }
+    let ver = env!("CARGO_PKG_VERSION");
+    const TAG: &str = "<key>CFBundleShortVersionString</key><string>";
+    if let Some(tag_start) = plist.find(TAG) {
+        let val_start = tag_start + TAG.len();
+        if let Some(len) = plist[val_start..].find("</string>") {
+            if &plist[val_start..val_start + len] != ver {
+                plist.replace_range(val_start..val_start + len, ver);
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        let _ = std::fs::write(&path, plist);
+    }
 }
 
 /// Hardlink `real_exe` into the bundle at `dst`, but skip if `dst` already points at the
