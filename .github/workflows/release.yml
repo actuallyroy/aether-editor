@@ -69,15 +69,26 @@ jobs:
             libxkbcommon-dev libwayland-dev libxcb1-dev \
             libfontconfig1-dev \
             clang libclang-dev \
-            meson ninja-build \
+            ninja-build \
             libasound2-dev
 
       # meson/ninja/pkg-config build the bundled WebRTC AEC3 library
       # (`webrtc-audio-processing`, live voice chat's echo cancellation) from
       # source on every platform — no prebuilt/system package to link against.
+      # meson specifically comes from pip everywhere (not apt): the build
+      # script unconditionally passes `--reconfigure` on first setup, which
+      # Ubuntu 22.04's ancient apt meson (0.61) rejects on a directory it
+      # hasn't configured yet ("Directory does not contain a valid build
+      # tree") — a recent pip meson handles it fine.
       - name: Install macOS AEC build tools
         if: matrix.os == 'macos-latest'
         run: brew install meson ninja pkg-config
+
+      - name: Install Linux AEC build tools
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          pip install --user meson
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Install Windows AEC build tools
         if: matrix.os == 'windows-latest'
