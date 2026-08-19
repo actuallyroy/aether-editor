@@ -24,7 +24,7 @@ const TOKEN_RESOURCE: &str = "https://cognitiveservices.azure.com";
 // summary message doesn't need every line. ~24k chars ≈ a few hundred lines.
 const MAX_DIFF_CHARS: usize = 24_000;
 
-fn endpoint() -> String {
+pub(crate) fn endpoint() -> String {
     std::env::var("AETHER_AZURE_ENDPOINT")
         .ok()
         .or_else(|| option_env!("AETHER_AZURE_ENDPOINT").map(str::to_string))
@@ -68,7 +68,9 @@ static TOKEN_CACHE: Mutex<Option<(String, Instant)>> = Mutex::new(None);
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Fetch a bearer token via the Azure CLI, reusing a cached one when still fresh.
-fn get_token() -> Result<String, String> {
+/// `pub(crate)` so `voice.rs` (Realtime API) can reuse it — same resource, same
+/// az-CLI-token auth, no separate credential to manage.
+pub(crate) fn get_token() -> Result<String, String> {
     if let Ok(guard) = TOKEN_CACHE.lock() {
         if let Some((tok, fetched)) = guard.as_ref() {
             if fetched.elapsed() < Duration::from_secs(45 * 60) {

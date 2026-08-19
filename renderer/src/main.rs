@@ -60,6 +60,7 @@ mod macos_urls;
 mod perf;
 mod update;
 mod media;
+mod voice;
 mod ptyhost;
 mod quad;
 mod render;
@@ -4858,6 +4859,15 @@ impl App {
         self.redraw();
     }
 
+    /// Start a live voice call (mic click). A no-op if one is already running.
+    fn ensure_voice_session(&mut self) {
+        let Some(c) = self.chat.as_mut() else { return };
+        if c.voice.is_some() {
+            return;
+        }
+        c.voice = Some(crate::voice::start(self.worker_tx.clone(), self.proxy.clone(), self.mcp_req_tx.clone()));
+    }
+
     /// Aether's closest equivalent to VSCode's "reload window": extensions ask for
     /// it after a settings change needs a restart to take effect (e.g. Gemini Code
     /// Assist's http.systemCertificatesNode toggle). There's no whole-app window to
@@ -8575,6 +8585,22 @@ impl App {
             if self.right_split.press((x, y), layout.right_sidebar) {
                 return;
             }
+            // Mic button toggles a live voice call, phone-call style: one click
+            // starts it (mic streams continuously, server VAD decides turns),
+            // another click ends it — not press-and-hold.
+            if self.chat.as_ref().map_or(false, |c| c.mic_hit((x, y), layout.right_sidebar)) {
+                if self.chat.as_ref().map_or(false, |c| c.voice.is_some()) {
+                    if let Some(c) = self.chat.as_mut() {
+                        if let Some(v) = c.voice.take() {
+                            v.stop();
+                        }
+                    }
+                } else {
+                    self.ensure_voice_session();
+                }
+                self.redraw();
+                return;
+            }
             let handled = self.chat.as_mut().map_or(false, |c| c.on_press((x, y), layout.right_sidebar));
             if handled {
                 self.redraw();
@@ -12177,6 +12203,33 @@ impl ApplicationHandler for App {
                     }
                 }
                 WorkerMsg::LspExited { server } => self.lsp.drop_server(server),
+                WorkerMsg::VoiceConnected => {}
+                WorkerMsg::VoiceUserTranscript { text, done } => {
+                    if let Some(c) = self.chat.as_mut() {
+                        c.push_voice_user(&text, done);
+                    }
+                    self.redraw();
+                }
+                WorkerMsg::VoiceAssistantTextDelta { text } => {
+                    if let Some(c) = self.chat.as_mut() {
+                        c.push_voice_assistant_delta(&text);
+                    }
+                    self.redraw();
+                }
+                WorkerMsg::VoiceAssistantDone => {}
+                WorkerMsg::VoiceError { message } => {
+                    if let Some(c) = self.chat.as_mut() {
+                        c.push_voice_error(&message);
+                        c.voice = None;
+                    }
+                    self.redraw();
+                }
+                WorkerMsg::VoiceStopped => {
+                    if let Some(c) = self.chat.as_mut() {
+                        c.voice = None;
+                    }
+                    self.redraw();
+                }
                 WorkerMsg::LspLog { server, message } => {
                     eprintln!("[lsp:{server}] {message}");
                     self.lsp_log.push_back(format!("[{server}] {message}"));

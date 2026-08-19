@@ -84,6 +84,13 @@ pub enum WorkerMsg {
     LspSemanticRefresh { server: &'static str },                // server asked us to re-pull semantic tokens
     LspLog { server: &'static str, message: String },           // server log / stderr line
     LspExited { server: &'static str },                         // server process ended
+    // ---- Live voice chat (see voice.rs) ----
+    VoiceConnected,                                             // Realtime API session ready
+    VoiceUserTranscript { text: String, done: bool },           // your speech, transcribed (incremental)
+    VoiceAssistantTextDelta { text: String },                   // assistant reply text, incremental
+    VoiceAssistantDone,                                         // assistant finished this turn
+    VoiceError { message: String },                             // session failed to start or dropped
+    VoiceStopped,                                                // session torn down (user stopped it)
     // ---- Debug adapter (see dap.rs) ----
     DebugInitialized,                                            // initialize response arrived
     DebugConfigured,                                             // `initialized` event: send breakpoints + configurationDone

@@ -34,6 +34,18 @@ pub struct ChatPanel {
     header: crate::widgets::TextLabel,
     role_you: crate::widgets::TextLabel,
     role_ai: crate::widgets::TextLabel,
+    mic_icon: crate::widgets::TextLabel,
+    /// Live voice call: `Some` for the duration of the call (a phone-call model —
+    /// one click starts it, the mic streams continuously with the server's own
+    /// voice-activity detection deciding turns, another click ends it).
+    pub voice: Option<crate::voice::VoiceHandle>,
+    /// True while the current turn's user transcript is still arriving (deltas
+    /// append; the final `done` chunk replaces with the authoritative text and
+    /// closes it) — so the NEXT turn knows to start a fresh bubble.
+    user_turn_open: bool,
+    /// True once the current turn's assistant reply has its first bubble —
+    /// later deltas append to it; cleared when the next user turn opens.
+    assistant_started: bool,
 }
 
 fn header_h() -> f32 {
@@ -62,6 +74,9 @@ impl ChatPanel {
         role_ai.set(fs, "Assistant", theme::UI_FAMILY());
         let mut input = TextInput::new(fs, 200.0, input_h()).multiline(true);
         input.set_placeholder(fs, "Ask anything… (Enter to send)");
+        // Codicon mic glyph (same icon font used for status-bar/gutter icons).
+        let mut mic_icon = crate::widgets::TextLabel::new(fs, 24.0, 24.0);
+        mic_icon.set(fs, "\u{ec12}", theme::ICON_FAMILY);
         Self {
             scroll: ScrollView::new(ScrollOpts { vertical: true, horizontal: false, stick_to_end: true }),
             input,
@@ -71,7 +86,58 @@ impl ChatPanel {
             header,
             role_you,
             role_ai,
+            mic_icon,
+            voice: None,
+            user_turn_open: false,
+            assistant_started: false,
         }
+    }
+
+    /// Screen rect of the mic button (click to start/end a voice call), right
+    /// edge of the input box.
+    fn mic_rect(region: Rect) -> Rect {
+        let ir = Self::input_rect(region);
+        let s = theme::zpx(28.0);
+        Rect { x: ir.x + ir.w - s - theme::zpx(8.0), y: ir.y + (ir.h - s) * 0.5, w: s, h: s }
+    }
+
+    /// A user-speech transcript delta (incremental fragment) or, when `done`,
+    /// the turn's authoritative final transcript (replaces whatever the deltas
+    /// had accumulated, in case they drifted).
+    pub fn push_voice_user(&mut self, text: &str, done: bool) {
+        if !self.user_turn_open {
+            self.msgs.push(Msg { role: Role::User, text: text.to_string() });
+            self.user_turn_open = true;
+            self.assistant_started = false;
+        } else if done {
+            if let Some(m) = self.msgs.last_mut() {
+                m.text = text.to_string();
+            }
+        } else if let Some(m) = self.msgs.last_mut() {
+            m.text.push_str(text);
+        }
+        if done {
+            self.user_turn_open = false;
+        }
+        self.shape_key.clear(); // force reshape
+        self.scroll.scroll_to_end();
+    }
+    /// An assistant reply delta — starts a new bubble on the first delta of a
+    /// turn, appends on every one after.
+    pub fn push_voice_assistant_delta(&mut self, delta: &str) {
+        if !self.assistant_started {
+            self.msgs.push(Msg { role: Role::Assistant, text: delta.to_string() });
+            self.assistant_started = true;
+        } else if let Some(m) = self.msgs.last_mut() {
+            m.text.push_str(delta);
+        }
+        self.shape_key.clear();
+        self.scroll.scroll_to_end();
+    }
+    pub fn push_voice_error(&mut self, message: &str) {
+        self.msgs.push(Msg { role: Role::Assistant, text: format!("Voice error: {message}") });
+        self.shape_key.clear();
+        self.scroll.scroll_to_end();
     }
 
     fn messages_region(region: Rect) -> Rect {
@@ -155,6 +221,18 @@ impl ChatPanel {
         let ring = if self.input.focused() { theme::ACCENT() } else { [1.0, 1.0, 1.0, 0.14] };
         bg.push(Quad::rounded(ir.x - 1.0, ir.y - 1.0, ir.w + 2.0, ir.h + 2.0, ring, theme::zpx(7.0)));
         bg.push(Quad::rounded(ir.x, ir.y, ir.w, ir.h, [0.10, 0.11, 0.15, 1.0], theme::zpx(6.0)));
+        // Push-to-talk mic button — red fill while actually recording, otherwise a
+        // quiet pill matching the input's own chrome.
+        let mr_btn = Self::mic_rect(region);
+        // Yellow while the call is being set up (mic click already registered,
+        // Realtime API session not up yet) so a fast connect failure reverting
+        // to idle doesn't read as "the click did nothing" — see `VoiceHandle::is_connected`.
+        let mic_fill = match self.voice.as_ref().map(|v| v.is_connected()) {
+            Some(true) => [0.86, 0.24, 0.24, 1.0],
+            Some(false) => [0.86, 0.65, 0.15, 1.0],
+            None => [1.0, 1.0, 1.0, 0.08],
+        };
+        bg.push(mr_btn.rounded_quad(mic_fill, mr_btn.w * 0.5));
         self.scroll.draw(now, fg);
     }
 
@@ -199,6 +277,15 @@ impl ChatPanel {
         // The input draws its own text/caret/placeholder.
         let ir = Self::input_rect(region);
         self.input.draw(ir, theme::zpx(10.0), theme::FG_TEXT(), areas);
+        let mr_btn = Self::mic_rect(region);
+        let mic_color = if self.voice.is_some() { glyphon::Color::rgba(255, 255, 255, 255) } else { theme::FG_DIM() };
+        self.mic_icon.push_in(
+            mr_btn.x + (mr_btn.w - self.mic_icon.width()) * 0.5,
+            mr_btn,
+            mr_btn,
+            mic_color,
+            areas,
+        );
     }
 
     pub fn on_wheel(&mut self, p: (f32, f32), region: Rect, dy: f32) -> bool {
@@ -209,13 +296,25 @@ impl ChatPanel {
         true
     }
 
-    /// Click: focus the input, grab the scrollbar, or just consume in-panel clicks.
+    /// True if `p` is over the mic button — checked by the caller before/instead
+    /// of the normal press handling (a click toggles the voice call on/off,
+    /// rather than focusing the text input).
+    pub fn mic_hit(&self, p: (f32, f32), region: Rect) -> bool {
+        region.contains(p) && Self::mic_rect(region).contains(p)
+    }
+
+    /// Click: focus the input, grab the scrollbar, or just consume in-panel
+    /// clicks. The mic button is handled separately by the caller via `mic_hit`
+    /// (click toggles the call on/off — a click-through-focus model doesn't fit).
     pub fn on_press(&mut self, p: (f32, f32), region: Rect) -> bool {
         if !region.contains(p) {
             if self.input.focused() {
                 self.input.focus(false);
             }
             return false;
+        }
+        if self.mic_hit(p, region) {
+            return true;
         }
         if self.scroll.press(p) {
             return true;
@@ -225,7 +324,9 @@ impl ChatPanel {
     }
 
     pub fn cursor(&self, p: (f32, f32), region: Rect) -> Option<winit::window::CursorIcon> {
-        if Self::input_rect(region).contains(p) {
+        if self.mic_hit(p, region) {
+            Some(winit::window::CursorIcon::Pointer)
+        } else if Self::input_rect(region).contains(p) {
             Some(winit::window::CursorIcon::Text)
         } else if region.contains(p) {
             Some(winit::window::CursorIcon::Default)

@@ -40,7 +40,18 @@ tree-sitter-rust = "0.23"
 ureq = { version = "2", features = ["tls"] }
 # Blocking WebSocket server for the Claude Code IDE-integration MCP channel
 # (localhost ws://, no TLS) — sync, fits the std-threads model (no async runtime).
-tungstenite = "0.24"
+# The `rustls-tls-webpki-roots` feature also lets the SAME crate dial OUT over
+# wss:// (OpenAI's Realtime voice API) with a self-contained cert store — no
+# extra TLS dependency needed for that outbound connection.
+tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+# Mic capture + speaker playback for live voice chat (OpenAI Realtime API).
+cpal = "0.15"
+base64 = "0.22"
+# Real acoustic echo cancellation (Google's AEC3, the same one Chrome/WebRTC use
+# for `echoCancellation: true`) — lets the voice call mic stay live and pick up
+# a genuine interruption while the assistant is talking, instead of just muting.
+# `bundled` builds the (small) C++ core from source; needs meson/ninja/pkg-config.
+webrtc-audio-processing = { version = "2", features = ["bundled"] }
 wgpu = "22"
 winit = "0.30"
 zip = { version = "2", default-features = false, features = ["deflate"] }
