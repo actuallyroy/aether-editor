@@ -298,9 +298,17 @@ impl ChatPanel {
 
     /// True if `p` is over the mic button — checked by the caller before/instead
     /// of the normal press handling (a click toggles the voice call on/off,
-    /// rather than focusing the text input).
+    /// rather than focusing the text input). Padded a few px beyond the visual
+    /// circle — at 28px wide with zero slack, a dead-center-looking click can
+    /// miss by a couple physical pixels on a high-DPI display.
     pub fn mic_hit(&self, p: (f32, f32), region: Rect) -> bool {
-        region.contains(p) && Self::mic_rect(region).contains(p)
+        if !region.contains(p) {
+            return false;
+        }
+        let r = Self::mic_rect(region);
+        let pad = theme::zpx(4.0);
+        let padded = Rect { x: r.x - pad, y: r.y - pad, w: r.w + pad * 2.0, h: r.h + pad * 2.0 };
+        padded.contains(p)
     }
 
     /// Click: focus the input, grab the scrollbar, or just consume in-panel

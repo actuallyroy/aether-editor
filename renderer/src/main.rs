@@ -4496,7 +4496,7 @@ impl App {
         self.redraw();
     }
 
-    fn request_close(&mut self, idx: usize) {
+    pub(crate) fn request_close(&mut self, idx: usize) {
         let dirty = self.workspace.documents.get(idx).map(|d| d.dirty).unwrap_or(false);
         if !dirty {
             self.workspace.close_idx(idx);
@@ -8588,6 +8588,15 @@ impl App {
             // Mic button toggles a live voice call, phone-call style: one click
             // starts it (mic streams continuously, server VAD decides turns),
             // another click ends it — not press-and-hold.
+            #[cfg(debug_assertions)]
+            if let Some(c) = self.chat.as_ref() {
+                eprintln!(
+                    "[voice-debug] press ({x:.0},{y:.0}) mic_hit={} voice_active={} connected={:?}",
+                    c.mic_hit((x, y), layout.right_sidebar),
+                    c.voice.is_some(),
+                    c.voice.as_ref().map(|v| v.is_connected())
+                );
+            }
             if self.chat.as_ref().map_or(false, |c| c.mic_hit((x, y), layout.right_sidebar)) {
                 if self.chat.as_ref().map_or(false, |c| c.voice.is_some()) {
                     if let Some(c) = self.chat.as_mut() {
@@ -12203,7 +12212,10 @@ impl ApplicationHandler for App {
                     }
                 }
                 WorkerMsg::LspExited { server } => self.lsp.drop_server(server),
-                WorkerMsg::VoiceConnected => {}
+                WorkerMsg::VoiceConnected => {
+                    #[cfg(debug_assertions)]
+                    eprintln!("[voice-debug] VoiceConnected");
+                }
                 WorkerMsg::VoiceUserTranscript { text, done } => {
                     if let Some(c) = self.chat.as_mut() {
                         c.push_voice_user(&text, done);
@@ -12218,6 +12230,8 @@ impl ApplicationHandler for App {
                 }
                 WorkerMsg::VoiceAssistantDone => {}
                 WorkerMsg::VoiceError { message } => {
+                    #[cfg(debug_assertions)]
+                    eprintln!("[voice-debug] VoiceError: {message}");
                     if let Some(c) = self.chat.as_mut() {
                         c.push_voice_error(&message);
                         c.voice = None;

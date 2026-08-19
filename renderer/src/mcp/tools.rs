@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 
 use crate::commands::Command;
 use crate::lsp::Severity;
+use crate::mcp::relevance;
 use crate::ui::Intent;
 
 /// The `tools/list` response: tools surfaced to the agent as `mcp__ide__<name>`.
@@ -167,6 +168,52 @@ pub fn list() -> Value {
                 "id":{"type":"number","description":"Stable terminal id (preferred)"},
                 "index":{"type":"number","description":"Tab position index (fallback); omits to the active tab"}
             },"required":["name"]}),
+        ),
+        tool(
+            "closeEditor",
+            "Close an editor tab. Target by `filePath` (matches the end of the path) or \
+             `index`; omit both to close the active tab. Unsaved changes prompt the normal \
+             Save/Don't Save/Cancel dialog instead of closing immediately.",
+            json!({"type":"object","properties":{
+                "filePath":{"type":"string","description":"Path (or suffix of one) of the open tab to close"},
+                "index":{"type":"number","description":"Tab position index"}
+            }}),
+        ),
+        tool(
+            "closeAllEditors",
+            "Close every open editor tab. Clean tabs close immediately; the first dirty tab \
+             (if any) prompts the Save/Don't Save/Cancel dialog and the rest are left open \
+             until that's resolved.",
+            json!({"type":"object","properties":{}}),
+        ),
+        tool(
+            "searchWorkspace",
+            "Relevance-ranked search across every file in the workspace (respects the same \
+             ignore rules as the file tree — .git, node_modules, target, etc. skipped). Not \
+             literal grep: plain words are ranked by relevance (common words matter less, \
+             rare/repeated terms matter more); wrap an exact phrase or identifier in \
+             \"double quotes\" for a required exact match, boosted above word-scored hits. \
+             Use this over openFile+reading text when you don't already know which file has \
+             what you're after.",
+            json!({"type":"object","properties":{
+                "query":{"type":"string","description":"Words and/or \"quoted phrases\""},
+                "path":{"type":"string","description":"Optional subdirectory (relative to the workspace root) to restrict the search to"},
+                "maxResults":{"type":"number","description":"Cap on ranked hits returned (default 30)"}
+            },"required":["query"]}),
+        ),
+        tool(
+            "searchTerminal",
+            "Relevance-ranked search over one terminal's full scrollback (history + visible \
+             screen) — for finding a specific past command/error/line in a long session \
+             without reading the whole buffer. Same ranking as searchWorkspace: plain words \
+             ranked by relevance, \"quoted phrases\" required exact + boosted. Target by \
+             stable `id` (preferred), `index`, or the focused terminal.",
+            json!({"type":"object","properties":{
+                "query":{"type":"string","description":"Words and/or \"quoted phrases\""},
+                "id":{"type":"number","description":"Stable terminal id (preferred)"},
+                "index":{"type":"number","description":"Tab position index (fallback); omit for the focused terminal"},
+                "maxResults":{"type":"number","description":"Cap on ranked hits returned (default 20)"}
+            },"required":["query"]}),
         ),
     ])
 }
@@ -523,6 +570,83 @@ pub fn execute(app: &mut crate::App, name: &str, args: &Value) -> Result<Value, 
             let idx = target_tab(app, args)?;
             app.terminal.rename_tab(idx, name);
             Ok(json!({ "ok": true, "id": app.terminal.tab_id(idx) }))
+        }
+
+        "closeEditor" => {
+            if args.get("filePath").is_none() && args.get("index").is_none() && app.workspace.documents.is_empty() {
+                return Ok(json!({ "ok": true, "note": "no editors are open" }));
+            }
+            let idx = if let Some(path) = args.get("filePath").and_then(|p| p.as_str()) {
+                // Non-file tabs (markdown preview, diff view, image) have no `path` —
+                // fall back to matching the tab's display name too, so "close
+                // readme.md" also finds a "Preview README.md" tab.
+                app.workspace
+                    .documents
+                    .iter()
+                    .position(|d| {
+                        d.path.as_ref().map_or(false, |p| p.to_string_lossy().ends_with(path)) || d.name.ends_with(path)
+                    })
+                    .ok_or_else(|| format!("no open editor matches {path}"))?
+            } else if let Some(i) = args.get("index").and_then(|v| v.as_u64()) {
+                let i = i as usize;
+                (i < app.workspace.documents.len()).then_some(i).ok_or_else(|| format!("no editor at index {i}"))?
+            } else {
+                app.workspace.active.ok_or("no active editor")?
+            };
+            app.request_close(idx);
+            Ok(json!({ "ok": true, "closed": idx }))
+        }
+
+        "closeAllEditors" => {
+            let dirty_remaining = loop {
+                let Some(i) = app.workspace.documents.iter().position(|d| !d.dirty) else {
+                    break app.workspace.documents.len();
+                };
+                app.workspace.close_idx(i);
+            };
+            if dirty_remaining > 0 {
+                app.request_close(0); // prompts for the first (now only) dirty tab
+            }
+            app.redraw();
+            Ok(json!({ "ok": true, "dirtyRemaining": dirty_remaining }))
+        }
+
+        "searchWorkspace" => {
+            let query = args.get("query").and_then(|q| q.as_str()).ok_or("searchWorkspace requires query")?;
+            let max_results = args.get("maxResults").and_then(|m| m.as_u64()).unwrap_or(30).max(1) as usize;
+            let root = match args.get("path").and_then(|p| p.as_str()) {
+                Some(p) => app.cwd.join(p),
+                None => app.cwd.clone(),
+            };
+            let ranker = relevance::Ranker::new(query);
+            if ranker.is_empty() {
+                return Ok(json!({ "query": query, "results": [], "truncated": false }));
+            }
+            let (hits, truncated) = relevance::search_workspace(&root, &app.cwd, &ranker);
+            let results: Vec<Value> = hits
+                .into_iter()
+                .take(max_results)
+                .map(|h| json!({ "filePath": h.file, "line": h.line, "score": h.score, "text": h.text }))
+                .collect();
+            Ok(json!({ "query": query, "results": results, "truncated": truncated }))
+        }
+
+        "searchTerminal" => {
+            let query = args.get("query").and_then(|q| q.as_str()).ok_or("searchTerminal requires query")?;
+            let max_results = args.get("maxResults").and_then(|m| m.as_u64()).unwrap_or(20).max(1) as usize;
+            let idx = target_tab(app, args)?;
+            let output = app.terminal.read_tab(idx, usize::MAX).unwrap_or_default();
+            let ranker = relevance::Ranker::new(query);
+            if ranker.is_empty() {
+                return Ok(json!({ "query": query, "id": app.terminal.tab_id(idx), "results": [] }));
+            }
+            let hits = relevance::search_lines(output.lines(), &ranker);
+            let results: Vec<Value> = hits
+                .into_iter()
+                .take(max_results)
+                .map(|h| json!({ "line": h.line, "score": h.score, "text": h.text }))
+                .collect();
+            Ok(json!({ "query": query, "id": app.terminal.tab_id(idx), "results": results }))
         }
 
         other => Err(format!("unknown tool: {other}")),

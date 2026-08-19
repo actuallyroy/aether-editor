@@ -48,6 +48,19 @@ use winit::event_loop::EventLoopProxy;
 use crate::marketplace::WorkerMsg;
 use crate::mcp::McpRequest;
 
+/// Voice's identity: it's Aether itself talking, with the same tools Claude
+/// Code gets over the IDE-MCP channel — not a generic assistant that happens
+/// to have some functions attached.
+const SYSTEM_PROMPT: &str = "You are Aether, the AI built into the Aether code editor, talking to the \
+developer by voice. You're not a separate assistant bolted onto the editor — you are the editor's own \
+voice. Speak as \"I\": \"I opened it\", \"I'll check your git diff\", never \"Aether will\" or third person.\n\n\
+You have real tools to actually act inside the user's open Aether window: read and open files, edit/insert \
+text, check the current selection and diagnostics, view and stage git changes, commit, run editor commands \
+(save, find, format, go to definition, toggle panels, and more), and manage integrated terminals (open one, \
+send commands, read output). When the user asks you to do something in the editor, use the tools — don't just \
+describe how they'd do it themselves. Keep spoken replies short and conversational; this is a voice call, not \
+a chat transcript.";
+
 const API_VERSION: &str = "2024-10-01-preview";
 const SAMPLE_RATE: u32 = 24_000; // required wire format for the Realtime API
 // WebRTC's audio processing module only runs at one of a handful of fixed native
@@ -61,7 +74,7 @@ fn deployment() -> String {
     std::env::var("AETHER_AZURE_VOICE_DEPLOYMENT")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "gpt-realtime-2.1-mini".to_string())
+        .unwrap_or_else(|| "gpt-realtime-2.1".to_string())
 }
 fn resource_name() -> String {
     std::env::var("AETHER_AZURE_RESOURCE_NAME").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| {
@@ -125,6 +138,28 @@ fn get_api_key() -> Result<String, String> {
 /// the Realtime API's function-calling wants a flat
 /// `{type:"function", name, description, parameters}`. Same tools Claude Code
 /// gets over the IDE-MCP channel — no separate/narrower set for voice.
+/// The Realtime API rejects a `function_call_output` over 1_048_576 chars
+/// ("Invalid 'item.output': string too long") — a full-file `getActiveFile`/
+/// `readFile` on anything but a small file blows past that instantly. Clip
+/// well under the real cap (the model doesn't need a whole large file read
+/// aloud anyway — it should follow up with a narrower call if it needs more).
+const MAX_TOOL_OUTPUT_CHARS: usize = 200_000;
+fn truncate_tool_output(s: String) -> String {
+    if s.len() <= MAX_TOOL_OUTPUT_CHARS {
+        return s;
+    }
+    let mut cut = MAX_TOOL_OUTPUT_CHARS;
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!(
+        "{}\n\n[...truncated: {} of {} bytes shown — narrow your request (e.g. a line range or a search query) to see more]",
+        &s[..cut],
+        cut,
+        s.len()
+    )
+}
+
 fn tools_for_session() -> Value {
     let mcp_tools = crate::mcp::tools::list();
     let arr = mcp_tools.as_array().cloned().unwrap_or_default();
@@ -225,6 +260,7 @@ fn run(
             "output_audio_format": "pcm16",
             "input_audio_transcription": { "model": "whisper-1" },
             "turn_detection": { "type": "server_vad", "interrupt_response": true },
+            "instructions": SYSTEM_PROMPT,
             "tools": tools_for_session(),
             "tool_choice": "auto",
         }
@@ -319,7 +355,7 @@ fn run(
             match rx.try_recv() {
                 Ok(result) => {
                     let output = match result {
-                        Ok(v) => v.to_string(),
+                        Ok(v) => truncate_tool_output(v.to_string()),
                         Err(e) => json!({ "error": e }).to_string(),
                     };
                     let _ = send(&mut ws, &json!({

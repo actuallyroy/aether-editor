@@ -4341,7 +4341,13 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         let msg_h = theme::zpx(44.0);
         let btn_row_h = theme::zpx(34.0);
         let btn_gap = theme::zpx(8.0);
-        let right = cfg_w as f32 - theme::zpx(16.0);
+        // Anchor left of the right (AI chat) sidebar when it's open — otherwise
+        // the toast stack sits directly on top of the chat panel's input box
+        // and mic button (both also bottom-right), swallowing clicks meant for
+        // them (the toast's own close/button rects are hit-tested first).
+        let sidebar_edge =
+            if app.right_sidebar_visible && layout.right_sidebar.w > 0.0 { layout.right_sidebar.x } else { cfg_w as f32 };
+        let right = sidebar_edge - theme::zpx(16.0);
         // Stack upward from just above the status bar.
         let mut bottom = cfg_h as f32 - theme::STATUS_BAR_HEIGHT() - theme::zpx(16.0);
         let mut tq: Vec<Quad> = Vec::new();

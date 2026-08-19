@@ -23,6 +23,7 @@ use winit::event_loop::EventLoopProxy;
 pub mod agents;
 pub mod discovery;
 pub mod proxy;
+pub mod relevance;
 pub mod server;
 pub mod tools;
 
