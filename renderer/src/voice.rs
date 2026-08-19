@@ -41,8 +41,43 @@ use cpal::{SampleFormat, StreamConfig};
 use serde_json::{json, Value};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
+#[cfg(not(windows))]
 use webrtc_audio_processing::config::EchoCanceller;
+#[cfg(not(windows))]
 use webrtc_audio_processing::{Config as AecConfig, Processor};
+
+/// Thin wrapper so the call sites below don't need `#[cfg]`s of their own. Real
+/// AEC3 everywhere except Windows, where the bundled abseil-cpp dependency
+/// doesn't build on the release runner's MinGW toolchain (WinRT header
+/// conflicts) — Windows gets unprocessed passthrough audio instead: mic stays
+/// live throughout, just without echo cancellation, so barge-in doesn't work
+/// cleanly there yet.
+#[cfg(not(windows))]
+struct Aec(Processor);
+#[cfg(not(windows))]
+impl Aec {
+    fn new(rate: u32) -> Result<Self, String> {
+        let p = Processor::new(rate).map_err(|e| format!("couldn't start echo cancellation: {e:?}"))?;
+        p.set_config(AecConfig { echo_canceller: Some(EchoCanceller::default()), ..Default::default() });
+        Ok(Self(p))
+    }
+    fn analyze_render_frame(&self, frame: &mut [f32]) {
+        let _ = self.0.analyze_render_frame([frame]);
+    }
+    fn process_capture_frame(&self, frame: &mut [f32]) {
+        let _ = self.0.process_capture_frame([frame]);
+    }
+}
+#[cfg(windows)]
+struct Aec;
+#[cfg(windows)]
+impl Aec {
+    fn new(_rate: u32) -> Result<Self, String> {
+        Ok(Self)
+    }
+    fn analyze_render_frame(&self, _frame: &mut [f32]) {}
+    fn process_capture_frame(&self, _frame: &mut [f32]) {}
+}
 use winit::event_loop::EventLoopProxy;
 
 use crate::marketplace::WorkerMsg;
@@ -280,8 +315,7 @@ fn run(
     let out_cfg = output_device.default_output_config().map_err(|e| format!("speaker config: {e}"))?;
     let out_rate = out_cfg.sample_rate().0;
 
-    let aec = Processor::new(AEC_RATE).map_err(|e| format!("couldn't start echo cancellation: {e:?}"))?;
-    aec.set_config(AecConfig { echo_canceller: Some(EchoCanceller::default()), ..Default::default() });
+    let aec = Aec::new(AEC_RATE)?;
 
     // Raw mic audio, downmixed to mono and resampled to the AEC's rate — NOT yet
     // echo-cancelled (that happens in fixed 10ms frames on the main loop below,
@@ -342,9 +376,9 @@ fn run(
             // output callback drains keeps this locked to real playback timing
             // instead of drifting with decode-time network jitter.
             let mut render_frame = peek_for_aec(&playback_buf, out_rate);
-            let _ = aec.analyze_render_frame([render_frame.as_mut_slice()]);
+            aec.analyze_render_frame(&mut render_frame);
             let mut capture_frame = pull_or_pad(&capture_raw, AEC_FRAME);
-            let _ = aec.process_capture_frame([capture_frame.as_mut_slice()]);
+            aec.process_capture_frame(&mut capture_frame);
             let cleaned_i16: Vec<i16> =
                 capture_frame.iter().map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16).collect();
             let wire = resample_i16(&cleaned_i16, AEC_RATE, SAMPLE_RATE);

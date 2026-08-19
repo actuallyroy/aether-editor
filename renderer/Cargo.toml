@@ -47,11 +47,6 @@ tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 # Mic capture + speaker playback for live voice chat (OpenAI Realtime API).
 cpal = "0.15"
 base64 = "0.22"
-# Real acoustic echo cancellation (Google's AEC3, the same one Chrome/WebRTC use
-# for `echoCancellation: true`) — lets the voice call mic stay live and pick up
-# a genuine interruption while the assistant is talking, instead of just muting.
-# `bundled` builds the (small) C++ core from source; needs meson/ninja/pkg-config.
-webrtc-audio-processing = { version = "2", features = ["bundled"] }
 wgpu = "22"
 winit = "0.30"
 zip = { version = "2", default-features = false, features = ["deflate"] }
@@ -86,3 +81,13 @@ x11rb = { version = "0.13", features = ["composite", "shape", "xtest"] }
 # Snapshot API for the offscreen webview (webkit renders frames itself — the only
 # reliable headless frame source). Version matches wry's own webkit2gtk dep.
 webkit2gtk = { version = "2.0", features = ["v2_40"] }
+
+# Real acoustic echo cancellation (Google's AEC3, the same one Chrome/WebRTC use for
+# `echoCancellation: true`) — lets the voice call mic stay live and pick up a genuine
+# interruption while the assistant is talking, instead of just muting. `bundled` builds
+# the (small) C++ core from source; needs meson/ninja/pkg-config. macOS/Linux only for
+# now — the bundled abseil-cpp dependency doesn't build on the Windows runner's MinGW
+# toolchain (WinRT header conflicts in abseil's cctz); Windows voice calls fall back to
+# unprocessed mic audio (no barge-in echo cancellation) until that's sorted out.
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+webrtc-audio-processing = { version = "2", features = ["bundled"] }

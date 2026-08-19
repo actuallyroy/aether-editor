@@ -60,7 +60,8 @@ jobs:
             libxkbcommon-dev libwayland-dev libxcb1-dev \
             libfontconfig1-dev \
             clang libclang-dev \
-            meson ninja-build
+            meson ninja-build \
+            libasound2-dev
 
       # meson/ninja/pkg-config build the bundled WebRTC AEC3 library
       # (`webrtc-audio-processing`, live voice chat's echo cancellation) from
