@@ -52,18 +52,18 @@ jobs:
       # (tree-sitter grammars, QuickJS via rquickjs).
       - name: Install Linux dependencies
         if: matrix.os == 'ubuntu-22.04'
-        timeout-minutes: 5 # fail fast instead of hanging silently if this stalls again
+        timeout-minutes: 8 # fail fast instead of hanging silently if this stalls again
         env:
-          # needrestart (an apt post-install hook on recent Ubuntu images) prompts
-          # interactively asking which services to restart, hanging a non-interactive
-          # CI shell indefinitely — 'a' (auto-restart, no prompt) skips that. `sudo`
-          # resets the environment by default, so `-E` below is required or these
-          # never reach apt-get/needrestart at all (confirmed: without -E it still hangs).
+          # Harmless belt-and-suspenders in case needrestart's interactive "restart
+          # services?" prompt ever fires; NOT what actually caused the hang below (see
+          # Acquire:: flags) — confirmed by log: apt-get update itself stalled on the
+          # runner's flaky azure.archive.ubuntu.com mirror with no built-in timeout.
           DEBIAN_FRONTEND: noninteractive
           NEEDRESTART_MODE: a
         run: |
-          sudo -E apt-get update
-          sudo -E apt-get install -y --no-install-recommends \
+          APT_OPTS="-o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15"
+          sudo -E apt-get update $APT_OPTS
+          sudo -E apt-get install -y --no-install-recommends $APT_OPTS \
             build-essential pkg-config \
             libgtk-3-dev libwebkit2gtk-4.1-dev \
             libxkbcommon-dev libwayland-dev libxcb1-dev \
