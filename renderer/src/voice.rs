@@ -113,7 +113,13 @@ fn deployment() -> String {
     std::env::var("AETHER_AZURE_VOICE_DEPLOYMENT")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "gpt-realtime-2.1".to_string())
+        // The full (non-mini) gpt-realtime-2.1 is NOT usable on this preview
+        // endpoint/API version — Azure rejects it: "OpperationNotSupported: The
+        // realtime operation does not work with the specified model." (verified
+        // live). Only the mini variant works here; the full model needs the
+        // newer GA endpoint (`/openai/v1/realtime/client_secrets`+`/calls`
+        // instead of `/openai/realtime`), a separate protocol migration.
+        .unwrap_or_else(|| "gpt-realtime-2.1-mini".to_string())
 }
 fn resource_name() -> String {
     std::env::var("AETHER_AZURE_RESOURCE_NAME").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| {
@@ -403,6 +409,8 @@ fn run(
                         Ok(v) => truncate_tool_output(v.to_string()),
                         Err(e) => json!({ "error": e }).to_string(),
                     };
+                    let _ = tx.send(WorkerMsg::VoiceToolResult { result: output.clone() });
+                    wake(proxy);
                     let _ = send(&mut ws, &json!({
                         "type": "conversation.item.create",
                         "item": {
@@ -440,6 +448,8 @@ fn run(
                         _ => {}
                     }
                     if let Some((call_id, name, args)) = handle_event(&v, tx, proxy, &playback_buf, out_rate) {
+                        let _ = tx.send(WorkerMsg::VoiceToolCall { name: name.clone(), args: args.to_string() });
+                        wake(proxy);
                         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
                         let _ = mcp_req_tx.send(McpRequest { tool: name, args, reply: reply_tx });
                         pending_calls.push((call_id, reply_rx));

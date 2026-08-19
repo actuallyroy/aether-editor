@@ -91,6 +91,8 @@ pub enum WorkerMsg {
     VoiceAssistantDone,                                         // assistant finished this turn
     VoiceError { message: String },                             // session failed to start or dropped
     VoiceStopped,                                                // session torn down (user stopped it)
+    VoiceToolCall { name: String, args: String },               // the model just called a tool (name + JSON args)
+    VoiceToolResult { result: String },                         // that tool call's result (or error) came back
     // ---- Debug adapter (see dap.rs) ----
     DebugInitialized,                                            // initialize response arrived
     DebugConfigured,                                             // `initialized` event: send breakpoints + configurationDone

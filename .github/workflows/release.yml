@@ -55,15 +55,18 @@ jobs:
         timeout-minutes: 8 # fail fast instead of hanging silently if this stalls again
         env:
           # Harmless belt-and-suspenders in case needrestart's interactive "restart
-          # services?" prompt ever fires; NOT what actually caused the hang below (see
-          # Acquire:: flags) — confirmed by log: apt-get update itself stalled on the
-          # runner's flaky azure.archive.ubuntu.com mirror with no built-in timeout.
+          # services?" prompt ever fires; NOT what actually caused the hang below.
           DEBIAN_FRONTEND: noninteractive
           NEEDRESTART_MODE: a
         run: |
-          APT_OPTS="-o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15"
-          sudo -E apt-get update $APT_OPTS
-          sudo -E apt-get install -y --no-install-recommends $APT_OPTS \
+          # The runner's default mirrorlist (/etc/apt/apt-mirrors.txt) tries
+          # azure.archive.ubuntu.com first, which repeatedly stalls fetching
+          # package indexes over plain HTTP (confirmed live — Acquire:: timeout/
+          # retry flags didn't help, it just re-stalled on each retry). Skip it
+          # entirely and go straight to the real Ubuntu archive.
+          echo "http://archive.ubuntu.com/ubuntu" | sudo tee /etc/apt/apt-mirrors.txt
+          sudo -E apt-get update
+          sudo -E apt-get install -y --no-install-recommends \
             build-essential pkg-config \
             libgtk-3-dev libwebkit2gtk-4.1-dev \
             libxkbcommon-dev libwayland-dev libxcb1-dev \

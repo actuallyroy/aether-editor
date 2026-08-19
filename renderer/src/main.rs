@@ -12236,6 +12236,18 @@ impl ApplicationHandler for App {
                     self.redraw();
                 }
                 WorkerMsg::VoiceAssistantDone => {}
+                WorkerMsg::VoiceToolCall { name, args } => {
+                    if let Some(c) = self.chat.as_mut() {
+                        c.push_voice_tool_call(&name, &args);
+                    }
+                    self.redraw();
+                }
+                WorkerMsg::VoiceToolResult { result } => {
+                    if let Some(c) = self.chat.as_mut() {
+                        c.push_voice_tool_result(&result);
+                    }
+                    self.redraw();
+                }
                 WorkerMsg::VoiceError { message } => {
                     #[cfg(debug_assertions)]
                     eprintln!("[voice-debug] VoiceError: {message}");

@@ -12,6 +12,9 @@ use crate::widgets::{Rect, ScrollOpts, ScrollView, TextInput};
 pub enum Role {
     User,
     Assistant,
+    /// A tool the model called (voice or otherwise) — shown so the user can see
+    /// what it actually did, not just what it said.
+    Tool,
 }
 
 struct Msg {
@@ -34,6 +37,7 @@ pub struct ChatPanel {
     header: crate::widgets::TextLabel,
     role_you: crate::widgets::TextLabel,
     role_ai: crate::widgets::TextLabel,
+    role_tool: crate::widgets::TextLabel,
     mic_icon: crate::widgets::TextLabel,
     /// Live voice call: `Some` for the duration of the call (a phone-call model —
     /// one click starts it, the mic streams continuously with the server's own
@@ -72,6 +76,8 @@ impl ChatPanel {
         role_you.set(fs, "You", theme::UI_FAMILY());
         let mut role_ai = crate::widgets::TextLabel::new(fs, 100.0, role_h());
         role_ai.set(fs, "Assistant", theme::UI_FAMILY());
+        let mut role_tool = crate::widgets::TextLabel::new(fs, 100.0, role_h());
+        role_tool.set(fs, "Tool", theme::UI_FAMILY());
         let mut input = TextInput::new(fs, 200.0, input_h()).multiline(true);
         input.set_placeholder(fs, "Ask anything… (Enter to send)");
         // Codicon mic glyph (same icon font used for status-bar/gutter icons).
@@ -86,6 +92,7 @@ impl ChatPanel {
             header,
             role_you,
             role_ai,
+            role_tool,
             mic_icon,
             voice: None,
             user_turn_open: false,
@@ -130,6 +137,31 @@ impl ChatPanel {
             self.assistant_started = true;
         } else if let Some(m) = self.msgs.last_mut() {
             m.text.push_str(delta);
+        }
+        self.shape_key.clear();
+        self.scroll.scroll_to_end();
+    }
+    /// A tool the model just called — shown as its own bubble (name + args) so
+    /// the user can see what it actually did, not just what it said. The result
+    /// (see `push_voice_tool_result`) appends to this same bubble once it's back.
+    pub fn push_voice_tool_call(&mut self, name: &str, args: &str) {
+        // Closes whatever turn was open so a following assistant delta starts a
+        // fresh bubble instead of appending after the tool call text.
+        self.user_turn_open = false;
+        self.assistant_started = false;
+        let text = if args.is_empty() || args == "{}" { name.to_string() } else { format!("{name}({args})") };
+        self.msgs.push(Msg { role: Role::Tool, text });
+        self.shape_key.clear();
+        self.scroll.scroll_to_end();
+    }
+    /// The result of the most recently pushed tool call — appended to that same
+    /// bubble (truncated for display; the model itself got the full payload).
+    pub fn push_voice_tool_result(&mut self, result: &str) {
+        const MAX: usize = 400;
+        let shown = if result.len() > MAX { format!("{}…", &result[..MAX]) } else { result.to_string() };
+        if let Some(m) = self.msgs.iter_mut().rev().find(|m| m.role == Role::Tool) {
+            m.text.push_str("\n→ ");
+            m.text.push_str(&shown);
         }
         self.shape_key.clear();
         self.scroll.scroll_to_end();
@@ -257,6 +289,7 @@ impl ChatPanel {
                 let (label, color) = match s.role {
                     Role::User => (&self.role_you, theme::FG_ACTIVE()),
                     Role::Assistant => (&self.role_ai, theme::FG_DIM()),
+                    Role::Tool => (&self.role_tool, theme::FG_DIM()),
                 };
                 label.push_in(role_rect.x, role_rect, mr, color, areas);
             }
